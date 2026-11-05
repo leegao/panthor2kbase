@@ -47,7 +47,6 @@ build-*/
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
-Makefile
 install_manifest.txt
 compile_commands.json
 
@@ -66,3 +65,9 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+re_scripts/
+artifacts/
+unit_tests_edge_cases
+run_vulkan_samples_and_equivalence_suite
+tests/test_runtime_hook_unpatched

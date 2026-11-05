@@ -1,0 +1,24 @@
+# Meson Cross-Compilation Template for Android NDK (arm64-v8a / API 30+)
+# Processed via: envsubst < android.toml > android-cross.txt
+[binaries]
+c = '${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang'
+cpp = '${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang++'
+ar = '${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar'
+strip = '${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip'
+pkg-config = 'pkg-config'
+
+[host_machine]
+system = 'android'
+cpu_family = 'aarch64'
+cpu = 'aarch64'
+endian = 'little'
+
+[built-in options]
+c_args = ['-I${MESON_WORKING_DIR}/shims/include', '-D__ANDROID_API__=30']
+cpp_args = ['-I${MESON_WORKING_DIR}/shims/include', '-D__ANDROID_API__=30']
+c_link_args = ['-L${MESON_WORKING_DIR}/shims/lib', '-static-libstdc++']
+cpp_link_args = ['-L${MESON_WORKING_DIR}/shims/lib', '-static-libstdc++']
+
+[properties]
+sys_root = '${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot'
+pkg_config_libdir = '${MESON_WORKING_DIR}/shims'
