@@ -104,6 +104,7 @@ target_link_libraries(vulkan_panfrost_unpatched PRIVATE panthor_kbase_runtime_ho
 # -----------------------------------------------------------------------------
 if(PANTHOR_KBASE_BUILD_TESTS AND NOT ANDROID)
    enable_testing()
+   file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/artifacts")
 
    add_executable(unit_tests_edge_cases
       tests/unit_tests_edge_cases.c

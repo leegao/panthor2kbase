@@ -6,29 +6,50 @@ panthor_kmod mmap/munmap to panthor_kbase_adapter_* when /dev/mali0 is active.
 Zero changes to src/panfrost/vulkan/* are required.
 ---
  src/panfrost/lib/kmod/meson.build | 1 +
- src/panfrost/lib/kmod/pan_kmod.h  | 6 ++++++
- 2 files changed, 7 insertions(+)
+ src/panfrost/lib/kmod/pan_kmod.h  | 16 ++++++++++++++++
+ 2 files changed, 17 insertions(+)
 
 diff --git a/src/panfrost/lib/kmod/meson.build b/src/panfrost/lib/kmod/meson.build
+index cb021a3..c5f6992 100644
 --- a/src/panfrost/lib/kmod/meson.build
 +++ b/src/panfrost/lib/kmod/meson.build
-@@ -6,6 +6,7 @@ libpankmod_lib_files = files(
+@@ -5,6 +5,7 @@ libpankmod_lib_files = files(
    'pan_kmod.c',
    'panfrost_kmod.c',
    'panthor_kmod.c',
 +  '../../uapi_adapter/panthor_kbase_adapter.c',
  )
+ 
+ libpankmod_lib = static_library(
 diff --git a/src/panfrost/lib/kmod/pan_kmod.h b/src/panfrost/lib/kmod/pan_kmod.h
+index 8d37023..d8bab9d 100644
 --- a/src/panfrost/lib/kmod/pan_kmod.h
 +++ b/src/panfrost/lib/kmod/pan_kmod.h
-@@ -850,6 +850,12 @@ static inline int
- pan_kmod_ioctl(int fd, unsigned long request, void *arg)
- {
-+#ifdef HAVE_PANTHOR_KBASE_UAPI_ADAPTER
-+   extern bool panthor_kbase_adapter_is_virtual_drm_fd(int fd);
-+   extern int panthor_kbase_adapter_ioctl(int fd, unsigned long req, void *a);
-+   if (panthor_kbase_adapter_is_virtual_drm_fd(fd))
-+      return panthor_kbase_adapter_ioctl(fd, request, arg);
+@@ -621,11 +621,27 @@ struct pan_kmod_dev {
+    void *user_priv;
+ };
+ 
++#ifndef HAVE_PANTHOR_KBASE_UAPI_ADAPTER
++#define HAVE_PANTHOR_KBASE_UAPI_ADAPTER 1
 +#endif
-    return drmIoctl(fd, request, arg);
- }
++#ifdef HAVE_PANTHOR_KBASE_UAPI_ADAPTER
++#include <stdbool.h>
++extern bool panthor_kbase_adapter_is_virtual_drm_fd(int fd);
++extern int panthor_kbase_adapter_ioctl(int fd, unsigned long req, void *a);
++#define pan_kmod_ioctl(fd, op, arg)                                          \
++   ({                                                                        \
++      PAN_TRACE_SCOPE(PAN_TRACE_LIB_KMOD, "pan_kmod_ioctl op=" #op);         \
++      (panthor_kbase_adapter_is_virtual_drm_fd(fd) ?                         \
++         panthor_kbase_adapter_ioctl(fd, op, arg) :                          \
++         drmIoctl(fd, op, arg));                                             \
++   })
++#else
+ #define pan_kmod_ioctl(fd, op, arg)                                          \
+    ({                                                                        \
+       PAN_TRACE_SCOPE(PAN_TRACE_LIB_KMOD, "pan_kmod_ioctl op=" #op);         \
+       drmIoctl(fd, op, arg);                                                 \
+    })
++#endif
+ 
+ struct pan_kmod_dev *
+ pan_kmod_dev_create(int fd, uint32_t flags,

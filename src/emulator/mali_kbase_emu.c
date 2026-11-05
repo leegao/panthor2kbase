@@ -481,10 +481,10 @@ int open(const char *pathname, int flags, ...)
       va_end(ap);
    }
 
-   if (pathname && (strcmp(pathname, "/dev/dri/renderD128") == 0))
+   if (strcmp(pathname, "/dev/dri/renderD128") == 0)
       return panthor_kbase_adapter_open(pathname, flags);
 
-   if (pathname && strncmp(pathname, "/dev/mali", 9) == 0) {
+   if (strncmp(pathname, "/dev/mali", 9) == 0) {
       /* Enforce kbase_check_flags: O_CLOEXEC is strictly mandatory! */
       if (!(flags & O_CLOEXEC)) {
          errno = EINVAL;

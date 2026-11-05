@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS ?= -Wall -Wextra -Werror -Wno-nonnull-compare -Wno-stringop-truncation -O2 -fPIC -Iinclude -Isrc/adapter -Isrc/emulator
+CFLAGS ?= -Wall -Wextra -Werror -O2 -fPIC -Iinclude -Isrc/adapter -Isrc/emulator
 
 .PHONY: all test coverage conformance verify cmake-host cmake-android clean
 
@@ -32,6 +32,7 @@ tests/test_runtime_hook_unpatched: tests/test_runtime_hook_unpatched.c libpantho
 	$(CC) $(CFLAGS) -o $@ tests/test_runtime_hook_unpatched.c ./libpanthor_kbase_runtime_hook.so ./libpanthor_kbase_adapter.so ./libmali_kbase_emu.so -Wl,-rpath,'$$ORIGIN/..' -ldl -lpthread
 
 test: all
+	mkdir -p artifacts
 	./tests/unit_tests_edge_cases
 	./tests/run_vulkan_samples_and_equivalence_suite
 	./tests/test_runtime_hook_unpatched ./libvulkan_panfrost_patched.so ./libvulkan_panfrost_unpatched.so

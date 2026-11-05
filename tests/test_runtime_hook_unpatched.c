@@ -97,7 +97,7 @@ static void run_icd_variant(const char *so_path,
 
    VkPhysicalDeviceProperties props;
    pfnGetProps(phys_dev, &props);
-   strncpy(out->device_name, props.deviceName, sizeof(out->device_name) - 1);
+   snprintf(out->device_name, sizeof(out->device_name), "%s", props.deviceName);
    out->vendor_id = props.vendorID;
    out->device_id = props.deviceID;
 

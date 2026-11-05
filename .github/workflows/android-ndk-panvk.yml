@@ -1,0 +1,199 @@
+name: Android NDK Build (libvulkan_panfrost Variant)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-android-libvulkan_panfrost:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        build-type: [debugoptimized, release]
+        variant: [patched, unpatched-runtime-hook]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+              build-essential \
+              cmake \
+              llvm-20-dev \
+              libclang-20-dev \
+              libclc-20-dev \
+              libllvmspirvlib-20-dev \
+              libelf-dev \
+              spirv-tools \
+              spirv-tools-dev \
+              bison \
+              flex \
+              libdrm-dev \
+              libxcb1-dev \
+              libx11-xcb-dev \
+              libxcb-randr0-dev \
+              libxcb-dri3-dev \
+              libxcb-present-dev \
+              libxcb-shm0-dev \
+              libxcb-sync-dev \
+              libxcb-xfixes0-dev \
+              libxshmfence-dev \
+              libx11-dev \
+              libxext-dev \
+              libxrandr-dev \
+              gettext-base \
+              unzip \
+              wget \
+              pkg-config
+          python -m pip install --upgrade pip
+          pip install mako PyYAML meson ninja packaging ortools
+
+      - name: Download Upstream Mesa 26.3.0 Source into mesa/
+        run: |
+          wget -q -O mesa-src.zip \
+            "https://github.com/leegao/panthor2kbase/releases/download/mesa-5a07217f034b3e50d8c7c7794f97a2df1742613b/mesa-5a07217f034b3e50d8c7c7794f97a2df1742613b.zip"
+          unzip -q mesa-src.zip
+          if [ -d "mesa-5a07217f034b3e50d8c7c7794f97a2df1742613b" ]; then
+            mv mesa-5a07217f034b3e50d8c7c7794f97a2df1742613b mesa
+          fi
+          rm -f mesa-src.zip
+
+      - name: Generate Host Tools
+        working-directory: mesa
+        env:
+          LLVM_CONFIG: /usr/bin/llvm-config-20
+        run: |
+          export LLVM_CONFIG=/usr/bin/llvm-config-20
+          meson setup build-host \
+              -Dplatforms=[] \
+              -Dgallium-drivers=[] \
+              -Dvulkan-drivers=[] \
+              -Dtools=panfrost \
+              -Dprecomp-compiler=enabled \
+              -Dinstall-precomp-compiler=true \
+              -Dllvm=enabled \
+              -Dmesa-clc=enabled -Dinstall-mesa-clc=true
+          ninja -C build-host src/compiler/clc/mesa_clc src/compiler/spirv/vtn_bindgen2 src/panfrost/clc/panfrost_compile
+          ln -sf "build-host/src/compiler/clc/mesa_clc" "build-host/src/compiler/clc/mesa-clc"
+          ln -sf "build-host/src/compiler/spirv/vtn_bindgen2" "build-host/src/compiler/spirv/vtn-bindgen2"
+          echo "$GITHUB_WORKSPACE/mesa/build-host/src/compiler/clc" >> $GITHUB_PATH
+          echo "$GITHUB_WORKSPACE/mesa/build-host/src/compiler/spirv" >> $GITHUB_PATH
+          echo "$GITHUB_WORKSPACE/mesa/build-host/src/panfrost/clc" >> $GITHUB_PATH
+
+      - name: Patch anon_file.c for memfd_create and Configure Variant (${{ matrix.variant }})
+        run: |
+          # SDK 30+ has native memfd_create in NDK
+          sed -i 's/#if defined(HAVE_MEMFD_CREATE) \&\& !defined __TERMUX__/#if defined(HAVE_MEMFD_CREATE)/' mesa/src/util/anon_file.c
+          # Ensure android_stub hardware_stub returns -ENOENT cleanly when probed
+          # sed -i '/with_gallium_drisw_kms = false/{n;s/if system_has_kms_drm/if false/;}' mesa/meson.build
+          sed -i "s/dep_libudev = dependency('libudev', required : false)/dep_libudev = null_dep/g" mesa/meson.build
+
+          if [ "${{ matrix.variant }}" = "patched" ]; then
+            echo "Applying minimal pan_kmod / panthor_kmod UAPI adapter patch..."
+            mkdir -p mesa/src/panfrost/uapi_adapter \
+                     mesa/subprojects/panthor_kbase_adapter/include \
+                     mesa/subprojects/panthor_kbase_adapter/src/adapter
+            cp -r include/* mesa/src/panfrost/uapi_adapter/
+            cp -r src/adapter/* mesa/src/panfrost/uapi_adapter/
+            cp -r include/* mesa/subprojects/panthor_kbase_adapter/include/
+            cp -r src/adapter/* mesa/subprojects/panthor_kbase_adapter/src/adapter/
+            cp mesa_subproject/meson.build mesa/subprojects/panthor_kbase_adapter/meson.build
+            (cd mesa && patch -p1 < ../mesa_subproject/0001-panfrost-kmod-minimal-uapi-adapter-hook.patch)
+          else
+            echo "Building UNPATCHED upstream Mesa 26.3.0 panvk with ELF GOT/PLT Runtime Hook setup..."
+          fi
+
+      - name: Build Adapter & Runtime Hook Tooling via CMake (Host & Android NDK)
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          # 1. Host CMake build & CTest verification
+          cmake -B build-cmake-host -G Ninja -DPANTHOR_KBASE_BUILD_TESTS=ON
+          cmake --build build-cmake-host
+          ctest --test-dir build-cmake-host --output-on-failure
+
+          # 2. Android NDK CMake build (arm64-v8a, android-30)
+          cmake -B build-cmake-android -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-30 \
+            -DPANTHOR_KBASE_BUILD_TESTS=OFF
+          cmake --build build-cmake-android
+
+      - name: Generate Shims
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          if [ -f shims.zip ]; then
+            unzip -o shims.zip -d ./
+          fi
+          chmod +x scripts/generate_shims.sh
+          ./scripts/generate_shims.sh
+          cp -r shims mesa/shims
+          cp android.toml mesa/android.toml
+
+      - name: Configure Meson
+        working-directory: mesa
+        env:
+          PKG_CONFIG_LIBDIR: ${{ github.workspace }}/mesa/shims
+        run: |
+          ls shims
+          cat shims/libdrm.pc
+          pkg-config --modversion libdrm
+          pkg-config --libs libdrm
+          echo "----------"
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          export MESON_WORKING_DIR="$GITHUB_WORKSPACE/mesa"
+          envsubst < android.toml > android-cross.txt
+          meson setup build --reconfigure \
+              --cross-file android-cross.txt \
+              -Dbuildtype=${{ matrix.build-type }} \
+              -Dplatforms=android,x11 \
+              -Dandroid-stub=true \
+              -Dandroid-libbacktrace=disabled \
+              -Dplatform-sdk-version=30 \
+              -Dglx=disabled \
+              -Dgbm=disabled \
+              -Degl=disabled \
+              -Dopengl=false \
+              -Dgles1=disabled \
+              -Dgles2=disabled \
+              -Dglvnd=disabled \
+              -Dvalgrind=disabled \
+              -Dgallium-drivers= \
+              -Dshared-glapi=disabled \
+              -Dzstd=disabled \
+              -Dmesa-clc=system \
+              -Dprecomp-compiler=system \
+              -Dvulkan-drivers=panfrost \
+              -Dllvm=disabled
+
+      - name: Compile Project
+        working-directory: mesa
+        run: |
+          meson compile -C build
+          mkdir -p dist-artifact
+          cp build/src/panfrost/vulkan/libvulkan_panfrost.so dist-artifact/
+          cp ../build-cmake-android/libpanthor_kbase_adapter.so dist-artifact/
+          cp ../build-cmake-android/libpanthor_kbase_runtime_hook.so dist-artifact/
+          cp ../build-cmake-android/libmali_kbase_emu.so dist-artifact/
+
+      - name: Upload Vulkan libvulkan_panfrost Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libvulkan_panfrost-aarch64-${{ matrix.variant }}-${{ matrix.build-type }}
+          path: |
+            mesa/dist-artifact/libvulkan_panfrost.so
+            mesa/dist-artifact/libpanthor_kbase_adapter.so
+            mesa/dist-artifact/libpanthor_kbase_runtime_hook.so
+            mesa/dist-artifact/libmali_kbase_emu.so
+          if-no-files-found: error

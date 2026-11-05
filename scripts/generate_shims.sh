@@ -8,7 +8,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NDK_DIR="${ANDROID_NDK_HOME:-/working_dir/c_3106ac7496559798/work/ndk/android-ndk-r27d}"
+NDK_DIR="${ANDROID_NDK_HOME:-$HOME/Android/Sdk/ndk/27.0.12077973}"
 NDK_BIN="${NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/bin"
 CC="${NDK_BIN}/aarch64-linux-android30-clang"
 AR="${NDK_BIN}/llvm-ar"
@@ -17,6 +17,7 @@ SHIMS_DIR="${ROOT_DIR}/shims"
 rm -rf "${SHIMS_DIR}"
 mkdir -p "${SHIMS_DIR}/include/libdrm" \
          "${SHIMS_DIR}/include/drm-uapi" \
+         "${SHIMS_DIR}/include/sync" \
          "${SHIMS_DIR}/lib/pkgconfig"
 
 # 1. Copy DRM / Panthor / Kbase headers into shims/include
@@ -33,6 +34,44 @@ cp -f "${ROOT_DIR}/include/xf86drm.h"        "${SHIMS_DIR}/include/libdrm/"
 cp -f "${ROOT_DIR}/include/xf86drmMode.h"    "${SHIMS_DIR}/include/libdrm/"
 cp -f "${ROOT_DIR}/src/adapter/panthor_kbase_adapter.h"      "${SHIMS_DIR}/include/"
 cp -f "${ROOT_DIR}/src/adapter/panthor_kbase_runtime_hook.h" "${SHIMS_DIR}/include/"
+
+# Android sync.h header shim
+cat > "${SHIMS_DIR}/include/sync/sync.h" << 'EOF'
+#ifndef __SYS_CORE_SYNC_H
+#define __SYS_CORE_SYNC_H
+
+#include <sys/cdefs.h>
+#include <stdint.h>
+#include <linux/types.h>
+
+__BEGIN_DECLS
+
+struct sync_fence_info_data {
+    uint32_t len;
+    char name[32];
+    int32_t status;
+    uint8_t stageHeader[0];
+};
+
+struct sync_pt_info {
+    uint32_t len;
+    char obj_name[32];
+    char driver_name[32];
+    int32_t status;
+    uint64_t timestamp_ns;
+    uint8_t driver_data[0];
+};
+
+int sync_wait(int fd, int timeout);
+int sync_merge(const char *name, int fd1, int fd2);
+struct sync_fence_info_data *sync_fence_info(int fd);
+struct sync_pt_info *sync_pt_info(struct sync_fence_info_data *info, struct sync_pt_info *itr);
+void sync_fence_info_free(struct sync_fence_info_data *info);
+
+__END_DECLS
+
+#endif /* __SYS_CORE_SYNC_H */
+EOF
 
 # Copy host /usr/include/xcb and /usr/include/X11 if available in CI environment
 if [ -d "/usr/include/xcb" ]; then
@@ -80,7 +119,64 @@ trap 'rm -rf "${BUILD_TMP}"' EXIT
    -ldl -llog -lm \
    -o "${SHIMS_DIR}/lib/libpanthor_kbase_runtime_hook.so"
 
-# 3. Build Android aarch64 X11/XCB runtime dlopen stub library so -Dplatforms=android,x11 links cleanly
+# 3. Build functional Android libsync.a via ioctl calls
+cat > "${BUILD_TMP}/libsync.c" << 'EOF'
+#include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <linux/ioctl.h>
+#include <linux/types.h>
+
+struct sync_merge_data {
+    char name[32];
+    int32_t fd2;
+    int32_t fence;
+    uint32_t flags;
+    uint32_t pad;
+};
+
+#define SYNC_IOC_MAGIC '>'
+#define SYNC_IOC_MERGE _IOWR(SYNC_IOC_MAGIC, 3, struct sync_merge_data)
+
+int sync_wait(int fd, int timeout) {
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    return poll(&pfd, 1, timeout);
+}
+
+int sync_merge(const char *name, int fd1, int fd2) {
+    struct sync_merge_data data;
+    memset(&data, 0, sizeof(data));
+    if (name) strncpy(data.name, name, sizeof(data.name) - 1);
+    data.fd2 = fd2;
+    data.fence = -1;
+    if (ioctl(fd1, SYNC_IOC_MERGE, &data) < 0)
+        return -1;
+    return data.fence;
+}
+
+void sync_fence_info_free(void *info) {
+    free(info);
+}
+EOF
+
+"${CC}" -O2 -fPIC -c "${BUILD_TMP}/libsync.c" -o "${BUILD_TMP}/libsync.o"
+"${AR}" rcs "${SHIMS_DIR}/lib/libsync.a" "${BUILD_TMP}/libsync.o"
+
+# 4. Create empty stub archives for libatomic, librt, libpthread
+cat > "${BUILD_TMP}/empty_stub.c" << 'EOF'
+static const int __unused_stub = 0;
+EOF
+"${CC}" -O2 -fPIC -c "${BUILD_TMP}/empty_stub.c" -o "${BUILD_TMP}/empty_stub.o"
+for dummy in atomic rt pthread; do
+    "${AR}" rcs "${SHIMS_DIR}/lib/lib${dummy}.a" "${BUILD_TMP}/empty_stub.o"
+done
+
+# 5. Build Android aarch64 X11/XCB runtime dlopen stub library
 cat > "${BUILD_TMP}/x11_xcb_stubs.c" << 'EOF'
 #include <stdint.h>
 #include <stddef.h>
@@ -224,7 +320,10 @@ for libname in xcb X11-xcb xcb-dri3 xcb-present xcb-randr xcb-shm xcb-sync xcb-x
    "${AR}" rcs "${SHIMS_DIR}/lib/lib${libname}.a" "${BUILD_TMP}/x11_xcb_stubs.o"
 done
 
-# 4. Write pkg-config (.pc) files into BOTH shims/ and shims/lib/pkgconfig/
+# Copy static archives into shims/ root as well so -L shims and -L shims/lib both find them
+cp -f "${SHIMS_DIR}"/lib/*.a "${SHIMS_DIR}/"
+
+# 6. Write pkg-config (.pc) files into BOTH shims/ and shims/lib/pkgconfig/
 write_pc() {
    local name="$1"
    local ver="$2"
@@ -242,7 +341,7 @@ PCEOF
 }
 
 # libdrm.pc links libdrm.a with --whole-archive so the runtime hook & adapter symbols are retained
-write_pc "libdrm"      "2.4.125" "-Wl,--whole-archive -ldrm -Wl,--no-whole-archive -ldl -llog" ""
+write_pc "libdrm"      "2.5.0" "-Wl,--whole-archive -ldrm -Wl,--no-whole-archive -ldl -llog" ""
 write_pc "zlib"        "1.3.1"   "-lz" ""
 write_pc "xcb"         "1.17.0"  "-lxcb" ""
 write_pc "x11-xcb"     "1.8.12"  "-lX11-xcb -lX11 -lxcb" ""
@@ -258,6 +357,6 @@ write_pc "xext"        "1.3.6"   "-lXext" ""
 write_pc "xrandr"      "1.5.4"   "-lXrandr" ""
 write_pc "xxf86vm"     "1.1.5"   "-lXxf86vm" ""
 
-# 5. Package shims.zip at repository root
+# 7. Package shims.zip at repository root
 (cd "${ROOT_DIR}" && rm -f shims.zip && python3 -m zipfile -c shims.zip shims/)
 echo "Generated ${ROOT_DIR}/shims.zip successfully."

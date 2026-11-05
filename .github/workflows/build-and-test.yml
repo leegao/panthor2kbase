@@ -1,0 +1,59 @@
+name: Build and Test Panthor-to-Kbase UAPI Adapter (Make & CMake)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: Build & Verify (${{ matrix.compiler }} - ${{ matrix.build_system }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        build_system: [cmake, make]
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang cmake ninja-build libdrm-dev mesa-vulkan-drivers vulkan-tools
+          python3 -m pip install --upgrade pip
+          python3 -m pip install ortools
+
+      - name: Build and Test via CMake + Ninja + CTest
+        if: matrix.build_system == 'cmake'
+        env:
+          CC: ${{ matrix.compiler }}
+        run: |
+          cmake -B build-host -G Ninja -DPANTHOR_KBASE_BUILD_TESTS=ON
+          cmake --build build-host
+          ctest --test-dir build-host --output-on-failure -V
+
+      - name: Build and Test via Make
+        if: matrix.build_system == 'make'
+        env:
+          CC: ${{ matrix.compiler }}
+        run: |
+          make clean
+          make all CC=${{ matrix.compiler }}
+          make test CC=${{ matrix.compiler }}
+
+      - name: Upload Verification Reports & Dual-Variant ICDs
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-and-test-artifacts-${{ matrix.compiler }}-${{ matrix.build_system }}
+          path: |
+            artifacts/*.json
+            build-host/*.so
+            *.so

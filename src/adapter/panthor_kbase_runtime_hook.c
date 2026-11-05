@@ -368,8 +368,10 @@ char *drmGetDeviceNameFromFd2(int fd)
 }
 
 /* Forward declarers for libdrm functions implemented in panthor_kbase_adapter.c */
-extern void *drmGetVersion(int fd);
-extern void drmFreeVersion(void *ptr);
+struct _drmVersion;
+typedef struct _drmVersion *drmVersionPtr;
+extern drmVersionPtr drmGetVersion(int fd);
+extern void drmFreeVersion(drmVersionPtr ptr);
 extern int drmIoctl(int fd, unsigned long request, void *arg);
 extern int drmGetCap(int fd, uint64_t capability, uint64_t *value);
 extern int drmSetClientCap(int fd, uint64_t capability, uint64_t value);

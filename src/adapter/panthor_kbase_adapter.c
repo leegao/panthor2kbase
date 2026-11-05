@@ -9,7 +9,9 @@
  * `DRM_IOCTL_PRIME_*`), and `libdrm` calls into `/dev/mali0` ARM Mali Kbase
  * CSF UAPI operations (`KBASE_IOCTL_*`, `USER_IO` mmaps, KCPU/CQS queues).
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -26,6 +28,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "xf86drm.h"
 #include "panthor_kbase_adapter.h"
 
 /* Real libc / syscall pointers */
@@ -1535,22 +1538,10 @@ int panthor_kbase_adapter_munmap(void *addr, size_t length)
  * LD_PRELOAD & libdrm Interception Wrappers
  * ============================================================================ */
 
-struct minimal_drm_version {
-   int version_major;
-   int version_minor;
-   int version_patchlevel;
-   int name_len;
-   char *name;
-   int date_len;
-   char *date;
-   int desc_len;
-   char *desc;
-};
-
-void *drmGetVersion(int fd)
+drmVersionPtr drmGetVersion(int fd)
 {
    if (panthor_kbase_adapter_is_virtual_drm_fd(fd)) {
-      struct minimal_drm_version *v = calloc(1, sizeof(*v));
+      drmVersionPtr v = calloc(1, sizeof(*v));
       v->version_major = 1;
       v->version_minor = 3;
       v->version_patchlevel = 0;
@@ -1562,15 +1553,15 @@ void *drmGetVersion(int fd)
       v->desc_len = strlen(v->desc);
       return v;
    }
-   void *(*next_fn)(int) = dlsym(RTLD_NEXT, "drmGetVersion");
+   drmVersionPtr (*next_fn)(int) = dlsym(RTLD_NEXT, "drmGetVersion");
    return next_fn ? next_fn(fd) : NULL;
 }
 
-void drmFreeVersion(void *ptr)
+void drmFreeVersion(drmVersionPtr ptr)
 {
    if (!ptr)
       return;
-   struct minimal_drm_version *v = (struct minimal_drm_version *)ptr;
+   drmVersionPtr v = ptr;
    if (v->name && strcmp(v->name, "panthor") == 0) {
       free(v->name);
       free(v->date);
@@ -1578,7 +1569,7 @@ void drmFreeVersion(void *ptr)
       free(v);
       return;
    }
-   void (*next_fn)(void *) = dlsym(RTLD_NEXT, "drmFreeVersion");
+   void (*next_fn)(drmVersionPtr) = dlsym(RTLD_NEXT, "drmFreeVersion");
    if (next_fn)
       next_fn(ptr);
 }

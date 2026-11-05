@@ -1,0 +1,56 @@
+name: Code Coverage Pipeline
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  coverage:
+    name: GCC Code Coverage & Threshold Gate
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Codebase
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libvulkan-dev mesa-vulkan-drivers lcov python3
+
+      - name: Run Code Coverage Pipeline
+        run: |
+          ./scripts/run_coverage.sh
+
+      - name: Publish Coverage Job Summary Table
+        run: |
+          python3 - << 'PYEOF'
+          import json, os
+          with open("artifacts/coverage_summary.json") as fp:
+              data = json.load(fp)
+
+          summary_md = "### Code Coverage Verification Report\n\n"
+          summary_md += "| Source File | Executed Lines / Total | Line Coverage % |\n"
+          summary_md += "| :--- | :--- | :--- |\n"
+          for k, v in data.items():
+              if k == "_TOTAL_":
+                  continue
+              summary_md += f"| `{k}` | {v['lines_executed']} / {v['lines_total']} | **{v['coverage_pct']:.2f}%** |\n"
+          tot = data.get("_TOTAL_", {})
+          summary_md += f"| **OVERALL TOTAL** | **{tot.get('lines_executed',0)} / {tot.get('lines_total',0)}** | **{tot.get('coverage_pct',0):.2f}%** |\n\n"
+          summary_md += f"**Quality Gate Status**: {'PASSED (>= 75.0%)' if tot.get('coverage_pct',0) >= 75.0 else 'FAILED'}\n"
+
+          print(summary_md)
+          if "GITHUB_STEP_SUMMARY" in os.environ:
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as sfp:
+                  sfp.write(summary_md)
+          PYEOF
+
+      - name: Upload Coverage Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-coverage-reports
+          path: |
+            artifacts/coverage_summary.json
+            coverage_output/*.gcov

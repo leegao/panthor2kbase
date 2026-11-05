@@ -1,6 +1,9 @@
 # Prerequisites
 *.d
 
+# Archives
+mesa-*.zip
+
 # Compiled Object files
 *.slo
 *.lo
@@ -67,7 +70,11 @@ Testing/
 .cache/
 
 re_scripts/
-artifacts/
+artifacts/*
+!artifacts/.gitkeep
 unit_tests_edge_cases
 run_vulkan_samples_and_equivalence_suite
 tests/test_runtime_hook_unpatched
+mesa/
+shims/
+archives/

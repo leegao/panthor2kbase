@@ -29,28 +29,16 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include "drm.h"
 #include "panthor_drm.h"
 #include "mali_kbase_uapi.h"
+#include "xf86drm.h"
 #include "panthor_kbase_adapter.h"
 #include "mali_kbase_emu.h"
-
-/* Minimal libdrm declarations matching panthor_kbase_adapter.c */
-struct minimal_drm_version {
-   int version_major;
-   int version_minor;
-   int version_patchlevel;
-   int name_len;
-   char *name;
-   int date_len;
-   char *date;
-   int desc_len;
-   char *desc;
-};
-extern void *drmGetVersion(int fd);
-extern void drmFreeVersion(void *ptr);
 extern int drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle);
 extern int drmSyncobjDestroy(int fd, uint32_t handle);
 extern int drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles,
@@ -178,7 +166,7 @@ int main(void)
    int drm_fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
    assert(drm_fd >= 0);
 
-   struct minimal_drm_version *ver = (struct minimal_drm_version *)drmGetVersion(drm_fd);
+   drmVersionPtr ver = drmGetVersion(drm_fd);
    assert(ver != NULL && strcmp(ver->name, "panthor") == 0);
    printf("[Stage 0] drmGetVersion(fd=%d) -> name='%s' (%d.%d.%d)\n",
           drm_fd, ver->name, ver->version_major, ver->version_minor, ver->version_patchlevel);
@@ -505,7 +493,11 @@ int main(void)
    assert(stats.csg_scope_warnings == 0 && stats.oom_heap_stat_errors == 0 && stats.same_va_munmap_destroys == 0);
    assert(stats.queue_kick_count >= 5 && stats.csf_calls_followed >= 5 && stats.valhall_instructions_executed >= 15);
 
+   mkdir("artifacts", 0777);
    FILE *fp = fopen("artifacts/live_workload_traces.json", "w");
+   if (!fp) {
+      fprintf(stderr, "Failed to create/open artifacts/live_workload_traces.json: %s\n", strerror(errno));
+   }
    assert(fp != NULL);
    fprintf(fp, "{\n");
    fprintf(fp, "  \"emulator_telemetry\": {\n");
