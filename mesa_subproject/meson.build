@@ -4,7 +4,10 @@
 
 libpanthor_kbase_adapter = shared_library(
   'panthor_kbase_adapter',
-  files('../src/adapter/panthor_kbase_adapter.c'),
+  files(
+      '../src/adapter/panthor_kbase_adapter.c',
+      '../src/adapter/log.c',
+    ),
   include_directories : [inc_include, include_directories('../include')],
   dependencies : [dep_dl, dep_thread],
   install : true,

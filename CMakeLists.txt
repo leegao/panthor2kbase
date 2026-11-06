@@ -26,6 +26,9 @@ else()
    add_compile_options(-O2 -g -Wall -Wextra -Wno-unused-parameter)
 endif()
 
+# Ensure shared libraries are protected against premature unloading across dlclose()
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,nodelete")
+
 include_directories(
    ${CMAKE_CURRENT_SOURCE_DIR}/include
    ${CMAKE_CURRENT_SOURCE_DIR}/src/adapter
@@ -37,12 +40,14 @@ include_directories(
 # -----------------------------------------------------------------------------
 add_library(panthor_kbase_adapter SHARED
    src/adapter/panthor_kbase_adapter.c
+   src/adapter/log.c
    src/adapter/drm_mode_stubs.c
 )
 target_link_libraries(panthor_kbase_adapter PRIVATE ${PLATFORM_LIBS})
 
 add_library(panthor_kbase_adapter_static STATIC
    src/adapter/panthor_kbase_adapter.c
+   src/adapter/log.c
    src/adapter/drm_mode_stubs.c
 )
 set_target_properties(panthor_kbase_adapter_static PROPERTIES OUTPUT_NAME panthor_kbase_adapter)
@@ -66,6 +71,7 @@ set_target_properties(panthor_kbase_runtime_hook_static PROPERTIES OUTPUT_NAME p
 # -----------------------------------------------------------------------------
 add_library(drm_shim STATIC
    src/adapter/panthor_kbase_adapter.c
+   src/adapter/log.c
    src/adapter/panthor_kbase_runtime_hook.c
    src/adapter/drm_mode_stubs.c
 )
@@ -152,6 +158,11 @@ if(PANTHOR_KBASE_BUILD_TESTS AND NOT ANDROID)
       add_test(
          NAME kbase_kernel_symbolic_verifier
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/src/verifier/kbase_kernel_symbolic_verifier.py
+         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      )
+      add_test(
+         NAME aarch64_mc_lifter_verifier
+         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/src/verifier/aarch64_mc_lifter.py ${CMAKE_CURRENT_SOURCE_DIR}/mali_kbase.ko
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
       )
    endif()

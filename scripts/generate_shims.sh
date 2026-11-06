@@ -106,13 +106,13 @@ trap 'rm -rf "${BUILD_TMP}"' EXIT
    "${BUILD_TMP}/panthor_kbase_adapter.o" \
    "${BUILD_TMP}/drm_mode_stubs.o"
 
-"${CC}" -shared -O2 -fPIC \
+"${CC}" -shared -O2 -fPIC -Wl,-z,nodelete \
    "${BUILD_TMP}/panthor_kbase_adapter.o" \
    "${BUILD_TMP}/drm_mode_stubs.o" \
    -ldl -llog -lm \
    -o "${SHIMS_DIR}/lib/libpanthor_kbase_adapter.so"
 
-"${CC}" -shared -O2 -fPIC \
+"${CC}" -shared -O2 -fPIC -Wl,-z,nodelete \
    "${BUILD_TMP}/panthor_kbase_runtime_hook.o" \
    "${BUILD_TMP}/panthor_kbase_adapter.o" \
    "${BUILD_TMP}/drm_mode_stubs.o" \
@@ -340,8 +340,9 @@ PCEOF
    done
 }
 
-# libdrm.pc links libdrm.a with --whole-archive so the runtime hook & adapter symbols are retained
-write_pc "libdrm"      "2.5.0" "-Wl,--whole-archive -ldrm -Wl,--no-whole-archive -ldl -llog" ""
+# libdrm.pc links libdrm.a with --whole-archive so the runtime hook & adapter symbols are retained,
+# and -Wl,-z,nodelete ensures the Vulkan driver is not unloaded during loader pre-instance queries.
+write_pc "libdrm"      "2.5.0" "-Wl,-z,nodelete -Wl,--whole-archive -ldrm -Wl,--no-whole-archive -ldl -llog" ""
 write_pc "zlib"        "1.3.1"   "-lz" ""
 write_pc "xcb"         "1.17.0"  "-lxcb" ""
 write_pc "x11-xcb"     "1.8.12"  "-lX11-xcb -lX11 -lxcb" ""

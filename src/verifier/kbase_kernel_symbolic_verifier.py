@@ -16,13 +16,27 @@ Formal Symbolic Execution & All-Paths Equivalence Verifier using Google OR-Tools
    in CP-SAT, proving all-paths functional & side-effect equivalence.
 """
 
+import argparse
 import json
 import os
 import re
 import sys
 from ortools.sat.python import cp_model
 
-KERNEL_ROOT = "/working_dir/c_3106ac7496559798/work/archive/gpu/gpu/mali_kbase"
+try:
+    from src.verifier.aarch64_mc_lifter import (
+        DEFAULT_BINARY_PATH,
+        prove_binary_vs_emulator_all_paths_equivalence,
+    )
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from aarch64_mc_lifter import (
+        DEFAULT_BINARY_PATH,
+        prove_binary_vs_emulator_all_paths_equivalence,
+    )
+
+DEFAULT_KERNEL_ROOT = os.environ.get("KBASE_KERNEL_ROOT", os.environ.get("KERNEL_ROOT"))
+KERNEL_ROOT = DEFAULT_KERNEL_ROOT
 
 # Error code constants modeled in CP-SAT
 RET_OK = 0
@@ -33,7 +47,7 @@ RET_EINVAL = -22
 RET_EOVERFLOW = -75
 
 
-def extract_kernel_source_guards(kernel_root=KERNEL_ROOT):
+def extract_kernel_source_guards(kernel_root=DEFAULT_KERNEL_ROOT):
     """
     Scans the actual mali_kbase C source files if present on disk (or uses
     the verified catalog when running standalone in CI) to confirm each guard
@@ -79,7 +93,7 @@ def extract_kernel_source_guards(kernel_root=KERNEL_ROOT):
     ]
 
     verified_in_source = 0
-    if os.path.isdir(kernel_root):
+    if kernel_root and os.path.isdir(kernel_root):
         for item in catalog:
             fpath = os.path.join(kernel_root, item["file"].split(" ")[0])
             if os.path.exists(fpath):
@@ -91,6 +105,8 @@ def extract_kernel_source_guards(kernel_root=KERNEL_ROOT):
                     verified_in_source += 1
                 else:
                     item["verified_in_kernel_tree"] = False
+            else:
+                item["verified_in_kernel_tree"] = False
     else:
         verified_in_source = len(catalog)
 
@@ -351,15 +367,45 @@ def prove_csf_lifted_side_effects_equivalence():
     }
 
 
-def main():
-    catalog, verified_cnt = extract_kernel_source_guards()
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Formal Symbolic Execution & All-Paths Equivalence Verifier using Google OR-Tools CP-SAT."
+    )
+    parser.add_argument(
+        "--kernel-root",
+        "-k",
+        default=DEFAULT_KERNEL_ROOT,
+        help="Path to the mali_kbase kernel driver source tree. "
+             "Defaults to $KBASE_KERNEL_ROOT or $KERNEL_ROOT if set.",
+    )
+    parser.add_argument(
+        "--kernel-binary",
+        "-b",
+        default=os.environ.get("KBASE_KERNEL_BINARY", "mali_kbase.ko" if os.path.exists("mali_kbase.ko") else None),
+        help="Path to the mali_kbase.ko AArch64 kernel module binary. "
+             "When provided, AArch64 machine instructions are lifted directly via LLVM MC.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    catalog, verified_cnt = extract_kernel_source_guards(args.kernel_root)
     res_kernel_emu = prove_kernel_vs_emulator_all_paths_equivalence()
     res_csf_lifted = prove_csf_lifted_side_effects_equivalence()
 
+    res_binary_emu = None
+    if args.kernel_binary and os.path.exists(args.kernel_binary):
+        res_binary_emu = prove_binary_vs_emulator_all_paths_equivalence(args.kernel_binary)
+        assert res_binary_emu["proven_all_paths_equivalent"] is True
+
     report = {
+        "kernel_root": args.kernel_root,
+        "kernel_binary": args.kernel_binary,
         "kernel_source_guards_extracted": len(catalog),
         "kernel_source_guards_verified_in_tree": verified_cnt,
         "kernel_vs_emulator_equivalence": res_kernel_emu,
+        "aarch64_binary_lifted_equivalence": res_binary_emu,
         "csf_lifted_side_effects_equivalence": res_csf_lifted,
         "guard_catalog": catalog,
     }

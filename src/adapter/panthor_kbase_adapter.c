@@ -30,6 +30,7 @@
 
 #include "xf86drm.h"
 #include "panthor_kbase_adapter.h"
+#include "log.h"
 
 /* Real libc / syscall pointers */
 static int (*real_open)(const char *, int, ...) = NULL;
@@ -42,6 +43,8 @@ static void resolve_real_funcs(void)
 {
    bool has_emu = (dlsym(RTLD_DEFAULT, "mali_kbase_emu_get_stats") != NULL);
    void *handle = has_emu ? RTLD_DEFAULT : RTLD_NEXT;
+   // LOG_DEBUG("resolve_real_funcs: symbol backend = %s",
+   //           has_emu ? "RTLD_DEFAULT (mali_kbase_emu present)" : "RTLD_NEXT");
    if (!real_open) {
       real_open = dlsym(handle, "open");
       if (!real_open) real_open = dlsym(RTLD_DEFAULT, "open");
@@ -447,30 +450,27 @@ size_t panthor_kbase_emit_ring_slot(uint64_t *ring_slot,
 static int init_kbase_context(struct adapter_ctx *ctx, int mali_fd)
 {
    resolve_real_funcs();
+   LOG_DEBUG("init_kbase_context mali_fd=%d", mali_fd);
    ctx->mali_fd = mali_fd;
 
    /* Step 1: KBASE_IOCTL_VERSION_CHECK (nr 52) — MUST be first ioctl on fd */
    struct kbase_ioctl_version_check ver = { .major = 1, .minor = 38 };
-   if (real_ioctl(mali_fd, KBASE_IOCTL_VERSION_CHECK, &ver) < 0)
+   if (adapter_ioctl(mali_fd, KBASE_IOCTL_VERSION_CHECK, &ver) < 0)
       return -1;
    ctx->kbase_ver_major = ver.major;
    ctx->kbase_ver_minor = ver.minor;
-   trace_log("KBASE_IOCTL_VERSION_CHECK major=%u minor=%u\n", ver.major, ver.minor);
 
    /* Step 2: KBASE_IOCTL_SET_FLAGS (nr 1) — MUST follow VERSION_CHECK */
    struct kbase_ioctl_set_flags flags = {
       .create_flags = BASE_CONTEXT_SYSTEM_MONITOR_SUBMIT_DISABLED
    };
-   if (real_ioctl(mali_fd, KBASE_IOCTL_SET_FLAGS, &flags) < 0)
+   if (adapter_ioctl(mali_fd, KBASE_IOCTL_SET_FLAGS, &flags) < 0)
       return -1;
-   trace_log("KBASE_IOCTL_SET_FLAGS create_flags=0x%x\n", flags.create_flags);
 
    /* Step 3: KBASE_IOCTL_MEM_EXEC_INIT (nr 38) — MUST precede GPU_EX BO allocs */
    struct kbase_ioctl_mem_exec_init exec_init = { .va_pages = 0x80000ULL };
-   if (real_ioctl(mali_fd, KBASE_IOCTL_MEM_EXEC_INIT, &exec_init) < 0)
+   if (adapter_ioctl(mali_fd, KBASE_IOCTL_MEM_EXEC_INIT, &exec_init) < 0)
       return -1;
-   trace_log("KBASE_IOCTL_MEM_EXEC_INIT va_pages=0x%llx\n",
-             (unsigned long long)exec_init.va_pages);
 
    /* Step 4: KBASE_IOCTL_MEM_JIT_INIT (nr 14) */
    struct kbase_ioctl_mem_jit_init jit_init = {
@@ -480,38 +480,31 @@ static int init_kbase_context(struct adapter_ctx *ctx, int mali_fd)
       .group_id = 0,
       .phys_pages = 0x100000ULL,
    };
-   real_ioctl(mali_fd, KBASE_IOCTL_MEM_JIT_INIT, &jit_init);
-   trace_log("KBASE_IOCTL_MEM_JIT_INIT va_pages=0x%llx\n",
-             (unsigned long long)jit_init.va_pages);
+   adapter_ioctl(mali_fd, KBASE_IOCTL_MEM_JIT_INIT, &jit_init);
 
    /* Step 5: Two-pass KBASE_IOCTL_GET_GPUPROPS (nr 3) */
    struct kbase_ioctl_get_gpuprops gp = { .buffer = 0, .size = 0, .flags = 0 };
-   int blob_len = real_ioctl(mali_fd, KBASE_IOCTL_GET_GPUPROPS, &gp);
+   int blob_len = adapter_ioctl(mali_fd, KBASE_IOCTL_GET_GPUPROPS, &gp);
    if (blob_len > 0) {
       uint8_t *blob = calloc(1, (size_t)blob_len);
       gp.buffer = (uintptr_t)blob;
       gp.size = (uint32_t)blob_len;
-      if (real_ioctl(mali_fd, KBASE_IOCTL_GET_GPUPROPS, &gp) >= 0)
+      if (adapter_ioctl(mali_fd, KBASE_IOCTL_GET_GPUPROPS, &gp) >= 0)
          parse_kbase_gpuprops(ctx, blob, (size_t)blob_len);
       free(blob);
    } else {
       parse_kbase_gpuprops(ctx, NULL, 0);
    }
-   trace_log("KBASE_IOCTL_GET_GPUPROPS gpu_id=0x%x arch=%u\n",
-             ctx->gpu_info.gpu_id, ctx->arch_major);
 
    /* Step 6: KBASE_IOCTL_CS_GET_GLB_IFACE (nr 51) */
    union kbase_ioctl_cs_get_glb_iface glb = {0};
-   if (real_ioctl(mali_fd, KBASE_IOCTL_CS_GET_GLB_IFACE, &glb) >= 0) {
+   if (adapter_ioctl(mali_fd, KBASE_IOCTL_CS_GET_GLB_IFACE, &glb) >= 0) {
       ctx->csif_info.csg_slot_count = glb.out.group_num ? glb.out.group_num : 8;
       ctx->csif_info.cs_slot_count = glb.out.total_stream_num ? glb.out.total_stream_num : 24;
       ctx->csif_info.cs_reg_count = (ctx->arch_major >= 11) ? 96 : 64;
       ctx->csif_info.scoreboard_slot_count = 8;
       ctx->csif_info.unpreserved_cs_reg_count = 4;
    }
-   trace_log("KBASE_IOCTL_CS_GET_GLB_IFACE csg=%u cs=%u regs=%u\n",
-             ctx->csif_info.csg_slot_count, ctx->csif_info.cs_slot_count,
-             ctx->csif_info.cs_reg_count);
 
    /* Step 7: Map CSF USER_REG page (cookie 47UL << 12) for LATEST_FLUSH reads */
    ctx->user_reg_page = real_mmap(NULL, 4096, PROT_READ, MAP_SHARED,
@@ -521,15 +514,18 @@ static int init_kbase_context(struct adapter_ctx *ctx, int mali_fd)
 
    /* Step 8: Create KCPU queue & stream fd for CQS/sync_file operations */
    struct kbase_ioctl_kcpu_queue_new kcpu = {0};
-   if (real_ioctl(mali_fd, KBASE_IOCTL_KCPU_QUEUE_CREATE, &kcpu) >= 0) {
+   if (adapter_ioctl(mali_fd, KBASE_IOCTL_KCPU_QUEUE_CREATE, &kcpu) >= 0) {
       ctx->kcpu_queue_id = kcpu.id;
       ctx->has_kcpu_queue = true;
-      trace_log("KBASE_IOCTL_KCPU_QUEUE_CREATE id=%u\n", kcpu.id);
    }
    union kbase_ioctl_stream_create_u strm = {0};
    snprintf(strm.in.name, sizeof(strm.in.name), "panvk-kbase-sync");
-   if (real_ioctl(mali_fd, KBASE_IOCTL_STREAM_CREATE, &strm) >= 0)
+   if (adapter_ioctl(mali_fd, KBASE_IOCTL_STREAM_CREATE, &strm) >= 0)
       ctx->stream_fd = strm.out.fd;
+
+   LOG_DEBUG("init_kbase_context done arch=%u kbase_ver=%u.%u has_kcpu=%d stream_fd=%d",
+            ctx->arch_major, ctx->kbase_ver_major, ctx->kbase_ver_minor,
+            ctx->has_kcpu_queue, ctx->stream_fd);
 
    /* Step 9: Allocate CSF_EVENT BO for CQS syncobjs & subqueue seqnos */
    union kbase_ioctl_mem_alloc ev_alloc = {
@@ -542,7 +538,7 @@ static int init_kbase_context(struct adapter_ctx *ctx, int mali_fd)
                   BASE_MEM_SAME_VA | BASE_MEM_CSF_EVENT | BASE_MEM_COHERENT_LOCAL,
       }
    };
-   if (real_ioctl(mali_fd, KBASE_IOCTL_MEM_ALLOC, &ev_alloc) == 0) {
+   if (adapter_ioctl(mali_fd, KBASE_IOCTL_MEM_ALLOC, &ev_alloc) == 0) {
       ctx->event_bo_size = 16 * 4096;
       ctx->event_bo_cpu = real_mmap(NULL, ctx->event_bo_size, PROT_READ | PROT_WRITE,
                                     MAP_SHARED, mali_fd, ev_alloc.out.gpu_va);
@@ -565,6 +561,7 @@ static int init_kbase_context(struct adapter_ctx *ctx, int mali_fd)
 int panthor_kbase_adapter_open(const char *path, int flags)
 {
    resolve_real_funcs();
+   LOG_DEBUG("adapter_open path=%s flags=0x%x", path ? path : "(null)", flags);
    pthread_mutex_lock(&g_lock);
    const char *mali_path = getenv("PANVK_KBASE_NODE_PATH");
    if (!mali_path || !mali_path[0])
@@ -572,18 +569,22 @@ int panthor_kbase_adapter_open(const char *path, int flags)
    (void)path;
    int mali_fd = real_open(mali_path, flags | O_RDWR | O_CLOEXEC, 0);
    if (mali_fd < 0) {
+      LOG_ERROR("adapter_open: real_open(%s) failed: %s", mali_path,
+                strerror(errno));
       pthread_mutex_unlock(&g_lock);
       return -1;
    }
    memset(&g_ctx, 0, sizeof(g_ctx));
    g_ctx.drm_fd = mali_fd;
    if (init_kbase_context(&g_ctx, mali_fd) < 0) {
+      LOG_ERROR("adapter_open: init_kbase_context failed for fd=%d", mali_fd);
       real_close(mali_fd);
       g_ctx.active = false;
       pthread_mutex_unlock(&g_lock);
       return -1;
    }
    pthread_mutex_unlock(&g_lock);
+   LOG_DEBUG("adapter_open: mali_fd=%d drm_fd=%d active", mali_fd, g_ctx.drm_fd);
    return mali_fd;
 }
 
@@ -594,6 +595,8 @@ int panthor_kbase_adapter_dup(int fd)
     * can only run once. Our adapter tracks the context across dup'd fds or
     * opens a fresh /dev/mali0 context when required.
     */
+   LOG_DEBUG("adapter_dup fd=%d active=%d drm_fd=%d", fd, g_ctx.active,
+             g_ctx.drm_fd);
    if (g_ctx.active && fd == g_ctx.drm_fd)
       return fd;
    return dup(fd);
@@ -602,11 +605,12 @@ int panthor_kbase_adapter_dup(int fd)
 int panthor_kbase_adapter_close(int fd)
 {
    resolve_real_funcs();
+   LOG_DEBUG("adapter_close fd=%d active=%d", fd, g_ctx.active);
    pthread_mutex_lock(&g_lock);
    if (g_ctx.active && fd == g_ctx.drm_fd) {
       if (g_ctx.has_kcpu_queue) {
          struct kbase_ioctl_kcpu_queue_delete del = { .id = g_ctx.kcpu_queue_id };
-         real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_KCPU_QUEUE_DELETE, &del);
+         adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_KCPU_QUEUE_DELETE, &del);
       }
       if (g_ctx.user_reg_page)
          real_munmap(g_ctx.user_reg_page, 4096);
@@ -651,13 +655,20 @@ static struct adapter_group *find_group(uint32_t handle)
 int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
 {
    resolve_real_funcs();
-   if (!panthor_kbase_adapter_is_virtual_drm_fd(fd))
+   if (!panthor_kbase_adapter_is_virtual_drm_fd(fd)) {
+      LOG_DEBUG("ioctl passthrough fd=%d req=%s", fd,
+                panthor2kbase_ioctl_req_name(request));
       return real_ioctl(fd, request, arg);
+   }
 
    pthread_mutex_lock(&g_lock);
    unsigned int nr = _IOC_NR(request);
    unsigned int type = _IOC_TYPE(request);
    int ret = 0;
+
+   LOG_INFO("ioctl intercepted: req=%s(0x%lx) fd=%d nr=%u type=%c",
+            panthor2kbase_ioctl_req_name(request), request, fd, nr,
+            type ? type : '?');
 
    if (type != 'd') {
       pthread_mutex_unlock(&g_lock);
@@ -685,6 +696,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             strncpy(v->desc, desc, v->desc_len);
          v->desc_len = strlen(desc);
       }
+      LOG_INFO("DRM_IOCTL_VERSION -> major=1 minor=3 patch=0");
       pthread_mutex_unlock(&g_lock);
       return 0;
    }
@@ -692,10 +704,14 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       struct { uint64_t capability; uint64_t value; } *cap = arg;
       if (cap)
          cap->value = 1ULL;
+      LOG_INFO("DRM_IOCTL_GET_CAP capability=%llu -> value=%llu",
+               (unsigned long long)(cap ? cap->capability : 0),
+               (unsigned long long)(cap ? cap->value : 0));
       pthread_mutex_unlock(&g_lock);
       return 0;
    }
    case 0x0d: { /* DRM_IOCTL_SET_CLIENT_CAP */
+      LOG_INFO("DRM_IOCTL_SET_CLIENT_CAP");
       pthread_mutex_unlock(&g_lock);
       return 0;
    }
@@ -704,6 +720,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       if (sh) {
          sh->fd = (g_ctx.stream_fd >= 0) ? dup(g_ctx.stream_fd) : dup(g_ctx.mali_fd);
       }
+      LOG_INFO("DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD -> fd=%d", sh ? sh->fd : -1);
       pthread_mutex_unlock(&g_lock);
       return 0;
    }
@@ -720,6 +737,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             }
          }
       }
+      LOG_INFO("DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE -> handle=%u", sh ? sh->handle : 0);
       pthread_mutex_unlock(&g_lock);
       return 0;
    }
@@ -740,12 +758,13 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             real_munmap(unmap_ptr, unmap_sz);
          else if (free_va) {
             struct kbase_ioctl_mem_free mf = { .gpu_addr = free_va };
-            real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_FREE, &mf);
+            adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_FREE, &mf);
          }
-         trace_log("DRM_IOCTL_GEM_CLOSE handle=%u -> KBASE_IOCTL_MEM_FREE va=0x%llx\n",
-                   h, (unsigned long long)va);
+         LOG_INFO("DRM_IOCTL_GEM_CLOSE handle=%u -> KBASE_IOCTL_MEM_FREE va=0x%llx",
+                  h, (unsigned long long)va);
          return 0;
       }
+      LOG_WARN("DRM_IOCTL_GEM_CLOSE handle=%u not found", cl ? cl->handle : 0);
       pthread_mutex_unlock(&g_lock);
       return 0;
    }
@@ -753,6 +772,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       struct drm_prime_handle *ph = (struct drm_prime_handle *)arg;
       struct adapter_bo *bo = find_bo(ph->handle);
       if (!bo) {
+         LOG_WARN("DRM_IOCTL_PRIME_HANDLE_TO_FD handle=%u not found",
+                  ph ? ph->handle : 0);
          pthread_mutex_unlock(&g_lock);
          errno = ENOENT;
          return -1;
@@ -767,6 +788,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          }
       }
       ph->fd = dup(bo->dmabuf_fd);
+      LOG_INFO("DRM_IOCTL_PRIME_HANDLE_TO_FD handle=%u -> fd=%d",
+               ph ? ph->handle : 0, ph ? ph->fd : -1);
       pthread_mutex_unlock(&g_lock);
       return (ph->fd >= 0) ? 0 : -1;
    }
@@ -778,6 +801,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       if (have_stat && st.st_ino != 0) {
          for (size_t i = 0; i < ADAPTER_MAX_BOS; i++) {
             if (g_ctx.bos[i].in_use && g_ctx.bos[i].dmabuf_ino == (uint64_t)st.st_ino) {
+               LOG_INFO("DRM_IOCTL_PRIME_FD_TO_HANDLE fd=%d -> existing handle=%u",
+                        ph->fd, g_ctx.bos[i].gem_handle);
                ph->handle = g_ctx.bos[i].gem_handle;
                pthread_mutex_unlock(&g_lock);
                return 0;
@@ -794,13 +819,13 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             .type = BASE_MEM_IMPORT_TYPE_UMM,
          }
       };
-      if (real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_IMPORT, &imp) < 0 && errno == ENOTTY) {
+      if (adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_IMPORT, &imp) < 0 && errno == ENOTTY) {
          /* Retry with 40-byte MediaTek SLC layout (csf-v11/186) */
          union kbase_ioctl_mem_import_mtk imp_mtk = {0};
          imp_mtk.in.flags = imp.in.flags;
          imp_mtk.in.phandle = (uintptr_t)&fd_copy;
          imp_mtk.in.type = BASE_MEM_IMPORT_TYPE_UMM;
-         if (real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_IMPORT_MTK, &imp_mtk) == 0) {
+         if (adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_IMPORT_MTK, &imp_mtk) == 0) {
             imp.out.gpu_va = imp_mtk.out.gpu_va;
             imp.out.va_pages = imp_mtk.out.va_pages;
             imp.out.flags = imp_mtk.out.flags;
@@ -818,13 +843,14 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             bo->dmabuf_ino = have_stat ? (uint64_t)st.st_ino : 0;
             bo->is_imported = true;
             ph->handle = bo->gem_handle;
-            trace_log("DRM_IOCTL_PRIME_FD_TO_HANDLE fd=%d -> KBASE_IOCTL_MEM_IMPORT va=0x%llx handle=%u\n",
-                      ph->fd, (unsigned long long)bo->gpu_va, bo->gem_handle);
+            LOG_INFO("DRM_IOCTL_PRIME_FD_TO_HANDLE fd=%d -> KBASE_IOCTL_MEM_IMPORT va=0x%llx handle=%u",
+                     ph->fd, (unsigned long long)bo->gpu_va, bo->gem_handle);
             pthread_mutex_unlock(&g_lock);
             return 0;
          }
       }
       close(fd_copy);
+      LOG_ERROR("DRM_IOCTL_PRIME_FD_TO_HANDLE fd=%d: no free BO slot", ph->fd);
       pthread_mutex_unlock(&g_lock);
       errno = ENOMEM;
       return -1;
@@ -844,10 +870,13 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                *so->cqs_cpu_ptr = so->value;
             }
             sc->handle = so->handle;
+            LOG_INFO("DRM_IOCTL_SYNCOBJ_CREATE -> handle=%u signaled=%d",
+                     so->handle, (so->value != 0));
             pthread_mutex_unlock(&g_lock);
             return 0;
          }
       }
+      LOG_ERROR("DRM_IOCTL_SYNCOBJ_CREATE: no free syncobj slot");
       pthread_mutex_unlock(&g_lock);
       errno = ENOMEM;
       return -1;
@@ -857,11 +886,13 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       struct adapter_syncobj *so = find_syncobj(sd->handle);
       if (so)
          memset(so, 0, sizeof(*so));
+      LOG_INFO("DRM_IOCTL_SYNCOBJ_DESTROY handle=%u", sd ? sd->handle : 0);
       pthread_mutex_unlock(&g_lock);
       return 0;
    }
    case 0xc3: /* DRM_IOCTL_SYNCOBJ_WAIT */
    case 0xca: { /* DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT */
+      LOG_DEBUG("DRM_IOCTL_SYNCOBJ_WAIT/TIMELINE_WAIT");
       if (g_ctx.has_kcpu_queue && g_ctx.event_bo_gpu_va) {
          struct base_cqs_wait_operation_info winfo = {
             .addr = g_ctx.event_bo_gpu_va,
@@ -881,7 +912,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             .nr_commands = 1,
             .id = g_ctx.kcpu_queue_id,
          };
-         real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_KCPU_QUEUE_ENQUEUE, &enq);
+         adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_KCPU_QUEUE_ENQUEUE, &enq);
       }
       pthread_mutex_unlock(&g_lock);
       return 0;
@@ -891,9 +922,14 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
    case 0xcb: /* DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL */
    case 0xcc: /* DRM_IOCTL_SYNCOBJ_TRANSFER */
    case 0xcd: /* DRM_IOCTL_SYNCOBJ_QUERY */
+      LOG_DEBUG("DRM_IOCTL_SYNCOBJ_* nr=0x%x (no-op)", nr);
       pthread_mutex_unlock(&g_lock);
       return 0;
    default:
+      /* nr in the Panthor command range is handled by the switch below. */
+      if (nr < DRM_COMMAND_BASE || nr >= DRM_COMMAND_BASE + 0x10)
+         LOG_WARN("ioctl fd=%d req=%s(0x%lx) nr=0x%x: unhandled drm ioctl",
+                  fd, panthor2kbase_ioctl_req_name(request), request, nr);
       break;
    }
 
@@ -937,7 +973,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             q->size = sizeof(struct drm_panthor_timestamp_info);
          } else {
             union kbase_ioctl_get_cpu_gpu_timeinfo ti = {0};
-            real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_GET_CPU_GPU_TIMEINFO, &ti);
+            adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_GET_CPU_GPU_TIMEINFO, &ti);
             struct drm_panthor_timestamp_info out_ti = {
                .timestamp_frequency = 26000000ULL,
                .current_timestamp = ti.out.timestamp,
@@ -955,7 +991,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             q->size = sizeof(struct drm_panthor_group_priorities_info);
          } else {
             struct kbase_ioctl_context_priority_check pc = { .priority = 3 };
-            real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CONTEXT_PRIORITY_CHECK, &pc);
+            adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CONTEXT_PRIORITY_CHECK, &pc);
             struct drm_panthor_group_priorities_info pi = { .allowed_mask = 0x7 };
             memcpy((void *)(uintptr_t)q->pointer, &pi,
                    q->size < sizeof(pi) ? q->size : sizeof(pi));
@@ -965,6 +1001,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       default:
          break;
       }
+      LOG_INFO("DRM_PANTHOR_DEV_QUERY type=%u", q->type);
       trace_log("DRM_PANTHOR_DEV_QUERY type=%u\n", q->type);
       break;
    }
@@ -973,6 +1010,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       struct drm_panthor_set_user_mmio_offset *mo =
          (struct drm_panthor_set_user_mmio_offset *)arg;
       g_ctx.user_mmio_offset = mo->offset;
+      LOG_INFO("DRM_PANTHOR_SET_USER_MMIO_OFFSET offset=0x%llx",
+               (unsigned long long)mo->offset);
       trace_log("DRM_PANTHOR_SET_USER_MMIO_OFFSET offset=0x%llx\n",
                 (unsigned long long)mo->offset);
       break;
@@ -982,12 +1021,15 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       struct drm_panthor_vm_create *vc = (struct drm_panthor_vm_create *)arg;
       vc->id = g_ctx.next_vm_id++;
       if (!vc->user_va_range) vc->user_va_range = (1ULL << 39);
+      LOG_INFO("DRM_PANTHOR_VM_CREATE -> vm_id=%u user_va_range=0x%llx", vc->id,
+               (unsigned long long)vc->user_va_range);
       trace_log("DRM_PANTHOR_VM_CREATE -> vm_id=%u\n", vc->id);
       break;
    }
 
    case DRM_PANTHOR_VM_DESTROY: {
       struct drm_panthor_vm_destroy *vd = (struct drm_panthor_vm_destroy *)arg;
+      LOG_INFO("DRM_PANTHOR_VM_DESTROY vm_id=%u", vd->id);
       trace_log("DRM_PANTHOR_VM_DESTROY vm_id=%u\n", vd->id);
       break;
    }
@@ -995,6 +1037,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
    case DRM_PANTHOR_VM_GET_STATE: {
       struct drm_panthor_vm_get_state *vs = (struct drm_panthor_vm_get_state *)arg;
       vs->state = DRM_PANTHOR_VM_STATE_USABLE;
+      LOG_DEBUG("DRM_PANTHOR_VM_GET_STATE -> state=USABLE");
       break;
    }
 
@@ -1021,7 +1064,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             .flags = kflags,
          }
       };
-      if (real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_ALLOC, &ma) < 0) {
+      if (adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_ALLOC, &ma) < 0) {
          ret = -1;
          break;
       }
@@ -1061,6 +1104,9 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
 
       bc->handle = bo->gem_handle;
       bc->size = aligned_sz;
+      LOG_INFO("DRM_PANTHOR_BO_CREATE size=%llu -> KBASE_IOCTL_MEM_ALLOC handle=%u va=0x%llx flags=0x%llx",
+               (unsigned long long)aligned_sz, bo->gem_handle,
+               (unsigned long long)bo->gpu_va, (unsigned long long)kflags);
       trace_log("DRM_PANTHOR_BO_CREATE size=%llu -> KBASE_IOCTL_MEM_ALLOC handle=%u va=0x%llx\n",
                 (unsigned long long)aligned_sz, bo->gem_handle,
                 (unsigned long long)bo->gpu_va);
@@ -1071,6 +1117,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       struct drm_panthor_bo_mmap_offset *mo = (struct drm_panthor_bo_mmap_offset *)arg;
       /* Encode GEM handle into fake mmap offset above 0x1000000000ULL */
       mo->offset = 0x1000000000ULL | ((uint64_t)mo->handle << 12);
+      LOG_DEBUG("DRM_PANTHOR_BO_MMAP_OFFSET handle=%u -> offset=0x%llx", mo->handle,
+                (unsigned long long)mo->offset);
       break;
    }
 
@@ -1078,6 +1126,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       struct drm_panthor_vm_bind *vb = (struct drm_panthor_vm_bind *)arg;
       struct drm_panthor_vm_bind_op *ops =
          (struct drm_panthor_vm_bind_op *)(uintptr_t)vb->ops.array;
+      LOG_INFO("DRM_PANTHOR_VM_BIND op_count=%u", vb->ops.count);
       for (uint32_t i = 0; i < vb->ops.count; i++) {
          uint32_t op_type = ops[i].flags & DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
          if (op_type == DRM_PANTHOR_VM_BIND_OP_TYPE_MAP) {
@@ -1089,6 +1138,9 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                   /* Executable shader BO in EXEC_VA zone */
                   bo->kbase_flags |= BASE_MEM_PROT_GPU_EX;
                }
+               LOG_INFO("DRM_PANTHOR_VM_BIND MAP bo=%u va=0x%llx -> kbase_va=0x%llx",
+                        bo->gem_handle, (unsigned long long)ops[i].va,
+                        (unsigned long long)bo->gpu_va);
                trace_log("DRM_PANTHOR_VM_BIND MAP bo=%u va=0x%llx -> kbase_va=0x%llx\n",
                          bo->gem_handle, (unsigned long long)ops[i].va,
                          (unsigned long long)bo->gpu_va);
@@ -1102,6 +1154,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       struct drm_panthor_bo_sync *bs = (struct drm_panthor_bo_sync *)arg;
       struct drm_panthor_bo_sync_op *ops =
          (struct drm_panthor_bo_sync_op *)(uintptr_t)bs->ops.array;
+      LOG_INFO("DRM_PANTHOR_BO_SYNC op_count=%u", bs->ops.count);
       for (uint32_t i = 0; i < bs->ops.count; i++) {
          struct adapter_bo *bo = find_bo(ops[i].handle);
          if (bo && bo->cpu_ptr) {
@@ -1113,10 +1166,10 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                           ? BASE_SYNCSET_OP_MSYNC
                           : (BASE_SYNCSET_OP_MSYNC | BASE_SYNCSET_OP_CSYNC),
             };
-            real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_SYNC, &ms);
-            trace_log("DRM_PANTHOR_BO_SYNC bo=%u -> KBASE_IOCTL_MEM_SYNC va=0x%llx size=%llu\n",
-                      bo->gem_handle, (unsigned long long)bo->gpu_va,
-                      (unsigned long long)ops[i].size);
+            adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_SYNC, &ms);
+            LOG_INFO("DRM_PANTHOR_BO_SYNC bo=%u -> KBASE_IOCTL_MEM_SYNC va=0x%llx size=%llu",
+                     bo->gem_handle, (unsigned long long)bo->gpu_va,
+                     (unsigned long long)ops[i].size);
          }
       }
       break;
@@ -1128,6 +1181,11 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       if (bo) {
          qi->extra_flags = bo->is_imported ? DRM_PANTHOR_BO_IS_IMPORTED : 0;
          qi->create_flags = bo->panthor_flags;
+         LOG_DEBUG("DRM_PANTHOR_BO_QUERY_INFO handle=%u imported=%d flags=0x%x",
+                   bo->gem_handle, bo->is_imported, bo->panthor_flags);
+      } else {
+         LOG_WARN("DRM_PANTHOR_BO_QUERY_INFO handle=%u not found",
+                  qi ? qi->handle : 0);
       }
       break;
    }
@@ -1137,6 +1195,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       struct adapter_bo *bo = find_bo(bl->handle);
       if (bo && bl->label)
          snprintf(bo->label, sizeof(bo->label), "%s", (const char *)(uintptr_t)bl->label);
+      LOG_DEBUG("DRM_PANTHOR_BO_SET_LABEL handle=%u label=%s",
+                bl ? bl->handle : 0, bl && bl->label ? (const char *)(uintptr_t)bl->label : "(null)");
       break;
    }
 
@@ -1152,7 +1212,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             .group_id = 0,
          }
       };
-      if (real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_TILER_HEAP_INIT_1_13, &hi13) < 0) {
+      if (adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_TILER_HEAP_INIT_1_13, &hi13) < 0) {
          union kbase_ioctl_cs_tiler_heap_init hi24 = {
             .in = {
                .chunk_size = hi13.in.chunk_size,
@@ -1163,7 +1223,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                .buf_desc_va = 0,
             }
          };
-         if (real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_TILER_HEAP_INIT, &hi24) < 0) {
+         if (adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_TILER_HEAP_INIT, &hi24) < 0) {
+            LOG_ERROR("DRM_PANTHOR_TILER_HEAP_CREATE: KBASE_IOCTL_CS_TILER_HEAP_INIT failed");
             ret = -1;
             break;
          }
@@ -1186,12 +1247,16 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                if (g_ctx.groups[g].in_use && g_ctx.groups[g].vm_id == hc->vm_id)
                   g_ctx.groups[g].active_tiler_heap_ctx_va = hi13.out.gpu_heap_va;
             }
+            LOG_INFO("DRM_PANTHOR_TILER_HEAP_CREATE -> KBASE_IOCTL_CS_TILER_HEAP_INIT heap_va=0x%llx first_chunk=0x%llx handle=%u",
+                     (unsigned long long)hc->tiler_heap_ctx_gpu_va,
+                     (unsigned long long)hc->first_heap_chunk_gpu_va, hc->handle);
             trace_log("DRM_PANTHOR_TILER_HEAP_CREATE -> KBASE_IOCTL_CS_TILER_HEAP_INIT heap_va=0x%llx first_chunk=0x%llx\n",
                       (unsigned long long)hc->tiler_heap_ctx_gpu_va,
                       (unsigned long long)hc->first_heap_chunk_gpu_va);
             break;
          }
       }
+      LOG_ERROR("DRM_PANTHOR_TILER_HEAP_CREATE: no free heap slot");
       break;
    }
 
@@ -1203,13 +1268,14 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             struct kbase_ioctl_cs_tiler_heap_term ht = {
                .gpu_heap_va = g_ctx.heaps[i].gpu_heap_va
             };
-            real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_TILER_HEAP_TERM, &ht);
-            trace_log("DRM_PANTHOR_TILER_HEAP_DESTROY -> KBASE_IOCTL_CS_TILER_HEAP_TERM va=0x%llx\n",
-                      (unsigned long long)ht.gpu_heap_va);
+            adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_TILER_HEAP_TERM, &ht);
+            LOG_INFO("DRM_PANTHOR_TILER_HEAP_DESTROY -> KBASE_IOCTL_CS_TILER_HEAP_TERM va=0x%llx handle=%u",
+                     (unsigned long long)ht.gpu_heap_va, hd->handle);
             memset(&g_ctx.heaps[i], 0, sizeof(g_ctx.heaps[i]));
             break;
          }
       }
+      LOG_WARN("DRM_PANTHOR_TILER_HEAP_DESTROY handle=%u not found", hd ? hd->handle : 0);
       break;
    }
 
@@ -1218,6 +1284,9 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       uint32_t qcnt = gc->queues.count;
       if (qcnt > ADAPTER_MAX_SUBQUEUES)
          qcnt = ADAPTER_MAX_SUBQUEUES;
+
+      LOG_INFO("DRM_PANTHOR_GROUP_CREATE vm_id=%u queues=%u priority=%u", gc->vm_id, qcnt,
+               gc->priority <= 3 ? gc->priority : 1);
 
       union kbase_ioctl_cs_queue_group_create_1_6 csg = {
          .in = {
@@ -1231,7 +1300,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             .compute_max = gc->max_compute_cores ? gc->max_compute_cores : 64,
          }
       };
-      if (real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6, &csg) < 0) {
+      if (adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6, &csg) < 0) {
+         LOG_ERROR("DRM_PANTHOR_GROUP_CREATE: KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6 failed");
          ret = -1;
          break;
       }
@@ -1244,6 +1314,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          }
       }
       if (!grp) {
+         LOG_ERROR("DRM_PANTHOR_GROUP_CREATE: no free group slot");
          ret = -1;
          break;
       }
@@ -1268,13 +1339,15 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                         BASE_MEM_PROT_GPU_RD | BASE_MEM_SAME_VA,
             }
          };
-         if (real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_ALLOC, &ra) < 0) {
+         if (adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_ALLOC, &ra) < 0) {
+            LOG_ERROR("DRM_PANTHOR_GROUP_CREATE: KBASE_IOCTL_MEM_ALLOC ring failed for queue %u", q);
             ret = -1;
             break;
          }
          void *rcpu = real_mmap(NULL, ADAPTER_RINGBUF_SIZE, PROT_READ | PROT_WRITE,
                                 MAP_SHARED, g_ctx.mali_fd, ra.out.gpu_va);
          if (rcpu == MAP_FAILED) {
+            LOG_ERROR("DRM_PANTHOR_GROUP_CREATE: ring mmap failed for queue %u", q);
             ret = -1;
             break;
          }
@@ -1287,7 +1360,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             .buffer_size = ADAPTER_RINGBUF_SIZE,
             .priority = 1,
          };
-         if (real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_REGISTER, &qreg) < 0) {
+         if (adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_REGISTER, &qreg) < 0) {
+            LOG_ERROR("DRM_PANTHOR_GROUP_CREATE: KBASE_IOCTL_CS_QUEUE_REGISTER failed for queue %u", q);
             ret = -1;
             break;
          }
@@ -1299,7 +1373,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                .csi_index = (uint8_t)q,
             }
          };
-         if (real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_BIND, &qbind) < 0) {
+         if (adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_BIND, &qbind) < 0) {
+            LOG_ERROR("DRM_PANTHOR_GROUP_CREATE: KBASE_IOCTL_CS_QUEUE_BIND failed for queue %u", q);
             ret = -1;
             break;
          }
@@ -1308,6 +1383,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          void *uio = real_mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE,
                                MAP_SHARED, g_ctx.mali_fd, qbind.out.mmap_handle);
          if (uio == MAP_FAILED) {
+            LOG_ERROR("DRM_PANTHOR_GROUP_CREATE: USER_IO mmap failed for queue %u", q);
             ret = -1;
             break;
          }
@@ -1323,6 +1399,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       }
 
       gc->group_handle = grp->group_handle;
+      LOG_INFO("DRM_PANTHOR_GROUP_CREATE -> KBASE_IOCTL_CS_QUEUE_GROUP_CREATE handle=%u kbase_group=%u queues=%u",
+               grp->group_handle, grp->kbase_group_handle, qcnt);
       trace_log("DRM_PANTHOR_GROUP_CREATE -> KBASE_IOCTL_CS_QUEUE_GROUP_CREATE handle=%u queues=%u\n",
                 grp->group_handle, qcnt);
       break;
@@ -1340,7 +1418,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                struct kbase_ioctl_cs_queue_terminate qt = {
                   .buffer_gpu_addr = sq->ring_gpu_va
                };
-               real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_TERMINATE, &qt);
+               adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_TERMINATE, &qt);
                if (sq->ring_cpu_ptr)
                   real_munmap(sq->ring_cpu_ptr, sq->ringbuf_size);
             }
@@ -1348,10 +1426,12 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          struct kbase_ioctl_cs_queue_group_term gt = {
             .group_handle = grp->kbase_group_handle
          };
-         real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_GROUP_TERMINATE, &gt);
-         trace_log("DRM_PANTHOR_GROUP_DESTROY -> KBASE_IOCTL_CS_QUEUE_GROUP_TERMINATE handle=%u\n",
-                   grp->group_handle);
+         adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_GROUP_TERMINATE, &gt);
+         LOG_INFO("DRM_PANTHOR_GROUP_DESTROY -> KBASE_IOCTL_CS_QUEUE_GROUP_TERMINATE handle=%u",
+                  grp->group_handle);
          memset(grp, 0, sizeof(*grp));
+      } else {
+         LOG_WARN("DRM_PANTHOR_GROUP_DESTROY handle=%u not found", gd ? gd->group_handle : 0);
       }
       break;
    }
@@ -1361,6 +1441,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          (struct drm_panthor_group_get_state *)arg;
       gs->state = 0;
       gs->fatal_queues = 0;
+      LOG_DEBUG("DRM_PANTHOR_GROUP_GET_STATE -> state=0 fatal_queues=0");
       break;
    }
 
@@ -1368,11 +1449,16 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       struct drm_panthor_group_submit *gs = (struct drm_panthor_group_submit *)arg;
       struct adapter_group *grp = find_group(gs->group_handle);
       if (!grp) {
+         LOG_ERROR("DRM_PANTHOR_GROUP_SUBMIT handle=%u not found",
+                   gs ? gs->group_handle : 0);
          ret = -1;
          break;
       }
       struct drm_panthor_queue_submit *qsubs =
          (struct drm_panthor_queue_submit *)(uintptr_t)gs->queue_submits.array;
+
+      LOG_INFO("DRM_PANTHOR_GROUP_SUBMIT handle=%u queue_submits=%u",
+               grp->group_handle, gs->queue_submits.count);
 
       for (uint32_t i = 0; i < gs->queue_submits.count; i++) {
          struct drm_panthor_queue_submit *qs = &qsubs[i];
@@ -1433,7 +1519,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          struct kbase_ioctl_cs_queue_kick kick = {
             .buffer_gpu_addr = sq->ring_gpu_va
          };
-         real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_KICK, &kick);
+         adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_KICK, &kick);
 
          /* 4. Update signaled drm_syncobjs */
          struct drm_panthor_sync_op *sops =
@@ -1449,6 +1535,11 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             }
          }
 
+         LOG_INFO("DRM_PANTHOR_GROUP_SUBMIT q=%u stream=0x%llx sz=%u sync_upgrades=%u heap_nops=%u -> KBASE_IOCTL_CS_QUEUE_KICK insert=%llu jobs=%llu",
+                  qs->queue_index, (unsigned long long)qs->stream_addr,
+                  qs->stream_size, stats.sync_scope_upgrades,
+                  stats.heap_op_nops, (unsigned long long)sq->insert_offset,
+                  (unsigned long long)sq->emitted_jobs);
          trace_log("DRM_PANTHOR_GROUP_SUBMIT q=%u stream=0x%llx sz=%u sync_upgrades=%u heap_nops=%u -> KBASE_IOCTL_CS_QUEUE_KICK insert=%llu\n",
                    qs->queue_index, (unsigned long long)qs->stream_addr,
                    qs->stream_size, stats.sync_scope_upgrades,
@@ -1458,6 +1549,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
    }
 
    default:
+      LOG_WARN("ioctl fd=%d req=%s(0x%lx): unhandled panthor ioctl id=%u",
+               fd, panthor2kbase_ioctl_req_name(request), request, panthor_id);
       break;
    }
 
@@ -1468,8 +1561,12 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
 void *panthor_kbase_adapter_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 {
    resolve_real_funcs();
-   if (!panthor_kbase_adapter_is_virtual_drm_fd(fd))
+   LOG_DEBUG("adapter_mmap addr=%p length=%zu prot=0x%x flags=0x%x fd=%d offset=0x%llx",
+             addr, length, prot, flags, fd, (unsigned long long)offset);
+   if (!panthor_kbase_adapter_is_virtual_drm_fd(fd)) {
+      LOG_DEBUG("adapter_mmap: non-virtual fd, passthrough");
       return real_mmap(addr, length, prot, flags, fd, offset);
+   }
 
    pthread_mutex_lock(&g_lock);
    uint64_t uoff = (uint64_t)offset;
@@ -1482,6 +1579,8 @@ void *panthor_kbase_adapter_mmap(void *addr, size_t length, int prot, int flags,
       if (!res)
          res = real_mmap(addr, length, PROT_READ, MAP_SHARED,
                          g_ctx.mali_fd, BASEP_MEM_CSF_USER_REG_PAGE_HANDLE);
+      LOG_INFO("adapter_mmap: USER_REG_PAGE fd=%d offset=0x%llx -> %p", fd,
+               (unsigned long long)offset, res);
       pthread_mutex_unlock(&g_lock);
       return res ? res : MAP_FAILED;
    }
@@ -1492,6 +1591,8 @@ void *panthor_kbase_adapter_mmap(void *addr, size_t length, int prot, int flags,
       struct adapter_bo *bo = find_bo(handle);
       if (bo) {
          if (bo->cpu_ptr) {
+            LOG_DEBUG("adapter_mmap: BO handle=%u returning cached cpu_ptr=%p",
+                      bo->gem_handle, bo->cpu_ptr);
             void *ptr = bo->cpu_ptr;
             pthread_mutex_unlock(&g_lock);
             return ptr;
@@ -1502,6 +1603,8 @@ void *panthor_kbase_adapter_mmap(void *addr, size_t length, int prot, int flags,
                bo->cpu_ptr = ptr;
                bo->cpu_size = length;
             }
+            LOG_INFO("adapter_mmap: BO handle=%u dmabuf_fd=%d -> %p",
+                     bo->gem_handle, bo->dmabuf_fd, ptr);
             pthread_mutex_unlock(&g_lock);
             return ptr;
          }
@@ -1509,12 +1612,15 @@ void *panthor_kbase_adapter_mmap(void *addr, size_t length, int prot, int flags,
    }
 
    pthread_mutex_unlock(&g_lock);
-   return real_mmap(addr, length, prot, flags, g_ctx.mali_fd, offset);
+   void *res = real_mmap(addr, length, prot, flags, g_ctx.mali_fd, offset);
+   LOG_DEBUG("adapter_mmap: mali passthrough -> %p", res);
+   return res;
 }
 
 int panthor_kbase_adapter_munmap(void *addr, size_t length)
 {
    resolve_real_funcs();
+   LOG_DEBUG("adapter_munmap addr=%p length=%zu", addr, length);
    pthread_mutex_lock(&g_lock);
    /*
     * Guard against the kbase SAME_VA munmap trap (mali_kbase_mem_linux.c:2805):
@@ -1524,6 +1630,8 @@ int panthor_kbase_adapter_munmap(void *addr, size_t length)
    for (size_t i = 0; i < ADAPTER_MAX_BOS; i++) {
       if (g_ctx.bos[i].in_use && g_ctx.bos[i].is_same_va &&
           g_ctx.bos[i].cpu_ptr == addr) {
+         LOG_INFO("ADAPTER_MUNMAP_GUARD pinned SAME_VA bo=%u addr=%p len=%zu",
+                  g_ctx.bos[i].gem_handle, addr, length);
          trace_log("ADAPTER_MUNMAP_GUARD pinned SAME_VA bo=%u addr=%p len=%zu\n",
                    g_ctx.bos[i].gem_handle, addr, length);
          pthread_mutex_unlock(&g_lock);
@@ -1540,6 +1648,8 @@ int panthor_kbase_adapter_munmap(void *addr, size_t length)
 
 drmVersionPtr drmGetVersion(int fd)
 {
+   LOG_DEBUG("drmGetVersion fd=%d virtual=%d", fd,
+             panthor_kbase_adapter_is_virtual_drm_fd(fd));
    if (panthor_kbase_adapter_is_virtual_drm_fd(fd)) {
       drmVersionPtr v = calloc(1, sizeof(*v));
       v->version_major = 1;
@@ -1551,6 +1661,7 @@ drmVersionPtr drmGetVersion(int fd)
       v->date_len = strlen(v->date);
       v->desc = strdup("Panthor-to-Kbase UAPI Adapter");
       v->desc_len = strlen(v->desc);
+      LOG_DEBUG("drmGetVersion fd=%d -> panthor 1.3.0", fd);
       return v;
    }
    drmVersionPtr (*next_fn)(int) = dlsym(RTLD_NEXT, "drmGetVersion");
@@ -1559,6 +1670,7 @@ drmVersionPtr drmGetVersion(int fd)
 
 void drmFreeVersion(drmVersionPtr ptr)
 {
+   LOG_DEBUG("drmFreeVersion ptr=%p", (void *)ptr);
    if (!ptr)
       return;
    drmVersionPtr v = ptr;
@@ -1576,26 +1688,33 @@ void drmFreeVersion(drmVersionPtr ptr)
 
 int drmIoctl(int fd, unsigned long request, void *arg)
 {
+   LOG_DEBUG("drmIoctl fd=%d req=%s(0x%lx)", fd,
+             panthor2kbase_ioctl_req_name(request), request);
    return panthor_kbase_adapter_ioctl(fd, request, arg);
 }
 
 int drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle)
 {
+   LOG_DEBUG("drmSyncobjCreate fd=%d flags=0x%x", fd, flags);
    struct drm_syncobj_create arg = { .flags = flags };
    int ret = panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &arg);
    if (ret == 0 && handle)
       *handle = arg.handle;
+   LOG_DEBUG("drmSyncobjCreate fd=%d -> handle=%u ret=%d", fd,
+             handle ? *handle : 0, ret);
    return ret;
 }
 
 int drmSyncobjDestroy(int fd, uint32_t handle)
 {
+   LOG_DEBUG("drmSyncobjDestroy fd=%d handle=%u", fd, handle);
    struct drm_syncobj_destroy arg = { .handle = handle };
    return panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &arg);
 }
 
 int drmSyncobjReset(int fd, const uint32_t *handles, uint32_t handle_count)
 {
+   LOG_DEBUG("drmSyncobjReset fd=%d handle_count=%u", fd, handle_count);
    struct drm_syncobj_array arg = {
       .handles = (uintptr_t)handles,
       .count_handles = handle_count,
@@ -1607,6 +1726,8 @@ int drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles,
                    int64_t timeout_nsec, unsigned flags,
                    uint32_t *first_signaled)
 {
+   LOG_DEBUG("drmSyncobjWait fd=%d num_handles=%u timeout_nsec=%lld flags=0x%x",
+             fd, num_handles, (long long)timeout_nsec, flags);
    struct drm_syncobj_wait arg = {
       .handles = (uintptr_t)handles,
       .count_handles = num_handles,
@@ -1616,6 +1737,8 @@ int drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles,
    int ret = panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &arg);
    if (ret == 0 && first_signaled)
       *first_signaled = arg.first_signaled;
+   LOG_DEBUG("drmSyncobjWait fd=%d -> ret=%d first_signaled=%u", fd, ret,
+             first_signaled ? *first_signaled : 0);
    return ret;
 }
 
@@ -1623,6 +1746,8 @@ int drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points,
                            unsigned num_handles, int64_t timeout_nsec,
                            unsigned flags, uint32_t *first_signaled)
 {
+   LOG_DEBUG("drmSyncobjTimelineWait fd=%d num_handles=%u timeout_nsec=%lld flags=0x%x",
+             fd, num_handles, (long long)timeout_nsec, flags);
    struct drm_syncobj_timeline_wait arg = {
       .handles = (uintptr_t)handles,
       .points = (uintptr_t)points,
@@ -1633,12 +1758,16 @@ int drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points,
    int ret = panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &arg);
    if (ret == 0 && first_signaled)
       *first_signaled = arg.first_signaled;
+   LOG_DEBUG("drmSyncobjTimelineWait fd=%d -> ret=%d first_signaled=%u", fd, ret,
+             first_signaled ? *first_signaled : 0);
    return ret;
 }
 
 int drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point,
                        uint32_t src_handle, uint64_t src_point, uint32_t flags)
 {
+   LOG_DEBUG("drmSyncobjTransfer fd=%d src=%u dst=%u flags=0x%x", fd, src_handle,
+             dst_handle, flags);
    struct drm_syncobj_transfer arg = {
       .src_handle = src_handle,
       .dst_handle = dst_handle,
@@ -1651,24 +1780,31 @@ int drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point,
 
 int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)
 {
+   LOG_DEBUG("drmPrimeHandleToFD fd=%d handle=%u flags=0x%x", fd, handle, flags);
    struct drm_prime_handle arg = { .handle = handle, .flags = flags, .fd = -1 };
    int ret = panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &arg);
    if (ret == 0 && prime_fd)
       *prime_fd = arg.fd;
+   LOG_DEBUG("drmPrimeHandleToFD fd=%d -> prime_fd=%d ret=%d", fd,
+             prime_fd ? *prime_fd : -1, ret);
    return ret;
 }
 
 int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
 {
+   LOG_DEBUG("drmPrimeFDToHandle fd=%d prime_fd=%d", fd, prime_fd);
    struct drm_prime_handle arg = { .fd = prime_fd };
    int ret = panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &arg);
    if (ret == 0 && handle)
       *handle = arg.handle;
+   LOG_DEBUG("drmPrimeFDToHandle fd=%d -> handle=%u ret=%d", fd,
+             handle ? *handle : 0, ret);
    return ret;
 }
 
 int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd)
 {
+   LOG_DEBUG("drmSyncobjExportSyncFile fd=%d handle=%u", fd, handle);
    (void)handle;
    if (!panthor_kbase_adapter_is_virtual_drm_fd(fd))
       return -1;
@@ -1684,10 +1820,12 @@ int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd)
          .nr_commands = 1,
          .id = g_ctx.kcpu_queue_id,
       };
-      real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_KCPU_QUEUE_ENQUEUE, &enq);
+      adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_KCPU_QUEUE_ENQUEUE, &enq);
       if (sync_file_fd)
          *sync_file_fd = (fence.basep.fd >= 0) ? fence.basep.fd : dup(g_ctx.mali_fd);
       pthread_mutex_unlock(&g_lock);
+      LOG_DEBUG("drmSyncobjExportSyncFile fd=%d -> sync_file_fd=%d", fd,
+                sync_file_fd ? *sync_file_fd : -1);
       return 0;
    }
    pthread_mutex_unlock(&g_lock);
@@ -1696,6 +1834,8 @@ int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd)
 
 int drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd)
 {
+   LOG_DEBUG("drmSyncobjImportSyncFile fd=%d handle=%u sync_file_fd=%d", fd, handle,
+             sync_file_fd);
    (void)handle;
    if (!panthor_kbase_adapter_is_virtual_drm_fd(fd))
       return -1;
@@ -1711,7 +1851,7 @@ int drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd)
          .nr_commands = 1,
          .id = g_ctx.kcpu_queue_id,
       };
-      real_ioctl(g_ctx.mali_fd, KBASE_IOCTL_KCPU_QUEUE_ENQUEUE, &enq);
+      adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_KCPU_QUEUE_ENQUEUE, &enq);
    }
    pthread_mutex_unlock(&g_lock);
    return 0;
@@ -1719,21 +1859,27 @@ int drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd)
 
 int drmGetCap(int fd, uint64_t capability, uint64_t *value)
 {
+   LOG_DEBUG("drmGetCap fd=%d capability=%llu", fd, (unsigned long long)capability);
    struct { uint64_t capability; uint64_t value; } arg = { .capability = capability, .value = 0 };
    int ret = panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_GET_CAP, &arg);
    if (ret == 0 && value)
       *value = arg.value;
+   LOG_DEBUG("drmGetCap fd=%d -> value=%llu ret=%d", fd,
+             (unsigned long long)(value ? *value : 0), ret);
    return ret;
 }
 
 int drmSetClientCap(int fd, uint64_t capability, uint64_t value)
 {
+   LOG_DEBUG("drmSetClientCap fd=%d capability=%llu value=%llu", fd,
+             (unsigned long long)capability, (unsigned long long)value);
    (void)fd; (void)capability; (void)value;
    return 0;
 }
 
 int drmCloseBufferHandle(int fd, uint32_t handle)
 {
+   LOG_DEBUG("drmCloseBufferHandle fd=%d handle=%u", fd, handle);
    struct drm_gem_close arg = { .handle = handle };
    return panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_GEM_CLOSE, &arg);
 }
@@ -1741,11 +1887,14 @@ int drmCloseBufferHandle(int fd, uint32_t handle)
 int drmCommandWrite(int fd, unsigned long drmCommandIndex, void *data, unsigned long size)
 {
    unsigned long req = _IOC(_IOC_WRITE, 'd', DRM_COMMAND_BASE + drmCommandIndex, size);
+   LOG_DEBUG("drmCommandWrite fd=%d index=%lu req=%s(0x%lx) size=%lu", fd,
+             drmCommandIndex, panthor2kbase_ioctl_req_name(req), req, size);
    return panthor_kbase_adapter_ioctl(fd, req, data);
 }
 
 int drmSyncobjSignal(int fd, const uint32_t *handles, uint32_t handle_count)
 {
+   LOG_DEBUG("drmSyncobjSignal fd=%d handle_count=%u", fd, handle_count);
    struct drm_syncobj_array arg = {
       .handles = (uintptr_t)handles,
       .count_handles = handle_count,
@@ -1756,6 +1905,7 @@ int drmSyncobjSignal(int fd, const uint32_t *handles, uint32_t handle_count)
 int drmSyncobjTimelineSignal(int fd, const uint32_t *handles,
                              uint64_t *points, uint32_t handle_count)
 {
+   LOG_DEBUG("drmSyncobjTimelineSignal fd=%d handle_count=%u", fd, handle_count);
    struct drm_syncobj_timeline_array arg = {
       .handles = (uintptr_t)handles,
       .points = (uintptr_t)points,
@@ -1766,6 +1916,7 @@ int drmSyncobjTimelineSignal(int fd, const uint32_t *handles,
 
 int drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points, uint32_t handle_count)
 {
+   LOG_DEBUG("drmSyncobjQuery fd=%d handle_count=%u", fd, handle_count);
    struct drm_syncobj_timeline_array arg = {
       .handles = (uintptr_t)handles,
       .points = (uintptr_t)points,
@@ -1778,30 +1929,39 @@ int drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points, uint32_t handle
             points[i] = 1ULL;
       }
    }
+   LOG_DEBUG("drmSyncobjQuery fd=%d -> ret=%d", fd, ret);
    return ret;
 }
 
 int drmSyncobjQuery2(int fd, uint32_t *handles, uint64_t *points,
                      uint32_t handle_count, uint32_t flags)
 {
+   LOG_DEBUG("drmSyncobjQuery2 fd=%d handle_count=%u flags=0x%x", fd, handle_count,
+             flags);
    (void)flags;
    return drmSyncobjQuery(fd, handles, points, handle_count);
 }
 
 int drmSyncobjHandleToFD(int fd, uint32_t handle, int *obj_fd)
 {
+   LOG_DEBUG("drmSyncobjHandleToFD fd=%d handle=%u", fd, handle);
    struct drm_syncobj_handle arg = { .handle = handle, .fd = -1 };
    int ret = panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &arg);
    if (ret == 0 && obj_fd)
       *obj_fd = arg.fd;
+   LOG_DEBUG("drmSyncobjHandleToFD fd=%d -> obj_fd=%d ret=%d", fd,
+             obj_fd ? *obj_fd : -1, ret);
    return ret;
 }
 
 int drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle)
 {
+   LOG_DEBUG("drmSyncobjFDToHandle fd=%d obj_fd=%d", fd, obj_fd);
    struct drm_syncobj_handle arg = { .fd = obj_fd, .handle = 0 };
    int ret = panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &arg);
    if (ret == 0 && handle)
       *handle = arg.handle;
+   LOG_DEBUG("drmSyncobjFDToHandle fd=%d -> handle=%u ret=%d", fd,
+             handle ? *handle : 0, ret);
    return ret;
 }

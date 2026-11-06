@@ -94,7 +94,6 @@ static int (*orig_ioctl)(int, unsigned long, ...) = NULL;
 static void *(*orig_mmap)(void *, size_t, int, int, int, off_t) = NULL;
 static int (*orig_munmap)(void *, size_t) = NULL;
 static int (*orig_stat)(const char *, struct stat *) = NULL;
-static void *(*orig_dlopen)(const char *, int) = NULL;
 
 static void ensure_orig_resolved(void)
 {
@@ -121,10 +120,6 @@ static void ensure_orig_resolved(void)
    if (!orig_stat) {
       orig_stat = dlsym(RTLD_NEXT, "stat");
       if (!orig_stat) orig_stat = dlsym(RTLD_DEFAULT, "stat");
-   }
-   if (!orig_dlopen) {
-      orig_dlopen = dlsym(RTLD_NEXT, "dlopen");
-      if (!orig_dlopen) orig_dlopen = dlsym(RTLD_DEFAULT, "dlopen");
    }
 }
 
@@ -400,20 +395,6 @@ extern int drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd);
 extern int drmSyncobjHandleToFD(int fd, uint32_t handle, int *obj_fd);
 extern int drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle);
 
-/* Hook dlopen so that dynamically loaded libvulkan_panfrost.so gets patched immediately */
-void *panthor_kbase_hook_dlopen(const char *filename, int flags)
-{
-   ensure_orig_resolved();
-   void *handle = orig_dlopen ? orig_dlopen(filename, flags) : NULL;
-   if (handle && filename &&
-       (strstr(filename, "panfrost") != NULL ||
-        strstr(filename, "vulkan") != NULL ||
-        strstr(filename, "mesa") != NULL)) {
-      panthor_kbase_install_runtime_hooks();
-   }
-   return handle;
-}
-
 /* ============================================================================
  * ELF GOT / PLT Relocation Patching Engine (AArch64 & x86_64)
  * ============================================================================ */
@@ -436,7 +417,6 @@ static const struct hook_symbol_entry g_hook_table[] = {
    { "mmap64",                    (void *)panthor_kbase_hook_mmap },
    { "munmap",                    (void *)panthor_kbase_hook_munmap },
    { "stat",                      (void *)panthor_kbase_hook_stat },
-   { "dlopen",                    (void *)panthor_kbase_hook_dlopen },
 
    /* libdrm device & version query entrypoints */
    { "drmIoctl",                  (void *)drmIoctl },
@@ -551,7 +531,7 @@ static bool should_skip_module(const char *name)
 {
    if (!name)
       return true;
-   /* Never patch our own adapter, runtime hook, kbase emulator, or system libc/ld */
+   /* Never patch our own adapter, runtime hook, kbase emulator, loader, wrapper, or system libc/ld */
    if (strstr(name, "panthor_kbase_adapter") != NULL ||
        strstr(name, "panthor_kbase_runtime_hook") != NULL ||
        strstr(name, "mali_kbase_emu") != NULL ||
@@ -560,7 +540,11 @@ static bool should_skip_module(const char *name)
        strstr(name, "libpthread.so") != NULL ||
        strstr(name, "ld-linux") != NULL ||
        strstr(name, "linker64") != NULL ||
-       strstr(name, "linux-vdso") != NULL) {
+       strstr(name, "linux-vdso") != NULL ||
+       strstr(name, "libvulkan.so") != NULL ||
+       strstr(name, "libvulkan_wrapper.so") != NULL ||
+       strstr(name, "winevulkan.so") != NULL ||
+       strstr(name, "_patched.so") != NULL) {
       return true;
    }
    return false;
@@ -577,12 +561,10 @@ static bool should_hook_module(const char *name, const char *filter_substr)
    if (name[0] == '\0')
       return false;
 
-   return (strstr(name, "vulkan") != NULL ||
-           strstr(name, "panfrost") != NULL ||
-           strstr(name, "panvk") != NULL ||
-           strstr(name, "mesa") != NULL ||
-           strstr(name, "unpatched") != NULL ||
-           strstr(name, "test") != NULL);
+   /* Only target libvulkan_panfrost (.so and _unpatched.so in test suite) */
+   return (strstr(name, "libvulkan_panfrost.so") != NULL ||
+           strstr(name, "libvulkan_panfrost_unpatched.so") != NULL ||
+           strstr(name, "libvulkan_panfrost") != NULL);
 }
 
 static int phdr_callback(struct dl_phdr_info *info, size_t size, void *data)
