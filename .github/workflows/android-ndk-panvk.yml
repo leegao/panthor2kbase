@@ -71,6 +71,23 @@ jobs:
           sed -i 's/#if defined(HAVE_MEMFD_CREATE) \&\& !defined __TERMUX__/#if defined(HAVE_MEMFD_CREATE)/' mesa/src/util/anon_file.c
           sed -i "s/dep_libudev = dependency('libudev', required : false)/dep_libudev = null_dep/g" mesa/meson.build
 
+      - name: Create mesa_overlay vs mesa diff patch (additions/modifications only)
+        run: |
+          # mesa_overlay is an overlay (not a full repo), so only emit additions
+          # and modifications; skip deletions of files that exist only in mesa
+          (
+            cd mesa_overlay
+            find . -type f | sort | while read -r f; do
+              if [ -f "../mesa/$f" ]; then
+                diff -u --label "a/$f" --label "b/$f" "../mesa/$f" "$f" || true
+              else
+                echo "--- /dev/null"
+                echo "+++ b/$f"
+                cat "$f" || true
+              fi
+            done
+          ) > mesa_overlay.patch || true
+
       - name: Build C++ Adapter & Verification Tooling via CMake (Host & Android NDK)
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
@@ -201,4 +218,5 @@ jobs:
             dist-artifact/libpanthor_kbase_adapter.so
             dist-artifact/libmali_kbase_emu.so
             artifacts/*
+            mesa_overlay.patch
           if-no-files-found: error
