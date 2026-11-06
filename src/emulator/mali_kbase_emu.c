@@ -651,7 +651,9 @@ static int emu_handle_mem_alloc(uint64_t va_pages, uint64_t commit_pages,
 int stat(const char *pathname, struct stat *statbuf)
 {
    init_orig_syscalls();
-   if (pathname && statbuf &&
+   const char *volatile p = pathname;
+   struct stat *volatile sb = statbuf;
+   if (p != NULL && sb != NULL &&
        (strcmp(pathname, "/dev/dri/renderD128") == 0 ||
         strcmp(pathname, "/dev/dri/card0") == 0 ||
         strncmp(pathname, "/dev/mali", 9) == 0)) {
@@ -680,13 +682,14 @@ int open(const char *pathname, int flags, ...)
       va_end(ap);
    }
 
-   if (pathname &&
+   const char *volatile p = pathname;
+   if (p != NULL &&
        (strcmp(pathname, "/dev/dri/renderD128") == 0 ||
         strcmp(pathname, "/dev/dri/card0") == 0)) {
       return panthor_kbase_adapter_open(pathname, flags);
    }
 
-   if (pathname && strncmp(pathname, "/dev/mali", 9) == 0) {
+   if (p != NULL && strncmp(pathname, "/dev/mali", 9) == 0) {
       /* Enforce kbase_check_flags: O_CLOEXEC is strictly mandatory! */
       if (!(flags & O_CLOEXEC)) {
          errno = EINVAL;

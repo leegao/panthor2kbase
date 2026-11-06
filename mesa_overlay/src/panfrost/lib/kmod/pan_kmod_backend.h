@@ -146,6 +146,9 @@ pan_kmod_vm_op_check(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
 
    /* Make sure the PAN_KMOD_VM_FLAG_AUTO_VA and VA passed to the op match. */
    if (op->type == PAN_KMOD_VM_OP_TYPE_MAP &&
+#ifdef HAVE_PANTHOR_KBASE_UAPI_ADAPTER
+       !panthor_kbase_adapter_is_virtual_drm_fd(vm->dev->fd) &&
+#endif
        !!(vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA) !=
           (op->va.start == PAN_KMOD_VM_MAP_AUTO_VA)) {
       mesa_loge("op->va.start and vm->flags don't match");

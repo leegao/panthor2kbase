@@ -62,8 +62,9 @@ finish_render_desc_ringbuf(struct panvk_gpu_queue *queue)
          pan_kmod_vm_bind(dev->kmod.vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &op, 1);
       assert(!ret);
 
-      panvk_as_free(dev, dev->as.priv_heap, ringbuf->addr.dev,
-                    ringbuf->size * 2);
+      if (!(dev->kmod.vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA))
+         panvk_as_free(dev, dev->as.priv_heap, ringbuf->addr.dev,
+                       ringbuf->size * 2);
    }
 
    if (ringbuf->addr.host) {
@@ -112,12 +113,16 @@ init_render_desc_ringbuf(struct panvk_gpu_queue *queue)
    /* We choose the alignment to guarantee that we won't ever cross a 4G
     * boundary when accessing the mapping. This way we can encode the wraparound
     * using 32-bit operations. */
-   dev_addr = panvk_as_alloc(dev, dev->as.priv_heap, ringbuf->size * 2,
-                             ringbuf->size * 2);
+   const bool auto_va = dev->kmod.vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA;
+   dev_addr = PAN_KMOD_VM_MAP_AUTO_VA;
+   if (!auto_va) {
+      dev_addr = panvk_as_alloc(dev, dev->as.priv_heap, ringbuf->size * 2,
+                                ringbuf->size * 2);
 
-   if (!dev_addr)
-      return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                          "Failed to allocate virtual address for ringbuf BO");
+      if (!dev_addr)
+         return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                             "Failed to allocate virtual address for ringbuf BO");
+   }
 
    struct pan_kmod_vm_op vm_ops[] = {
       {
@@ -134,7 +139,7 @@ init_render_desc_ringbuf(struct panvk_gpu_queue *queue)
       {
          .type = PAN_KMOD_VM_OP_TYPE_MAP,
          .va = {
-            .start = dev_addr + ringbuf->size,
+            .start = auto_va ? PAN_KMOD_VM_MAP_AUTO_VA : (dev_addr + ringbuf->size),
             .size = ringbuf->size,
          },
          .map = {
@@ -149,15 +154,13 @@ init_render_desc_ringbuf(struct panvk_gpu_queue *queue)
    ret = pan_kmod_vm_bind(dev->kmod.vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, vm_ops,
                           tracing_enabled ? 1 : ARRAY_SIZE(vm_ops));
    if (ret) {
-      panvk_as_free(dev, dev->as.priv_heap, dev_addr, ringbuf->size * 2);
+      if (!auto_va)
+         panvk_as_free(dev, dev->as.priv_heap, dev_addr, ringbuf->size * 2);
       return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "Failed to GPU map ringbuf BO");
    }
 
-   ringbuf->addr.dev =
-      panthor_kbase_adapter_is_virtual_drm_fd(dev->kmod.dev->fd)
-         ? vm_ops[0].va.start
-         : dev_addr;
+   ringbuf->addr.dev = auto_va ? vm_ops[0].va.start : dev_addr;
 
    panvk_address_binding_report(dev, NULL, ringbuf->addr.dev, ringbuf->size,
                                 VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
@@ -219,8 +222,9 @@ finish_subqueue_tracing(struct panvk_gpu_queue *queue,
          pan_kmod_vm_bind(dev->kmod.vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &op, 1);
       assert(!ret);
 
-      panvk_as_free(dev, dev->as.priv_heap, subq->tracebuf.addr.dev,
-                    subq->tracebuf.size + pgsize);
+      if (!(dev->kmod.vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA))
+         panvk_as_free(dev, dev->as.priv_heap, subq->tracebuf.addr.dev,
+                       subq->tracebuf.size + pgsize);
    }
 
    if (subq->tracebuf.addr.host) {
@@ -274,12 +278,16 @@ init_subqueue_tracing(struct panvk_gpu_queue *queue,
 
    /* Add a guard page. */
    uint64_t pgsize = panvk_get_gpu_page_size(dev);
-   dev_addr = panvk_as_alloc(dev, dev->as.priv_heap,
-                             subq->tracebuf.size + pgsize, pgsize);
+   const bool auto_va = dev->kmod.vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA;
+   dev_addr = PAN_KMOD_VM_MAP_AUTO_VA;
+   if (!auto_va) {
+      dev_addr = panvk_as_alloc(dev, dev->as.priv_heap,
+                                subq->tracebuf.size + pgsize, pgsize);
 
-   if (!dev_addr)
-      return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                          "Failed to allocate virtual address for tracebuf");
+      if (!dev_addr)
+         return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                             "Failed to allocate virtual address for tracebuf");
+   }
 
    struct pan_kmod_vm_op vm_op = {
       .type = PAN_KMOD_VM_OP_TYPE_MAP,
@@ -298,13 +306,14 @@ init_subqueue_tracing(struct panvk_gpu_queue *queue,
    int ret =
       pan_kmod_vm_bind(dev->kmod.vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &vm_op, 1);
    if (ret) {
-      panvk_as_free(dev, dev->as.priv_heap, dev_addr,
-                    subq->tracebuf.size + pgsize);
+      if (!auto_va)
+         panvk_as_free(dev, dev->as.priv_heap, dev_addr,
+                       subq->tracebuf.size + pgsize);
       return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "Failed to GPU map ringbuf BO");
    }
 
-   subq->tracebuf.addr.dev = dev_addr;
+   subq->tracebuf.addr.dev = auto_va ? vm_op.va.start : dev_addr;
 
    panvk_address_binding_report(dev, NULL, subq->tracebuf.addr.dev,
                                 subq->tracebuf.size,

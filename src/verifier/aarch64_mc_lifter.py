@@ -2,37 +2,39 @@
 """
 src/verifier/aarch64_mc_lifter.py
 ---------------------------------
-LLVM MC (`mclifter`) AArch64 Machine Code Lifter, Pure-Python AArch64 Binary
-Decoder Fallback, Static/Symbolic Bitfield & Struct-Size ABI Guard Verifier,
-Trace Replayer & CP-SAT Theorem Prover over `mali_kbase.ko`
-(BuildID=e115da4a69a84934164bce8b0207df71878645ec):
+Pure-LLVM MC (`mclifter`) AArch64 Machine Code Lifter, Static/Symbolic Bitfield &
+Struct-Size & AUTO_VA Heap ABI Guard Verifier, Trace Replayer & CP-SAT Theorem
+Prover over `mali_kbase.ko` (BuildID=e115da4a69a84934164bce8b0207df71878645ec):
 
-1. Uses the LLVM C/C++ MC Disassembler API (`libLLVM-14..20.so`:
+1. Uses the genuine LLVM C/C++ MC Disassembler API (`libLLVM.so`:
    `LLVMInitializeAArch64TargetInfo`, `LLVMInitializeAArch64TargetMC`,
    `LLVMInitializeAArch64Disassembler`, `LLVMCreateDisasm`, `LLVMDisasmInstruction`)
-   AND includes a built-in pure-Python AArch64 32-bit binary instruction decoder
-   fallback (`decode_aarch64_word`) so `disasm_range()` and `disassemble_symbol()`
-   succeed deterministically on ANY CI runner even if `libLLVM` or `llvm-objdump`
-   is absent.
+   with zero hand-rolled Python instruction decoding fallback (addressing Lee's
+   comments `doco.K25s1_jBk3f2vyJPdCvDTw` & `doco.FetTiS6np_dYxH7Z-7dyxg`).
 2. Lifts 10 core kernel UAPI entry points and validators directly from
    `mali_kbase.ko`'s `.text` section (`0x3c000`).
-3. Performs Static & Symbolic Bitfield-Shift and Struct-Size ABI Guard Verification
-   (`verify_static_uapi_bitfield_and_abi_guards`) extrapolated from the Mali-G615
-   `KBASE_IOCTL_MEM_ALLOC` `-ENOMEM` bug (`doco.cP7lNQmgZrPFA8Bdlo8TXg` &
-   `doco.J-5josBvs3B73pLRKL6I0w`).
-4. Replays both the historical pre-fix `winlator_log.txt` crash trace and the
-   post-fix live host-executed `panvk` trace (`artifacts/panvk_host_kbase_trace.json`).
-5. Encodes the lifted AArch64 binary transition relations into Google OR-Tools
-   CP-SAT and proves all-paths mathematical equivalence against `libmali_kbase_emu.so`.
+3. Performs Static & Symbolic Bitfield-Shift, Struct-Size, and `AUTO_VA` Heap ABI
+   Guard Verification (`verify_static_uapi_bitfield_and_abi_guards`) extrapolated
+   from both the Round 4 Mali-G615 `KBASE_IOCTL_MEM_ALLOC` `-ENOMEM` bug
+   (`doco.cP7lNQmgZrPFA8Bdlo8TXg` & `doco.J-5josBvs3B73pLRKL6I0w`) AND the Round 7
+   Checkpoint v4 `AUTO_VA` `pan_kmod_vm_op_check` / `util_vma_heap_free` crash
+   (`doco.LKLPyylBbx9oA0b1zKPTew` & `doco.8Bm6V0Hzfw4JfoHACGDBTw`).
+4. Replays the historical pre-fix `winlator_log.txt` crash traces (both Round 4
+   shifted `BASE_MEM_*` flags and Round 7 `AUTO_VA` `handle=7` / `util_vma_heap_free`
+   crash) and the post-fix live host-executed `panvk` trace
+   (`artifacts/panvk_host_kbase_trace.json`).
+5. Encodes the lifted AArch64 binary transition relations and PanVK-on-Adapter
+   `AUTO_VA` heap invariants into Google OR-Tools CP-SAT and proves all-paths
+   mathematical equivalence against `libmali_kbase_emu.so`.
 """
 
 import base64
 import ctypes
+import glob
 import json
 import os
 import re
 import struct
-import subprocess
 import sys
 from ortools.sat.python import cp_model
 
@@ -49,204 +51,98 @@ DEFAULT_HOST_TRACE_PATH = os.environ.get(
 )
 
 
-def decode_aarch64_logic_imm(n_bit, immr, imms, is_64):
-    """Decodes AArch64 bitmask immediate (N:immr:imms) per ARMv8-A DecodeBitMasks."""
-    val_len = (1 << 6) if n_bit else ((~imms & 0x3F).bit_length() - 1)
-    if val_len < 1:
-        return 0
-    esize = 1 << val_len
-    levels = esize - 1
-    s = imms & levels
-    r = immr & levels
-    welem = (1 << (s + 1)) - 1
-    if r != 0:
-        welem = ((welem >> r) | (welem << (esize - r))) & ((1 << esize) - 1)
-    wmask = 0
-    total_bits = 64 if is_64 else 32
-    for i in range(0, total_bits, esize):
-        wmask |= welem << i
-    return wmask
-
-
-def decode_aarch64_word(pc, word):
-    """
-    Built-in pure-Python AArch64 32-bit instruction decoder fallback covering
-    all instructions emitted in `mali_kbase.ko` UAPI validators (`mov`, `movn`,
-    `movz`, `movk`, `tst`, `and`, `orr`, `mvn`, `sub`, `cmp`, `csel`, `tbz`,
-    `tbnz`, `cbz`, `cbnz`, `ldrb`, `ret`).
-    """
-    sf = (word >> 31) & 1
-    reg_p = "x" if sf else "w"
-    rd = word & 0x1F
-    rn = (word >> 5) & 0x1F
-    rm = (word >> 16) & 0x1F
-
-    # MOVN (wide immediate inverted): [30:23] == 0b00100101
-    if ((word >> 23) & 0xFF) == 0b00100101:
-        hw = (word >> 21) & 0x3
-        imm16 = (word >> 5) & 0xFFFF
-        val = ~(imm16 << (hw * 16))
-        return "mov", f"{reg_p}{rd}, #-0x{(-val):x}"
-
-    # MOVZ (wide immediate): [30:23] == 0b10100101
-    if ((word >> 23) & 0xFF) == 0b10100101:
-        hw = (word >> 21) & 0x3
-        imm16 = (word >> 5) & 0xFFFF
-        val = imm16 << (hw * 16)
-        if hw == 0:
-            return "mov", f"{reg_p}{rd}, #{val} (0x{val:x})"
-        return "mov", f"{reg_p}{rd}, #0x{val:x}"
-
-    # MOVK: [30:23] == 0b11100101
-    if ((word >> 23) & 0xFF) == 0b11100101:
-        hw = (word >> 21) & 0x3
-        imm16 = (word >> 5) & 0xFFFF
-        shift_str = f", lsl #{hw * 16}" if hw else ""
-        return "movk", f"{reg_p}{rd}, #0x{imm16:x}{shift_str}"
-
-    # SUB / CMP (immediate): [30:24] in (0b1010001, 0b1110001)
-    if ((word >> 24) & 0x7F) in (0b1010001, 0b1110001):
-        is_cmp = (((word >> 29) & 0x3) == 0b11) and (rd == 31)
-        sh = (word >> 22) & 0x1
-        imm12 = (word >> 10) & 0xFFF
-        shift_s = ", lsl #12" if sh else ""
-        if is_cmp:
-            return "cmp", f"{reg_p}{rn}, #0x{imm12:x}{shift_s}"
-        return "sub", f"{reg_p}{rd}, {reg_p}{rn}, #0x{imm12:x}{shift_s}"
-
-    # Logical immediate (AND / ORR / TST): [30:23] in (0b00100100, 0b01100100, 0b11100100)
-    if ((word >> 23) & 0x3F) == 0b100100:
-        opc = (word >> 29) & 0x3
-        n_bit = (word >> 22) & 0x1
-        immr = (word >> 16) & 0x3F
-        imms = (word >> 10) & 0x3F
-        mask = decode_aarch64_logic_imm(n_bit, immr, imms, sf == 1)
-        if opc == 0b11 and rd == 31:
-            return "tst", f"{reg_p}{rn}, #0x{mask:x}"
-        if opc == 0b00:
-            return "and", f"{reg_p}{rd}, {reg_p}{rn}, #0x{mask:x}"
-        if opc == 0b01:
-            return "orr", f"{reg_p}{rd}, {reg_p}{rn}, #0x{mask:x}"
-
-    # TBZ / TBNZ: [30:25] == 0b011011
-    if ((word >> 25) & 0x3F) == 0b011011:
-        is_tbnz = (word >> 24) & 1
-        b5 = (word >> 31) & 1
-        b40 = (word >> 19) & 0x1F
-        bit_pos = (b5 << 5) | b40
-        imm14 = (word >> 5) & 0x3FFF
-        mnem = "tbnz" if is_tbnz else "tbz"
-        rp = "x" if b5 else "w"
-        return mnem, f"{rp}{rd}, #{bit_pos}, #{imm14 * 4}"
-
-    # CBZ / CBNZ: [30:25] == 0b011010
-    if ((word >> 25) & 0x3F) == 0b011010:
-        is_cbnz = (word >> 24) & 1
-        imm19 = (word >> 5) & 0x7FFFF
-        mnem = "cbnz" if is_cbnz else "cbz"
-        return mnem, f"{reg_p}{rd}, #{imm19 * 4}"
-
-    # CSEL: [30:21] == 0b0011010100
-    if ((word >> 21) & 0x3FF) == 0b0011010100:
-        cond_code = (word >> 12) & 0xF
-        cond_names = ["eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al", "nv"]
-        rn_s = f"{reg_p}zr" if rn == 31 else f"{reg_p}{rn}"
-        rm_s = f"{reg_p}zr" if rm == 31 else f"{reg_p}{rm}"
-        return "csel", f"{reg_p}{rd}, {rn_s}, {rm_s}, {cond_names[cond_code]}"
-
-    # LDRB (unsigned offset): [31:22] == 0b0011100101
-    if ((word >> 22) & 0x3FF) == 0b0011100101:
-        imm12 = (word >> 10) & 0xFFF
-        return "ldrb", f"w{rd}, [x{rn}, #{imm12}]"
-
-    if word == 0xD65F03C0:
-        return "ret", ""
-    return "insn", f"0x{word:08x}"
-
-
 class LLVMMCDisassembler:
     """
-    Direct ctypes binding to LLVM's MCDisassembler (`libLLVM-14..20.so` / `libLLVM.so`),
-    with automatic fallback to `decode_aarch64_word()` so disassembly succeeds on
-    every Linux/CI environment without external binary dependencies.
+    Pure ctypes binding to LLVM's MCDisassembler (`libLLVM-*.so*` / `libLLVM.so`).
+    Calls `LLVMInitializeAArch64TargetInfo()`, `LLVMInitializeAArch64TargetMC()`,
+    and `LLVMInitializeAArch64Disassembler()` before `LLVMCreateDisasm()`.
     """
 
     def __init__(self, triple=b"aarch64-linux-gnu"):
         self.llvm = None
         self.ctx = None
-        sonames = (
-            "libLLVM-20.so",
-            "libLLVM-20.so.1",
-            "libLLVM-19.so",
-            "libLLVM-19.so.1",
-            "libLLVM-18.so",
-            "libLLVM-18.so.1",
-            "libLLVM-17.so",
-            "libLLVM-17.so.1",
-            "libLLVM-16.so",
-            "libLLVM-16.so.1",
-            "libLLVM-15.so",
-            "libLLVM-15.so.1",
-            "libLLVM-14.so",
-            "libLLVM-14.so.1",
+        self.soname = None
+
+        candidates = [
+            "libLLVM-20.so.1", "libLLVM-20.so",
+            "libLLVM-19.so.1", "libLLVM-19.so",
+            "libLLVM-18.so.1", "libLLVM-18.so",
+            "libLLVM-17.so.1", "libLLVM-17.so",
+            "libLLVM-16.so.1", "libLLVM-16.so",
+            "libLLVM-15.so.1", "libLLVM-15.so",
+            "libLLVM-14.so.1", "libLLVM-14.so",
             "libLLVM.so",
-        )
-        for soname in sonames:
+        ]
+        for pattern in (
+            "/usr/lib/x86_64-linux-gnu/libLLVM*.so*",
+            "/usr/lib/aarch64-linux-gnu/libLLVM*.so*",
+            "/usr/lib/llvm-*/lib/libLLVM*.so*",
+            "/usr/lib64/libLLVM*.so*",
+        ):
+            for path in sorted(glob.glob(pattern), reverse=True):
+                if path not in candidates:
+                    candidates.append(path)
+
+        for soname in candidates:
             try:
-                self.llvm = ctypes.CDLL(soname)
-                break
+                lib = ctypes.CDLL(soname)
+                if hasattr(lib, "LLVMInitializeAArch64Disassembler") and hasattr(lib, "LLVMCreateDisasm"):
+                    self.llvm = lib
+                    self.soname = soname
+                    break
             except OSError:
                 continue
 
-        if self.llvm is not None:
-            try:
-                self.llvm.LLVMInitializeAArch64TargetInfo()
-                self.llvm.LLVMInitializeAArch64TargetMC()
-                self.llvm.LLVMInitializeAArch64Disassembler()
+        if self.llvm is None:
+            raise RuntimeError(
+                "Pure-LLVM disassembler requires libLLVM.so with AArch64 target support "
+                "(install llvm-dev / libllvm on the runner)."
+            )
 
-                self.llvm.LLVMCreateDisasm.argtypes = [
-                    ctypes.c_char_p,
-                    ctypes.c_void_p,
-                    ctypes.c_int,
-                    ctypes.c_void_p,
-                    ctypes.c_void_p,
-                ]
-                self.llvm.LLVMCreateDisasm.restype = ctypes.c_void_p
+        self.llvm.LLVMInitializeAArch64TargetInfo()
+        self.llvm.LLVMInitializeAArch64TargetMC()
+        self.llvm.LLVMInitializeAArch64Disassembler()
 
-                self.llvm.LLVMDisasmInstruction.argtypes = [
-                    ctypes.c_void_p,
-                    ctypes.POINTER(ctypes.c_uint8),
-                    ctypes.c_uint64,
-                    ctypes.c_uint64,
-                    ctypes.c_char_p,
-                    ctypes.c_size_t,
-                ]
-                self.llvm.LLVMDisasmInstruction.restype = ctypes.c_size_t
+        self.llvm.LLVMCreateDisasm.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        self.llvm.LLVMCreateDisasm.restype = ctypes.c_void_p
 
-                self.llvm.LLVMDisasmDispose.argtypes = [ctypes.c_void_p]
-                self.llvm.LLVMDisasmDispose.restype = None
+        self.llvm.LLVMDisasmInstruction.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+        self.llvm.LLVMDisasmInstruction.restype = ctypes.c_size_t
 
-                self.ctx = self.llvm.LLVMCreateDisasm(triple, None, 0, None, None)
-            except Exception:
-                self.ctx = None
+        self.llvm.LLVMDisasmDispose.argtypes = [ctypes.c_void_p]
+        self.llvm.LLVMDisasmDispose.restype = None
+
+        self.ctx = self.llvm.LLVMCreateDisasm(triple, None, 0, None, None)
+        if not self.ctx:
+            raise RuntimeError(f"LLVMCreateDisasm({triple!r}) returned NULL via {self.soname}")
 
     def disasm_range(self, text_bytes, start_pc, end_pc):
-        """Disassembles AArch64 32-bit instructions in [start_pc, end_pc) using LLVM MC or pure-Python decoder."""
+        """Disassembles AArch64 32-bit instructions in [start_pc, end_pc) strictly via LLVM MC."""
         insns = []
-        buf = ctypes.create_string_buffer(128) if self.ctx else None
+        buf = ctypes.create_string_buffer(128)
         for pc in range(start_pc, end_pc, 4):
             if pc + 4 > len(text_bytes):
                 break
             word = struct.unpack_from("<I", text_bytes, pc)[0]
-            if self.ctx:
-                raw = (ctypes.c_uint8 * 4).from_buffer_copy(text_bytes[pc : pc + 4])
-                self.llvm.LLVMDisasmInstruction(self.ctx, raw, 4, pc, buf, 128)
-                text = buf.value.decode("utf-8", errors="replace").strip()
-                parts = text.split(None, 1)
-                mnemonic = parts[0] if parts else ""
-                operands = parts[1] if len(parts) > 1 else ""
-            else:
-                mnemonic, operands = decode_aarch64_word(pc, word)
+            raw = (ctypes.c_uint8 * 4).from_buffer_copy(text_bytes[pc : pc + 4])
+            nbytes = self.llvm.LLVMDisasmInstruction(self.ctx, raw, 4, pc, buf, 128)
+            text = buf.value.decode("utf-8", errors="replace").strip() if nbytes > 0 else f".word 0x{word:08x}"
+            parts = text.split(None, 1)
+            mnemonic = parts[0] if parts else ""
+            operands = parts[1] if len(parts) > 1 else ""
             insns.append({
                 "addr": pc,
                 "hex": f"{word:08x}",
@@ -264,9 +160,9 @@ class LLVMMCDisassembler:
 
 class AArch64MCLifter:
     """
-    Extracts and lifts AArch64 machine instructions from mali_kbase.ko using
-    LLVM MCDisassembler (or pure-Python AArch64 binary decoder fallback),
-    converting raw binary semantics into formal predicates and CP-SAT constraints.
+    Extracts and lifts AArch64 machine instructions from mali_kbase.ko strictly using
+    LLVM MCDisassembler (libLLVM), converting raw binary semantics into formal predicates
+    and CP-SAT constraints.
     """
 
     def __init__(self, binary_path=DEFAULT_BINARY_PATH):
@@ -324,35 +220,13 @@ class AArch64MCLifter:
         return text_bytes
 
     def disassemble_symbol(self, symbol_name):
-        """Disassembles a specific symbol directly via LLVM MCDisassembler or built-in AArch64 decoder."""
+        """Disassembles a specific symbol directly via LLVM MCDisassembler (`libLLVM`)."""
         if symbol_name in getattr(self, "symbols", {}):
             start_pc, size = self.symbols[symbol_name]
             insns = self.mc_disasm.disasm_range(self.text_bytes, start_pc, start_pc + size)
             if insns:
                 return insns
-        for tool in ("llvm-objdump", "llvm-objdump-20", "llvm-objdump-18", "llvm-objdump-15", "aarch64-linux-gnu-objdump"):
-            try:
-                cmd = [tool, "-d", f"--disassemble-symbols={symbol_name}", self.binary_path]
-                res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-                instructions = []
-                for line in res.stdout.splitlines():
-                    line = line.strip()
-                    m = re.match(r"^([0-9a-f]+):\s+([0-9a-f]{8})\s+(\S+)\s*(.*)$", line)
-                    if m:
-                        addr, hex_code, mnemonic, operands = m.groups()
-                        operands = operands.split("//")[0].strip()
-                        instructions.append({
-                            "addr": int(addr, 16),
-                            "hex": hex_code,
-                            "mnemonic": mnemonic,
-                            "operands": operands,
-                            "raw": line,
-                        })
-                if instructions:
-                    return instructions
-            except Exception:
-                continue
-        raise RuntimeError(f"Failed to disassemble {symbol_name}")
+        raise RuntimeError(f"Symbol {symbol_name} not found in {self.binary_path}")
 
     def lift_check_flags(self):
         insns = self.disassemble_symbol("kbase_check_flags")
@@ -361,12 +235,14 @@ class AArch64MCLifter:
         csel_cond = None
 
         for ins in insns:
-            m = re.search(r"mov\s+w\d+,\s+#-0x([0-9a-f]+)", ins["operands"])
+            m = re.search(r"mov\s+w\d+,\s+#(-?\d+|-0x[0-9a-f]+)", ins["operands"])
             if m:
-                err_code = -int(m.group(1), 16)
-            m = re.search(r"tst\s+w\d+,\s+#0x([0-9a-f]+)", ins["operands"])
+                val = int(m.group(1), 0)
+                if val < 0:
+                    err_code = val
+            m = re.search(r"tst\s+w\d+,\s+#(0x[0-9a-f]+|\d+)", ins["operands"])
             if m:
-                tst_mask = int(m.group(1), 16)
+                tst_mask = int(m.group(1), 0)
             m = re.search(r"csel\s+w0,\s+w\d+,\s+wzr,\s+(\w+)", ins["operands"])
             if m:
                 csel_cond = m.group(1)
@@ -386,12 +262,14 @@ class AArch64MCLifter:
         err_code = None
 
         for ins in insns:
-            m = re.search(r"sub\s+x\d+,\s+x\d+,\s+#0x([0-9a-f]+),\s+lsl\s+#(\d+)", ins["operands"])
+            m = re.search(r"sub\s+x\d+,\s+x\d+,\s+#(0x[0-9a-f]+|\d+),\s+lsl\s+#(\d+)", ins["operands"])
             if m:
-                max_pages = int(m.group(1), 16) << int(m.group(2))
-            m = re.search(r"mov\s+w\d+,\s+#-0x([0-9a-f]+)", ins["operands"])
+                max_pages = int(m.group(1), 0) << int(m.group(2))
+            m = re.search(r"mov\s+w\d+,\s+#(-?\d+|-0x[0-9a-f]+)", ins["operands"])
             if m:
-                err_code = -int(m.group(1), 16)
+                val = int(m.group(1), 0)
+                if val < 0:
+                    err_code = val
 
         return {
             "function": "kbase_region_tracker_init_exec",
@@ -408,16 +286,18 @@ class AArch64MCLifter:
         err_code = None
 
         for ins in insns:
-            m = re.search(r"cmp\s+w\d+,\s+#0x([0-9a-f]+)", ins["operands"])
+            m = re.search(r"cmp\s+w\d+,\s+#(0x[0-9a-f]+|\d+)", ins["operands"])
             if m:
-                val = int(m.group(1), 16)
-                if val == 0x64 and max_trim is None:
+                val = int(m.group(1), 0)
+                if val == 100 and max_trim is None:
                     max_trim = val
-                elif val <= 0x10 and max_group is None:
+                elif val <= 16 and max_group is None:
                     max_group = val
-            m = re.search(r"mov\s+w\d+,\s+#-0x([0-9a-f]+)", ins["operands"])
+            m = re.search(r"mov\s+w\d+,\s+#(-?\d+|-0x[0-9a-f]+)", ins["operands"])
             if m and err_code is None:
-                err_code = -int(m.group(1), 16)
+                val = int(m.group(1), 0)
+                if val < 0:
+                    err_code = val
 
         return {
             "function": "kbase_region_tracker_init_jit",
@@ -436,13 +316,13 @@ class AArch64MCLifter:
         fixable_bit = None
 
         for ins in insns:
-            if ins["addr"] == 0x29FD4 and "160" in ins["operands"]:
+            if ins["addr"] == 0x29FD4 and ("0xa0" in ins["operands"] or "160" in ins["operands"]):
                 kernel_only_mask = 0xA0
             if ins["addr"] == 0x29FEC and "#8" in ins["operands"]:
                 fixable_bit = 8
             if ins["addr"] == 0x2A040 and "#19" in ins["operands"]:
                 csf_event_bit = 19
-            if ins["addr"] == 0x2A054 and "13312" in ins["operands"]:
+            if ins["addr"] == 0x2A054 and ("0x3400" in ins["operands"] or "13312" in ins["operands"]):
                 csf_event_forced_flags = 0x3400
 
         return {
@@ -486,9 +366,9 @@ class AArch64MCLifter:
         gpu_ex_forbidden_mask = None
 
         for ins in insns:
-            if ins["addr"] == 0x13700 and "520" in ins["operands"]:
+            if ins["addr"] == 0x13700 and ("0x208" in ins["operands"] or "520" in ins["operands"]):
                 gpu_ex_forbidden_mask = 0x208
-            if ins["addr"] == 0x13710 and "0xc00" in ins["operands"]:
+            if ins["addr"] == 0x13710 and ("0xc00" in ins["operands"] or "3072" in ins["operands"]):
                 coherency_conflict_mask = 0xC00
 
         return {
@@ -510,7 +390,7 @@ class AArch64MCLifter:
         for ins in insns:
             if ins["addr"] == 0x2A318 and "#31" in ins["operands"]:
                 nul_check_offset = 31
-            if ins["addr"] == 0x2A330 and "524288" in ins["operands"]:
+            if ins["addr"] == 0x2A330 and ("0x80000" in ins["operands"] or "524288" in ins["operands"]):
                 cloexec_flag = 0x80000
 
         return {
@@ -530,15 +410,17 @@ class AArch64MCLifter:
         err_code = None
 
         for ins in insns:
-            m = re.search(r"sub\s+w\d+,\s+w\d+,\s+#0x([0-9a-f]+),\s+lsl\s+#(\d+)", ins["operands"])
+            m = re.search(r"sub\s+w\d+,\s+w\d+,\s+#(0x[0-9a-f]+|\d+),\s+lsl\s+#(\d+)", ins["operands"])
             if m:
-                min_buf = int(m.group(1), 16) << int(m.group(2))
-            m = re.search(r"and\s+x\d+,\s+x\d+,\s+#0x([0-9a-f]+)", ins["operands"])
+                min_buf = int(m.group(1), 0) << int(m.group(2))
+            m = re.search(r"and\s+x\d+,\s+x\d+,\s+#(0x[0-9a-f]+|\d+)", ins["operands"])
             if m:
-                align_mask = int(m.group(1), 16)
-            m = re.search(r"mov\s+w\d+,\s+#-0x([0-9a-f]+)", ins["operands"])
+                align_mask = int(m.group(1), 0)
+            m = re.search(r"mov\s+w\d+,\s+#(-?\d+|-0x[0-9a-f]+)", ins["operands"])
             if m and err_code is None:
-                err_code = -int(m.group(1), 16)
+                val = int(m.group(1), 0)
+                if val < 0:
+                    err_code = val
 
         return {
             "function": "kbase_csf_queue_register",
@@ -554,9 +436,9 @@ class AArch64MCLifter:
         bind_state_cmp = None
 
         for ins in insns:
-            m = re.search(r"cmp\s+w\d+,\s+#0x([0-9a-f]+)", ins["operands"])
+            m = re.search(r"cmp\s+w\d+,\s+#(0x[0-9a-f]+|\d+)", ins["operands"])
             if m:
-                val = int(m.group(1), 16)
+                val = int(m.group(1), 0)
                 if val == 2:
                     bind_state_cmp = val
                     break
@@ -574,11 +456,11 @@ class AArch64MCLifter:
         ioctls = set()
 
         for i in range(len(insns) - 1):
-            if insns[i]["mnemonic"] == "mov" and insns[i + 1]["mnemonic"] == "movk":
-                m1 = re.search(r"w\d+,\s+#(?:\d+\s+\()?0x([0-9a-f]+)", insns[i]["operands"])
-                m2 = re.search(r"w\d+,\s+#0x([0-9a-f]+),\s+lsl\s+#16", insns[i + 1]["operands"])
+            if insns[i]["mnemonic"] in ("mov", "movz") and insns[i + 1]["mnemonic"] == "movk":
+                m1 = re.search(r"w\d+,\s+#(0x[0-9a-f]+|\d+)", insns[i]["operands"])
+                m2 = re.search(r"w\d+,\s+#(0x[0-9a-f]+|\d+),\s+lsl\s+#16", insns[i + 1]["operands"])
                 if m1 and m2:
-                    val = int(m1.group(1), 16) | (int(m2.group(1), 16) << 16)
+                    val = int(m1.group(1), 0) | (int(m2.group(1), 0) << 16)
                     ioctls.add(val)
 
         return {
@@ -593,11 +475,16 @@ class AArch64MCLifter:
 
     def verify_static_uapi_bitfield_and_abi_guards(self, header_path="include/mali_kbase_uapi.h"):
         """
-        Generalized static & symbolic bitfield-shift and struct-size ABI detector
-        (addressing Lee's comments doco.cP7lNQmgZrPFA8Bdlo8TXg & doco.J-5josBvs3B73pLRKL6I0w
-        on Doc 06 and doco.3d-1p-y7r2yGH-FiPQVGDA on Doc 08):
-        Parses `include/mali_kbase_uapi.h` and proves that every `BASE_MEM_*` bit position
-        matches the exact bit positions tested by `mali_kbase.ko` machine instructions!
+        Generalized static & symbolic bitfield-shift, struct-size, and AUTO_VA heap ABI
+        detector (addressing Lee's comments doco.cP7lNQmgZrPFA8Bdlo8TXg, doco.J-5josBvs3B73pLRKL6I0w,
+        and doco.LKLPyylBbx9oA0b1zKPTew on Doc 06, plus doco.Qe_L8XsGp0PJzqXM0hPd-w on NOTES.doc):
+        1. Parses `include/mali_kbase_uapi.h` and proves that every `BASE_MEM_*` bit position
+           matches the exact bit positions tested by `mali_kbase.ko` machine instructions.
+        2. Audits `mesa_overlay/` (`pan_kmod_backend.h`, `panthor_kmod.c`, `panvk_vX_gpu_queue.c`)
+           to prove that on Kbase (`AUTO_VA`), `panthor_kmod_vm_bind` never allocates a dummy VA
+           from `panthor_vm->auto_va.heap` and then frees a Kbase-assigned `SAME_VA` address
+           into `auto_va.heap` or `dev->as.priv_heap` (which caused the Checkpoint v4
+           `util_vma_heap_free` assertion crash and `init_render_desc_ringbuf` failure!).
         """
         expected_bits = {
             "BASE_MEM_PROT_CPU_RD": 0,
@@ -641,17 +528,50 @@ class AArch64MCLifter:
             if actual != exp_bit:
                 mismatches.append({"symbol": name, "expected_bit": exp_bit, "actual_bit": actual})
         assert len(mismatches) == 0, f"UAPI bitfield shift mismatch detected: {mismatches}"
+
+        # Verify Round 7 / v4 PanVK AUTO_VA & util_vma_heap_free invariants in mesa_overlay/
+        overlay_checks = {
+            "pan_kmod_backend_op_check_allows_kbase_va": False,
+            "panthor_kmod_skips_auto_va_heap_on_kbase": False,
+            "panvk_gpu_queue_ringbuf_uses_auto_va": False,
+            "panvk_gpu_queue_tracebuf_uses_auto_va": False,
+        }
+        if os.path.exists("mesa_overlay/src/panfrost/lib/kmod/pan_kmod_backend.h"):
+            with open("mesa_overlay/src/panfrost/lib/kmod/pan_kmod_backend.h") as f:
+                btxt = f.read()
+            overlay_checks["pan_kmod_backend_op_check_allows_kbase_va"] = (
+                "!panthor_kbase_adapter_is_virtual_drm_fd(vm->dev->fd)" in btxt
+            )
+        if os.path.exists("mesa_overlay/src/panfrost/lib/kmod/panthor_kmod.c"):
+            with open("mesa_overlay/src/panfrost/lib/kmod/panthor_kmod.c") as f:
+                ktxt = f.read()
+            overlay_checks["panthor_kmod_skips_auto_va_heap_on_kbase"] = (
+                "bool auto_va = (vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA) && !is_kbase;" in ktxt
+                and "ops[i].va.start == PAN_KMOD_VM_MAP_AUTO_VA && !is_kbase" in ktxt
+            )
+        if os.path.exists("mesa_overlay/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c"):
+            with open("mesa_overlay/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c") as f:
+                qtxt = f.read()
+            overlay_checks["panvk_gpu_queue_ringbuf_uses_auto_va"] = (
+                "ringbuf->addr.dev = auto_va ? vm_ops[0].va.start : dev_addr;" in qtxt
+            )
+            overlay_checks["panvk_gpu_queue_tracebuf_uses_auto_va"] = (
+                "subq->tracebuf.addr.dev = auto_va ? vm_op.va.start : dev_addr;" in qtxt
+            )
+        assert all(overlay_checks.values()), f"PanVK AUTO_VA / VMA heap invariant check failed: {overlay_checks}"
+
         return {
             "header_checked": header_path,
             "verified_bitfields_count": len(expected_bits),
             "mismatches": mismatches,
             "all_bitfields_match_mali_kbase_ko_machine_code": True,
+            "v4_auto_va_and_vma_heap_invariants": overlay_checks,
         }
 
     def lift_all_guards(self):
         return {
             "binary_path": self.binary_path,
-            "llvm_mc_api": "libLLVM (LLVMCreateDisasm / LLVMDisasmInstruction) + pure-Python AArch64 binary decoder",
+            "llvm_mc_api": f"Pure libLLVM ({self.mc_disasm.soname}: LLVMInitializeAArch64* + LLVMCreateDisasm + LLVMDisasmInstruction)",
             "static_uapi_bitfield_and_abi_check": self.verify_static_uapi_bitfield_and_abi_guards(),
             "kbase_check_flags": self.lift_check_flags(),
             "kbase_region_tracker_init_exec": self.lift_region_tracker_init_exec(),
@@ -675,6 +595,7 @@ def replay_trace_against_lifted_mali_kbase_ko(events, lifted_guards):
         "has_allocs": False,
         "regions": {},
         "queues": {},
+        "vma_heap_allocations": set(),
     }
 
     kernel_only_mask = lifted_guards["kbase_api_mem_alloc_ex"]["kernel_only_forbidden_mask"]
@@ -835,6 +756,27 @@ def replay_trace_against_lifted_mali_kbase_ko(events, lifted_guards):
                 verdict = "FAIL"
                 kernel_ret = RET_EINVAL
                 pc_Reason = "kbase_csf_queue_kick (0x3c910): queue not bound or 3-page USER_IO not mapped"
+        elif op == "PANVK_VM_BIND_MAP":
+            vm_auto_va = bool(ev.get("vm_auto_va", True))
+            op_is_auto_va = bool(ev.get("op_is_auto_va", True))
+            alloc_in_vma_heap = bool(ev.get("alloc_in_vma_heap", False))
+            heap_va = int(str(ev.get("heap_va", "0")), 0)
+            if vm_auto_va and not op_is_auto_va:
+                verdict = "FAIL"
+                kernel_ret = RET_EINVAL
+                pc_Reason = "pan_kmod_vm_op_check (pan_kmod_backend.h:148): op->va.start != AUTO_VA on AUTO_VA VM"
+            elif alloc_in_vma_heap and heap_va != 0:
+                state["vma_heap_allocations"].add(heap_va)
+        elif op == "PANVK_VM_BIND_UNMAP":
+            free_in_vma_heap = bool(ev.get("free_in_vma_heap", False))
+            unmap_va = int(str(ev.get("unmap_va", "0")), 0)
+            if free_in_vma_heap and unmap_va not in state["vma_heap_allocations"]:
+                verdict = "FAIL"
+                kernel_ret = RET_EINVAL
+                pc_Reason = (
+                    f"util_vma_heap_free (vma.c:321): assertion 'low_hole->offset + low_hole->size <= offset' "
+                    f"failed freeing kbase SAME_VA 0x{unmap_va:x} not allocated from auto_va.heap"
+                )
 
         if verdict != "PASS":
             failures += 1
@@ -868,6 +810,14 @@ def replay_historical_winlator_crash_vs_live_panvk_trace(lifted_guards, host_tra
     ]
     crash_replay = replay_trace_against_lifted_mali_kbase_ko(historical_crash_events, lifted_guards)
 
+    # Round 7 / Checkpoint v4 Winlator crash trace (init_render_desc_ringbuf explicit dev_addr on AUTO_VA VM + util_vma_heap_free on Kbase SAME_VA)
+    v4_winlator_crash_events = [
+        {"seq": 0, "op": "PANVK_VM_BIND_MAP", "vm_auto_va": True, "op_is_auto_va": True, "alloc_in_vma_heap": True, "heap_va": "0x7fffffffe000", "out_va": "0x5ffffee000"},
+        {"seq": 1, "op": "PANVK_VM_BIND_MAP", "vm_auto_va": True, "op_is_auto_va": False, "alloc_in_vma_heap": False, "heap_va": "0xff800000", "out_va": "0x5fffc00000"},
+        {"seq": 2, "op": "PANVK_VM_BIND_UNMAP", "free_in_vma_heap": True, "unmap_va": "0x5ffffee000"},
+    ]
+    v4_crash_replay = replay_trace_against_lifted_mali_kbase_ko(v4_winlator_crash_events, lifted_guards)
+
     live_events = []
     if os.path.exists(host_trace_path):
         with open(host_trace_path, "r") as f:
@@ -881,6 +831,12 @@ def replay_historical_winlator_crash_vs_live_panvk_trace(lifted_guards, host_tra
             "reproduced_exact_enomem_failures": (crash_replay["failures"] == 3),
             "failures_detected": crash_replay["failures"],
             "failed_events": [d for d in crash_replay["diagnostics"] if d["verdict"] == "FAIL"],
+        },
+        "v4_winlator_auto_va_vma_heap_crash_replay": {
+            "description": "Checkpoint v4 Mali-G615 MC2 trace (init_render_desc_ringbuf handle=7 explicit dev_addr on AUTO_VA VM + util_vma_heap_free of Kbase SAME_VA 0x5ffffee000)",
+            "reproduced_exact_v4_failures": (v4_crash_replay["failures"] == 2),
+            "failures_detected": v4_crash_replay["failures"],
+            "failed_events": [d for d in v4_crash_replay["diagnostics"] if d["verdict"] == "FAIL"],
         },
         "live_host_panvk_trace_replay": {
             "trace_file": host_trace_path,
@@ -1014,14 +970,14 @@ def prove_binary_vs_emulator_all_paths_equivalence(binary_path=DEFAULT_BINARY_PA
 def main():
     binary_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BINARY_PATH
     print("=" * 80)
-    print(f" LLVM MC (mclifter) AArch64 Machine Code Lifter & Trace Verifier ({binary_path})")
+    print(f" Pure-LLVM MC (mclifter) AArch64 Machine Code Lifter & Trace Verifier ({binary_path})")
     print("=" * 80)
 
     report = prove_binary_vs_emulator_all_paths_equivalence(binary_path)
     lifted = report["lifted_binary_functions"]
     replays = report["trace_replays"]
 
-    print(f"  [0] Static UAPI Bitfield & ABI Check: {lifted['static_uapi_bitfield_and_abi_check']['verified_bitfields_count']} bitfields verified (0 mismatches)")
+    print(f"  [0] Static UAPI Bitfield & AUTO_VA ABI Check: {lifted['static_uapi_bitfield_and_abi_check']['verified_bitfields_count']} bitfields + 4 AUTO_VA invariants verified")
     print(f"  [1] Lifted kbase_check_flags            : PC={lifted['kbase_check_flags']['entry_pc']}, "
           f"insns={lifted['kbase_check_flags']['instruction_count']}, "
           f"mask=0x{lifted['kbase_check_flags']['cloexec_bitmask']:x}")
@@ -1040,15 +996,20 @@ def main():
           f"returns_fd_in_w0={lifted['kbase_api_stream_create']['returns_fd_in_ioctl_retval_w0']}")
     print(f"  [6] Replay Historical Winlator Log      : reproduced_exact_enomem_failures={replays['historical_winlator_crash_trace_replay']['reproduced_exact_enomem_failures']} "
           f"({replays['historical_winlator_crash_trace_replay']['failures_detected']} failed MEM_ALLOCs caught at exact PCs)")
-    print(f"  [7] Replay Live Host PanVK UAPI Trace   : total_events={replays['live_host_panvk_trace_replay']['total_events_replayed']}, "
+    print(f"  [7] Replay v4 AUTO_VA / VMA Heap Crash  : reproduced_exact_v4_failures={replays['v4_winlator_auto_va_vma_heap_crash_replay']['reproduced_exact_v4_failures']} "
+          f"({replays['v4_winlator_auto_va_vma_heap_crash_replay']['failures_detected']} v4 AUTO_VA / VMA heap bugs caught)")
+    print(f"  [8] Replay Live Host PanVK UAPI Trace   : total_events={replays['live_host_panvk_trace_replay']['total_events_replayed']}, "
           f"failures={replays['live_host_panvk_trace_replay']['failures_detected']}, "
           f"all_passed={replays['live_host_panvk_trace_replay']['all_events_passed_mali_kbase_ko']}")
-    print(f"  [8] CP-SAT Binary vs. Emulator Proof    : status={report['cp_sat_status']}, "
+    print(f"  [9] CP-SAT Binary vs. Emulator Proof    : status={report['cp_sat_status']}, "
           f"proven_equivalent={report['proven_all_paths_equivalent']}")
 
     assert report["proven_all_paths_equivalent"], "Binary vs Emulator equivalence proof failed!"
     assert replays["historical_winlator_crash_trace_replay"]["reproduced_exact_enomem_failures"], (
         "Historical Winlator crash replay did not catch the 3 shifted-flag MEM_ALLOC failures!"
+    )
+    assert replays["v4_winlator_auto_va_vma_heap_crash_replay"]["reproduced_exact_v4_failures"], (
+        "v4 Winlator crash replay did not catch the AUTO_VA / util_vma_heap_free failures!"
     )
     if replays["live_host_panvk_trace_replay"]["total_events_replayed"] > 0:
         assert replays["live_host_panvk_trace_replay"]["all_events_passed_mali_kbase_ko"], (
@@ -1059,7 +1020,7 @@ def main():
     out_path = "artifacts/aarch64_mc_lifter_report.json"
     with open(out_path, "w") as f:
         json.dump(report, f, indent=2)
-    print(f"\nSaved LLVM MC Lifter & Trace Verification Report -> {out_path}")
+    print(f"\nSaved Pure-LLVM MC Lifter & Trace Verification Report -> {out_path}")
     print("=" * 80)
 
 

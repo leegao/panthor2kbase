@@ -27,7 +27,7 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential clang cmake ninja-build libdrm-dev mesa-vulkan-drivers vulkan-tools
+          sudo apt-get install -y build-essential llvm-dev clang cmake ninja-build libdrm-dev mesa-vulkan-drivers vulkan-tools
           python3 -m pip install --upgrade pip
           python3 -m pip install ortools
 

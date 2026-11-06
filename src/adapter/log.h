@@ -1,7 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * Panthor2Kbase runtime logging with C++ RAII scoped indentation.
+ * Panthor2Kbase runtime logging with C++ RAII scoped indentation and
+ * full input/output ioctl struct deserialization.
  *
  * The minimum log level is controlled by the PANTHOR2KBASE_LOG_LEVEL
  * environment variable. Accepted values are the integer 0..4 or the
@@ -66,9 +67,13 @@ static inline bool panthor2kbase_log_level_enabled(panthor2kbase_log_level_t lev
 /* Decode a drm/kbase ioctl request into a human-readable name for logging. */
 const char *panthor2kbase_ioctl_req_name(unsigned long request);
 
+/* Deserialize and log input/output structs for DRM, Panthor, and Kbase ioctls. */
+void panthor2kbase_log_ioctl_struct_in(unsigned long request, const void *arg);
+void panthor2kbase_log_ioctl_struct_out(unsigned long request, const void *arg, int ret, int err);
+
 /*
  * Wrapper around the real ioctl that logs the call at trace level, including
- * the call text and a detailed rendering of the parameters and result.
+ * the call text and a detailed rendering of the input/output structs and result.
  */
 int panthor2kbase_adapter_ioctl(int fd, unsigned long request, void *arg, const char *call_text);
 

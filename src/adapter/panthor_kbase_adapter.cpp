@@ -1064,6 +1064,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
    LOG_INFO("ioctl intercepted: req=%s(0x%lx) fd=%d nr=%u type=%c",
             panthor2kbase_ioctl_req_name(request), request, fd, nr,
             type ? static_cast<char>(type) : '?');
+   panthor2kbase_log_ioctl_struct_in(request, arg);
 
    if (type != 'd') {
       pthread_mutex_unlock(&g_lock);
@@ -1581,22 +1582,34 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                { .handle = bo->gpu_va, .offset = 0, .length = page_cnt },
                { .handle = bo->gpu_va, .offset = 0, .length = page_cnt },
             };
-            union kbase_ioctl_mem_alias alias_req;
-            memset(&alias_req, 0, sizeof(alias_req));
-            alias_req.in.flags = BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR | BASE_MEM_PROT_CPU_RD;
-            alias_req.in.stride = page_cnt;
-            alias_req.in.nents = 2;
-            alias_req.in.aliasing_info = reinterpret_cast<uintptr_t>(ai);
-            if (adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_ALIAS, &alias_req) == 0 &&
-                alias_req.out.gpu_va != 0) {
-               void *aptr = real_mmap(nullptr, static_cast<size_t>(ops[0].size * 2),
+            uint64_t total_alias_sz = ops[0].size * 2;
+            for (unsigned attempt = 0; attempt < 16; attempt++) {
+               union kbase_ioctl_mem_alias alias_req;
+               memset(&alias_req, 0, sizeof(alias_req));
+               alias_req.in.flags = BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR | BASE_MEM_PROT_CPU_RD;
+               alias_req.in.stride = page_cnt;
+               alias_req.in.nents = 2;
+               alias_req.in.aliasing_info = reinterpret_cast<uintptr_t>(ai);
+               if (adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_ALIAS, &alias_req) != 0 ||
+                   alias_req.out.gpu_va == 0) {
+                  break;
+               }
+               void *aptr = real_mmap(nullptr, static_cast<size_t>(total_alias_sz),
                                       PROT_READ, MAP_SHARED, g_ctx.mali_fd,
                                       static_cast<off_t>(alias_req.out.gpu_va));
-               if (aptr != MAP_FAILED) {
-                  bo->alias_ptr = aptr;
-                  bo->alias_size = static_cast<size_t>(ops[0].size * 2);
-                  bo->alias_gpu_va = reinterpret_cast<uintptr_t>(aptr);
+               if (aptr == MAP_FAILED) {
+                  struct kbase_ioctl_mem_free free_req = { .gpu_addr = alias_req.out.gpu_va };
+                  adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_FREE, &free_req);
+                  break;
                }
+               uint64_t ava = reinterpret_cast<uintptr_t>(aptr);
+               if ((ava >> 32) == ((ava + total_alias_sz - 1) >> 32)) {
+                  bo->alias_ptr = aptr;
+                  bo->alias_size = static_cast<size_t>(total_alias_sz);
+                  bo->alias_gpu_va = ava;
+                  break;
+               }
+               real_munmap(aptr, static_cast<size_t>(total_alias_sz));
             }
             uint64_t base_va = bo->alias_gpu_va ? bo->alias_gpu_va : bo->gpu_va;
             ops[0].va = base_va;
@@ -1973,7 +1986,9 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             qs->stream_size,
             qs->latest_flush,
             sq->seqno_gpu_va,
-            0xffffU);
+            static_cast<uint16_t>(g_ctx.csif_info.scoreboard_slot_count
+               ? ((1U << g_ctx.csif_info.scoreboard_slot_count) - 1U)
+               : 0x00ffU));
 
          sq->insert_offset += slot_bytes;
          sq->emitted_jobs++;
@@ -2026,6 +2041,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
    }
 
    pthread_mutex_unlock(&g_lock);
+  panthor2kbase_log_ioctl_struct_out(request, arg, ret, errno);
    return ret;
 }
 

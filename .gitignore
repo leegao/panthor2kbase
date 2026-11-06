@@ -78,3 +78,5 @@ test_runtime_hook_unpatched
 mesa/
 shims/
 archives/
+*.pyc
+archive.zip

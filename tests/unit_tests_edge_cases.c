@@ -265,6 +265,75 @@ static void test_kms_and_libdrm_wrappers(void)
    printf("  -> KMS Stubs & libdrm Wrappers: PASS\n");
 }
 
+static void test_panvk_auto_va_ringbuf_and_tracebuf_integration(void)
+{
+   int drm_fd = panthor_kbase_adapter_open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+   assert(drm_fd >= 0);
+
+   struct drm_panthor_vm_create vmc = { .flags = 0, .user_va_range = (1ULL << 47) };
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_VM_CREATE, &vmc) == 0);
+   assert(vmc.id != 0);
+
+   /* 1. Test 2MB tracebuf / ringbuf BO allocation with GPU_UNCACHED (PANVK_DEBUG=trace) */
+   panthor_kbase_adapter_hint_bo_flags(1U << 2 /* PAN_KMOD_BO_FLAG_GPU_UNCACHED */);
+   struct drm_panthor_bo_create boc = {
+      .size = 2 * 1024 * 1024,
+      .flags = 0,
+      .exclusive_vm_id = vmc.id,
+   };
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_BO_CREATE, &boc) == 0);
+   assert(boc.handle != 0);
+
+   struct drm_panthor_bo_mmap_offset mmo = { .handle = boc.handle };
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET, &mmo) == 0);
+   void *cpu_ptr = panthor_kbase_adapter_mmap(NULL, boc.size, PROT_READ | PROT_WRITE,
+                                              MAP_SHARED, drm_fd, (off_t)mmo.offset);
+   assert(cpu_ptr != MAP_FAILED && cpu_ptr != NULL);
+
+   /* 2. Test 2-op contiguous circular wraparound mapping (init_render_desc_ringbuf) with AUTO_VA (~0ULL) */
+   struct drm_panthor_vm_bind_op bind_ops[2];
+   memset(bind_ops, 0, sizeof(bind_ops));
+   for (int i = 0; i < 2; i++) {
+      bind_ops[i].flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP |
+                          DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC |
+                          DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED;
+      bind_ops[i].bo_handle = boc.handle;
+      bind_ops[i].bo_offset = 0;
+      bind_ops[i].va = ~0ULL; /* PAN_KMOD_VM_MAP_AUTO_VA */
+      bind_ops[i].size = boc.size;
+   }
+   struct drm_panthor_vm_bind vmb = {
+      .vm_id = vmc.id,
+      .flags = 0,
+      .ops = DRM_PANTHOR_OBJ_ARRAY(2, bind_ops),
+   };
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_VM_BIND, &vmb) == 0);
+   assert(bind_ops[0].va != 0 && bind_ops[0].va != ~0ULL);
+   assert(bind_ops[1].va == bind_ops[0].va + boc.size);
+   /* Verify 2x mapping does not cross a 4GB boundary */
+   assert((bind_ops[0].va >> 32) == ((bind_ops[0].va + boc.size * 2 - 1) >> 32));
+
+   /* 3. Test UNMAP of Kbase-assigned VA without VMA heap corruption + munmap + GEM_CLOSE */
+   struct drm_panthor_vm_bind_op unmap_op;
+   memset(&unmap_op, 0, sizeof(unmap_op));
+   unmap_op.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP;
+   unmap_op.va = bind_ops[0].va;
+   unmap_op.size = boc.size * 2;
+   struct drm_panthor_vm_bind vmb_unmap = {
+      .vm_id = vmc.id,
+      .flags = 0,
+      .ops = DRM_PANTHOR_OBJ_ARRAY(1, &unmap_op),
+   };
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_VM_BIND, &vmb_unmap) == 0);
+   assert(panthor_kbase_adapter_munmap(cpu_ptr, boc.size) == 0);
+   assert(drmCloseBufferHandle(drm_fd, boc.handle) == 0);
+
+   struct drm_panthor_vm_destroy vmd = { .id = vmc.id };
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_VM_DESTROY, &vmd) == 0);
+   assert(panthor_kbase_adapter_close(drm_fd) == 0);
+   printf("  -> PanVK AUTO_VA + 2MB Ringbuf/Tracebuf 2x Alias + UNMAP Integration Test: PASS\n");
+}
+
 int main(void)
 {
    printf("[Unit Tests] Running edge cases, mali_kbase.ko flag invariants, and RAII logging suite...\n");
@@ -273,6 +342,7 @@ int main(void)
    test_ring_slot_emitter_v10_and_v11();
    test_mali0_state_machine_and_flag_regressions();
    test_kms_and_libdrm_wrappers();
+   test_panvk_auto_va_ringbuf_and_tracebuf_integration();
    printf("[Unit Tests] ALL EDGE CASES PASSED!\n");
    return 0;
 }
