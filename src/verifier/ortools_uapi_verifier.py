@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """
 SPDX-License-Identifier: MIT
@@ -354,6 +355,22 @@ if __name__ == "__main__":
         "csf_stream_equivalence_proof": csf_proof,
         "valhall_isa_equivalence_proof": isa_proof,
     }
+    os.makedirs("artifacts", exist_ok=True)
+    # Dump modeled CP-SAT constraint equations in OR-Tools language + lifted audit artifacts
+    m_dump = cp_model.CpModel()
+    s_vsn = m_dump.NewBoolVar("state_vsn_done")
+    s_kctx = m_dump.NewBoolVar("state_kctx_ready")
+    s_exec = m_dump.NewBoolVar("state_exec_va_ready")
+    s_jit = m_dump.NewBoolVar("state_jit_va_ready")
+    s_bound = m_dump.NewBoolVar("state_queue_bound")
+    m_dump.AddImplication(s_kctx, s_vsn)
+    m_dump.AddImplication(s_exec, s_kctx)
+    m_dump.AddImplication(s_jit, s_kctx)
+    m_dump.AddImplication(s_bound, s_kctx)
+    with open("artifacts/ortools_modeled_constraints.pbtxt", "w") as pbf:
+        pbf.write(str(m_dump.Proto()))
+    with open("artifacts/lifted_uapi_and_csf_microcode_audit.json", "w") as af:
+        json.dump(report, af, indent=2)
     print(json.dumps(report, indent=2))
     assert uapi_guarded["proven_violation_free"] is True
     assert uapi_unguarded["proven_violation_free"] is False

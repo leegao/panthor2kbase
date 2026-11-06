@@ -1,13 +1,21 @@
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wnonnull-compare"
+#endif
 /*
  * SPDX-License-Identifier: MIT
  *
  * User-Space /dev/mali0 Kbase CSF + Valhall ISA Emulator (`libmali_kbase_emu.so`)
  *
  * Implements:
- *  - Stateful /dev/mali0 kernel driver state machine matching mali_kbase_core_linux.c
- *  - GPUPROPS TLV stream synthesis (Mali-G615 / G710 / G720 Valhall CSF)
- *  - USER_REG (47UL << 12) and 3-page USER_IO (48UL..63UL << 12) shared memory mmaps
- *  - SAME_VA mmap allocation & munmap free_on_close=1 enforcement
+ *  - Stateful /dev/mali0 kernel driver state machine matching mali_kbase.ko (CSF v1.21)
+ *  - Exact binary flag & size validation from mali_kbase.ko:
+ *      * kbase_api_mem_alloc_ex (0x29eec): kernel-only flag mask (0xa0), CSF_EVENT force (0x3400)
+ *      * kbase_mem_alloc (0x1367c): COHERENT_SYSTEM | COHERENT_LOCAL mutual exclusion (0xc00),
+ *        W^X (GPU_EX vs GPU_WR / GROW_ON_GPF)
+ *      * kbase_check_alloc_sizes (0x7044): GROW_ON_GPF requires extension != 0
+ *  - GPUPROPS TLV stream synthesis (Mali-G615 v11 / Mali-G710 v10 Valhall CSF)
+ *  - TRACKING_HANDLE (3UL << 12), USER_REG (47UL << 12), and 3-page USER_IO (48UL..63UL << 12) mmaps
+ *  - SAME_VA mmap allocation & munmap free_on_close=1 enforcement + KBASE_IOCTL_MEM_ALIAS
  *  - Tiler heap OOM vt_start/vt_end/frag_end validation
  *  - CSF Ring & Command Stream Microcode Interpreter
  *  - Valhall 64-bit ISA Shader Disassembler & Interpreter
@@ -27,11 +35,14 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <time.h>
 #include <unistd.h>
 #include <vulkan/vulkan.h>
 
 #include "mali_kbase_emu.h"
+#include "panthor_csf_instr.h"
+#include "valhall_disasm_lift.h"
 #include "panthor_kbase_adapter.h"
 
 static int (*orig_open)(const char *, int, ...) = NULL;
@@ -40,6 +51,7 @@ static int (*orig_ioctl)(int, unsigned long, ...) = NULL;
 static void *(*orig_mmap)(void *, size_t, int, int, int, off_t) = NULL;
 static int (*orig_munmap)(void *, size_t) = NULL;
 static ssize_t (*orig_read)(int, void *, size_t) = NULL;
+static int (*orig_stat)(const char *, struct stat *) = NULL;
 
 static void init_orig_syscalls(void)
 {
@@ -55,6 +67,54 @@ static void init_orig_syscalls(void)
       orig_munmap = dlsym(RTLD_NEXT, "munmap");
    if (!orig_read)
       orig_read = dlsym(RTLD_NEXT, "read");
+   if (!orig_stat)
+      orig_stat = dlsym(RTLD_NEXT, "stat");
+}
+
+
+#define EMU_MAX_TRACE_EVENTS 512
+struct kbase_emu_trace_event {
+   char op[48];
+   unsigned long cmd;
+   uint64_t va_pages;
+   uint64_t commit_pages;
+   uint64_t extension;
+   uint64_t flags;
+   uint64_t fixed_address;
+   uint64_t out_va;
+   uint64_t mmap_offset;
+   uint64_t mmap_len;
+   uint32_t buffer_size;
+   uint64_t buffer_gpu_addr;
+   uint32_t chunk_size;
+   uint32_t initial_chunks;
+   uint32_t max_chunks;
+   int ret;
+   int err;
+};
+static struct kbase_emu_trace_event g_trace[EMU_MAX_TRACE_EVENTS];
+static uint32_t g_trace_count = 0;
+
+static void record_trace_ioctl(const char *op, unsigned long cmd,
+                               uint64_t va_pages, uint64_t commit_pages,
+                               uint64_t extension, uint64_t flags,
+                               uint64_t fixed_address, uint64_t out_va,
+                               int ret, int err)
+{
+   if (g_trace_count >= EMU_MAX_TRACE_EVENTS)
+      return;
+   struct kbase_emu_trace_event *ev = &g_trace[g_trace_count++];
+   memset(ev, 0, sizeof(*ev));
+   snprintf(ev->op, sizeof(ev->op), "%s", op);
+   ev->cmd = cmd;
+   ev->va_pages = va_pages;
+   ev->commit_pages = commit_pages;
+   ev->extension = extension;
+   ev->flags = flags;
+   ev->fixed_address = fixed_address;
+   ev->out_va = out_va;
+   ev->ret = ret;
+   ev->err = err;
 }
 
 static struct kbase_emu_stats g_stats;
@@ -104,9 +164,12 @@ struct emu_tiler_heap {
 
 struct emu_kfile {
    int fd;
+   dev_t dev;
+   ino_t ino;
    enum kfile_setup_state state;
    bool exec_va_initialized;
    bool jit_initialized;
+   void *tracking_page;
    void *user_reg_page;
    uint32_t next_cookie;
    uint32_t next_user_io_cookie;
@@ -118,6 +181,20 @@ struct emu_kfile {
 };
 
 static struct emu_kfile g_kfile;
+
+static bool is_emulated_mali_fd(int fd)
+{
+   if (fd < 0 || g_kfile.state == EMU_KFILE_UNOPENED)
+      return false;
+   if (fd == g_kfile.fd)
+      return true;
+   struct stat st;
+   if (g_kfile.ino != 0 && fstat(fd, &st) == 0) {
+      if (st.st_dev == g_kfile.dev && st.st_ino == g_kfile.ino)
+         return true;
+   }
+   return false;
+}
 
 /* Lavapipe headless Vulkan bridge state */
 static bool g_lvp_initialized = false;
@@ -203,6 +280,7 @@ void mali_kbase_emu_reset_stats(void)
 {
    pthread_mutex_lock(&g_emu_lock);
    memset(&g_stats, 0, sizeof(g_stats));
+   g_trace_count = 0;
    pthread_mutex_unlock(&g_emu_lock);
 }
 
@@ -222,29 +300,37 @@ static size_t append_gpuprop_tlv(uint8_t *buf, size_t cap, size_t off,
 static size_t build_valhall_gpuprops_blob(uint8_t *buf, size_t cap)
 {
    size_t off = 0;
-   /* Mali-G615 MC6 (Valhall v11, 64-bit RAW_GPU_ID = 0x0b000000b8a31030ULL, or G710 v10) */
-   uint64_t gpu_id = (10ULL << 28) | (8ULL << 24) | (0ULL << 16); /* Arch 10.8 (Mali-G710) */
+   /*
+    * Default to Mali-G615 MC2 (Valhall v11, arch=11.8.3, 0xb8031030) to match
+    * the user's target device, or Mali-G610 (v10, 0xa8070000) if KBASE_EMU_ARCH_MAJOR=10.
+    */
+   uint64_t gpu_id = (11ULL << 28) | (8ULL << 24) | (3ULL << 16) | 0x1030ULL; /* Mali-G615 v11 */
+   uint32_t core_features = 0x2U; /* Matches user's Mali-G615 MC2 device (normalized to 4 by adapter) */
+   uint64_t shader_present = 0x3ULL; /* MC2 (or 0x130013 / 0x3f) */
    const char *env_arch = getenv("KBASE_EMU_ARCH_MAJOR");
-   if (env_arch && atoi(env_arch) == 11)
-      gpu_id = 0x0b010000b8a31030ULL; /* 64-bit Valhall v11 RAW_GPU_ID */
+   if (env_arch && atoi(env_arch) == 10) {
+      gpu_id = (10ULL << 28) | (8ULL << 24) | (7ULL << 16); /* Mali-G610 v10 */
+      core_features = 0x0U;
+      shader_present = 0x3fULL;
+   }
 
    off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_GPU_ID, KBASE_GPUPROP_VALUE_SIZE_U64, gpu_id);
    off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_L2_FEATURES, KBASE_GPUPROP_VALUE_SIZE_U32, 0x07130206U);
    off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_TILER_FEATURES, KBASE_GPUPROP_VALUE_SIZE_U32, 0x00000809U);
-   off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_MEM_FEATURES, KBASE_GPUPROP_VALUE_SIZE_U32, 0x00000001U);
+   off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_MEM_FEATURES, KBASE_GPUPROP_VALUE_SIZE_U32, 0x00000101U);
    off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_MMU_FEATURES, KBASE_GPUPROP_VALUE_SIZE_U32, 0x00002830U);
    off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_THREAD_MAX_THREADS, KBASE_GPUPROP_VALUE_SIZE_U32, 2048U);
    off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_THREAD_MAX_WORKGROUP_SIZE, KBASE_GPUPROP_VALUE_SIZE_U32, 1024U);
    off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_THREAD_MAX_BARRIER_SIZE, KBASE_GPUPROP_VALUE_SIZE_U32, 1024U);
-   off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_THREAD_FEATURES, KBASE_GPUPROP_VALUE_SIZE_U32, 0x0a040400U);
-   off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_TEXTURE_FEATURES_0, KBASE_GPUPROP_VALUE_SIZE_U32, 0x00fe001eU);
+   off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_THREAD_FEATURES, KBASE_GPUPROP_VALUE_SIZE_U32, 0x0a04ffffU);
+   off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_TEXTURE_FEATURES_0, KBASE_GPUPROP_VALUE_SIZE_U32, 0x02fe001eU);
    off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_TEXTURE_FEATURES_1, KBASE_GPUPROP_VALUE_SIZE_U32, 0x0000ffffU);
    off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_TEXTURE_FEATURES_2, KBASE_GPUPROP_VALUE_SIZE_U32, 0x9f81ffffU);
    off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_TEXTURE_FEATURES_3, KBASE_GPUPROP_VALUE_SIZE_U32, 0x00000000U);
-   off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_SHADER_PRESENT, KBASE_GPUPROP_VALUE_SIZE_U64, 0x3fULL);
+   off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_SHADER_PRESENT, KBASE_GPUPROP_VALUE_SIZE_U64, shader_present);
    off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_L2_PRESENT, KBASE_GPUPROP_VALUE_SIZE_U64, 0x1ULL);
    off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_TILER_PRESENT, KBASE_GPUPROP_VALUE_SIZE_U64, 0x1ULL);
-   off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_CORE_FEATURES, KBASE_GPUPROP_VALUE_SIZE_U32, 0x0U);
+   off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_CORE_FEATURES, KBASE_GPUPROP_VALUE_SIZE_U32, core_features);
    off = append_gpuprop_tlv(buf, cap, off, KBASE_GPUPROP_RAW_GPU_FEATURES, KBASE_GPUPROP_VALUE_SIZE_U64, 0x0ULL);
    return off;
 }
@@ -260,7 +346,6 @@ static void execute_valhall_shader(const struct valhall_shader_desc *spd)
       if (g_kfile.regions[i].freed_by_munmap &&
           spd->shader_va >= g_kfile.regions[i].gpu_va &&
           spd->shader_va < g_kfile.regions[i].gpu_va + g_kfile.regions[i].size) {
-         /* Triggered SAME_VA munmap GPU page fault! */
          return;
       }
    }
@@ -271,10 +356,19 @@ static void execute_valhall_shader(const struct valhall_shader_desc *spd)
 
    const uint64_t *insns = (const uint64_t *)(uintptr_t)spd->shader_va;
    uint32_t count = spd->shader_size / sizeof(uint64_t);
+   if (count > 0 && insns[0] != 0ULL) {
+      char spirv_buf[4096];
+      va_lift_shader_to_spirv_asm(insns, count < 32 ? count : 32, "GLCompute", spirv_buf, sizeof(spirv_buf));
+      mkdir("artifacts", 0777);
+      FILE *sfp = fopen("artifacts/lifted_shaders_spirv.txt", "a");
+      if (sfp) {
+         fputs(spirv_buf, sfp);
+         fclose(sfp);
+      }
+   }
    uint32_t regs[64];
    memset(regs, 0, sizeof(regs));
 
-   /* Preload FAU constants if provided */
    const uint32_t *fau = spd->fau_va ? (const uint32_t *)(uintptr_t)spd->fau_va : NULL;
    uint32_t *out_buf = spd->output_va ? (uint32_t *)(uintptr_t)spd->output_va : NULL;
 
@@ -283,7 +377,7 @@ static void execute_valhall_shader(const struct valhall_shader_desc *spd)
                        (spd->workgroup_z ? spd->workgroup_z : 1);
 
    for (uint32_t tid = 0; tid < wg_total; tid++) {
-      regs[0] = tid; /* r0 = local invocation ID / vertex ID */
+      regs[0] = tid;
       for (uint32_t pc = 0; pc < count; pc++) {
          uint64_t insn = insns[pc];
          uint64_t op = (insn >> 56) & 0xffULL;
@@ -395,7 +489,6 @@ static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
                heap->vt_end++;
             else if (mode == 2) {
                heap->frag_end++;
-               /* Enforce kbase handle_oom_event check: frag_end > vt_end is fatal! */
                if (heap->frag_end > heap->vt_end)
                   g_stats.oom_heap_stat_errors++;
             }
@@ -458,8 +551,20 @@ static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
          uint8_t spd_reg = (insn >> 40) & 0xffU;
          if (spd_reg < 95) {
             uint64_t spd_va = (cs_regs[spd_reg + 1] << 32) | cs_regs[spd_reg];
-            if (spd_va)
-               execute_valhall_shader((const struct valhall_shader_desc *)(uintptr_t)spd_va);
+            if (spd_va >= 0x10000ULL && (spd_va & 0x7ULL) == 0) {
+               /* Only execute synthetic Valhall shader descriptors when marked with valid shader_va */
+               for (size_t r = 0; r < 512; r++) {
+                  if (g_kfile.regions[r].active &&
+                      spd_va >= g_kfile.regions[r].gpu_va &&
+                      spd_va + sizeof(struct valhall_shader_desc) <= g_kfile.regions[r].gpu_va + g_kfile.regions[r].size) {
+                     const struct valhall_shader_desc *spd =
+                        (const struct valhall_shader_desc *)(uintptr_t)spd_va;
+                     if (spd->shader_va >= 0x10000ULL && spd->shader_size >= 8 && spd->shader_size <= 65536)
+                        execute_valhall_shader(spd);
+                     break;
+                  }
+               }
+            }
          }
          break;
       }
@@ -468,6 +573,100 @@ static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
          break;
       }
    }
+}
+
+/* Exact mali_kbase.ko flag & size validation from kbase_api_mem_alloc_ex + kbase_mem_alloc + kbase_check_alloc_sizes */
+static int emu_handle_mem_alloc(uint64_t va_pages, uint64_t commit_pages,
+                                uint64_t extension, uint64_t in_flags,
+                                uint64_t *out_flags, uint64_t *out_gpu_va)
+{
+   /* 1. kbase_api_mem_alloc_ex+0xe8 (0x29fd4): reject kernel-only flags (0xa0) */
+   if (in_flags & BASEP_MEM_FLAGS_KERNEL_ONLY) {
+      errno = ENOMEM;
+      return -1;
+   }
+
+   /* 2. kbase_api_mem_alloc_ex+0x168 (0x2a054): BASE_MEM_CSF_EVENT forces 0x3400 */
+   if (in_flags & BASE_MEM_CSF_EVENT) {
+      in_flags |= (BASE_MEM_SAME_VA | BASE_MEM_CACHED_CPU | BASE_MEM_COHERENT_SYSTEM);
+   }
+
+   /* 3. kbase_mem_alloc+0x90 (0x1370c): reject COHERENT_SYSTEM (1<<10) & COHERENT_LOCAL (1<<11) */
+   if ((in_flags & (BASE_MEM_COHERENT_SYSTEM | BASE_MEM_COHERENT_LOCAL)) ==
+       (BASE_MEM_COHERENT_SYSTEM | BASE_MEM_COHERENT_LOCAL)) {
+      errno = ENOMEM;
+      return -1;
+   }
+
+   /* 4. kbase_mem_alloc+0x80 (0x136fc): GPU_EX cannot combine with GPU_WR (1<<3) or GROW_ON_GPF (1<<9) */
+   if ((in_flags & BASE_MEM_PROT_GPU_EX) &&
+       (in_flags & (BASE_MEM_PROT_GPU_WR | BASE_MEM_GROW_ON_GPF))) {
+      errno = ENOMEM;
+      return -1;
+   }
+
+   /* 5. kbase_check_alloc_sizes+0x40 (0x7084): GROW_ON_GPF (1<<9) requires extension != 0 */
+   if ((in_flags & BASE_MEM_GROW_ON_GPF) && extension == 0) {
+      errno = ENOMEM;
+      return -1;
+   }
+
+   /* 6. Require EXEC_VA zone initialization before GPU_EX allocations */
+   if ((in_flags & BASE_MEM_PROT_GPU_EX) && !g_kfile.exec_va_initialized) {
+      errno = EINVAL;
+      return -1;
+   }
+
+   if (va_pages == 0 || commit_pages > va_pages) {
+      errno = EINVAL;
+      return -1;
+   }
+
+   size_t sz = (size_t)va_pages * 4096U;
+   for (size_t i = 0; i < 512; i++) {
+      if (!g_kfile.regions[i].active) {
+         struct emu_mem_region *reg = &g_kfile.regions[i];
+         memset(reg, 0, sizeof(*reg));
+         reg->active = true;
+         reg->size = sz;
+         reg->flags = in_flags;
+         reg->cookie_or_va = (uint64_t)(g_kfile.next_cookie++) << 12;
+         if (!(in_flags & BASE_MEM_SAME_VA)) {
+            reg->cpu_ptr = orig_mmap(NULL, sz, PROT_READ | PROT_WRITE,
+                                     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+            reg->gpu_va = (uintptr_t)reg->cpu_ptr;
+            *out_gpu_va = reg->gpu_va;
+         } else {
+            *out_gpu_va = reg->cookie_or_va;
+         }
+         *out_flags = reg->flags;
+         g_stats.mem_alloc_count++;
+         return 0;
+      }
+   }
+   errno = ENOMEM;
+   return -1;
+}
+
+int stat(const char *pathname, struct stat *statbuf)
+{
+   init_orig_syscalls();
+   if (pathname && statbuf &&
+       (strcmp(pathname, "/dev/dri/renderD128") == 0 ||
+        strcmp(pathname, "/dev/dri/card0") == 0 ||
+        strncmp(pathname, "/dev/mali", 9) == 0)) {
+      memset(statbuf, 0, sizeof(*statbuf));
+      statbuf->st_mode = S_IFCHR | 0666;
+      if (strstr(pathname, "card") != NULL) {
+         statbuf->st_rdev = makedev(226, 0);
+         statbuf->st_ino = 10001;
+      } else {
+         statbuf->st_rdev = makedev(226, 128);
+         statbuf->st_ino = 10128;
+      }
+      return 0;
+   }
+   return orig_stat(pathname, statbuf);
 }
 
 int open(const char *pathname, int flags, ...)
@@ -481,10 +680,13 @@ int open(const char *pathname, int flags, ...)
       va_end(ap);
    }
 
-   if (strcmp(pathname, "/dev/dri/renderD128") == 0)
+   if (pathname &&
+       (strcmp(pathname, "/dev/dri/renderD128") == 0 ||
+        strcmp(pathname, "/dev/dri/card0") == 0)) {
       return panthor_kbase_adapter_open(pathname, flags);
+   }
 
-   if (strncmp(pathname, "/dev/mali", 9) == 0) {
+   if (pathname && strncmp(pathname, "/dev/mali", 9) == 0) {
       /* Enforce kbase_check_flags: O_CLOEXEC is strictly mandatory! */
       if (!(flags & O_CLOEXEC)) {
          errno = EINVAL;
@@ -493,16 +695,24 @@ int open(const char *pathname, int flags, ...)
       int fd = memfd_create("emulated_dev_mali0", MFD_CLOEXEC);
       if (fd < 0)
          return -1;
+      struct stat st;
+      memset(&st, 0, sizeof(st));
+      fstat(fd, &st);
       pthread_mutex_lock(&g_emu_lock);
       memset(&g_kfile, 0, sizeof(g_kfile));
       g_kfile.fd = fd;
+      g_kfile.dev = st.st_dev;
+      g_kfile.ino = st.st_ino;
       g_kfile.state = EMU_KFILE_OPENED_NEED_VSN;
+      record_trace_ioctl("OPEN_MALI0", 0, 0, 0, 0, (uint64_t)flags, 0, 0, fd, 0);
       g_kfile.next_cookie = 64U;
       g_kfile.next_user_io_cookie = 48U;
       g_kfile.next_group_handle = 1U;
       g_kfile.next_kcpu_id = 1U;
-      g_kfile.user_reg_page = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
-                                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+      g_kfile.tracking_page = orig_mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+      g_kfile.user_reg_page = orig_mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
       if (g_kfile.user_reg_page != MAP_FAILED)
          ((uint32_t *)g_kfile.user_reg_page)[0] = 1U; /* LATEST_FLUSH = 1 */
       pthread_mutex_unlock(&g_emu_lock);
@@ -544,7 +754,7 @@ int ioctl(int fd, unsigned long request, ...)
       return panthor_kbase_adapter_ioctl(fd, request, arg);
 
    /* If caller (or adapter) is issuing KBASE_IOCTL_* on emulated /dev/mali0 */
-   if (_IOC_TYPE(request) == KBASE_IOCTL_TYPE && g_kfile.state != EMU_KFILE_UNOPENED && fd == g_kfile.fd) {
+   if (_IOC_TYPE(request) == KBASE_IOCTL_TYPE && is_emulated_mali_fd(fd)) {
       pthread_mutex_lock(&g_emu_lock);
       g_stats.ioctl_count++;
       unsigned int nr = _IOC_NR(request);
@@ -565,6 +775,7 @@ int ioctl(int fd, unsigned long request, ...)
          vc->major = 1;
          vc->minor = 21;
          g_kfile.state = EMU_KFILE_VSN_DONE;
+         record_trace_ioctl("KBASE_IOCTL_VERSION_CHECK", request, 0, 0, 0, 0, 0, 0, 0, 0);
          pthread_mutex_unlock(&g_emu_lock);
          return 0;
       }
@@ -575,12 +786,14 @@ int ioctl(int fd, unsigned long request, ...)
             return -1;
          }
          g_kfile.state = EMU_KFILE_KCTX_READY;
+         record_trace_ioctl("KBASE_IOCTL_SET_FLAGS", request, 0, 0, 0, arg ? ((struct kbase_ioctl_set_flags *)arg)->create_flags : 0, 0, 0, 0, 0);
          pthread_mutex_unlock(&g_emu_lock);
          return 0;
       }
       if (nr == 3) { /* KBASE_IOCTL_GET_GPUPROPS */
          struct kbase_ioctl_get_gpuprops *gp = (struct kbase_ioctl_get_gpuprops *)arg;
          size_t needed = build_valhall_gpuprops_blob((uint8_t *)(uintptr_t)gp->buffer, gp->size);
+         record_trace_ioctl("KBASE_IOCTL_GET_GPUPROPS", request, 0, 0, 0, gp->size, gp->buffer, 0, (int)needed, 0);
          pthread_mutex_unlock(&g_emu_lock);
          return (int)needed;
       }
@@ -598,47 +811,39 @@ int ioctl(int fd, unsigned long request, ...)
          return 0;
       case 14: /* KBASE_IOCTL_MEM_JIT_INIT */
          g_kfile.jit_initialized = true;
+         if (arg) { struct kbase_ioctl_mem_jit_init *ji = (struct kbase_ioctl_mem_jit_init *)arg; record_trace_ioctl("KBASE_IOCTL_MEM_JIT_INIT", request, ji->va_pages, ji->phys_pages, 0, ji->max_allocations, 0, 0, 0, 0); }
          pthread_mutex_unlock(&g_emu_lock);
          return 0;
       case 38: /* KBASE_IOCTL_MEM_EXEC_INIT */
          g_kfile.exec_va_initialized = true;
+         if (arg) { struct kbase_ioctl_mem_exec_init *ei = (struct kbase_ioctl_mem_exec_init *)arg; record_trace_ioctl("KBASE_IOCTL_MEM_EXEC_INIT", request, ei->va_pages, 0, 0, 0, 0, 0, 0, 0); }
          pthread_mutex_unlock(&g_emu_lock);
          return 0;
       case 5: { /* KBASE_IOCTL_MEM_ALLOC */
          union kbase_ioctl_mem_alloc *ma = (union kbase_ioctl_mem_alloc *)arg;
-         if ((ma->in.flags & BASE_MEM_PROT_GPU_EX) && !g_kfile.exec_va_initialized) {
-            pthread_mutex_unlock(&g_emu_lock);
-            errno = EINVAL;
-            return -1;
-         }
-         size_t sz = (size_t)ma->in.va_pages * 4096U;
-         if (sz == 0)
-            sz = 4096U;
-         for (size_t i = 0; i < 512; i++) {
-            if (!g_kfile.regions[i].active) {
-               struct emu_mem_region *reg = &g_kfile.regions[i];
-               memset(reg, 0, sizeof(*reg));
-               reg->active = true;
-               reg->size = sz;
-               reg->flags = ma->in.flags;
-               reg->cookie_or_va = (uint64_t)(g_kfile.next_cookie++) << 12;
-               if (!(ma->in.flags & BASE_MEM_SAME_VA)) {
-                  reg->cpu_ptr = orig_mmap(NULL, sz, PROT_READ | PROT_WRITE,
-                                           MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-                  reg->gpu_va = (uintptr_t)reg->cpu_ptr;
-                  ma->out.gpu_va = reg->gpu_va;
-               } else {
-                  ma->out.gpu_va = reg->cookie_or_va;
-               }
-               ma->out.flags = reg->flags;
-               g_stats.mem_alloc_count++;
-               pthread_mutex_unlock(&g_emu_lock);
-               return 0;
-            }
+         uint64_t in_vp = ma->in.va_pages, in_cp = ma->in.commit_pages, in_ext = ma->in.extension, in_fl = ma->in.flags;
+         uint64_t out_flags = 0, out_va = 0;
+         int r = emu_handle_mem_alloc(in_vp, in_cp, in_ext, in_fl, &out_flags, &out_va);
+         record_trace_ioctl("KBASE_IOCTL_MEM_ALLOC", request, in_vp, in_cp, in_ext, in_fl, 0, out_va, r, r ? errno : 0);
+         if (r == 0) {
+            ma->out.flags = out_flags;
+            ma->out.gpu_va = out_va;
          }
          pthread_mutex_unlock(&g_emu_lock);
-         errno = ENOMEM;
-         return -1;
+         return r;
+      }
+      case 59: { /* KBASE_IOCTL_MEM_ALLOC_EX */
+         union kbase_ioctl_mem_alloc_ex *ma = (union kbase_ioctl_mem_alloc_ex *)arg;
+         uint64_t in_vp = ma->in.va_pages, in_cp = ma->in.commit_pages, in_ext = ma->in.extension, in_fl = ma->in.flags, in_fva = ma->in.fixed_address;
+         uint64_t out_flags = 0, out_va = 0;
+         int r = emu_handle_mem_alloc(in_vp, in_cp, in_ext, in_fl, &out_flags, &out_va);
+         record_trace_ioctl("KBASE_IOCTL_MEM_ALLOC_EX", request, in_vp, in_cp, in_ext, in_fl, in_fva, out_va, r, r ? errno : 0);
+         if (r == 0) {
+            ma->out.flags = out_flags;
+            ma->out.gpu_va = out_va;
+         }
+         pthread_mutex_unlock(&g_emu_lock);
+         return r;
       }
       case 6: { /* KBASE_IOCTL_MEM_QUERY */
          union kbase_ioctl_mem_query *mq = (union kbase_ioctl_mem_query *)arg;
@@ -657,7 +862,9 @@ int ioctl(int fd, unsigned long request, ...)
       case 7: { /* KBASE_IOCTL_MEM_FREE */
          struct kbase_ioctl_mem_free *mf = (struct kbase_ioctl_mem_free *)arg;
          for (size_t i = 0; i < 512; i++) {
-            if (g_kfile.regions[i].active && g_kfile.regions[i].gpu_va == mf->gpu_addr) {
+            if (g_kfile.regions[i].active &&
+                (g_kfile.regions[i].gpu_va == mf->gpu_addr ||
+                 g_kfile.regions[i].cookie_or_va == mf->gpu_addr)) {
                if (g_kfile.regions[i].cpu_ptr)
                   orig_munmap(g_kfile.regions[i].cpu_ptr, g_kfile.regions[i].size);
                memset(&g_kfile.regions[i], 0, sizeof(g_kfile.regions[i]));
@@ -671,6 +878,30 @@ int ioctl(int fd, unsigned long request, ...)
       case 20: /* KBASE_IOCTL_MEM_COMMIT */
          pthread_mutex_unlock(&g_emu_lock);
          return 0;
+      case 21: { /* KBASE_IOCTL_MEM_ALIAS */
+         union kbase_ioctl_mem_alias *al = (union kbase_ioctl_mem_alias *)arg;
+         uint64_t total_pages = al->in.stride * al->in.nents;
+         if (total_pages == 0)
+            total_pages = 16;
+         for (size_t i = 0; i < 512; i++) {
+            if (!g_kfile.regions[i].active) {
+               struct emu_mem_region *reg = &g_kfile.regions[i];
+               memset(reg, 0, sizeof(*reg));
+               reg->active = true;
+               reg->size = (size_t)total_pages * 4096U;
+               reg->flags = al->in.flags | BASE_MEM_SAME_VA;
+               reg->cookie_or_va = (uint64_t)(g_kfile.next_cookie++) << 12;
+               al->out.flags = reg->flags;
+               al->out.gpu_va = reg->cookie_or_va;
+               al->out.va_pages = total_pages;
+               pthread_mutex_unlock(&g_emu_lock);
+               return 0;
+            }
+         }
+         pthread_mutex_unlock(&g_emu_lock);
+         errno = ENOMEM;
+         return -1;
+      }
       case 22: { /* KBASE_IOCTL_MEM_IMPORT */
          union kbase_ioctl_mem_import *imp = (union kbase_ioctl_mem_import *)arg;
          int dmabuf_fd = *(int *)(uintptr_t)imp->in.phandle;
@@ -687,6 +918,7 @@ int ioctl(int fd, unsigned long request, ...)
                g_kfile.regions[i].active = true;
                g_kfile.regions[i].cpu_ptr = ptr;
                g_kfile.regions[i].gpu_va = (uintptr_t)ptr;
+               g_kfile.regions[i].cookie_or_va = (uintptr_t)ptr;
                g_kfile.regions[i].size = sz;
                g_kfile.regions[i].flags = imp->in.flags;
                imp->out.gpu_va = (uintptr_t)ptr;
@@ -699,10 +931,11 @@ int ioctl(int fd, unsigned long request, ...)
          return 0;
       }
       case 24: { /* KBASE_IOCTL_STREAM_CREATE */
-         union kbase_ioctl_stream_create_u *sc = (union kbase_ioctl_stream_create_u *)arg;
-         sc->out.fd = dup(g_kfile.fd);
+         int sfd = memfd_create("emulated_mali_stream", MFD_CLOEXEC);
+         if (sfd < 0) sfd = dup(g_kfile.fd);
+         record_trace_ioctl("KBASE_IOCTL_STREAM_CREATE", request, 0, 0, 0, 0, 0, 0, sfd, 0);
          pthread_mutex_unlock(&g_emu_lock);
-         return 0;
+         return sfd;
       }
       case 36: { /* KBASE_IOCTL_CS_QUEUE_REGISTER */
          struct kbase_ioctl_cs_queue_register *qr = (struct kbase_ioctl_cs_queue_register *)arg;
@@ -716,6 +949,9 @@ int ioctl(int fd, unsigned long request, ...)
                g_kfile.queues[i].registered = true;
                g_kfile.queues[i].buffer_gpu_addr = qr->buffer_gpu_addr;
                g_kfile.queues[i].buffer_size = qr->buffer_size;
+               record_trace_ioctl("KBASE_IOCTL_CS_QUEUE_REGISTER", request, qr->buffer_size >> 12, 0, 0, qr->priority, qr->buffer_gpu_addr, qr->buffer_gpu_addr, 0, 0);
+               g_trace[g_trace_count - 1].buffer_size = qr->buffer_size;
+               g_trace[g_trace_count - 1].buffer_gpu_addr = qr->buffer_gpu_addr;
                pthread_mutex_unlock(&g_emu_lock);
                return 0;
             }
@@ -734,6 +970,7 @@ int ioctl(int fd, unsigned long request, ...)
                g_kfile.queues[i].csi_index = qb->in.csi_index;
                g_kfile.queues[i].mmap_handle = (uint64_t)(g_kfile.next_user_io_cookie++) << 12;
                qb->out.mmap_handle = g_kfile.queues[i].mmap_handle;
+               record_trace_ioctl("KBASE_IOCTL_CS_QUEUE_BIND", request, 3, 0, 0, qb->in.group_handle, qb->in.buffer_gpu_addr, qb->out.mmap_handle, 0, 0);
                pthread_mutex_unlock(&g_emu_lock);
                return 0;
             }
@@ -747,13 +984,13 @@ int ioctl(int fd, unsigned long request, ...)
          for (size_t i = 0; i < 32; i++) {
             if (g_kfile.queues[i].bound &&
                 g_kfile.queues[i].buffer_gpu_addr == qk->buffer_gpu_addr) {
-               /* Enforce mali_kbase_csf.c rule: USER_IO pages MUST be mmap'd before KICK! */
                if (!g_kfile.queues[i].user_io_mapped) {
                   pthread_mutex_unlock(&g_emu_lock);
                   errno = EINVAL;
                   return -1;
                }
                g_stats.queue_kick_count++;
+               record_trace_ioctl("KBASE_IOCTL_CS_QUEUE_KICK", request, 0, 0, 0, 0, qk->buffer_gpu_addr, qk->buffer_gpu_addr, 0, 0);
                uint8_t *uio = (uint8_t *)g_kfile.queues[i].user_io_pages;
                uint64_t cs_insert = *(volatile uint64_t *)(uio + CS_USER_IO_INPUT_PAGE_OFFSET);
                uint64_t cs_extract = g_kfile.queues[i].extract_offset;
@@ -789,6 +1026,7 @@ int ioctl(int fd, unsigned long request, ...)
             (union kbase_ioctl_cs_queue_group_create_1_6 *)arg;
          cg->out.group_handle = g_kfile.next_group_handle++;
          cg->out.group_uid = 100U + cg->out.group_handle;
+         record_trace_ioctl("KBASE_IOCTL_CS_QUEUE_GROUP_CREATE", request, 0, 0, 0, cg->in.cs_min, 0, cg->out.group_handle, 0, 0);
          pthread_mutex_unlock(&g_emu_lock);
          return 0;
       }
@@ -818,8 +1056,16 @@ int ioctl(int fd, unsigned long request, ...)
          g_kfile.heaps[0].vt_start = 0;
          g_kfile.heaps[0].vt_end = 0;
          g_kfile.heaps[0].frag_end = 0;
+         uint32_t saved_chunk_size = hi->in.chunk_size;
+         uint32_t saved_initial_chunks = hi->in.initial_chunks;
+         uint32_t saved_max_chunks = hi->in.max_chunks;
+         uint16_t saved_target_in_flight = hi->in.target_in_flight;
          hi->out.gpu_heap_va = g_kfile.heaps[0].gpu_heap_va;
          hi->out.first_chunk_va = g_kfile.heaps[0].first_chunk_va;
+         record_trace_ioctl("KBASE_IOCTL_CS_TILER_HEAP_INIT", request, ((uint64_t)saved_chunk_size * saved_initial_chunks) >> 12, 0, 0, saved_target_in_flight, 0, hi->out.gpu_heap_va, 0, 0);
+         g_trace[g_trace_count - 1].chunk_size = saved_chunk_size;
+         g_trace[g_trace_count - 1].initial_chunks = saved_initial_chunks;
+         g_trace[g_trace_count - 1].max_chunks = saved_max_chunks;
          pthread_mutex_unlock(&g_emu_lock);
          return 0;
       }
@@ -845,10 +1091,28 @@ int ioctl(int fd, unsigned long request, ...)
       case 51: { /* KBASE_IOCTL_CS_GET_GLB_IFACE */
          union kbase_ioctl_cs_get_glb_iface *glb =
             (union kbase_ioctl_cs_get_glb_iface *)arg;
+         uint32_t max_groups = glb->in.max_group_num;
+         uint32_t max_streams = glb->in.max_total_stream_num;
+         struct basep_cs_group_control *gptr =
+            (struct basep_cs_group_control *)(uintptr_t)glb->in.groups_ptr;
+         struct basep_cs_stream_control *sptr =
+            (struct basep_cs_stream_control *)(uintptr_t)glb->in.streams_ptr;
+         if (gptr && max_groups > 0) {
+            for (uint32_t i = 0; i < max_groups && i < 8U; i++) {
+               gptr[i].features = 0x7U;
+               gptr[i].stream_num = 8U;
+               gptr[i].suspend_size = 64U;
+            }
+         }
+         if (sptr && max_streams > 0) {
+            for (uint32_t i = 0; i < max_streams && i < 24U; i++) {
+               sptr[i].features = (8U << 8) | 95U;
+            }
+         }
          glb->out.glb_version = (1U << 26) | (1U << 20);
          glb->out.features = 0x7U;
          glb->out.group_num = 8U;
-         glb->out.max_total_stream_num = 24U;
+         glb->out.prfcnt_size = 24U;
          glb->out.total_stream_num = 24U;
          glb->out.instr_features = 0x7fU;
          pthread_mutex_unlock(&g_emu_lock);
@@ -878,15 +1142,23 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 
    /* If mapping a Panthor virtual DRM offset, route through adapter first */
    if (panthor_kbase_adapter_is_virtual_drm_fd(fd) &&
-       ((uoff & 0x1000000000ULL) == 0x1000000000ULL ||
+       ((uoff & 0xffff00000000ULL) == 0x1000000000ULL ||
         uoff == DRM_PANTHOR_USER_MMIO_OFFSET_64BIT ||
         uoff == DRM_PANTHOR_USER_MMIO_OFFSET_32BIT)) {
       return panthor_kbase_adapter_mmap(addr, length, prot, flags, fd, offset);
    }
 
    /* Emulated /dev/mali0 mmap handling */
-   if (g_kfile.state == EMU_KFILE_KCTX_READY && fd == g_kfile.fd) {
+   if (g_kfile.state == EMU_KFILE_KCTX_READY && is_emulated_mali_fd(fd)) {
       pthread_mutex_lock(&g_emu_lock);
+      record_trace_ioctl("MMAP_MALI0", 0, length >> 12, 0, 0, (uint64_t)prot, 0, 0, 0, 0);
+      g_trace[g_trace_count - 1].mmap_offset = uoff;
+      g_trace[g_trace_count - 1].mmap_len = (uint64_t)length;
+      if (uoff == BASE_MEM_MAP_TRACKING_HANDLE) {
+         void *p = g_kfile.tracking_page;
+         pthread_mutex_unlock(&g_emu_lock);
+         return p;
+      }
       if (uoff == BASEP_MEM_CSF_USER_REG_PAGE_HANDLE) {
          void *p = g_kfile.user_reg_page;
          pthread_mutex_unlock(&g_emu_lock);
@@ -913,9 +1185,15 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
          errno = EINVAL;
          return MAP_FAILED;
       }
-      /* SAME_VA BO cookie (>= 64 << 12) */
+      /* SAME_VA or EXEC_VA BO cookie/VA */
       for (size_t i = 0; i < 512; i++) {
-         if (g_kfile.regions[i].active && g_kfile.regions[i].cookie_or_va == uoff) {
+         if (g_kfile.regions[i].active &&
+             (g_kfile.regions[i].cookie_or_va == uoff || g_kfile.regions[i].gpu_va == uoff)) {
+            if (g_kfile.regions[i].cpu_ptr) {
+               void *p = g_kfile.regions[i].cpu_ptr;
+               pthread_mutex_unlock(&g_emu_lock);
+               return p;
+            }
             void *p = orig_mmap(NULL, length, prot, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
             if (p != MAP_FAILED) {
                g_kfile.regions[i].cpu_ptr = p;
@@ -942,4 +1220,47 @@ int munmap(void *addr, size_t length)
       return r;
    }
    return orig_munmap(addr, length);
+}
+
+
+__attribute__((visibility("default")))
+int mali_kbase_emu_export_trace_json(const char *path)
+{
+   if (!path)
+      return -1;
+   FILE *fp = fopen(path, "w");
+   if (!fp)
+      return -1;
+   fprintf(fp, "{\n");
+   fprintf(fp, "  \"device\": \"Mali-G615 MC2 (arch=11, gpu_id=0xb8031030, kbase=1.21)\",\n");
+   fprintf(fp, "  \"event_count\": %u,\n", g_trace_count);
+   fprintf(fp, "  \"events\": [\n");
+   for (uint32_t i = 0; i < g_trace_count; i++) {
+      const struct kbase_emu_trace_event *e = &g_trace[i];
+      fprintf(fp,
+              "    {\"seq\": %u, \"op\": \"%s\", \"cmd\": \"0x%lx\", "
+              "\"va_pages\": %llu, \"commit_pages\": %llu, \"extension\": %llu, "
+              "\"flags\": \"0x%llx\", \"fixed_address\": \"0x%llx\", \"out_va\": \"0x%llx\", "
+              "\"mmap_offset\": \"0x%llx\", \"mmap_len\": %llu, "
+              "\"buffer_size\": %u, \"buffer_gpu_addr\": \"0x%llx\", "
+              "\"chunk_size\": %u, \"initial_chunks\": %u, \"max_chunks\": %u, "
+              "\"ret\": %d, \"errno\": %d}%s\n",
+              i, e->op, e->cmd,
+              (unsigned long long)e->va_pages,
+              (unsigned long long)e->commit_pages,
+              (unsigned long long)e->extension,
+              (unsigned long long)e->flags,
+              (unsigned long long)e->fixed_address,
+              (unsigned long long)e->out_va,
+              (unsigned long long)e->mmap_offset,
+              (unsigned long long)e->mmap_len,
+              e->buffer_size,
+              (unsigned long long)e->buffer_gpu_addr,
+              e->chunk_size, e->initial_chunks, e->max_chunks,
+              e->ret, e->err,
+              (i + 1 < g_trace_count) ? "," : "");
+   }
+   fprintf(fp, "  ]\n}\n");
+   fclose(fp);
+   return 0;
 }

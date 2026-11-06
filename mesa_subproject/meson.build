@@ -1,14 +1,32 @@
 # SPDX-License-Identifier: MIT
-# Self-contained Mesa subproject: src/panfrost/uapi_adapter/meson.build
-# Can be built either as an LD_PRELOAD shared library or linked directly into libpankmod_lib
+# Self-contained Mesa subproject: subprojects/panthor_kbase_adapter/meson.build
+# Linked into src/panfrost/lib/kmod/meson.build via subproject('panthor_kbase_adapter').
 
-libpanthor_kbase_adapter = shared_library(
+project(
+  'panthor_kbase_adapter',
+  ['c', 'cpp'],
+  version : '1.0.0',
+  default_options : ['c_std=c11', 'cpp_std=c++17'],
+)
+
+cc = meson.get_compiler('c')
+dep_dl = cc.find_library('dl', required : false)
+dep_thread = dependency('threads')
+
+inc_adapter = include_directories('include', 'src/adapter')
+
+libpanthor_kbase_adapter = static_library(
   'panthor_kbase_adapter',
   files(
-      '../src/adapter/panthor_kbase_adapter.c',
-      '../src/adapter/log.c',
-    ),
-  include_directories : [inc_include, include_directories('../include')],
+    'src/adapter/panthor_kbase_adapter.cpp',
+    'src/adapter/log.cpp',
+  ),
+  include_directories : inc_adapter,
   dependencies : [dep_dl, dep_thread],
-  install : true,
+  pic : true,
+)
+
+panthor_kbase_adapter_dep = declare_dependency(
+  link_whole : libpanthor_kbase_adapter,
+  dependencies : [dep_dl, dep_thread],
 )

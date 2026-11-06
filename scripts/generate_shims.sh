@@ -2,15 +2,15 @@
 # SPDX-License-Identifier: MIT
 #
 # Generates shims/ and shims.zip for cross-compiling upstream Mesa 26.3.0
-# libvulkan_panfrost.so on Android NDK (aarch64-linux-android30) in both:
-#   1. Patched Kmod mode (0001-panfrost-kmod-minimal-uapi-adapter-hook.patch)
-#   2. Unpatched + Runtime Hook mode (libpanthor_kbase_runtime_hook.so + libdrm.a shim)
+# libvulkan_panfrost.so on Android NDK (aarch64-linux-android30) in
+# Source-Patched Kmod mode (0001-panfrost-kmod-minimal-uapi-adapter-hook.patch)
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NDK_DIR="${ANDROID_NDK_HOME:-$HOME/Android/Sdk/ndk/27.0.12077973}"
 NDK_BIN="${NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/bin"
 CC="${NDK_BIN}/aarch64-linux-android30-clang"
+CXX="${NDK_BIN}/aarch64-linux-android30-clang++"
 AR="${NDK_BIN}/llvm-ar"
 
 SHIMS_DIR="${ROOT_DIR}/shims"
@@ -20,20 +20,20 @@ mkdir -p "${SHIMS_DIR}/include/libdrm" \
          "${SHIMS_DIR}/include/sync" \
          "${SHIMS_DIR}/lib/pkgconfig"
 
-# 1. Copy DRM / Panthor / Kbase headers into shims/include
-cp -f "${ROOT_DIR}/include/drm.h"            "${SHIMS_DIR}/include/"
-cp -f "${ROOT_DIR}/include/drm_mode.h"       "${SHIMS_DIR}/include/"
-cp -f "${ROOT_DIR}/include/panthor_drm.h"    "${SHIMS_DIR}/include/"
-cp -f "${ROOT_DIR}/include/mali_kbase_uapi.h" "${SHIMS_DIR}/include/"
-cp -f "${ROOT_DIR}/include/xf86drm.h"        "${SHIMS_DIR}/include/"
-cp -f "${ROOT_DIR}/include/xf86drmMode.h"    "${SHIMS_DIR}/include/"
-cp -f "${ROOT_DIR}/include/drm.h"            "${SHIMS_DIR}/include/libdrm/"
-cp -f "${ROOT_DIR}/include/drm_mode.h"       "${SHIMS_DIR}/include/libdrm/"
-cp -f "${ROOT_DIR}/include/panthor_drm.h"    "${SHIMS_DIR}/include/libdrm/"
-cp -f "${ROOT_DIR}/include/xf86drm.h"        "${SHIMS_DIR}/include/libdrm/"
-cp -f "${ROOT_DIR}/include/xf86drmMode.h"    "${SHIMS_DIR}/include/libdrm/"
-cp -f "${ROOT_DIR}/src/adapter/panthor_kbase_adapter.h"      "${SHIMS_DIR}/include/"
-cp -f "${ROOT_DIR}/src/adapter/panthor_kbase_runtime_hook.h" "${SHIMS_DIR}/include/"
+# 1. Copy DRM / Panthor / Kbase / Adapter headers into shims/include
+cp -f "${ROOT_DIR}/include/drm.h"                  "${SHIMS_DIR}/include/"
+cp -f "${ROOT_DIR}/include/drm_mode.h"             "${SHIMS_DIR}/include/"
+cp -f "${ROOT_DIR}/include/panthor_drm.h"          "${SHIMS_DIR}/include/"
+cp -f "${ROOT_DIR}/include/mali_kbase_uapi.h"      "${SHIMS_DIR}/include/"
+cp -f "${ROOT_DIR}/include/xf86drm.h"              "${SHIMS_DIR}/include/"
+cp -f "${ROOT_DIR}/include/xf86drmMode.h"          "${SHIMS_DIR}/include/"
+cp -f "${ROOT_DIR}/include/drm.h"                  "${SHIMS_DIR}/include/libdrm/"
+cp -f "${ROOT_DIR}/include/drm_mode.h"             "${SHIMS_DIR}/include/libdrm/"
+cp -f "${ROOT_DIR}/include/panthor_drm.h"          "${SHIMS_DIR}/include/libdrm/"
+cp -f "${ROOT_DIR}/include/xf86drm.h"              "${SHIMS_DIR}/include/libdrm/"
+cp -f "${ROOT_DIR}/include/xf86drmMode.h"          "${SHIMS_DIR}/include/libdrm/"
+cp -f "${ROOT_DIR}/src/adapter/panthor_kbase_adapter.h" "${SHIMS_DIR}/include/"
+cp -f "${ROOT_DIR}/src/adapter/log.h"              "${SHIMS_DIR}/include/"
 
 # Android sync.h header shim
 cat > "${SHIMS_DIR}/include/sync/sync.h" << 'EOF'
@@ -81,43 +81,40 @@ if [ -d "/usr/include/X11" ]; then
    cp -rf /usr/include/X11 "${SHIMS_DIR}/include/"
 fi
 
-# 2. Build Android aarch64 libdrm.a (includes Panthor-to-Kbase Adapter + ELF GOT/PLT Runtime Hook + KMS stubs)
+# 2. Build Android aarch64 libdrm.a (includes C++ Panthor-to-Kbase Adapter + Scoped Logger + KMS stubs)
 BUILD_TMP="$(mktemp -d)"
 trap 'rm -rf "${BUILD_TMP}"' EXIT
 
-"${CC}" -O2 -fPIC -Wall -I"${ROOT_DIR}/include" -I"${ROOT_DIR}/src/adapter" \
-   -c "${ROOT_DIR}/src/adapter/panthor_kbase_adapter.c" \
+"${CXX}" -std=c++17 -O2 -fPIC -fno-emulated-tls -fno-exceptions -fno-unwind-tables \
+   -Wall -I"${ROOT_DIR}/include" -I"${ROOT_DIR}/src/adapter" \
+   -c "${ROOT_DIR}/src/adapter/panthor_kbase_adapter.cpp" \
    -o "${BUILD_TMP}/panthor_kbase_adapter.o"
 
-"${CC}" -O2 -fPIC -Wall -I"${ROOT_DIR}/include" -I"${ROOT_DIR}/src/adapter" \
-   -c "${ROOT_DIR}/src/adapter/panthor_kbase_runtime_hook.c" \
-   -o "${BUILD_TMP}/panthor_kbase_runtime_hook.o"
+"${CXX}" -std=c++17 -O2 -fPIC -fno-emulated-tls -fno-exceptions -fno-unwind-tables \
+   -Wall -I"${ROOT_DIR}/include" -I"${ROOT_DIR}/src/adapter" \
+   -c "${ROOT_DIR}/src/adapter/log.cpp" \
+   -o "${BUILD_TMP}/log.o"
 
-"${CC}" -O2 -fPIC -Wall -I"${ROOT_DIR}/include" -I"${ROOT_DIR}/src/adapter" \
+"${CC}" -O2 -fPIC -fno-emulated-tls -Wall -I"${ROOT_DIR}/include" -I"${ROOT_DIR}/src/adapter" \
    -c "${ROOT_DIR}/src/adapter/drm_mode_stubs.c" \
    -o "${BUILD_TMP}/drm_mode_stubs.o"
 
 "${AR}" rcs "${SHIMS_DIR}/lib/libdrm.a" \
    "${BUILD_TMP}/panthor_kbase_adapter.o" \
-   "${BUILD_TMP}/panthor_kbase_runtime_hook.o" \
+   "${BUILD_TMP}/log.o" \
    "${BUILD_TMP}/drm_mode_stubs.o"
 
 "${AR}" rcs "${SHIMS_DIR}/lib/libpanthor_kbase_adapter.a" \
    "${BUILD_TMP}/panthor_kbase_adapter.o" \
+   "${BUILD_TMP}/log.o" \
    "${BUILD_TMP}/drm_mode_stubs.o"
 
-"${CC}" -shared -O2 -fPIC -Wl,-z,nodelete \
+"${CXX}" -shared -O2 -fPIC -fno-emulated-tls -fno-exceptions -static-libstdc++ -Wl,-z,nodelete \
    "${BUILD_TMP}/panthor_kbase_adapter.o" \
+   "${BUILD_TMP}/log.o" \
    "${BUILD_TMP}/drm_mode_stubs.o" \
    -ldl -llog -lm \
    -o "${SHIMS_DIR}/lib/libpanthor_kbase_adapter.so"
-
-"${CC}" -shared -O2 -fPIC -Wl,-z,nodelete \
-   "${BUILD_TMP}/panthor_kbase_runtime_hook.o" \
-   "${BUILD_TMP}/panthor_kbase_adapter.o" \
-   "${BUILD_TMP}/drm_mode_stubs.o" \
-   -ldl -llog -lm \
-   -o "${SHIMS_DIR}/lib/libpanthor_kbase_runtime_hook.so"
 
 # 3. Build functional Android libsync.a via ioctl calls
 cat > "${BUILD_TMP}/libsync.c" << 'EOF'
@@ -320,10 +317,8 @@ for libname in xcb X11-xcb xcb-dri3 xcb-present xcb-randr xcb-shm xcb-sync xcb-x
    "${AR}" rcs "${SHIMS_DIR}/lib/lib${libname}.a" "${BUILD_TMP}/x11_xcb_stubs.o"
 done
 
-# Copy static archives into shims/ root as well so -L shims and -L shims/lib both find them
 cp -f "${SHIMS_DIR}"/lib/*.a "${SHIMS_DIR}/"
 
-# 6. Write pkg-config (.pc) files into BOTH shims/ and shims/lib/pkgconfig/
 write_pc() {
    local name="$1"
    local ver="$2"
@@ -340,9 +335,7 @@ PCEOF
    done
 }
 
-# libdrm.pc links libdrm.a with --whole-archive so the runtime hook & adapter symbols are retained,
-# and -Wl,-z,nodelete ensures the Vulkan driver is not unloaded during loader pre-instance queries.
-write_pc "libdrm"      "2.5.0" "-Wl,-z,nodelete -Wl,--whole-archive -ldrm -Wl,--no-whole-archive -ldl -llog" ""
+write_pc "libdrm"      "2.5.0" "-Wl,-z,nodelete -ldrm -ldl -llog" ""
 write_pc "zlib"        "1.3.1"   "-lz" ""
 write_pc "xcb"         "1.17.0"  "-lxcb" ""
 write_pc "x11-xcb"     "1.8.12"  "-lX11-xcb -lX11 -lxcb" ""
@@ -358,6 +351,5 @@ write_pc "xext"        "1.3.6"   "-lXext" ""
 write_pc "xrandr"      "1.5.4"   "-lXrandr" ""
 write_pc "xxf86vm"     "1.1.5"   "-lXxf86vm" ""
 
-# 7. Package shims.zip at repository root
 (cd "${ROOT_DIR}" && rm -f shims.zip && python3 -m zipfile -c shims.zip shims/)
 echo "Generated ${ROOT_DIR}/shims.zip successfully."

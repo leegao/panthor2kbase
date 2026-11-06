@@ -62,3 +62,9 @@ jobs:
             artifacts/conformance_report.json
             artifacts/live_workload_traces.json
             artifacts/ortools_equivalence_proof_report.json
+            artifacts/ortools_modeled_constraints.pbtxt
+            artifacts/lifted_uapi_and_csf_microcode_audit.json
+            artifacts/lifted_shaders_spirv.txt
+            artifacts/mali_kbase_ko_lifted_cfg.json
+            artifacts/mali_kbase_ko_symbolic_proof_report.json
+            artifacts/panvk_host_kbase_trace.json

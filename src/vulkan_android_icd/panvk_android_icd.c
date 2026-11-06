@@ -283,8 +283,37 @@ vkCreateDevice(VkPhysicalDevice physicalDevice,
    set_loader_magic_value(&g_default_device);
    g_default_device.instance = inst;
 
+   /* Exercise panvk_vX_device.c:396 os_dupfd_cloexec -> panthor_kbase_adapter_dup */
+   int dev_fd = panthor_kbase_adapter_dup(inst->drm_fd);
+   if (dev_fd < 0)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   /* Exercise PAN_KMOD_BO_FLAG_EXECUTABLE (1 << 0) shader heap allocation in EXEC_VA_ZONE */
+   panthor_kbase_adapter_hint_bo_flags(1U /* PAN_KMOD_BO_FLAG_EXECUTABLE */);
+   struct drm_panthor_bo_create exec_bo = { .size = 65536, .flags = 0 };
+   if (KMOD_IOCTL(dev_fd, DRM_IOCTL_PANTHOR_BO_CREATE, &exec_bo) != 0) {
+      panthor_kbase_adapter_close(dev_fd);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+   struct drm_panthor_vm_bind_op bind_exec = {
+      .flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP | DRM_PANTHOR_VM_BIND_OP_MAP_READONLY | DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC,
+      .bo_handle = exec_bo.handle,
+      .va = PANTHOR_USER_VA_AUTO,
+      .size = 65536,
+   };
+   bind_exec.flags &= ~DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC;
+   struct drm_panthor_vm_bind vb_exec = {
+      .vm_id = inst->vm_id,
+      .flags = 0,
+      .ops = DRM_PANTHOR_OBJ_ARRAY(1, &bind_exec),
+   };
+   KMOD_IOCTL(dev_fd, DRM_IOCTL_PANTHOR_VM_BIND, &vb_exec);
+   drmCloseBufferHandle(dev_fd, exec_bo.handle);
+   panthor_kbase_adapter_close(dev_fd);
+
    /* Allocate CS command stream BO + subqueue context BO via Panthor DRM UAPI */
-   struct drm_panthor_bo_create cs_bo = { .size = 16384, .flags = DRM_PANTHOR_BO_WB_MMAP };
+   panthor_kbase_adapter_hint_bo_flags(1U << 5 /* PAN_KMOD_BO_FLAG_WB_MMAP */);
+   struct drm_panthor_bo_create cs_bo = { .size = 16384, .flags = 0 };
    if (KMOD_IOCTL(inst->drm_fd, DRM_IOCTL_PANTHOR_BO_CREATE, &cs_bo) != 0)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 

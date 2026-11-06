@@ -78,3 +78,7 @@ with open(out_path, "w") as fp:
 print(f"Generated unified conformance report -> {out_path}")
 print("CONFORMANCE RESULT: ALL 5 WORKLOADS CONFORMANT, 3/3 FORMAL PROOFS INFEASIBLE (VIOLATION-FREE)")
 PYEOF
+
+echo "[7/7] Running AArch64 Machine-Code Lifter & Static/Symbolic Bitfield Verifier on mali_kbase.ko..."
+python3 src/verifier/aarch64_mc_lifter.py mali_kbase.ko > artifacts/aarch64_mc_lifter.log 2>&1
+tail -n 10 artifacts/aarch64_mc_lifter.log

@@ -1,42 +1,73 @@
+From 7c1ca676766bdf9a037f27244dd0ec3031e96f7d Mon Sep 17 00:00:00 2001
 From: Panthor-Kbase Adapter <adapter@panvk.local>
-Subject: [PATCH] panfrost/kmod: optional 6-line hook for in-tree panthor-to-kbase UAPI adapter
+Date: Fri, 6 Nov 2026 03:35:20 +0000
+Subject: [PATCH] panfrost/kmod & panvk: in-tree C++17 panthor-to-kbase UAPI
+ adapter + v11 support
 
-When building in-tree without LD_PRELOAD, redirect pan_kmod_ioctl and
-panthor_kmod mmap/munmap to panthor_kbase_adapter_* when /dev/mali0 is active.
-Zero changes to src/panfrost/vulkan/* are required.
 ---
- src/panfrost/lib/kmod/meson.build | 2 ++
- src/panfrost/lib/kmod/pan_kmod.h  | 16 ++++++++++++++++
- 2 files changed, 18 insertions(+)
+ src/panfrost/lib/kmod/meson.build            |  2 ++
+ src/panfrost/lib/kmod/pan_kmod.h             | 34 ++++++++++++++++++++
+ src/panfrost/lib/kmod/pan_kmod_backend.h     |  4 +++
+ src/panfrost/lib/kmod/panthor_kmod.c         |  6 +++-
+ src/panfrost/model/pan_model.c               |  7 ++++
+ src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c |  5 ++-
+ src/panfrost/vulkan/panvk_physical_device.c  | 13 ++++----
+ src/panfrost/vulkan/panvk_vX_device.c        |  6 ++--
+ 8 files changed, 67 insertions(+), 10 deletions(-)
 
 diff --git a/src/panfrost/lib/kmod/meson.build b/src/panfrost/lib/kmod/meson.build
-index cb021a3..c5f6992 100644
+index cb021a3..b42e81c 100644
 --- a/src/panfrost/lib/kmod/meson.build
 +++ b/src/panfrost/lib/kmod/meson.build
-@@ -5,6 +5,7 @@ libpankmod_lib_files = files(
-   'pan_kmod.c',
-   'panfrost_kmod.c',
+@@ -7,10 +7,13 @@ libpankmod_lib_files = files(
    'panthor_kmod.c',
-+  '../../uapi_adapter/panthor_kbase_adapter.c',
-+  '../../uapi_adapter/log.c',
  )
-
+ 
++panthor_kbase_adapter_proj = subproject('panthor_kbase_adapter')
++panthor_kbase_adapter_dep = panthor_kbase_adapter_proj.get_variable('panthor_kbase_adapter_dep')
++
  libpankmod_lib = static_library(
+   'pankmod_lib',
+   [libpankmod_lib_files],
+   include_directories : [inc_include, inc_src, inc_panfrost],
+-  dependencies : [dep_libdrm, idep_mesautil],
++  dependencies : [dep_libdrm, idep_mesautil, panthor_kbase_adapter_dep],
+   c_args : [no_override_init_args],
+   gnu_symbol_visibility : 'hidden',
+   build_by_default : false,
 diff --git a/src/panfrost/lib/kmod/pan_kmod.h b/src/panfrost/lib/kmod/pan_kmod.h
-index 8d37023..d8bab9d 100644
+index 8d37023..8814204 100644
 --- a/src/panfrost/lib/kmod/pan_kmod.h
 +++ b/src/panfrost/lib/kmod/pan_kmod.h
-@@ -621,11 +621,27 @@ struct pan_kmod_dev {
+@@ -621,11 +621,45 @@ struct pan_kmod_dev {
     void *user_priv;
  };
-
+ 
 +#ifndef HAVE_PANTHOR_KBASE_UAPI_ADAPTER
 +#define HAVE_PANTHOR_KBASE_UAPI_ADAPTER 1
 +#endif
 +#ifdef HAVE_PANTHOR_KBASE_UAPI_ADAPTER
 +#include <stdbool.h>
++#include "util/os_mman.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
 +extern bool panthor_kbase_adapter_is_virtual_drm_fd(int fd);
++extern int panthor_kbase_adapter_open(const char *path, int flags);
++extern int panthor_kbase_adapter_dup(int fd);
++extern int panthor_kbase_adapter_close(int fd);
 +extern int panthor_kbase_adapter_ioctl(int fd, unsigned long req, void *a);
++extern void *panthor_kbase_adapter_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
++extern int panthor_kbase_adapter_munmap(void *addr, size_t length);
++extern void panthor_kbase_adapter_hint_bo_flags(uint32_t kmod_flags);
++#ifdef __cplusplus
++}
++#endif
++#undef os_mmap
++#define os_mmap(addr, length, prot, flags, fd, offset)                       \
++   panthor_kbase_adapter_mmap(addr, length, prot, flags, fd, offset)
++#define os_munmap(addr, length)                                              \
++   panthor_kbase_adapter_munmap(addr, length)
 +#define pan_kmod_ioctl(fd, op, arg)                                          \
 +   ({                                                                        \
 +      PAN_TRACE_SCOPE(PAN_TRACE_LIB_KMOD, "pan_kmod_ioctl op=" #op);         \
@@ -51,6 +82,179 @@ index 8d37023..d8bab9d 100644
        drmIoctl(fd, op, arg);                                                 \
     })
 +#endif
-
+ 
  struct pan_kmod_dev *
  pan_kmod_dev_create(int fd, uint32_t flags,
+diff --git a/src/panfrost/lib/kmod/pan_kmod_backend.h b/src/panfrost/lib/kmod/pan_kmod_backend.h
+index 8a3ad16..27d1f6f 100644
+--- a/src/panfrost/lib/kmod/pan_kmod_backend.h
++++ b/src/panfrost/lib/kmod/pan_kmod_backend.h
+@@ -31,7 +31,11 @@ static inline void
+ pan_kmod_dev_cleanup(struct pan_kmod_dev *dev)
+ {
+    if (dev->flags & PAN_KMOD_DEV_FLAG_OWNS_FD)
++#ifdef HAVE_PANTHOR_KBASE_UAPI_ADAPTER
++      panthor_kbase_adapter_close(dev->fd);
++#else
+       close(dev->fd);
++#endif
+ 
+    util_dynarray_fini(&dev->pending_bo_syncs.array);
+    util_sparse_array_finish(&dev->handle_to_bo.array);
+diff --git a/src/panfrost/lib/kmod/panthor_kmod.c b/src/panfrost/lib/kmod/panthor_kmod.c
+index f033718..5193b2e 100644
+--- a/src/panfrost/lib/kmod/panthor_kmod.c
++++ b/src/panfrost/lib/kmod/panthor_kmod.c
+@@ -400,6 +400,9 @@ panthor_kmod_bo_alloc(struct pan_kmod_dev *dev,
+       mesa_loge("failed to allocate a panthor_kmod_bo object");
+       return NULL;
+    }
++#ifdef HAVE_PANTHOR_KBASE_UAPI_ADAPTER
++   panthor_kbase_adapter_hint_bo_flags(flags);
++#endif
+ 
+    struct drm_panthor_bo_create req = {
+       .size = size,
+@@ -1206,7 +1209,8 @@ out_update_vas:
+ 
+    for (uint32_t i = 0; i < op_count; i++) {
+       if (ops[i].type == PAN_KMOD_VM_OP_TYPE_MAP &&
+-          ops[i].va.start == PAN_KMOD_VM_MAP_AUTO_VA) {
++          (ops[i].va.start == PAN_KMOD_VM_MAP_AUTO_VA ||
++           panthor_kbase_adapter_is_virtual_drm_fd(vm->dev->fd))) {
+          if (!ret) {
+             ops[i].va.start = bind_ops[i].va;
+          } else if (bind_ops[i].va != 0) {
+diff --git a/src/panfrost/model/pan_model.c b/src/panfrost/model/pan_model.c
+index f46d98b..8ad0cbe 100644
+--- a/src/panfrost/model/pan_model.c
++++ b/src/panfrost/model/pan_model.c
+@@ -103,6 +103,8 @@ const struct pan_model pan_model_list[] = {
+                                               MODEL_RATES_X(4, 8,  8,  48,  48, 12)),
+    VALHALL_MODEL(PAN_PROD_ID(10, 12, 4), 4, "G310v5",   "G710", MODEL_ANISO(ALL),  MODEL_TB_SIZES(32768, 16384),
+                                               MODEL_RATES_X(4, 8,  8,  64,  64, 16)),
++   VALHALL_MODEL(PAN_PROD_ID(11, 8, 0), 4,  "G715",   "G715", MODEL_ANISO(ALL),  MODEL_TB_SIZES(32768, 16384),
++                                              MODEL_RATES_X(4, 8, 32,  64, 128, 16)),
+    VALHALL_MODEL(PAN_PROD_ID(11, 8, 2), 4,  "G715",   "G715", MODEL_ANISO(ALL),  MODEL_TB_SIZES(32768, 16384),
+                                               MODEL_RATES_X(4, 8, 32,  64, 128, 16)),
+    VALHALL_MODEL(PAN_PROD_ID(11, 8, 3), 4,  "G615",   "G715", MODEL_ANISO(ALL),  MODEL_TB_SIZES(32768, 16384),
+@@ -154,5 +156,10 @@ pan_get_model(uint64_t gpu_id, uint32_t gpu_variant)
+          return &pan_model_list[i];
+    }
+ 
++   for (unsigned i = 0; i < ARRAY_SIZE(pan_model_list); ++i) {
++      if (pan_model_list[i].gpu_prod_id == gpu_prod_id)
++         return &pan_model_list[i];
++   }
++
+    return NULL;
+ }
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+index 20d9bc8..d0ad892 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+@@ -154,7 +154,10 @@ init_render_desc_ringbuf(struct panvk_gpu_queue *queue)
+                           "Failed to GPU map ringbuf BO");
+    }
+ 
+-   ringbuf->addr.dev = dev_addr;
++   ringbuf->addr.dev =
++      panthor_kbase_adapter_is_virtual_drm_fd(dev->kmod.dev->fd)
++         ? vm_ops[0].va.start
++         : dev_addr;
+ 
+    panvk_address_binding_report(dev, NULL, ringbuf->addr.dev, ringbuf->size,
+                                 VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index 4aea162..dc463d2 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -80,7 +80,7 @@ create_kmod_dev(struct panvk_physical_device *device,
+    drmVersionPtr version;
+    int fd;
+ 
+-   fd = open(path, O_RDWR | O_CLOEXEC);
++   fd = panthor_kbase_adapter_open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+       return panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+                           "failed to open device %s", path);
+@@ -88,7 +88,7 @@ create_kmod_dev(struct panvk_physical_device *device,
+ 
+    version = drmGetVersion(fd);
+    if (!version) {
+-      close(fd);
++      panthor_kbase_adapter_close(fd);
+       return panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+                           "failed to query kernel driver version for device %s",
+                           path);
+@@ -96,7 +96,7 @@ create_kmod_dev(struct panvk_physical_device *device,
+ 
+    if (strcmp(version->name, "panfrost") && strcmp(version->name, "panthor")) {
+       drmFreeVersion(version);
+-      close(fd);
++      panthor_kbase_adapter_close(fd);
+       return VK_ERROR_INCOMPATIBLE_DRIVER;
+    }
+ 
+@@ -113,7 +113,7 @@ create_kmod_dev(struct panvk_physical_device *device,
+    device->kmod.dev = pan_kmod_dev_create(fd, flags, &instance->kmod.allocator);
+ 
+    if (!device->kmod.dev) {
+-      close(fd);
++      panthor_kbase_adapter_close(fd);
+       return panvk_errorf(instance, VK_ERROR_OUT_OF_HOST_MEMORY,
+                           "cannot create device");
+    }
+@@ -128,7 +128,8 @@ get_drm_device_ids(struct panvk_physical_device *device,
+ {
+    struct stat st;
+ 
+-   if (stat(drm_device->nodes[DRM_NODE_RENDER], &st)) {
++   if (stat(drm_device->nodes[DRM_NODE_RENDER], &st) &&
++       fstat(device->kmod.dev->fd, &st)) {
+       return vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
+                        "failed to query render node stat");
+    }
+@@ -405,7 +406,6 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+    switch (arch) {
+    case 6:
+    case 7:
+-   case 11:
+    case 14:
+       if (!os_get_option("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
+          result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+@@ -417,6 +417,7 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+       break;
+ 
+    case 10:
++   case 11:
+    case 12:
+    case 13:
+       break;
+diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
+index e4b7f5c..19c6840 100644
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -393,7 +393,7 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
+       .priv = &device->vk.alloc,
+    };
+    device->kmod.dev = pan_kmod_dev_create(
+-      os_dupfd_cloexec(physical_device->kmod.dev->fd),
++      panthor_kbase_adapter_dup(physical_device->kmod.dev->fd),
+       physical_device->kmod.dev->flags, &device->kmod.allocator);
+ 
+    if (!device->kmod.dev) {
+@@ -412,7 +412,9 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
+    uint64_t user_va_start = pan_clamp_to_usable_va_range(
+       device->kmod.dev, PANVK_VA_RESERVE_BOTTOM);
+    uint64_t user_va_end = physical_device->memory.max_supported_va;
+-   uint32_t vm_flags = PAN_ARCH < 10 ? PAN_KMOD_VM_FLAG_AUTO_VA : 0;
++   uint32_t vm_flags = (PAN_ARCH < 10 ||
++                        panthor_kbase_adapter_is_virtual_drm_fd(device->kmod.dev->fd))
++                          ? PAN_KMOD_VM_FLAG_AUTO_VA : 0;
+ 
+    device->kmod.vm =
+       pan_kmod_vm_create(device->kmod.dev, vm_flags,
+-- 
+2.39.5
+

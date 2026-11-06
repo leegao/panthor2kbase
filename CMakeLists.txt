@@ -1,20 +1,21 @@
 cmake_minimum_required(VERSION 3.18)
-project(panthor_kbase_uapi_adapter VERSION 1.0.0 LANGUAGES C)
+project(panthor_kbase_uapi_adapter VERSION 2.0.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-option(PANTHOR_KBASE_BUILD_TESTS "Build unit, equivalence, and runtime-hook test suites" ON)
+option(PANTHOR_KBASE_BUILD_TESTS "Build unit and equivalence test suites" ON)
 option(PANTHOR_KBASE_ENABLE_COVERAGE "Enable gcov/lcov coverage instrumentation" OFF)
 
 if(ANDROID)
-   message(STATUS "Configuring Panthor-to-Kbase Adapter Suite for Android NDK (${ANDROID_ABI}, API ${ANDROID_PLATFORM})")
+   message(STATUS "Configuring Panthor-to-Kbase C++ Adapter Suite for Android NDK (${ANDROID_ABI}, API ${ANDROID_PLATFORM})")
    set(PLATFORM_LIBS dl log m)
-   # On Android Bionic API 30+, memfd_create is natively in libc
    add_compile_definitions(HAVE_MEMFD_CREATE=1)
 else()
-   message(STATUS "Configuring Panthor-to-Kbase Adapter Suite for Host (${CMAKE_SYSTEM_PROCESSOR})")
+   message(STATUS "Configuring Panthor-to-Kbase C++ Adapter Suite for Host (${CMAKE_SYSTEM_PROCESSOR})")
    find_package(Threads REQUIRED)
    set(PLATFORM_LIBS dl Threads::Threads m)
 endif()
@@ -26,7 +27,6 @@ else()
    add_compile_options(-O2 -g -Wall -Wextra -Wno-unused-parameter)
 endif()
 
-# Ensure shared libraries are protected against premature unloading across dlclose()
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,nodelete")
 
 include_directories(
@@ -36,59 +36,45 @@ include_directories(
 )
 
 # -----------------------------------------------------------------------------
-# 1. Core Panthor-to-Kbase UAPI Adapter Library (Shared & Static)
+# 1. Core Panthor-to-Kbase C++ UAPI Adapter Library (Shared & Static)
 # -----------------------------------------------------------------------------
 add_library(panthor_kbase_adapter SHARED
-   src/adapter/panthor_kbase_adapter.c
-   src/adapter/log.c
+   src/adapter/panthor_kbase_adapter.cpp
+   src/adapter/log.cpp
    src/adapter/drm_mode_stubs.c
 )
 target_link_libraries(panthor_kbase_adapter PRIVATE ${PLATFORM_LIBS})
 
 add_library(panthor_kbase_adapter_static STATIC
-   src/adapter/panthor_kbase_adapter.c
-   src/adapter/log.c
+   src/adapter/panthor_kbase_adapter.cpp
+   src/adapter/log.cpp
    src/adapter/drm_mode_stubs.c
 )
 set_target_properties(panthor_kbase_adapter_static PROPERTIES OUTPUT_NAME panthor_kbase_adapter)
 
 # -----------------------------------------------------------------------------
-# 2. ELF GOT/PLT Runtime Hook Engine for Unpatched Mesa panvk (Shared & Static)
-# -----------------------------------------------------------------------------
-add_library(panthor_kbase_runtime_hook SHARED
-   src/adapter/panthor_kbase_runtime_hook.c
-)
-target_link_libraries(panthor_kbase_runtime_hook PRIVATE panthor_kbase_adapter ${PLATFORM_LIBS})
-
-add_library(panthor_kbase_runtime_hook_static STATIC
-   src/adapter/panthor_kbase_runtime_hook.c
-)
-set_target_properties(panthor_kbase_runtime_hook_static PROPERTIES OUTPUT_NAME panthor_kbase_runtime_hook)
-
-# -----------------------------------------------------------------------------
-# 3. Complete libdrm.a Shim Library (Bundles Adapter + Runtime Hook + KMS Stubs)
+# 2. Complete libdrm.a Shim Library (Bundles C++ Adapter + Logger + KMS Stubs)
 #    Used by shims.zip when cross-compiling Mesa 26.3.0 for Android NDK
 # -----------------------------------------------------------------------------
 add_library(drm_shim STATIC
-   src/adapter/panthor_kbase_adapter.c
-   src/adapter/log.c
-   src/adapter/panthor_kbase_runtime_hook.c
+   src/adapter/panthor_kbase_adapter.cpp
+   src/adapter/log.cpp
    src/adapter/drm_mode_stubs.c
 )
 set_target_properties(drm_shim PROPERTIES OUTPUT_NAME drm)
 
 # -----------------------------------------------------------------------------
-# 4. User-Space /dev/mali0 Kbase CSF & Valhall ISA Emulator
+# 3. User-Space /dev/mali0 Kbase CSF & Valhall ISA Emulator
+#    (Includes upstream Mesa ISA.xml generated Valhall disassembler)
 # -----------------------------------------------------------------------------
 add_library(mali_kbase_emu SHARED
    src/emulator/mali_kbase_emu.c
+   src/emulator/panfrost_valhall_disasm_gen.c
 )
 target_link_libraries(mali_kbase_emu PRIVATE panthor_kbase_adapter ${PLATFORM_LIBS})
 
 # -----------------------------------------------------------------------------
-# 5. Dual-Variant PanVK ICD Targets:
-#    - Variant A (libvulkan_panfrost_patched.so): Patched pan_kmod / panthor_kmod
-#    - Variant B (libvulkan_panfrost_unpatched.so): Unpatched + Runtime Hook
+# 4. Source-Patched PanVK ICD Target (libvulkan_panfrost_patched.so)
 # -----------------------------------------------------------------------------
 add_library(vulkan_panfrost_patched SHARED
    src/vulkan_android_icd/panvk_android_icd.c
@@ -96,17 +82,8 @@ add_library(vulkan_panfrost_patched SHARED
 target_compile_definitions(vulkan_panfrost_patched PRIVATE PANTHOR_KBASE_PATCHED_KMOD=1)
 target_link_libraries(vulkan_panfrost_patched PRIVATE panthor_kbase_adapter ${PLATFORM_LIBS})
 
-add_library(vulkan_panfrost_unpatched SHARED
-   src/vulkan_android_icd/panvk_android_icd.c
-)
-target_compile_definitions(vulkan_panfrost_unpatched PRIVATE PANTHOR_KBASE_PATCHED_KMOD=0)
-# Link with -fno-plt / standard dynamic calls so GOT slots are Exercise-able by runtime hook,
-# and also link panthor_kbase_runtime_hook so loading libvulkan_panfrost_unpatched.so
-# automatically installs the dl_iterate_phdr() GOT hooks via its constructor.
-target_link_libraries(vulkan_panfrost_unpatched PRIVATE panthor_kbase_runtime_hook panthor_kbase_adapter ${PLATFORM_LIBS})
-
 # -----------------------------------------------------------------------------
-# 6. Test Suites & Formal Verification (CTest Integration)
+# 5. Test Suites & Formal Verification (CTest Integration)
 # -----------------------------------------------------------------------------
 if(PANTHOR_KBASE_BUILD_TESTS AND NOT ANDROID)
    enable_testing()
@@ -130,23 +107,8 @@ if(PANTHOR_KBASE_BUILD_TESTS AND NOT ANDROID)
       mali_kbase_emu
       ${PLATFORM_LIBS}
    )
+   add_dependencies(run_vulkan_samples_and_equivalence_suite vulkan_panfrost_patched)
    add_test(NAME vulkan_samples_equivalence_suite COMMAND run_vulkan_samples_and_equivalence_suite WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
-
-   add_executable(test_runtime_hook_unpatched
-      tests/test_runtime_hook_unpatched.c
-   )
-   target_link_libraries(test_runtime_hook_unpatched PRIVATE
-      panthor_kbase_runtime_hook
-      panthor_kbase_adapter
-      mali_kbase_emu
-      ${PLATFORM_LIBS}
-   )
-   add_test(
-      NAME runtime_hook_dual_variant_test
-      COMMAND test_runtime_hook_unpatched
-         $<TARGET_FILE:vulkan_panfrost_patched>
-         $<TARGET_FILE:vulkan_panfrost_unpatched>
-   )
 
    find_package(Python3 COMPONENTS Interpreter)
    if(Python3_Interpreter_FOUND)

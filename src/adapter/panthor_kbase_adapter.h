@@ -63,23 +63,30 @@ extern "C" {
 #define CSF_RES_IDVS            (1U << 3)
 
 /* Ring buffer configuration */
-#define ADAPTER_RINGBUF_SIZE    (64U * 1024U)
-#define ADAPTER_RING_SLOT_QWORDS 24U
-#define ADAPTER_RING_SLOT_BYTES (ADAPTER_RING_SLOT_QWORDS * sizeof(uint64_t))
-#define ADAPTER_MAX_SUBQUEUES   4U
-#define ADAPTER_MAX_BOS         1024U
-#define ADAPTER_MAX_SYNCOBJS    512U
-#define ADAPTER_MAX_GROUPS      32U
-#define ADAPTER_MAX_HEAPS       32U
+#define ADAPTER_RINGBUF_SIZE      (64U * 1024U)
+#define ADAPTER_RING_SLOT_QWORDS  24U
+#define ADAPTER_RING_SLOT_BYTES   (ADAPTER_RING_SLOT_QWORDS * sizeof(uint64_t))
+#define ADAPTER_MAX_SUBQUEUES     4U
+#define ADAPTER_MAX_BOS           1024U
+#define ADAPTER_MAX_SYNCOBJS      512U
+#define ADAPTER_MAX_GROUPS        32U
+#define ADAPTER_MAX_HEAPS         32U
+#define ADAPTER_MAX_VIRTUAL_FDS   64U
 
-/* Public entrypoints usable both via LD_PRELOAD and direct Mesa kmod hook */
+/* Public entrypoints usable by direct Mesa kmod patch and tests */
 int panthor_kbase_adapter_open(const char *path, int flags);
 int panthor_kbase_adapter_dup(int fd);
+void panthor_kbase_adapter_set_dup_tracking(bool enable);
+bool panthor_kbase_adapter_get_dup_tracking(void);
 int panthor_kbase_adapter_close(int fd);
 bool panthor_kbase_adapter_is_virtual_drm_fd(int fd);
 int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg);
 void *panthor_kbase_adapter_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
 int panthor_kbase_adapter_munmap(void *addr, size_t length);
+
+/* Thread-local hint for pan_kmod_bo_alloc flags (EXECUTABLE / GPU_UNCACHED) */
+void panthor_kbase_adapter_hint_bo_flags(uint32_t kmod_flags);
+uint64_t panthor_kbase_adapter_get_bo_gpu_va(uint32_t gem_handle);
 
 /* CSF Bytecode Normalizer & Ring Emitter (exposed for unit tests & OR-Tools verifier) */
 struct adapter_cs_patch_stats {

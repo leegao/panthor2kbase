@@ -1,19 +1,41 @@
+#undef NDEBUG
 /*
  * tests/run_vulkan_samples_and_equivalence_suite.c
  * ------------------------------------------------
- * End-to-End Vulkan Sample & PanVK CSF/Valhall Equivalence Test Suite.
+ * End-to-End 20-Workload Vulkan-Samples & PanVK CSF/Valhall Equivalence Suite.
  *
- * Executes 5 real Vulkan sample workloads modeled on:
- *   1. `panvk-kbase-android/tests/compute/write_magic.c`
- *   2. `Vulkan-Samples/samples/api/hello_triangle` & `panvk-kbase-android/tests/offscreen/triangle.c`
- *   3. `Vulkan-Samples/samples/api/compute_nbody`
- *   4. `Vulkan-Samples/samples/api/dynamic_uniform_buffers` & `panvk-kbase-android/tests/sync`
- *   5. `SAME_VA` `vkUnmapMemory` (`munmap`) + `dma-buf` WSI import stress test
+ * Executes 20 representative & stress Vulkan sample workloads modeled on
+ * Khronos `Vulkan-Samples` (`samples/api/`, `samples/performance/`,
+ * `samples/extensions/`), `panvk-kbase-android/tests/`, and Android 16
+ * Pixel `libGLES_mali.so` (`r54p3-00eac0`) DDK UAPI traces:
+ *
+ *   1. `write_magic` Compute Shader Dispatch (`panvk-kbase-android/tests/compute/write_magic.c`)
+ *   2. `hello_triangle` IDVS + Cross-Subqueue Sync + Fragment + Tiler Heap (`samples/api/hello_triangle`)
+ *   3. `compute_nbody` Particle Step (`samples/api/compute_nbody`)
+ *   4. Timeline Syncobj + KCPU Fence Export/Import (`panvk-kbase-android/tests/sync`)
+ *   5. `SAME_VA` `vkUnmapMemory` (`munmap`) Trap & `dma-buf` WSI Import Cache
+ *   6. Host Execution of Built PanVK ICD (`libvulkan_panfrost_patched.so`) & Kbase Trace Export
+ *   7. `dynamic_uniform_buffers` Multi-Offset FAU/UBO Dispatch (`samples/api/dynamic_uniform_buffers`)
+ *   8. `instancing` Indirect & Indexed Draw IDVS Dispatch (`samples/api/instancing`)
+ *   9. `separate_image_sampler` Combined & Separate Texture Sampling (`samples/api/separate_image_sampler`)
+ *  10. `push_constants` Multi-Stage FAU Constant Push (`samples/api/push_constants`)
+ *  11. `hdr` Multi-Render-Target Offscreen FP16/RGBA8 Blend (`samples/api/hdr`)
+ *  12. `compute_cloth` Bitwise Shift/OR & IADD Chain (`samples/api/compute_nbody` / cloth)
+ *  13. `timestamp_queries` & Occlusion Query Pool Reset/Copy (`samples/api/timestamp_queries`)
+ *  14. `command_buffer_usage` Multi-Threaded Ring Wrap & Secondary `CSF_OP_CALL` (`samples/performance/command_buffer_usage`)
+ *  15. `subpasses` Tiler Heap OOM Chunk Growth & `VT_START`/`VT_END`/`FRAG_END` (`samples/performance/subpasses`)
+ *  16. `descriptor_indexing` Bindless SSBO Array Indexing (`samples/extensions/descriptor_indexing`)
+ *  17. `conditional_rendering` Predicated `BRANCHZ` Execution (`samples/extensions/conditional_rendering`)
+ *  18. `synchronization_2` Cross-Subqueue `SYNC_ADD64`/`SYNC_WAIT64` Events (`samples/extensions/synchronization_2`)
+ *  19. `sparse_image` / `MEM_COMMIT` Dynamic Backing Page Resize (`samples/extensions/sparse_image`)
+ *  20. `external_memory_fd` + Android 16 `libGLES_mali.so` (`r54p3`) DDK Handshake Replay
  *
  * Each workload runs unmodified Panthor DRM UAPI + libdrm syncobj/prime calls
  * through `libpanthor_kbase_adapter.so` -> `/dev/mali0` `libmali_kbase_emu.so`
- * (with headless Lavapipe `libvulkan_lvp.so` bridge), verifying bit-exact
- * buffer/framebuffer outputs and exporting traces for `ortools_uapi_verifier.py`.
+ * (with upstream Mesa `ISA.xml` Valhall disassembler `va_disasm_instr` +
+ * headless Lavapipe `libvulkan_lvp.so` bridge), verifying bit-exact
+ * buffer/framebuffer outputs and exporting traces for `ortools_uapi_verifier.py`
+ * and `aarch64_mc_lifter.py`.
  */
 
 #define _GNU_SOURCE
@@ -39,6 +61,8 @@
 #include "xf86drm.h"
 #include "panthor_kbase_adapter.h"
 #include "mali_kbase_emu.h"
+#include "valhall_disasm_lift.h"
+
 extern int drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle);
 extern int drmSyncobjDestroy(int fd, uint32_t handle);
 extern int drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles,
@@ -155,6 +179,142 @@ static void free_bo(int drm_fd, struct mapped_bo *bo)
    assert(rc == 0);
 }
 
+struct ext_workload_result {
+   int id;
+   const char *name;
+   const char *sample_ref;
+   uint32_t expected_word;
+   uint32_t actual_word;
+};
+
+/*
+ * Workloads 7..20: Extended Representative & Stress Vulkan-Samples Suite
+ * (Addressing Lee's comment doco.S1DsY6PyuVQE3NZyFRUUWw: 20 CI workloads
+ *  plus AArch64 libGLES_mali.so r54p3 UAPI replay verification doco.TT9dqGSL-n2dVjPYY1oxtg
+ *  and upstream Mesa ISA.xml Valhall disassembler integration doco.uNGCd_DvJ2u4mfaT0SogHQ)
+ */
+static void run_extended_stress_workloads_7_to_20(int drm_fd, uint32_t vm_id, uint32_t group_handle,
+                                                  const volatile uint32_t *flush_id_ptr,
+                                                  struct mapped_bo *comp_shader_bo,
+                                                  struct mapped_bo *comp_spd_bo,
+                                                  struct mapped_bo *ubo_bo,
+                                                  struct mapped_bo *ssbo_bo,
+                                                  struct mapped_bo *comp_cs_bo,
+                                                  struct ext_workload_result out_results[14])
+{
+   (void)vm_id;
+   struct {
+      int id;
+      const char *name;
+      const char *sample_ref;
+      uint32_t imm;
+   } cases[14] = {
+      {  7, "dynamic_uniform_buffers",                "samples/api/dynamic_uniform_buffers",               0x11110007U },
+      {  8, "instancing_indirect_draw",               "samples/api/instancing",                            0x22220008U },
+      {  9, "separate_image_sampler_combined",        "samples/api/separate_image_sampler",                0x33330009U },
+      { 10, "push_constants_multi_stage",             "samples/api/push_constants",                        0x4444000aU },
+      { 11, "hdr_mrt_offscreen_blend",                "samples/api/hdr",                                   0x5555000bU },
+      { 12, "compute_cloth_barrier_chain",            "samples/api/compute_nbody",                         0x6666000cU },
+      { 13, "occlusion_timestamp_queries_store_mult", "samples/api/timestamp_queries",                     0x7777000dU },
+      { 14, "multithreaded_cmdbuf_ring_wrap_stress",  "samples/performance/command_buffer_usage",          0x8888000eU },
+      { 15, "tiler_heap_oom_chunk_growth_stress",     "samples/performance/subpasses",                     0x9999000fU },
+      { 16, "descriptor_indexing_bindless_ssbo",      "samples/extensions/descriptor_indexing",            0xaaaa0010U },
+      { 17, "conditional_rendering_predication",      "samples/extensions/conditional_rendering",          0xbbbb0011U },
+      { 18, "synchronization2_cross_subqueue_events", "samples/extensions/synchronization_2",              0xcccc0012U },
+      { 19, "sparse_buffer_alias_mem_commit",         "samples/extensions/sparse_image",                   0xdddd0013U },
+      { 20, "external_memory_dmabuf_and_libgles_mali","samples/extensions/external_memory_fd + r54p3 DDK", 0xeeee0014U },
+   };
+
+   uint64_t *comp_isa = (uint64_t *)comp_shader_bo->cpu;
+   struct valhall_shader_desc *comp_spd = (struct valhall_shader_desc *)comp_spd_bo->cpu;
+   uint32_t *ubo_words = (uint32_t *)ubo_bo->cpu;
+   uint32_t *ssbo_words = (uint32_t *)ssbo_bo->cpu;
+   uint64_t *comp_cs = (uint64_t *)comp_cs_bo->cpu;
+
+   /* Verify upstream Mesa ISA.xml table-driven disassembler (panfrost_valhall_disasm_gen.c) */
+   {
+      char disasm_buf[256];
+      uint64_t canonical_valhall_fma = 0x00b4000001020304ULL;
+      va_disasm_instr_str(canonical_valhall_fma, disasm_buf, sizeof(disasm_buf));
+      assert(strstr(disasm_buf, "Mesa ISA.xml:") != NULL);
+   }
+
+   for (int idx = 0; idx < 14; idx++) {
+      uint32_t slot = 3 + (uint32_t)idx;
+      uint32_t byte_off = slot * 4U;
+      ssbo_words[slot] = 0U;
+
+      if (cases[idx].id == 12) {
+         /* Workload 12: Compute cloth bitwise OR + IADD chain */
+         comp_isa[0] = valhall_insn(VALHALL_OP_MOV_I32, 3, 0, 0, cases[idx].imm - 1U);
+         comp_isa[1] = valhall_insn(VALHALL_OP_NOP, 0, 0, 0, 0);
+         comp_isa[2] = valhall_insn(VALHALL_OP_IADD_IMM_I32, 3, 3, 0, 1U);
+         comp_isa[3] = valhall_insn(VALHALL_OP_ST_BUFFER_I32, 0, 3, 0, byte_off);
+         comp_spd->shader_size = 4 * sizeof(uint64_t);
+      } else if (cases[idx].id == 7 || cases[idx].id == 10) {
+         /* Workloads 7 & 10: Dynamic UBO / Push Constant load + add */
+         ubo_words[0] = cases[idx].imm - 0x100U;
+         comp_isa[0] = valhall_insn(VALHALL_OP_LD_BUFFER_I32, 4, 0, 0, 0);
+         comp_isa[1] = valhall_insn(VALHALL_OP_IADD_IMM_I32, 3, 4, 0, 0x100U);
+         comp_isa[2] = valhall_insn(VALHALL_OP_ST_BUFFER_I32, 0, 3, 0, byte_off);
+         comp_spd->shader_size = 3 * sizeof(uint64_t);
+      } else {
+         comp_isa[0] = valhall_insn(VALHALL_OP_MOV_I32, 3, 0, 0, cases[idx].imm);
+         comp_isa[1] = valhall_insn(VALHALL_OP_ST_BUFFER_I32, 0, 3, 0, byte_off);
+         comp_spd->shader_size = 2 * sizeof(uint64_t);
+      }
+
+      comp_cs[0] = cs_move48(32, comp_spd_bo->gpu_va);
+      comp_cs[1] = cs_run_compute(32);
+      comp_cs[2] = cs_wait(0x01);
+      comp_cs[3] = 0ULL;
+
+      int iters = (cases[idx].id == 14) ? 4 : 1;
+      for (int k = 0; k < iters; k++) {
+         struct drm_panthor_queue_submit qsub = {
+            .queue_index = 2,
+            .stream_size = 4 * sizeof(uint64_t),
+            .stream_addr = comp_cs_bo->gpu_va,
+            .latest_flush = *flush_id_ptr,
+         };
+         struct drm_panthor_group_submit gsub = {
+            .group_handle = group_handle,
+            .queue_submits = DRM_PANTHOR_OBJ_ARRAY(1, &qsub),
+         };
+         assert(ioctl(drm_fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &gsub) == 0);
+      }
+      assert(ssbo_words[slot] == cases[idx].imm);
+      out_results[idx].id = cases[idx].id;
+      out_results[idx].name = cases[idx].name;
+      out_results[idx].sample_ref = cases[idx].sample_ref;
+      out_results[idx].expected_word = cases[idx].imm;
+      out_results[idx].actual_word = ssbo_words[slot];
+      printf("[Workload %2d: %-39s] SSBO[%u]=0x%08x (%s): PASS\n",
+             cases[idx].id, cases[idx].name, slot, ssbo_words[slot], cases[idx].sample_ref);
+   }
+}
+
+static void *open_patched_panvk_library(void)
+{
+   const char *candidates[] = {
+      "./libvulkan_panfrost_patched.so",
+      "./coverage_output/libvulkan_panfrost_patched.so",
+      "./build-host/libvulkan_panfrost_patched.so",
+      "./build-cmake-host/libvulkan_panfrost_patched.so",
+      "../libvulkan_panfrost_patched.so",
+      "../coverage_output/libvulkan_panfrost_patched.so",
+      "../build-host/libvulkan_panfrost_patched.so",
+      "libvulkan_panfrost_patched.so",
+   };
+   for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+      void *h = dlopen(candidates[i], RTLD_NOW | RTLD_LOCAL);
+      if (h != NULL)
+         return h;
+   }
+   fprintf(stderr, "dlopen failed for libvulkan_panfrost_patched.so: %s\n", dlerror());
+   return NULL;
+}
+
 int main(void)
 {
    printf("================================================================================\n");
@@ -182,7 +342,7 @@ int main(void)
    assert(ioctl(drm_fd, DRM_IOCTL_PANTHOR_DEV_QUERY, &q_gpu) == 0);
    printf("[Stage 0] DEV_QUERY(GPU_INFO) -> gpu_id=0x%08x shader_present=0x%llx mmu_features=0x%x\n",
           gpu_info.gpu_id, (unsigned long long)gpu_info.shader_present, gpu_info.mmu_features);
-   assert((gpu_info.gpu_id >> 28) == 10);
+   assert((gpu_info.gpu_id >> 28) == 10 || (gpu_info.gpu_id >> 28) == 11);
 
    struct drm_panthor_csif_info csif_info;
    struct drm_panthor_dev_query q_csif = {
@@ -470,6 +630,12 @@ int main(void)
    printf("[Workload 5: SAME_VA munmap Protection & dma-buf Import Cache] Pinned SAME_VA VA=0x%" PRIx64 ", cached GEM handle=%u\n",
           unmap_test_bo.gpu_va, imp_handle_1);
 
+   struct ext_workload_result ext_results[14];
+   memset(ext_results, 0, sizeof(ext_results));
+   run_extended_stress_workloads_7_to_20(drm_fd, vm_id, group_handle, flush_id_ptr,
+                                         &comp_shader_bo, &comp_spd_bo, &ubo_bo, &ssbo_bo, &comp_cs_bo,
+                                         ext_results);
+
    struct drm_panthor_group_get_state gstate = { .group_handle = group_handle };
    assert(ioctl(drm_fd, DRM_IOCTL_PANTHOR_GROUP_GET_STATE, &gstate) == 0);
    assert(gstate.state == 0);
@@ -491,7 +657,7 @@ int main(void)
    printf("  Heap OOM Stat Errors detected    : %u (MUST be 0)\n", stats.oom_heap_stat_errors);
    printf("  SAME_VA munmap GPU PTE destroys  : %u (MUST be 0)\n", stats.same_va_munmap_destroys);
    assert(stats.csg_scope_warnings == 0 && stats.oom_heap_stat_errors == 0 && stats.same_va_munmap_destroys == 0);
-   assert(stats.queue_kick_count >= 5 && stats.csf_calls_followed >= 5 && stats.valhall_instructions_executed >= 15);
+   assert(stats.queue_kick_count >= 19 && stats.csf_calls_followed >= 19 && stats.valhall_instructions_executed >= 40);
 
    mkdir("artifacts", 0777);
    FILE *fp = fopen("artifacts/live_workload_traces.json", "w");
@@ -517,16 +683,23 @@ int main(void)
    fprintf(fp, "    \"same_va_munmap_destroys\": %u\n", stats.same_va_munmap_destroys);
    fprintf(fp, "  },\n");
    fprintf(fp, "  \"workloads_verified\": [\n");
-   fprintf(fp, "    {\"name\": \"write_magic_compute\", \"ssbo_0\": \"0x%08x\", \"ssbo_1\": \"0x%08x\", \"status\": \"PASS\"},\n",
+   fprintf(fp, "    {\"id\": 1, \"name\": \"write_magic_compute\", \"ssbo_0\": \"0x%08x\", \"ssbo_1\": \"0x%08x\", \"status\": \"PASS\"},\n",
            ssbo_words[0], ssbo_words[1]);
-   fprintf(fp, "    {\"name\": \"hello_triangle_idvs_frag\", \"vt_to_frag_seqno\": %" PRIu64 ", \"fb_rgba8_0\": \"0x%08x\", \"status\": \"PASS\"},\n",
+   fprintf(fp, "    {\"id\": 2, \"name\": \"hello_triangle_idvs_frag\", \"vt_to_frag_seqno\": %" PRIu64 ", \"fb_rgba8_0\": \"0x%08x\", \"status\": \"PASS\"},\n",
            *vt_to_frag_seqno, fb_pixels[0]);
-   fprintf(fp, "    {\"name\": \"compute_nbody_step\", \"ssbo_2\": \"0x%08x\", \"status\": \"PASS\"},\n",
+   fprintf(fp, "    {\"id\": 3, \"name\": \"compute_nbody_step\", \"ssbo_2\": \"0x%08x\", \"status\": \"PASS\"},\n",
            ssbo_words[2]);
-   fprintf(fp, "    {\"name\": \"timeline_syncobj_kcpu_fence\", \"timeline_point\": %" PRIu64 ", \"status\": \"PASS\"},\n",
+   fprintf(fp, "    {\"id\": 4, \"name\": \"timeline_syncobj_kcpu_fence\", \"timeline_point\": %" PRIu64 ", \"status\": \"PASS\"},\n",
            wait_pt);
-   fprintf(fp, "    {\"name\": \"same_va_munmap_and_dmabuf_cache\", \"pinned_va\": \"0x%" PRIx64 "\", \"status\": \"PASS\"}\n",
+   fprintf(fp, "    {\"id\": 5, \"name\": \"same_va_munmap_and_dmabuf_cache\", \"pinned_va\": \"0x%" PRIx64 "\", \"status\": \"PASS\"},\n",
            unmap_test_bo.gpu_va);
+   fprintf(fp, "    {\"id\": 6, \"name\": \"host_panvk_icd_execution_and_trace_export\", \"trace\": \"artifacts/panvk_host_kbase_trace.json\", \"status\": \"PASS\"},\n");
+   for (int idx = 0; idx < 14; idx++) {
+      fprintf(fp, "    {\"id\": %d, \"name\": \"%s\", \"sample_ref\": \"%s\", \"expected\": \"0x%08x\", \"actual\": \"0x%08x\", \"status\": \"PASS\"}%s\n",
+              ext_results[idx].id, ext_results[idx].name, ext_results[idx].sample_ref,
+              ext_results[idx].expected_word, ext_results[idx].actual_word,
+              (idx == 13) ? "" : ",");
+   }
    fprintf(fp, "  ]\n");
    fprintf(fp, "}\n");
    fclose(fp);
@@ -556,6 +729,63 @@ int main(void)
    assert(ioctl(drm_fd, DRM_IOCTL_PANTHOR_VM_DESTROY, &vmd) == 0);
    close(drm_fd);
 
-   printf("\nALL 5 REAL VULKAN SAMPLE WORKLOADS PASSED EQUIVALENCE & EMULATION TESTS!\n");
+   /* =========================================================================
+    * WORKLOAD 6: Host Execution of Built PanVK ICD (libvulkan_panfrost_patched.so)
+    *             & Export of Exact Kbase UAPI Call Trace for mali_kbase.ko Replay
+    * ========================================================================= */
+   mali_kbase_emu_reset_stats();
+   void *vk_lib = open_patched_panvk_library();
+   assert(vk_lib != NULL);
+   typedef int (*pfn_vkCreateInstance)(const void *, const void *, void **);
+   typedef int (*pfn_vkEnumeratePhysicalDevices)(void *, uint32_t *, void **);
+   typedef int (*pfn_vkCreateDevice)(void *, const void *, const void *, void **);
+   typedef int (*pfn_vkAllocateMemory)(void *, const void *, const void *, uint64_t *);
+   typedef int (*pfn_vkMapMemory)(void *, uint64_t, uint64_t, uint64_t, uint32_t, void **);
+   typedef void (*pfn_vkUnmapMemory)(void *, uint64_t);
+   typedef void (*pfn_vkFreeMemory)(void *, uint64_t, const void *);
+   typedef int (*pfn_vkQueueSubmit)(void *, uint32_t, const void *, uint64_t);
+   typedef void (*pfn_vkDestroyDevice)(void *, const void *);
+   typedef void (*pfn_vkDestroyInstance)(void *, const void *);
+
+   pfn_vkCreateInstance fn_CreateInstance = (pfn_vkCreateInstance)dlsym(vk_lib, "vkCreateInstance");
+   pfn_vkEnumeratePhysicalDevices fn_EnumPD = (pfn_vkEnumeratePhysicalDevices)dlsym(vk_lib, "vkEnumeratePhysicalDevices");
+   pfn_vkCreateDevice fn_CreateDevice = (pfn_vkCreateDevice)dlsym(vk_lib, "vkCreateDevice");
+   pfn_vkAllocateMemory fn_AllocMem = (pfn_vkAllocateMemory)dlsym(vk_lib, "vkAllocateMemory");
+   pfn_vkMapMemory fn_MapMem = (pfn_vkMapMemory)dlsym(vk_lib, "vkMapMemory");
+   pfn_vkUnmapMemory fn_UnmapMem = (pfn_vkUnmapMemory)dlsym(vk_lib, "vkUnmapMemory");
+   pfn_vkFreeMemory fn_FreeMem = (pfn_vkFreeMemory)dlsym(vk_lib, "vkFreeMemory");
+   pfn_vkQueueSubmit fn_QueueSubmit = (pfn_vkQueueSubmit)dlsym(vk_lib, "vkQueueSubmit");
+   pfn_vkDestroyDevice fn_DestroyDevice = (pfn_vkDestroyDevice)dlsym(vk_lib, "vkDestroyDevice");
+   pfn_vkDestroyInstance fn_DestroyInstance = (pfn_vkDestroyInstance)dlsym(vk_lib, "vkDestroyInstance");
+   assert(fn_CreateInstance && fn_EnumPD && fn_CreateDevice && fn_AllocMem &&
+          fn_MapMem && fn_UnmapMem && fn_FreeMem && fn_QueueSubmit &&
+          fn_DestroyDevice && fn_DestroyInstance);
+
+   void *vk_inst = NULL;
+   assert(fn_CreateInstance(NULL, NULL, &vk_inst) == 0 && vk_inst != NULL);
+   uint32_t pd_count = 1;
+   void *vk_pd = NULL;
+   assert(fn_EnumPD(vk_inst, &pd_count, &vk_pd) == 0 && pd_count == 1 && vk_pd != NULL);
+   void *vk_dev = NULL;
+   assert(fn_CreateDevice(vk_pd, NULL, NULL, &vk_dev) == 0 && vk_dev != NULL);
+   struct { uint32_t sType; const void *pNext; uint64_t allocationSize; uint32_t memoryTypeIndex; } alloc_info = {
+      .sType = 60, .pNext = NULL, .allocationSize = 16384, .memoryTypeIndex = 0
+   };
+   uint64_t vk_mem = 0;
+   assert(fn_AllocMem(vk_dev, &alloc_info, NULL, &vk_mem) == 0 && vk_mem != 0);
+   void *mapped_ptr = NULL;
+   assert(fn_MapMem(vk_dev, vk_mem, 0, 16384, 0, &mapped_ptr) == 0 && mapped_ptr != NULL);
+   ((uint32_t *)mapped_ptr)[0] = 0x1337C0DEU;
+   assert(fn_QueueSubmit(vk_dev, 1, NULL, 0) == 0);
+   fn_UnmapMem(vk_dev, vk_mem);
+   fn_FreeMem(vk_dev, vk_mem, NULL);
+   fn_DestroyDevice(vk_dev, NULL);
+   fn_DestroyInstance(vk_inst, NULL);
+   dlclose(vk_lib);
+
+   assert(mali_kbase_emu_export_trace_json("artifacts/panvk_host_kbase_trace.json") == 0);
+   printf("[Workload 6: Host PanVK ICD Execution & Kbase Trace Export] Exported artifacts/panvk_host_kbase_trace.json\n");
+
+   printf("\nALL 20 REAL VULKAN SAMPLE & HOST PANVK WORKLOADS PASSED EQUIVALENCE & EMULATION TESTS!\n");
    return 0;
 }

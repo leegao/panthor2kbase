@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # scripts/run_coverage.sh
 # -----------------------
-# Compiles the Panthor-to-Kbase adapter and /dev/mali0 emulator with GCC code
-# coverage instrumentation (--coverage), executes the full 5-stage Vulkan
+# Compiles the C++ Panthor-to-Kbase adapter and /dev/mali0 emulator with GCC code
+# coverage instrumentation (--coverage), executes the full 20-workload Vulkan
 # sample suite and supplementary unit test suites, generates gcov reports,
 # and calculates line and branch coverage statistics.
 set -euo pipefail
@@ -19,13 +19,38 @@ echo "==========================================================================
 echo " Building Panthor-Kbase Suite with Code Coverage Instrumentation"
 echo "================================================================================"
 
-gcc -Wall -Wextra -Werror -Wno-nonnull-compare -O0 -g --coverage -fPIC -shared \
+g++ -std=c++17 -Wall -Wextra -Werror -Wno-nonnull-compare -O0 -g --coverage -fPIC \
     -Iinclude -Isrc/adapter -Isrc/emulator \
-    -o "${COVERAGE_DIR}/libpanthor_kbase_adapter.so" src/adapter/panthor_kbase_adapter.c -ldl -lpthread
+    -c src/adapter/panthor_kbase_adapter.cpp -o "${COVERAGE_DIR}/panthor_kbase_adapter.o"
+
+g++ -std=c++17 -Wall -Wextra -Werror -Wno-nonnull-compare -O0 -g --coverage -fPIC \
+    -Iinclude -Isrc/adapter -Isrc/emulator \
+    -c src/adapter/log.cpp -o "${COVERAGE_DIR}/log.o"
+
+gcc -Wall -Wextra -Werror -Wno-nonnull-compare -O0 -g --coverage -fPIC \
+    -Iinclude -Isrc/adapter -Isrc/emulator \
+    -c src/adapter/drm_mode_stubs.c -o "${COVERAGE_DIR}/drm_mode_stubs.o"
+
+g++ -std=c++17 -O0 -g --coverage -fPIC -shared \
+    -o "${COVERAGE_DIR}/libpanthor_kbase_adapter.so" \
+    "${COVERAGE_DIR}/panthor_kbase_adapter.o" \
+    "${COVERAGE_DIR}/log.o" \
+    "${COVERAGE_DIR}/drm_mode_stubs.o" \
+    -ldl -lpthread
 
 gcc -Wall -Wextra -Werror -Wno-nonnull-compare -O0 -g --coverage -fPIC -shared \
     -Iinclude -Isrc/adapter -Isrc/emulator \
-    -o "${COVERAGE_DIR}/libmali_kbase_emu.so" src/emulator/mali_kbase_emu.c -ldl -lpthread
+    -o "${COVERAGE_DIR}/libmali_kbase_emu.so" \
+    src/emulator/mali_kbase_emu.c \
+    src/emulator/panfrost_valhall_disasm_gen.c \
+    "${COVERAGE_DIR}/libpanthor_kbase_adapter.so" -Wl,-rpath,"${COVERAGE_DIR}" -ldl -lpthread
+
+gcc -Wall -Wextra -Werror -Wno-nonnull-compare -O0 -g -fPIC -DPANTHOR_KBASE_PATCHED_KMOD=1 -shared \
+    -Iinclude -Isrc/adapter -Isrc/emulator \
+    -o "${COVERAGE_DIR}/libvulkan_panfrost_patched.so" src/vulkan_android_icd/panvk_android_icd.c \
+    "${COVERAGE_DIR}/libpanthor_kbase_adapter.so" -Wl,-rpath,"${COVERAGE_DIR}" -ldl -lpthread
+
+cp -f "${COVERAGE_DIR}/libvulkan_panfrost_patched.so" "${ROOT_DIR}/libvulkan_panfrost_patched.so"
 
 gcc -Wall -Wextra -Werror -Wno-nonnull-compare -O0 -g --coverage \
     -Iinclude -Isrc/adapter -Isrc/emulator \
@@ -62,11 +87,15 @@ files = glob.glob(os.path.join(cov_dir, "*.gcda"))
 for f in files:
     subprocess.run(["gcov", "-b", "-c", "-o", cov_dir, f], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-# Move generated .gcov files into coverage_output/
 for g in glob.glob("*.gcov"):
     os.replace(g, os.path.join(cov_dir, g))
 
-gcov_files = [f for f in os.listdir(cov_dir) if f.endswith(".c.gcov")]
+gcov_files = [
+    f for f in os.listdir(cov_dir)
+    if (f.endswith(".c.gcov") or f.endswith(".cpp.gcov"))
+    and not f.startswith("usr#")
+    and f != "panfrost_valhall_disasm_gen.c.gcov"
+]
 coverage_data = {}
 total_lines = 0
 total_exec = 0

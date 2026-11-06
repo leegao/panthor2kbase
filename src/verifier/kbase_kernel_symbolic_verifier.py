@@ -90,6 +90,16 @@ def extract_kernel_source_guards(kernel_root=DEFAULT_KERNEL_ROOT):
          "guard": "frag_end > vt_end || vt_end >= vt_start", "ret": "EINVAL"},
         {"id": "G18_SAME_VA_MUNMAP_FREE_ON_CLOSE", "file": "mali_kbase_mem_linux.c", "func": "kbase_context_mmap / kbase_cpu_vm_close",
          "guard": "munmap(same_va_ptr) -> free_on_close=1 tears down GPU PTEs", "ret": "PTE_DESTROYED"},
+        {"id": "G19_MEM_ALLOC_KERNEL_ONLY_0xA0", "file": "mali_kbase_core_linux.c", "func": "kbase_api_mem_alloc_ex",
+         "guard": "(flags & BASEP_MEM_FLAGS_KERNEL_ONLY (0xa0)) != 0 (PC 0x29fd4)", "ret": "ENOMEM"},
+        {"id": "G20_MEM_ALLOC_GROW_ON_GPF_EXT", "file": "mali_kbase_mem.c", "func": "kbase_check_alloc_sizes",
+         "guard": "(flags & BASE_MEM_GROW_ON_GPF (0x200)) && extension == 0 (PC 0x07084)", "ret": "ENOMEM"},
+        {"id": "G21_MEM_ALLOC_COHERENCY_MUTUAL_EXCLUSION", "file": "mali_kbase_mem_linux.c", "func": "kbase_mem_alloc",
+         "guard": "(flags & (BASE_MEM_COHERENT_SYSTEM | BASE_MEM_COHERENT_LOCAL) (0xc00)) == 0xc00 (PC 0x13710)", "ret": "ENOMEM"},
+        {"id": "G22_CSF_EVENT_FORCED_COHERENT_SYSTEM", "file": "mali_kbase_core_linux.c", "func": "kbase_api_mem_alloc_ex",
+         "guard": "(flags & BASE_MEM_CSF_EVENT (1<<19)) -> forces flags |= 0x3400 (SAME_VA|COHERENT_SYSTEM|CACHED_CPU) (PC 0x2a054)", "ret": "FORCED_0x3400"},
+        {"id": "G23_STREAM_CREATE_RETVAL_FD", "file": "mali_kbase_core_linux.c", "func": "kbase_api_stream_create",
+         "guard": "name[31] == 0 && returns anon_inode_getfd in ioctl retval w0 without modifying name[32] (PC 0x2a318..0x2a340)", "ret": "FD_IN_W0"},
     ]
 
     verified_in_source = 0
