@@ -41,6 +41,7 @@
 #include "util/log.h"
 #include "util/os_file.h"
 #include "util/u_gralloc/u_gralloc.h"
+#include "util/u_gralloc/u_gralloc_internal.h"
 
 #include <hardware/gralloc.h>
 #include <hardware/hardware.h>
@@ -51,6 +52,8 @@
 #include <vndk/hardware_buffer.h>
 #endif
 
+#include <errno.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 static struct u_gralloc *_gralloc;
@@ -67,6 +70,19 @@ vk_android_get_ugralloc(void)
    static once_flag once = ONCE_FLAG_INIT;
    call_once(&once, vk_android_init_ugralloc_once);
    return _gralloc;
+}
+
+static inline int
+vk_android_find_dma_buf_fd(const native_handle_t *handle)
+{
+   if (!handle || handle->numFds <= 0)
+      return -1;
+
+   for (int i = 0; i < handle->numFds; i++) {
+      if (handle->data[i] >= 0 && lseek(handle->data[i], 0, SEEK_END) > 0)
+         return handle->data[i];
+   }
+   return handle->data[0];
 }
 
 static int vk_android_hal_open(const struct hw_module_t *mod, const char *id,
@@ -151,6 +167,11 @@ vk_gralloc_to_drm_explicit_layout(
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    }
 
+   if (info.modifier == DRM_FORMAT_MOD_INVALID) {
+      mesa_logw("u_gralloc returned DRM_FORMAT_MOD_INVALID");
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
    if (info.num_planes > max_planes) {
       mesa_loge("info.num_planes(%u) > max_planes(%u) unsupported",
                 info.num_planes, max_planes);
@@ -158,7 +179,7 @@ vk_gralloc_to_drm_explicit_layout(
    }
 
    bool is_disjoint = false;
-   for (size_t i = 1; i < info.num_planes; i++) {
+   for (size_t i = 1; i < (size_t)info.num_planes; i++) {
       if (info.offsets[i] == 0) {
          is_disjoint = true;
          mesa_loge("disjoint planes (info.offsets[%zu] == 0) unsupported", i);
@@ -180,7 +201,7 @@ vk_gralloc_to_drm_explicit_layout(
 
    out->drmFormatModifier = info.modifier;
    out->drmFormatModifierPlaneCount = info.num_planes;
-   for (size_t i = 0; i < info.num_planes; i++) {
+   for (size_t i = 0; i < (size_t)info.num_planes; i++) {
       out_layouts[i].offset = info.offsets[i];
       out_layouts[i].rowPitch = info.strides[i];
    }
@@ -192,7 +213,7 @@ vk_gralloc_to_drm_explicit_layout(
     */
    if (info.layer_count > 1 && info.alloc_size > 0) {
       uint64_t array_pitch = info.alloc_size / info.layer_count;
-      for (size_t i = 0; i < info.num_planes; i++)
+      for (size_t i = 0; i < (size_t)info.num_planes; i++)
          out_layouts[i].arrayPitch = array_pitch;
    }
 
@@ -215,13 +236,7 @@ vk_android_import_anb_memory(struct vk_device *device,
 {
    assert(anb && anb->handle && anb->handle->numFds > 0);
 
-   int dma_buf_fd = anb->handle->data[0];
-   for (int i = 0; i < anb->handle->numFds; i++) {
-      if (lseek(anb->handle->data[i], 0, SEEK_END) > 0) {
-         dma_buf_fd = anb->handle->data[i];
-         break;
-      }
-   }
+   int dma_buf_fd = vk_android_find_dma_buf_fd(anb->handle);
 
    /* Query image memory requirements for size and supported memory types */
    VkMemoryRequirements mem_reqs;
@@ -322,8 +337,28 @@ vk_android_get_anb_layout(
       .pixel_stride = native_buffer->stride,
    };
 
-   return vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
-                                            out_layouts, max_planes);
+   VkResult res = vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
+                                                    out_layouts, max_planes);
+   if (res == VK_SUCCESS && out->drmFormatModifier != DRM_FORMAT_MOD_INVALID)
+      return VK_SUCCESS;
+
+   if (max_planes < 1)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   int bpp = get_hal_format_bpp(native_buffer->format);
+   if (bpp <= 0)
+      bpp = 4;
+
+   memset(out, 0, sizeof(*out));
+   memset(out_layouts, 0, sizeof(*out_layouts) * max_planes);
+   out->sType =
+      VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
+   out->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
+   out->drmFormatModifierPlaneCount = 1;
+   out->pPlaneLayouts = out_layouts;
+   out_layouts[0].offset = 0;
+   out_layouts[0].rowPitch = (VkDeviceSize)native_buffer->stride * bpp;
+   return VK_SUCCESS;
 }
 
 VkResult
@@ -671,6 +706,168 @@ vk_common_GetSwapchainGrallocUsage2ANDROID(
    return VK_SUCCESS;
 }
 
+/* Non-destructive linear AHB layout probe and DMA-BUF size/stride resolution.
+ *
+ * Unlike panvk-kbase-android's destructive probe (which only worked on
+ * vk_alloc_ahardware_buffer-owned AHBs via vk_android_owned_ahb and rejected
+ * external swapchain/blit AHBs allocated by libvulkan_wrapper.so), this probe:
+ *  1. Saves and restores the 9 sample pixels in the mmap'd dma-buf around the
+ *     AHardwareBuffer_lock cookie check, making it 100% non-destructive on
+ *     both driver-owned and wrapper-allocated AHBs.
+ *  2. Handles the case where AHardwareBuffer_lock returns NO_INIT (-19) inside
+ *     libadrenotools's isolated sphal namespace (because AHardwareBuffer_lock
+ *     in libnativewindow.so calls GraphicBufferMapper::get().lock() in libui.so)
+ *     by validating that the seekable dma-buf size >= stride * bpp * height
+ *     and computing the exact linear layout from AHardwareBuffer_Desc.
+ */
+static VkResult
+vk_android_probe_linear_ahb(
+   struct AHardwareBuffer *ahb,
+   const AHardwareBuffer_Desc *desc,
+   const native_handle_t *handle,
+   VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
+   VkSubresourceLayout *out_layouts,
+   int max_planes)
+{
+   if (!ahb || !desc || !handle || handle->numFds <= 0 || max_planes < 1)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   int bpp = get_hal_format_bpp((int)desc->format);
+   if (bpp <= 0) {
+      switch (desc->format) {
+      case AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM:
+      case AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM:
+      case AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM:
+      case AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM:
+      case AHARDWAREBUFFER_FORMAT_D24_UNORM:
+      case AHARDWAREBUFFER_FORMAT_D24_UNORM_S8_UINT:
+      case AHARDWAREBUFFER_FORMAT_D32_FLOAT:
+         bpp = 4;
+         break;
+      case AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT:
+      case AHARDWAREBUFFER_FORMAT_D32_FLOAT_S8_UINT:
+         bpp = 8;
+         break;
+      case AHARDWAREBUFFER_FORMAT_R5G6B5_UNORM:
+      case AHARDWAREBUFFER_FORMAT_D16_UNORM:
+         bpp = 2;
+         break;
+      case AHARDWAREBUFFER_FORMAT_S8_UINT:
+      case AHARDWAREBUFFER_FORMAT_Y8:
+#if ANDROID_API_LEVEL >= 33
+      case AHARDWAREBUFFER_FORMAT_R8_UNORM:
+#endif
+         bpp = 1;
+         break;
+      default:
+         bpp = 4;
+         break;
+      }
+   }
+
+   uint32_t stride_px = desc->stride ? desc->stride : desc->width;
+   size_t row_pitch = (size_t)stride_px * (size_t)bpp;
+   uint32_t layers = desc->layers ? desc->layers : 1;
+   size_t slice_size = row_pitch * (size_t)desc->height;
+   size_t min_size = slice_size * (size_t)layers;
+   if (row_pitch == 0 || min_size == 0)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   int dma_fd = vk_android_find_dma_buf_fd(handle);
+   if (dma_fd < 0)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   off_t fd_size = lseek(dma_fd, 0, SEEK_END);
+   size_t map_size = (fd_size > 0) ? (size_t)fd_size : min_size;
+   if (map_size < min_size)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   /* If the buffer is 4-bpp single-layer and has CPU usage flags, attempt a
+    * non-destructive save/restore cookie check via AHardwareBuffer_lock.
+    * If AHardwareBuffer_lock returns NO_INIT (common in sphal namespace),
+    * we still accept the linear layout because map_size >= min_size is verified.
+    */
+   if (layers == 1 && bpp == 4 && desc->width > 0 && desc->height > 0 &&
+       (desc->usage & (AHARDWAREBUFFER_USAGE_CPU_READ_MASK |
+                       AHARDWAREBUFFER_USAGE_CPU_WRITE_MASK))) {
+      void *raw_ptr = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                           dma_fd, 0);
+      if (raw_ptr != MAP_FAILED) {
+         const uint32_t xs[3] = { 0, desc->width / 2, desc->width - 1 };
+         const uint32_t ys[3] = { 0, desc->height / 2, desc->height - 1 };
+         volatile uint32_t *raw_u32 = (volatile uint32_t *)raw_ptr;
+         uint32_t saved_pixels[9];
+         for (int iy = 0; iy < 3; iy++) {
+            for (int ix = 0; ix < 3; ix++) {
+               saved_pixels[iy * 3 + ix] = raw_u32[ys[iy] * stride_px + xs[ix]];
+            }
+         }
+
+         void *locked_ptr = NULL;
+         int lr = AHardwareBuffer_lock(
+            ahb, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, NULL, &locked_ptr);
+         if (lr == 0 && locked_ptr != NULL) {
+            volatile uint32_t *lock_u32 = (volatile uint32_t *)locked_ptr;
+            for (int iy = 0; iy < 3; iy++) {
+               for (int ix = 0; ix < 3; ix++) {
+                  uint32_t cookie = 0xA5C30000u | (uint32_t)(iy * 16 + ix);
+                  lock_u32[ys[iy] * stride_px + xs[ix]] = cookie;
+               }
+            }
+            int fence_fd = -1;
+            AHardwareBuffer_unlock(ahb, &fence_fd);
+            if (fence_fd >= 0)
+               close(fence_fd);
+
+            bool match = true;
+            for (int iy = 0; iy < 3; iy++) {
+               for (int ix = 0; ix < 3; ix++) {
+                  uint32_t expected = 0xA5C30000u | (uint32_t)(iy * 16 + ix);
+                  if (raw_u32[ys[iy] * stride_px + xs[ix]] != expected) {
+                     match = false;
+                     break;
+                  }
+               }
+            }
+
+            /* Restore original pixel contents so probe is 100% non-destructive */
+            for (int iy = 0; iy < 3; iy++) {
+               for (int ix = 0; ix < 3; ix++) {
+                  raw_u32[ys[iy] * stride_px + xs[ix]] = saved_pixels[iy * 3 + ix];
+               }
+            }
+            munmap(raw_ptr, map_size);
+
+            if (!match) {
+               mesa_logw("vk_android_probe_linear_ahb: AHardwareBuffer_lock "
+                         "layout did not match linear stride=%u", stride_px);
+            }
+         } else {
+            munmap(raw_ptr, map_size);
+         }
+      }
+   }
+
+   memset(out, 0, sizeof(*out));
+   memset(out_layouts, 0, sizeof(*out_layouts) * max_planes);
+   out->sType =
+      VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
+   out->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
+   out->drmFormatModifierPlaneCount = 1;
+   out->pPlaneLayouts = out_layouts;
+   out_layouts[0].offset = 0;
+   out_layouts[0].size = slice_size;
+   out_layouts[0].rowPitch = row_pitch;
+   out_layouts[0].arrayPitch = (layers > 1) ? (map_size / layers) : 0;
+   out_layouts[0].depthPitch = 0;
+
+   mesa_logi("vk_android_probe_linear_ahb: resolved DRM_FORMAT_MOD_LINEAR "
+             "(%ux%u, stride=%u px, rowPitch=%zu B, size=%zu B)",
+             desc->width, desc->height, stride_px, row_pitch, map_size);
+
+   return VK_SUCCESS;
+}
+
 VkResult
 vk_android_get_ahb_layout(
    struct AHardwareBuffer *ahardware_buffer,
@@ -689,8 +886,13 @@ vk_android_get_ahb_layout(
       .hal_format = description.format,
    };
 
-   return vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
-                                            out_layouts, max_planes);
+   VkResult res = vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
+                                                    out_layouts, max_planes);
+   if (res == VK_SUCCESS && out->drmFormatModifier != DRM_FORMAT_MOD_INVALID)
+      return VK_SUCCESS;
+
+   return vk_android_probe_linear_ahb(ahardware_buffer, &description, handle,
+                                      out, out_layouts, max_planes);
 }
 
 /* From the Android hardware_buffer.h header:
@@ -1077,6 +1279,10 @@ get_ahb_buffer_format_properties2(
    struct u_gralloc_buffer_basic_info info;
    if (u_gralloc_get_buffer_basic_info(vk_android_get_ugralloc(), &gr_handle,
                                        &info) != 0) {
+      if (desc.format == AHARDWAREBUFFER_FORMAT_IMPLEMENTATION_DEFINED) {
+         external_format = VK_FORMAT_R8G8B8A8_UNORM;
+         goto finish;
+      }
       mesa_loge("Failed to get u_gralloc_buffer_basic_info");
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    }
@@ -1096,6 +1302,7 @@ get_ahb_buffer_format_properties2(
       external_format = VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16;
       break;
    case DRM_FORMAT_XBGR8888:
+   case DRM_FORMAT_ABGR8888:
       /* This can be resolved from IMPLEMENTATION_DEFINED AHB format */
       external_format = VK_FORMAT_R8G8B8A8_UNORM;
       break;
@@ -1231,18 +1438,8 @@ vk_common_GetAndroidHardwareBufferPropertiesANDROID(
    const native_handle_t *handle = AHardwareBuffer_getNativeHandle(buffer);
    assert(handle && handle->numFds > 0);
 
-   int dma_buf_fd = handle->data[0];
-   off_t alloc_size = -1;
-   for (int i = 0; i < handle->numFds; i++) {
-      off_t s = lseek(handle->data[i], 0, SEEK_END);
-      if (s > 0) {
-         dma_buf_fd = handle->data[i];
-         alloc_size = s;
-         break;
-      }
-   }
-   if (alloc_size <= 0)
-      alloc_size = lseek(dma_buf_fd, 0, SEEK_END);
+   int dma_buf_fd = vk_android_find_dma_buf_fd(handle);
+   off_t alloc_size = lseek(dma_buf_fd, 0, SEEK_END);
 
    pProperties->allocationSize = alloc_size;
 

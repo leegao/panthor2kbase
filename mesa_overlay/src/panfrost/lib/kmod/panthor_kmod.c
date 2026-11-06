@@ -400,9 +400,6 @@ panthor_kmod_bo_alloc(struct pan_kmod_dev *dev,
       mesa_loge("failed to allocate a panthor_kmod_bo object");
       return NULL;
    }
-#ifdef HAVE_PANTHOR_KBASE_UAPI_ADAPTER
-   panthor_kbase_adapter_hint_bo_flags(flags);
-#endif
 
    struct drm_panthor_bo_create req = {
       .size = size,
@@ -478,17 +475,6 @@ panthor_kmod_bo_import(struct pan_kmod_dev *dev, uint32_t handle, uint64_t size)
          mesa_loge("PANTHOR_BO_QUERY_INFO failed (err=%d)", errno);
          goto err_free_bo;
       }
-
-      /* FIXME: If the BO comes from a different subsystem
-       * (args.extra_flags & DRM_PANTHOR_BO_IS_IMPORTED), we should normally
-       * add extra DMA_BUF_IOCTL_SYNC calls around CPU accesses to ensure the
-       * CPU mapping consistency, but this is something we never worried about
-       * (we've always assumed exporters were exposing uncached mappings with
-       * NOP {begin,end}_cpu_access() implementations), and it worked fine until
-       * now.
-       * The long term plan is to hook up DMA_BUF_IOCTL_SYNC, but this requires
-       * more work.
-       */
    }
 
    /* Create a unsignalled syncobj on import. Will serve as a
@@ -519,6 +505,8 @@ panthor_kmod_bo_export(struct pan_kmod_bo *bo, int dmabuf_fd)
 
    /* If the BO wasn't already shared, we migrate our internal sync points to
     * the dmabuf itself, so implicit sync can work correctly after this point.
+    * On Android Kbase kernels where DMA_BUF_IOCTL_IMPORT_SYNC_FILE is not
+    * supported on exported BOs, tolerate ioctl failure gracefully.
     */
    if (!shared) {
       if (panthor_bo->sync.read_point || panthor_bo->sync.write_point) {
@@ -527,17 +515,14 @@ panthor_kmod_bo_export(struct pan_kmod_bo *bo, int dmabuf_fd)
          };
          int ret = drmSyncobjExportSyncFile(bo->dev->fd,
                                             panthor_bo->sync.handle, &isync.fd);
-         if (ret) {
-            mesa_loge("drmSyncobjExportSyncFile() failed (err=%d)", errno);
-            return -1;
-         }
-
-         ret = pan_kmod_ioctl(dmabuf_fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE,
-                              &isync);
-         close(isync.fd);
-         if (ret) {
-            mesa_loge("DMA_BUF_IOCTL_IMPORT_SYNC_FILE failed (err=%d)", errno);
-            return -1;
+         if (ret == 0 && isync.fd >= 0) {
+            ret = pan_kmod_ioctl(dmabuf_fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE,
+                                 &isync);
+            close(isync.fd);
+            if (ret) {
+               mesa_logw("DMA_BUF_IOCTL_IMPORT_SYNC_FILE unsupported on export (err=%d), continuing",
+                         errno);
+            }
          }
       }
 
@@ -584,61 +569,54 @@ panthor_kmod_bo_wait(struct pan_kmod_bo *bo, int64_t timeout_ns,
 
    if (shared) {
       /* If the object is shared, we have to do this export sync-file dance
-       * to reconcile with the implicit sync model. This implies exporting
-       * our GEM object as a dma-buf and closing it right after the
-       * EXPORT_SYNC_FILE, unfortunately.
+       * to reconcile with the implicit sync model. If DMA_BUF_IOCTL_EXPORT_SYNC_FILE
+       * is unsupported (e.g. Android Kbase kernels), fall back to timeline wait.
        */
-      int dmabuf_fd;
+      int dmabuf_fd = -1;
       int ret =
          drmPrimeHandleToFD(bo->dev->fd, bo->handle, DRM_CLOEXEC | DRM_RDWR, &dmabuf_fd);
 
-      if (ret) {
-         mesa_loge("drmPrimeHandleToFD() failed (err=%d)", errno);
-         return false;
+      if (ret == 0 && dmabuf_fd >= 0) {
+         struct dma_buf_export_sync_file esync = {
+            .flags = for_read_only_access ? DMA_BUF_SYNC_READ : DMA_BUF_SYNC_RW,
+            .fd = -1,
+         };
+
+         ret = pan_kmod_ioctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &esync);
+         close(dmabuf_fd);
+
+         if (ret == 0 && esync.fd >= 0) {
+            ret = sync_wait(esync.fd, timeout_ns / 1000000);
+            close(esync.fd);
+            return ret == 0;
+         }
       }
-
-      struct dma_buf_export_sync_file esync = {
-         .flags = for_read_only_access ? DMA_BUF_SYNC_READ : DMA_BUF_SYNC_RW,
-      };
-
-      ret = pan_kmod_ioctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &esync);
-      close(dmabuf_fd);
-
-      if (ret) {
-         mesa_loge("DMA_BUF_IOCTL_EXPORT_SYNC_FILE failed (err=%d)", errno);
-         return false;
-      }
-
-      ret = sync_wait(esync.fd, timeout_ns / 1000000);
-      close(esync.fd);
-      return ret == 0;
-   } else {
-      /* Waiting on non-shared object is much simpler. We just pick the
-       * right sync point based on for_read_only_access and call
-       * drmSyncobjTimelineWait().
-       */
-      uint64_t sync_point =
-         for_read_only_access
-            ? panthor_bo->sync.write_point
-            : MAX2(panthor_bo->sync.write_point, panthor_bo->sync.read_point);
-
-      if (!sync_point)
-         return true;
-
-      int64_t abs_timeout_ns = timeout_ns < INT64_MAX - os_time_get_nano()
-                                  ? timeout_ns + os_time_get_nano()
-                                  : INT64_MAX;
-      int ret = drmSyncobjTimelineWait(bo->dev->fd, &panthor_bo->sync.handle,
-                                       &sync_point, 1, abs_timeout_ns,
-                                       DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
-      if (ret >= 0)
-         return true;
-
-      if (ret != -ETIME)
-         mesa_loge("DMA_BUF_IOCTL_EXPORT_SYNC_FILE failed (err=%d)", ret);
-
-      return false;
    }
+
+   /* Waiting on non-shared object (or when DMA_BUF_IOCTL_EXPORT_SYNC_FILE is
+    * unsupported on Kbase) uses drmSyncobjTimelineWait().
+    */
+   uint64_t sync_point =
+      for_read_only_access
+         ? panthor_bo->sync.write_point
+         : MAX2(panthor_bo->sync.write_point, panthor_bo->sync.read_point);
+
+   if (!sync_point)
+      return true;
+
+   int64_t abs_timeout_ns = timeout_ns < INT64_MAX - os_time_get_nano()
+                               ? timeout_ns + os_time_get_nano()
+                               : INT64_MAX;
+   int ret = drmSyncobjTimelineWait(bo->dev->fd, &panthor_bo->sync.handle,
+                                    &sync_point, 1, abs_timeout_ns,
+                                    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+   if (ret >= 0)
+      return true;
+
+   if (ret != -ETIME)
+      mesa_loge("drmSyncobjTimelineWait failed (err=%d)", ret);
+
+   return false;
 }
 
 static int
@@ -688,36 +666,33 @@ panthor_kmod_bo_attach_sync_point(struct pan_kmod_bo *bo, uint32_t sync_handle,
       bo->flags & (PAN_KMOD_BO_FLAG_EXPORTED | PAN_KMOD_BO_FLAG_IMPORTED);
 
    if (shared) {
-      /* Reconciling explicit/implicit sync again: we need to import the
-       * new sync point in the dma-buf, so other parties can rely on
-       * implicit deps.
+      /* Reconciling explicit/implicit sync: import the new sync point in the
+       * dma-buf when supported by the kernel. If unsupported (e.g. Android
+       * Kbase), fall back to updating the internal BO timeline sync point.
        */
       struct dma_buf_import_sync_file isync = {
          .flags = written ? DMA_BUF_SYNC_RW : DMA_BUF_SYNC_READ,
+         .fd = -1,
       };
-      int dmabuf_fd;
+      int dmabuf_fd = -1;
       int ret = drmSyncobjExportSyncFile(bo->dev->fd, sync_handle, &isync.fd);
-      if (ret) {
-         mesa_loge("drmSyncobjExportSyncFile() failed (err=%d)", errno);
-         return -1;
+      if (ret == 0 && isync.fd >= 0) {
+         ret = drmPrimeHandleToFD(bo->dev->fd, bo->handle,
+                                  DRM_CLOEXEC | DRM_RDWR, &dmabuf_fd);
+         if (ret == 0 && dmabuf_fd >= 0) {
+            ret = pan_kmod_ioctl(dmabuf_fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE,
+                                 &isync);
+            close(dmabuf_fd);
+            close(isync.fd);
+            if (ret == 0)
+               return 0;
+         } else {
+            close(isync.fd);
+         }
       }
+   }
 
-      ret =
-         drmPrimeHandleToFD(bo->dev->fd, bo->handle, DRM_CLOEXEC | DRM_RDWR, &dmabuf_fd);
-      if (ret) {
-         mesa_loge("drmPrimeHandleToFD() failed (err=%d)", errno);
-         close(isync.fd);
-         return -1;
-      }
-
-      ret = pan_kmod_ioctl(dmabuf_fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &isync);
-      close(dmabuf_fd);
-      close(isync.fd);
-      if (ret) {
-         mesa_loge("DMA_BUF_IOCTL_IMPORT_SYNC_FILE failed (err=%d)", errno);
-         return -1;
-      }
-   } else if (panthor_vm) {
+   if (panthor_vm) {
       /* Private BOs should be passed the VM syncobj. */
       assert(sync_handle == panthor_vm->sync.handle);
 
@@ -728,7 +703,8 @@ panthor_kmod_bo_attach_sync_point(struct pan_kmod_bo *bo, uint32_t sync_handle,
             MAX2(sync_point, panthor_bo->sync.write_point);
       }
    } else {
-      /* For non-private BOs that are not shared yet, we add a new sync point
+      /* For non-private BOs that are not shared yet (or on Kbase where
+       * DMA_BUF_IOCTL_IMPORT_SYNC_FILE is unsupported), add a new sync point
        * to our timeline syncobj, and push the sync there.
        */
       uint32_t new_sync_point =
@@ -760,52 +736,41 @@ panthor_kmod_bo_get_sync_point(struct pan_kmod_bo *bo, uint32_t *sync_handle,
       bo->flags & (PAN_KMOD_BO_FLAG_EXPORTED | PAN_KMOD_BO_FLAG_IMPORTED);
 
    if (shared) {
-      /* Explicit/implicit sync reconciliation point. We need to export
-       * a sync-file from the dmabuf and make it a syncobj.
+      /* Explicit/implicit sync reconciliation point. Export a sync-file from
+       * the dmabuf when supported by the kernel; if unsupported (e.g. Android
+       * Kbase), fall back to the internal BO syncobj and sync_point.
        */
-      int dmabuf_fd;
+      int dmabuf_fd = -1;
       int ret =
          drmPrimeHandleToFD(bo->dev->fd, bo->handle, DRM_CLOEXEC | DRM_RDWR, &dmabuf_fd);
-      if (ret) {
-         mesa_loge("drmPrimeHandleToFD() failed (err=%d)\n", errno);
-         return -1;
+      if (ret == 0 && dmabuf_fd >= 0) {
+         struct dma_buf_export_sync_file esync = {
+            .flags = for_read_only_access ? DMA_BUF_SYNC_READ : DMA_BUF_SYNC_RW,
+            .fd = -1,
+         };
+
+         ret = pan_kmod_ioctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &esync);
+         close(dmabuf_fd);
+         if (ret == 0 && esync.fd >= 0) {
+            ret = drmSyncobjImportSyncFile(bo->dev->fd, panthor_bo->sync.handle,
+                                           esync.fd);
+            close(esync.fd);
+            if (ret == 0) {
+               *sync_handle = panthor_bo->sync.handle;
+               *sync_point = 0;
+               return 0;
+            }
+         }
       }
-
-      struct dma_buf_export_sync_file esync = {
-         .flags = for_read_only_access ? DMA_BUF_SYNC_READ : DMA_BUF_SYNC_RW,
-      };
-
-      ret = pan_kmod_ioctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &esync);
-      close(dmabuf_fd);
-      if (ret) {
-         mesa_loge("DMA_BUF_IOCTL_EXPORT_SYNC_FILE failed (err=%d)", errno);
-         return -1;
-      }
-
-      /* We store the resulting sync in our BO syncobj, which will be assigned
-       * a new sync next time we enter this function.
-       */
-      ret = drmSyncobjImportSyncFile(bo->dev->fd, panthor_bo->sync.handle,
-                                     esync.fd);
-      close(esync.fd);
-      if (ret) {
-         mesa_loge("drmSyncobjImportSyncFile() failed (err=%d)", errno);
-         return -1;
-      }
-
-      /* The syncobj is a binary syncobj in that case. */
-      *sync_handle = panthor_bo->sync.handle;
-      *sync_point = 0;
-   } else {
-      /* Fortunately, the non-shared path is much simpler, we just return
-       * the read/write sync point depending on the access type. The syncobj
-       * is a timeline syncobj in that case.
-       */
-      *sync_handle = panthor_bo->sync.handle;
-      *sync_point = for_read_only_access ? panthor_bo->sync.write_point
-                                         : MAX2(panthor_bo->sync.read_point,
-                                                panthor_bo->sync.write_point);
    }
+
+   /* Non-shared path (or fallback when DMA_BUF_IOCTL_EXPORT_SYNC_FILE is
+    * unsupported on Kbase).
+    */
+   *sync_handle = panthor_bo->sync.handle;
+   *sync_point = for_read_only_access ? panthor_bo->sync.write_point
+                                      : MAX2(panthor_bo->sync.read_point,
+                                             panthor_bo->sync.write_point);
    return 0;
 }
 
@@ -968,11 +933,7 @@ panthor_kmod_vm_bind(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
    uint32_t syncop_cnt = 0, syncop_ptr = 0;
    bool async = mode == PAN_KMOD_VM_OP_MODE_ASYNC ||
                 mode == PAN_KMOD_VM_OP_MODE_DEFER_TO_NEXT_IDLE_POINT;
-   bool is_kbase = false;
-#ifdef HAVE_PANTHOR_KBASE_UAPI_ADAPTER
-   is_kbase = panthor_kbase_adapter_is_virtual_drm_fd(vm->dev->fd);
-#endif
-   bool auto_va = (vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA) && !is_kbase;
+   bool auto_va = vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA;
    bool track_activity = vm->flags & PAN_KMOD_VM_FLAG_TRACK_ACTIVITY;
    struct panthor_kmod_va_collect *cur_va_collect = NULL;
    struct list_head va_collect_list;
@@ -1154,7 +1115,7 @@ panthor_kmod_vm_bind(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
             bind_ops[i].bo_offset = ops[i].map.bo_offset;
          }
 
-         if (ops[i].va.start == PAN_KMOD_VM_MAP_AUTO_VA && !is_kbase) {
+         if (ops[i].va.start == PAN_KMOD_VM_MAP_AUTO_VA) {
             bind_ops[i].va =
                panthor_kmod_vm_alloc_va(panthor_vm, bind_ops[i].size);
             if (!bind_ops[i].va) {
@@ -1213,10 +1174,10 @@ out_update_vas:
 
    for (uint32_t i = 0; i < op_count; i++) {
       if (ops[i].type == PAN_KMOD_VM_OP_TYPE_MAP &&
-          (ops[i].va.start == PAN_KMOD_VM_MAP_AUTO_VA || is_kbase)) {
+          ops[i].va.start == PAN_KMOD_VM_MAP_AUTO_VA) {
          if (!ret) {
             ops[i].va.start = bind_ops[i].va;
-         } else if (bind_ops[i].va != 0 && !is_kbase) {
+         } else if (bind_ops[i].va != 0) {
             panthor_kmod_vm_free_va(panthor_vm, bind_ops[i].va,
                                     bind_ops[i].size);
          }
@@ -1348,7 +1309,7 @@ panthor_kmod_bo_label(struct pan_kmod_dev *dev, struct pan_kmod_bo *bo, const ch
    if (!pan_kmod_driver_version_at_least(&dev->driver, 1, 4))
       return;
 
-    if (strnlen(label, PANTHOR_BO_LABEL_MAXLEN) == PANTHOR_BO_LABEL_MAXLEN) {
+   if (strnlen(label, PANTHOR_BO_LABEL_MAXLEN) == PANTHOR_BO_LABEL_MAXLEN) {
       strncpy(truncated_label, label, PANTHOR_BO_LABEL_MAXLEN - 1);
       truncated_label[PANTHOR_BO_LABEL_MAXLEN - 1] = '\0';
       label = truncated_label;

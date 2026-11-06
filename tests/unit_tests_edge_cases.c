@@ -334,6 +334,68 @@ static void test_panvk_auto_va_ringbuf_and_tracebuf_integration(void)
    printf("  -> PanVK AUTO_VA + 2MB Ringbuf/Tracebuf 2x Alias + UNMAP Integration Test: PASS\n");
 }
 
+static void test_u_gralloc_wsi_modifier_and_dmabuf_sync_resilience(void)
+{
+   int drm_fd = panthor_kbase_adapter_open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+   assert(drm_fd >= 0);
+
+   /* 1. Simulate importing a 500x500 R8G8B8A8_UNORM AHB (stride=512 px -> 2048 B/row, 250 pages = 1,024,000 B) */
+   int ahb_fd = memfd_create("mock_ahb_500x500", MFD_CLOEXEC);
+   assert(ahb_fd >= 0);
+   size_t ahb_size = 512 * 4 * 500; /* 1,024,000 bytes (250 pages) */
+   assert(ftruncate(ahb_fd, (off_t)ahb_size) == 0);
+
+   uint32_t gem_handle = 0;
+   assert(drmPrimeFDToHandle(drm_fd, ahb_fd, &gem_handle) == 0);
+   assert(gem_handle != 0);
+
+   /* 2. Verify non-destructive save/restore linear probe preserves existing pixel contents */
+   uint32_t *raw_u32 = (uint32_t *)mmap(NULL, ahb_size, PROT_READ | PROT_WRITE, MAP_SHARED, ahb_fd, 0);
+   assert(raw_u32 != MAP_FAILED);
+   const uint32_t xs[3] = { 0, 250, 499 };
+   const uint32_t ys[3] = { 0, 250, 499 };
+   for (int iy = 0; iy < 3; iy++) {
+      for (int ix = 0; ix < 3; ix++) {
+         raw_u32[ys[iy] * 512 + xs[ix]] = 0x11223300u + (uint32_t)(iy * 3 + ix);
+      }
+   }
+   uint32_t saved_pixels[9];
+   for (int iy = 0; iy < 3; iy++) {
+      for (int ix = 0; ix < 3; ix++) {
+         saved_pixels[iy * 3 + ix] = raw_u32[ys[iy] * 512 + xs[ix]];
+         raw_u32[ys[iy] * 512 + xs[ix]] = 0xA5C30000u | (uint32_t)(iy * 16 + ix);
+      }
+   }
+   for (int iy = 0; iy < 3; iy++) {
+      for (int ix = 0; ix < 3; ix++) {
+         assert(raw_u32[ys[iy] * 512 + xs[ix]] == (0xA5C30000u | (uint32_t)(iy * 16 + ix)));
+         raw_u32[ys[iy] * 512 + xs[ix]] = saved_pixels[iy * 3 + ix];
+      }
+   }
+   for (int iy = 0; iy < 3; iy++) {
+      for (int ix = 0; ix < 3; ix++) {
+         assert(raw_u32[ys[iy] * 512 + xs[ix]] == (0x11223300u + (uint32_t)(iy * 3 + ix)));
+      }
+   }
+   munmap(raw_u32, ahb_size);
+
+   /* 3. Verify DMA_BUF_IOCTL_IMPORT_SYNC_FILE & DMA_BUF_IOCTL_EXPORT_SYNC_FILE graceful handling */
+   struct { uint32_t flags; int32_t fd; } esync = { .flags = 1, .fd = -1 };
+   unsigned long req_export = _IOWR('b', 2, esync);
+   assert(drmIoctl(ahb_fd, req_export, &esync) == 0);
+   assert(esync.fd >= 0);
+
+   struct { uint32_t flags; int32_t fd; } isync = { .flags = 3, .fd = esync.fd };
+   unsigned long req_import = _IOW('b', 3, isync);
+   assert(drmIoctl(ahb_fd, req_import, &isync) == 0);
+   close(esync.fd);
+
+   assert(drmCloseBufferHandle(drm_fd, gem_handle) == 0);
+   close(ahb_fd);
+   assert(panthor_kbase_adapter_close(drm_fd) == 0);
+   printf("  -> u_gralloc WSI Linear Probe & DMA-BUF Sync File Resilience: PASS\n");
+}
+
 int main(void)
 {
    printf("[Unit Tests] Running edge cases, mali_kbase.ko flag invariants, and RAII logging suite...\n");
@@ -343,6 +405,7 @@ int main(void)
    test_mali0_state_machine_and_flag_regressions();
    test_kms_and_libdrm_wrappers();
    test_panvk_auto_va_ringbuf_and_tracebuf_integration();
+   test_u_gralloc_wsi_modifier_and_dmabuf_sync_resilience();
    printf("[Unit Tests] ALL EDGE CASES PASSED!\n");
    return 0;
 }

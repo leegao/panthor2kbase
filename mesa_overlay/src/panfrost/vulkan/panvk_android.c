@@ -8,6 +8,7 @@
 #include "panvk_device.h"
 #include "panvk_image.h"
 
+#include "drm-uapi/drm_fourcc.h"
 #include "vndk/hardware_buffer.h"
 #include "vulkan/vk_android_native_buffer.h"
 
@@ -15,6 +16,21 @@
 #include "vk_android.h"
 #include "vk_device_memory.h"
 #include "vk_util.h"
+
+#include <unistd.h>
+
+static inline int
+panvk_android_find_dma_buf_fd(const native_handle_t *handle)
+{
+   if (!handle || handle->numFds <= 0)
+      return -1;
+
+   for (int i = 0; i < handle->numFds; i++) {
+      if (handle->data[i] >= 0 && lseek(handle->data[i], 0, SEEK_END) > 0)
+         return handle->data[i];
+   }
+   return handle->data[0];
+}
 
 bool
 panvk_android_is_gralloc_image(const VkImageCreateInfo *pCreateInfo)
@@ -123,6 +139,9 @@ panvk_android_anb_init(struct panvk_device *dev,
                                       PANVK_MAX_PLANES);
    if (result != VK_SUCCESS)
       return result;
+
+   // if (mod_info.drmFormatModifier == DRM_FORMAT_MOD_INVALID)
+   //    mod_info.drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
 
    mod_info.pNext = create_info->pNext;
    const VkExternalMemoryImageCreateInfo external_info = {
@@ -233,6 +252,10 @@ panvk_android_ahb_image_init(struct AHardwareBuffer *ahb,
       vk_android_get_ahb_layout(ahb, &mod_info, layouts, PANVK_MAX_PLANES);
    if (result != VK_SUCCESS)
       return result;
+
+   if (mod_info.drmFormatModifier == DRM_FORMAT_MOD_INVALID)
+      mod_info.drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
+
    __vk_append_struct(img->vk.android_deferred_create_info, &mod_info);
 
    VkExternalMemoryImageCreateInfo external_info = {
@@ -258,13 +281,7 @@ panvk_android_import_ahb_memory(VkDevice device,
    VK_FROM_HANDLE(vk_device, dev, device);
    const native_handle_t *handle = AHardwareBuffer_getNativeHandle(ahb);
    assert(handle && handle->numFds > 0);
-   int dma_buf_fd = handle->data[0];
-   for (int i = 0; i < handle->numFds; i++) {
-      if (lseek(handle->data[i], 0, SEEK_END) > 0) {
-         dma_buf_fd = handle->data[i];
-         break;
-      }
-   }
+   int dma_buf_fd = panvk_android_find_dma_buf_fd(handle);
    VkResult result;
 
    VkImage img_handle = VK_NULL_HANDLE;

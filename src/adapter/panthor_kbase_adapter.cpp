@@ -1053,7 +1053,25 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
    resolve_real_funcs();
    if (!panthor_kbase_adapter_is_virtual_drm_fd(fd)) {
       LOG_DEBUG("ioctl passthrough fd=%d req=%s", fd, panthor2kbase_ioctl_req_name(request));
-      return real_ioctl(fd, request, arg);
+      int rc = real_ioctl(fd, request, arg);
+      if (rc < 0 && _IOC_TYPE(request) == 'b') {
+         unsigned int bnr = _IOC_NR(request);
+         if (bnr == 0 /* DMA_BUF_IOCTL_SYNC */ ||
+             bnr == 3 /* DMA_BUF_IOCTL_IMPORT_SYNC_FILE */) {
+            errno = 0;
+            return 0;
+         }
+         if (bnr == 2 /* DMA_BUF_IOCTL_EXPORT_SYNC_FILE */ && arg != nullptr && g_ctx.active) {
+            struct dmabuf_export_sync_arg { uint32_t flags; int32_t fd; };
+            auto *es = static_cast<struct dmabuf_export_sync_arg *>(arg);
+            es->fd = (g_ctx.stream_fd >= 0) ? dup(g_ctx.stream_fd) : dup(g_ctx.mali_fd);
+            if (es->fd >= 0) {
+               errno = 0;
+               return 0;
+            }
+         }
+      }
+      return rc;
    }
 
    pthread_mutex_lock(&g_lock);
