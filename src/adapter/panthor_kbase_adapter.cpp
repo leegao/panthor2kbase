@@ -1223,17 +1223,24 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       imp.in.phandle = reinterpret_cast<uintptr_t>(&fd_copy);
       imp.in.type = BASE_MEM_IMPORT_TYPE_UMM;
 
-      if (adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_IMPORT, &imp) < 0 && errno == ENOTTY) {
+      int ret = adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_IMPORT, &imp);
+      if (ret < 0 && errno == ENOTTY) {
          union kbase_ioctl_mem_import_mtk imp_mtk;
          memset(&imp_mtk, 0, sizeof(imp_mtk));
          imp_mtk.in.flags = imp.in.flags;
          imp_mtk.in.phandle = reinterpret_cast<uintptr_t>(&fd_copy);
          imp_mtk.in.type = BASE_MEM_IMPORT_TYPE_UMM;
-         if (adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_IMPORT_MTK, &imp_mtk) == 0) {
+         ret = adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_IMPORT_MTK, &imp_mtk);
+         if (ret == 0) {
             imp.out.gpu_va = imp_mtk.out.gpu_va;
             imp.out.va_pages = imp_mtk.out.va_pages;
             imp.out.flags = imp_mtk.out.flags;
          }
+      }
+      if (ret < 0) {
+         close(fd_copy);
+         pthread_mutex_unlock(&g_lock);
+         return -1; // Propagate kernel errno to caller instead of creating a va=0 BO
       }
 
       /* Establish GPU VA mapping for SAME_VA / NEED_MMAP imported dma-bufs */
