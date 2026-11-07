@@ -933,7 +933,8 @@ panthor_kmod_vm_bind(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
    uint32_t syncop_cnt = 0, syncop_ptr = 0;
    bool async = mode == PAN_KMOD_VM_OP_MODE_ASYNC ||
                 mode == PAN_KMOD_VM_OP_MODE_DEFER_TO_NEXT_IDLE_POINT;
-   bool auto_va = vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA;
+   bool is_kbase = panthor_kbase_adapter_is_virtual_drm_fd(vm->dev->fd);
+   bool auto_va = (vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA) && !is_kbase;
    bool track_activity = vm->flags & PAN_KMOD_VM_FLAG_TRACK_ACTIVITY;
    struct panthor_kmod_va_collect *cur_va_collect = NULL;
    struct list_head va_collect_list;
@@ -1115,7 +1116,7 @@ panthor_kmod_vm_bind(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
             bind_ops[i].bo_offset = ops[i].map.bo_offset;
          }
 
-         if (ops[i].va.start == PAN_KMOD_VM_MAP_AUTO_VA) {
+         if (ops[i].va.start == PAN_KMOD_VM_MAP_AUTO_VA && !is_kbase) {
             bind_ops[i].va =
                panthor_kmod_vm_alloc_va(panthor_vm, bind_ops[i].size);
             if (!bind_ops[i].va) {
@@ -1174,10 +1175,10 @@ out_update_vas:
 
    for (uint32_t i = 0; i < op_count; i++) {
       if (ops[i].type == PAN_KMOD_VM_OP_TYPE_MAP &&
-          ops[i].va.start == PAN_KMOD_VM_MAP_AUTO_VA) {
+          (ops[i].va.start == PAN_KMOD_VM_MAP_AUTO_VA || is_kbase)) {
          if (!ret) {
             ops[i].va.start = bind_ops[i].va;
-         } else if (bind_ops[i].va != 0) {
+         } else if (!is_kbase && bind_ops[i].va != 0) {
             panthor_kmod_vm_free_va(panthor_vm, bind_ops[i].va,
                                     bind_ops[i].size);
          }

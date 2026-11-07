@@ -42,7 +42,7 @@ c_args_for_u_gralloc += '-DUSE_IMAPPER4_METADATA_API'
 cpp_args_for_u_gralloc += '-DUSE_IMAPPER4_METADATA_API'
 c_args_for_u_gralloc += '-D_LIBCPP_ABI_NAMESPACE=__1'
 cpp_args_for_u_gralloc += [
-  '-include', meson.current_source_dir() / 'force_aosp_abi.h',
+  '-include', 'force_aosp_abi.h',
   '-D_LIBCPP_ABI_NAMESPACE=__1',
 ]
 options_for_u_gralloc += 'cpp_std=c++17'

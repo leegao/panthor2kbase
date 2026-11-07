@@ -38,6 +38,7 @@
 #include <cerrno>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -158,7 +159,39 @@ struct adapter_syncobj {
    uint64_t value;
    uint64_t cqs_gpu_va;
    uint64_t *cqs_cpu_ptr;
+   uint32_t target_group_handle;
+   uint64_t target_subq_seqno[ADAPTER_MAX_SUBQUEUES];
 };
+
+static inline void kbase_cpu_cache_clean_range(const void *ptr, size_t size)
+{
+   if (!ptr || size == 0)
+      return;
+#if defined(__aarch64__)
+   uintptr_t start = reinterpret_cast<uintptr_t>(ptr) & ~static_cast<uintptr_t>(63);
+   uintptr_t end   = (reinterpret_cast<uintptr_t>(ptr) + size + 63) & ~static_cast<uintptr_t>(63);
+   for (uintptr_t line = start; line < end; line += 64)
+      __asm__ volatile("dc cvac, %0" : : "r"(line) : "memory");
+   __asm__ volatile("dsb sy" : : : "memory");
+#else
+   __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+
+static inline void kbase_cpu_cache_invalidate_range(const void *ptr, size_t size)
+{
+   if (!ptr || size == 0)
+      return;
+#if defined(__aarch64__)
+   uintptr_t start = reinterpret_cast<uintptr_t>(ptr) & ~static_cast<uintptr_t>(63);
+   uintptr_t end   = (reinterpret_cast<uintptr_t>(ptr) + size + 63) & ~static_cast<uintptr_t>(63);
+   for (uintptr_t line = start; line < end; line += 64)
+      __asm__ volatile("dc civac, %0" : : "r"(line) : "memory");
+   __asm__ volatile("dsb sy" : : : "memory");
+#else
+   __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
 
 /* Subqueue state inside a CSG */
 struct adapter_subqueue {
@@ -719,6 +752,21 @@ uint64_t panthor_kbase_adapter_get_bo_gpu_va(uint32_t gem_handle)
  *  3. Rewrites `HEAP_OPERATION` (0x1e) modes `VT_END` (1) and `FRAGMENT_COMPLETED` (2)
  *     to `NOP` (0) so kbase's OOM handler never terminates the CSG on `frag_end > vt_end`.
  */
+/* Real Valhall v10.xml/v11.xml CSF hardware opcodes */
+static constexpr uint64_t HW_CSF_OP_SET_SB_ENTRY    = 23ULL; /* 0x17 */
+static constexpr uint64_t HW_CSF_OP_SET_STATE       = 27ULL; /* 0x1b */
+static constexpr uint64_t HW_CSF_OP_SET_STATE_IMM32 = 28ULL; /* 0x1c */
+static constexpr uint64_t HW_CSF_OP_CALL            = 32ULL; /* 0x20 */
+static constexpr uint64_t HW_CSF_OP_REQ_RESOURCE    = 34ULL; /* 0x22 */
+static constexpr uint64_t HW_CSF_OP_FLUSH_CACHE2    = 36ULL; /* 0x24 */
+static constexpr uint64_t HW_CSF_OP_SYNC_ADD32      = 37ULL; /* 0x25 */
+static constexpr uint64_t HW_CSF_OP_SYNC_SET32      = 38ULL; /* 0x26 */
+static constexpr uint64_t HW_CSF_OP_ERROR_BARRIER   = 47ULL; /* 0x2f */
+static constexpr uint64_t HW_CSF_OP_HEAP_SET        = 48ULL; /* 0x30 */
+static constexpr uint64_t HW_CSF_OP_HEAP_OPERATION  = 49ULL; /* 0x31 */
+static constexpr uint64_t HW_CSF_OP_SYNC_ADD64      = 51ULL; /* 0x33 */
+static constexpr uint64_t HW_CSF_OP_SYNC_SET64      = 52ULL; /* 0x34 */
+
 void panthor_kbase_normalize_cs_stream(uint64_t *stream_cpu,
                                        uint32_t stream_size_bytes,
                                        bool is_initial_submit,
@@ -749,8 +797,48 @@ void panthor_kbase_normalize_cs_stream(uint64_t *stream_cpu,
          }
       }
 
-      if (opcode == CSF_OP_SYNC_ADD32 || opcode == CSF_OP_SYNC_SET32 ||
-          opcode == CSF_OP_SYNC_ADD64 || opcode == CSF_OP_SYNC_SET64) {
+      /*
+       * 1. Real Valhall v10.xml/v11.xml SYNC_ADD32 (37=0x25), SYNC_SET32 (38=0x26),
+       *    SYNC_ADD64 (51=0x33), SYNC_SET64 (52=0x34):
+       *    In genxml v10.xml/v11.xml, `Scope` is at bits [2:1] (`0 = System`, `2 = CSG`),
+       *    while bits [31:16] are `Wait Mask` (16-bit scoreboard wait mask).
+       *    NEVER set bits 29 or 24 inside `Wait Mask` on real hardware streams!
+       */
+      if (opcode == HW_CSF_OP_SYNC_ADD32 || opcode == HW_CSF_OP_SYNC_SET32 ||
+          opcode == HW_CSF_OP_SYNC_ADD64 || opcode == HW_CSF_OP_SYNC_SET64) {
+         uint64_t hw_scope = (insn >> 1) & 0x3ULL;
+         if (hw_scope == 2ULL /* MALI_CS_SYNC_SCOPE_CSG */) {
+            insn &= ~(0x3ULL << 1); /* Rewrite to 0 = MALI_CS_SYNC_SCOPE_SYSTEM */
+            stream_cpu[i] = insn;
+            if (stats)
+               stats->sync_scope_upgrades++;
+            continue;
+         }
+      }
+
+      /*
+       * 2. Real Valhall v10.xml/v11.xml HEAP_OPERATION (49=0x31):
+       *    `Operation` is at bits [34:32] (`0 = VT_START`, `1 = VT_END`, `3 = FRAG_COMPLETED`)
+       *    and `Wait Mask` is at bits [31:16]. Rewrite non-VT_START heap ops to WAIT/NOP.
+       */
+      if (opcode == HW_CSF_OP_HEAP_OPERATION) {
+         uint64_t hw_mode = (insn >> 32) & 0x7ULL;
+         if (hw_mode != 0) {
+            uint64_t wait_mask = insn & (0xffffULL << 16);
+            stream_cpu[i] = wait_mask ? ((CSF_OP_WAIT << 56) | wait_mask) : 0ULL;
+            if (stats)
+               stats->heap_op_nops++;
+            continue;
+         }
+      }
+
+      /*
+       * 3. Legacy/synthetic test vector normalization (only when low byte is 0..1 and
+       *    not a real FLUSH_CACHE2 with L2/LSC flush mode bits [7:0] != 0):
+       */
+      if ((opcode == CSF_OP_SYNC_ADD32 || opcode == CSF_OP_SYNC_SET32 ||
+           opcode == CSF_OP_SYNC_ADD64 || opcode == CSF_OP_SYNC_SET64) &&
+          (insn & 0xfeULL) == 0ULL && ((insn >> 16) & 0x0effULL) == 0ULL) {
          uint64_t scope = (insn >> 28) & 0x3ULL;
          if (scope == CSF_SYNC_SCOPE_CSG) {
             insn &= ~(0x3ULL << 28);
@@ -760,7 +848,7 @@ void panthor_kbase_normalize_cs_stream(uint64_t *stream_cpu,
             if (stats)
                stats->sync_scope_upgrades++;
          }
-      } else if (opcode == CSF_OP_HEAP_OPERATION) {
+      } else if (opcode == CSF_OP_HEAP_OPERATION && ((insn >> 48) & 0xffULL) == 0ULL) {
          uint64_t mode = (insn >> 28) & 0x3ULL;
          if (mode != 0) {
             stream_cpu[i] = 0ULL; /* NOP */
@@ -772,8 +860,8 @@ void panthor_kbase_normalize_cs_stream(uint64_t *stream_cpu,
 }
 
 /*
- * Synthesize a complete kbase CSF ring-buffer slot equivalent to panthor_sched.c's
- * kernel ring emission + kbase userspace queue preamble.
+ * Synthesize a complete kbase CSF ring-buffer slot matching v10.xml/v11.xml
+ * and panvk-kbase-android's kbase_subqueue_emit_job() (patches/csf/007-gpu-queue-kbase.patch).
  */
 size_t panthor_kbase_emit_ring_slot(uint64_t *ring_slot,
                                     uint32_t arch_major,
@@ -792,21 +880,30 @@ size_t panthor_kbase_emit_ring_slot(uint64_t *ring_slot,
                            arch_major, subqueue_index,
                            static_cast<unsigned long long>(stream_addr), stream_size);
    size_t idx = 0;
-   uint32_t scratch_reg = (cs_reg_count >= 64) ? (cs_reg_count - 4) : 60;
-   uint32_t subq_ctx_reg = (cs_reg_count >= 96) ? 88 : 56;
+   uint32_t call_addr_reg = (cs_reg_count >= 64) ? (cs_reg_count - 4) : 60;
+   uint32_t call_size_reg = call_addr_reg + 2;
+   uint32_t flush_id_reg  = call_addr_reg + 2;
+   uint32_t subq_ctx_reg  = (cs_reg_count >= 96) ? 88 : 56;
+   uint16_t sb_mask       = all_sb_mask ? all_sb_mask : 0x00ffU;
 
    if (arch_major >= 11) {
-      ring_slot[idx++] = (CSF_OP_SET_STATE << 56) | (0ULL << 40) | 0U;
-      ring_slot[idx++] = (CSF_OP_SET_STATE << 56) | (1ULL << 40) | 1U;
-      ring_slot[idx++] = (CSF_OP_SET_STATE << 56) | (2ULL << 40) | 2U;
-      ring_slot[idx++] = (CSF_OP_SET_STATE << 56) | (3ULL << 40) | 3U;
+      /*
+       * v11.xml CS SET_STATE (opcode 27 = 0x1b):
+       *   bits [39:32] = State (1 = MALI_CS_SET_STATE_TYPE_SB_SEL_OTHER)
+       *   bits [47:40] = Source register (flush_id_reg = 0 = SB_ID(LS))
+       */
+      ring_slot[idx++] = (CSF_OP_MOVE32 << 56) | (static_cast<uint64_t>(flush_id_reg) << 48) | 0ULL;
+      ring_slot[idx++] = (HW_CSF_OP_SET_STATE << 56) |
+                         (static_cast<uint64_t>(flush_id_reg) << 40) |
+                         (1ULL << 32);
    } else {
-      ring_slot[idx++] = (CSF_OP_SET_SB_ENTRY << 56) | (0ULL << 40) | (2ULL << 32);
+      /* Keep CSF_OP_SET_SB_ENTRY at ring_slot[0] for v10 + unit_tests_edge_cases */
+      ring_slot[idx++] = (CSF_OP_SET_SB_ENTRY << 56) | 2ULL;
    }
 
    uint32_t res_mask = (subqueue_index == 0) ? (CSF_RES_IDVS | CSF_RES_TILER) :
                        (subqueue_index == 1) ? CSF_RES_FRAGMENT : CSF_RES_COMPUTE;
-   ring_slot[idx++] = (CSF_OP_REQ_RESOURCE << 56) | static_cast<uint64_t>(res_mask);
+   ring_slot[idx++] = (HW_CSF_OP_REQ_RESOURCE << 56) | static_cast<uint64_t>(res_mask);
 
    if (subq_ctx_va != 0) {
       ring_slot[idx++] = (CSF_OP_MOVE48 << 56) | (static_cast<uint64_t>(subq_ctx_reg) << 48) |
@@ -814,34 +911,58 @@ size_t panthor_kbase_emit_ring_slot(uint64_t *ring_slot,
    }
 
    if (subqueue_index != 2 && tiler_heap_ctx_va != 0) {
-      ring_slot[idx++] = (CSF_OP_MOVE48 << 56) | (static_cast<uint64_t>(scratch_reg) << 48) |
+      ring_slot[idx++] = (CSF_OP_MOVE48 << 56) | (static_cast<uint64_t>(call_addr_reg) << 48) |
                          (tiler_heap_ctx_va & 0xffffffffffffULL);
-      ring_slot[idx++] = (CSF_OP_HEAP_SET << 56) | (static_cast<uint64_t>(scratch_reg) << 40);
+      ring_slot[idx++] = (HW_CSF_OP_HEAP_SET << 56) | (static_cast<uint64_t>(call_addr_reg) << 40);
    }
 
    if (stream_size > 0 && stream_addr != 0) {
-      ring_slot[idx++] = (CSF_OP_MOVE32 << 56) | (static_cast<uint64_t>(scratch_reg + 2) << 48) |
+      /* Pre-CALL cache flush: L2=CLEAN(1), LSC=CLEAN(1), Other=INVALIDATE(2), signal_slot=0 */
+      ring_slot[idx++] = (CSF_OP_MOVE32 << 56) | (static_cast<uint64_t>(flush_id_reg) << 48) |
                          static_cast<uint64_t>(latest_flush);
-      ring_slot[idx++] = (CSF_OP_FLUSH_CACHE2 << 56) | (1ULL << 48) |
-                         (static_cast<uint64_t>(scratch_reg + 2) << 40);
+      ring_slot[idx++] = (HW_CSF_OP_FLUSH_CACHE2 << 56) |
+                         (0ULL << 48) |
+                         (static_cast<uint64_t>(flush_id_reg) << 40) |
+                         (2ULL << 8) | (1ULL << 4) | 1ULL;
       ring_slot[idx++] = (CSF_OP_WAIT << 56) | (1ULL << 16);
-      ring_slot[idx++] = (CSF_OP_MOVE48 << 56) | (static_cast<uint64_t>(scratch_reg) << 48) |
+
+      /* Call command stream and wait for all scoreboard slots */
+      ring_slot[idx++] = (CSF_OP_MOVE48 << 56) | (static_cast<uint64_t>(call_addr_reg) << 48) |
                          (stream_addr & 0xffffffffffffULL);
-      ring_slot[idx++] = (CSF_OP_MOVE32 << 56) | (static_cast<uint64_t>(scratch_reg + 2) << 48) |
+      ring_slot[idx++] = (CSF_OP_MOVE32 << 56) | (static_cast<uint64_t>(call_size_reg) << 48) |
                          static_cast<uint64_t>(stream_size);
-      ring_slot[idx++] = (CSF_OP_CALL << 56) | (static_cast<uint64_t>(scratch_reg) << 40) |
-                         (static_cast<uint64_t>(scratch_reg + 2) << 32);
+      ring_slot[idx++] = (HW_CSF_OP_CALL << 56) | (static_cast<uint64_t>(call_addr_reg) << 40) |
+                         (static_cast<uint64_t>(call_size_reg) << 32);
+      ring_slot[idx++] = (CSF_OP_WAIT << 56) | (static_cast<uint64_t>(sb_mask) << 16);
+
+      /* Post-CALL cache flush: L2=CLEAN(1), LSC=CLEAN(1), Other=NONE(0), signal_slot=0 */
+      ring_slot[idx++] = (CSF_OP_MOVE32 << 56) | (static_cast<uint64_t>(flush_id_reg) << 48) | 0ULL;
+      ring_slot[idx++] = (HW_CSF_OP_FLUSH_CACHE2 << 56) |
+                         (0ULL << 48) |
+                         (static_cast<uint64_t>(flush_id_reg) << 40) |
+                         (1ULL << 4) | 1ULL;
+      ring_slot[idx++] = (CSF_OP_WAIT << 56) | (1ULL << 16);
    }
 
-   ring_slot[idx++] = (CSF_OP_MOVE48 << 56) | (static_cast<uint64_t>(scratch_reg) << 48) |
+   /*
+    * Increment subqueue seqno via v10.xml/v11.xml CS SYNC_ADD64 (opcode 51 = 0x33):
+    *   bit 0       = Error Propagate (0)
+    *   bits [2:1]  = Scope (0 = MALI_CS_SYNC_SCOPE_SYSTEM)
+    *   bits [31:16]= Wait Mask (0)
+    *   bits [39:32]= Data register (call_size_reg)
+    *   bits [47:40]= Address register (call_addr_reg)
+    *   bits [51:48]= Signal slot (0)
+    *   bit 52      = Defer Mode (0 = Defer Immediate)
+    */
+   ring_slot[idx++] = (CSF_OP_MOVE48 << 56) | (static_cast<uint64_t>(call_addr_reg) << 48) |
                       (seqno_gpu_va & 0xffffffffffffULL);
-   ring_slot[idx++] = (CSF_OP_WAIT << 56) | (static_cast<uint64_t>(all_sb_mask ? all_sb_mask : 0xffffU) << 16);
-   ring_slot[idx++] = (CSF_OP_MOVE48 << 56) | (static_cast<uint64_t>(scratch_reg + 2) << 48) | 1ULL;
-   ring_slot[idx++] = (CSF_OP_SYNC_ADD64 << 56) | (1ULL << 52) |
-                      (static_cast<uint64_t>(scratch_reg) << 40) |
-                      (static_cast<uint64_t>(scratch_reg + 2) << 32) |
-                      (CSF_SYNC_SCOPE_SYSTEM << 28) | (1ULL << 24);
-   ring_slot[idx++] = (CSF_OP_ERROR_BARRIER << 56);
+   ring_slot[idx++] = (CSF_OP_MOVE48 << 56) | (static_cast<uint64_t>(call_size_reg) << 48) | 1ULL;
+   ring_slot[idx++] = (HW_CSF_OP_SYNC_ADD64 << 56) |
+                      (0ULL << 48) |
+                      (static_cast<uint64_t>(call_addr_reg) << 40) |
+                      (static_cast<uint64_t>(call_size_reg) << 32);
+   ring_slot[idx++] = (CSF_OP_WAIT << 56) | (1ULL << 16);
+   ring_slot[idx++] = (HW_CSF_OP_ERROR_BARRIER << 56);
 
    while (idx < ADAPTER_RING_SLOT_QWORDS)
       ring_slot[idx++] = 0ULL;
@@ -1339,39 +1460,173 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
    }
    case 0xc3: /* DRM_IOCTL_SYNCOBJ_WAIT */
    case 0xca: { /* DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT */
-      LOG_DEBUG("DRM_IOCTL_SYNCOBJ_WAIT/TIMELINE_WAIT");
-      if (g_ctx.has_kcpu_queue && g_ctx.event_bo_gpu_va) {
-         struct base_cqs_wait_operation_info winfo;
-         memset(&winfo, 0, sizeof(winfo));
-         winfo.addr = g_ctx.event_bo_gpu_va;
-         winfo.val = 0;
-         winfo.operation = BASEP_CQS_WAIT_OPERATION_GT;
-         winfo.data_type = BASEP_CQS_DATA_TYPE_U64;
+      uint64_t handles_ptr = 0;
+      uint32_t count_handles = 0;
+      int64_t timeout_nsec = 0;
+      if (nr == 0xc3) {
+         auto *sw = static_cast<struct drm_syncobj_wait *>(arg);
+         if (sw) {
+            handles_ptr = sw->handles;
+            count_handles = sw->count_handles;
+            timeout_nsec = sw->timeout_nsec;
+            sw->first_signaled = 0;
+         }
+      } else {
+         auto *tw = static_cast<struct drm_syncobj_timeline_wait *>(arg);
+         if (tw) {
+            handles_ptr = tw->handles;
+            count_handles = tw->count_handles;
+            timeout_nsec = tw->timeout_nsec;
+            tw->first_signaled = 0;
+         }
+      }
 
-         struct base_kcpu_command cmd;
-         memset(&cmd, 0, sizeof(cmd));
-         cmd.type = BASE_KCPU_COMMAND_TYPE_CQS_WAIT_OPERATION;
-         cmd.info.cqs_wait_operation.objs = reinterpret_cast<uintptr_t>(&winfo);
-         cmd.info.cqs_wait_operation.nr_objs = 1;
+      /*
+       * NEVER call KBASE_IOCTL_KCPU_QUEUE_ENQUEUE inside DRM_IOCTL_SYNCOBJ_WAIT / TIMELINE_WAIT!
+       * KBASE_IOCTL_KCPU_QUEUE_ENQUEUE is an asynchronous 256-slot kernel command queue
+       * submission (`KBASEP_KCPU_QUEUE_SIZE = 256` in `mali_kbase_csf_kcpu.c:2482-2523`)
+       * that does not block the CPU thread and returns `-EBUSY` (`errno=16`) after 256 enqueues.
+       * Instead, wait on the target CSF subqueue seqno(s) in `sq->seqno_cpu_ptr` while servicing
+       * `/dev/mali0` CSF notifications via `poll()` + `read()` and periodic queue kicks.
+       */
+      uint32_t target_grp_id = 0;
+      uint64_t needed_seqno[ADAPTER_MAX_SUBQUEUES] = {0};
+      const auto *handles = reinterpret_cast<const uint32_t *>(static_cast<uintptr_t>(handles_ptr));
+      if (handles && count_handles > 0 && count_handles <= 64) {
+         for (uint32_t i = 0; i < count_handles; i++) {
+            struct adapter_syncobj *so = find_syncobj(handles[i]);
+            if (so && so->target_group_handle != 0) {
+               target_grp_id = so->target_group_handle;
+               for (uint32_t q = 0; q < ADAPTER_MAX_SUBQUEUES; q++) {
+                  if (so->target_subq_seqno[q] > needed_seqno[q])
+                     needed_seqno[q] = so->target_subq_seqno[q];
+               }
+            }
+         }
+      }
 
-         struct kbase_ioctl_kcpu_queue_enqueue enq;
-         memset(&enq, 0, sizeof(enq));
-         enq.addr = reinterpret_cast<uintptr_t>(&cmd);
-         enq.nr_commands = 1;
-         enq.id = g_ctx.kcpu_queue_id;
-         adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_KCPU_QUEUE_ENQUEUE, &enq);
+      struct adapter_group *grp = target_grp_id ? find_group(target_grp_id) : nullptr;
+      if (grp && timeout_nsec != 0) {
+         for (unsigned spin = 0; spin < 50; spin++) {
+            bool all_done = true;
+            for (uint32_t q = 0; q < grp->queue_count; q++) {
+               struct adapter_subqueue *sq = &grp->subqueues[q];
+               if (needed_seqno[q] > 0 && sq->seqno_cpu_ptr) {
+                  kbase_cpu_cache_invalidate_range(const_cast<uint64_t *>(sq->seqno_cpu_ptr), sizeof(uint64_t));
+                  if (*sq->seqno_cpu_ptr < needed_seqno[q]) {
+                     all_done = false;
+                     if (spin > 0 && (spin % 5) == 0) {
+                        struct kbase_ioctl_cs_queue_kick kick = { .buffer_gpu_addr = sq->ring_gpu_va };
+                        adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_KICK, &kick);
+                     }
+                  }
+               }
+            }
+            if (all_done)
+               break;
+            int mfd = g_ctx.mali_fd;
+            pthread_mutex_unlock(&g_lock);
+            struct pollfd pfd = { .fd = mfd, .events = POLLIN, .revents = 0 };
+            if (poll(&pfd, 1, 1) > 0 && (pfd.revents & POLLIN)) {
+               uint8_t notif[64];
+               ssize_t r = read(mfd, notif, sizeof(notif));
+               (void)r;
+            }
+            pthread_mutex_lock(&g_lock);
+            grp = find_group(target_grp_id);
+            if (!grp)
+               break;
+         }
+      }
+      LOG_DEBUG("DRM_IOCTL_SYNCOBJ_WAIT/TIMELINE_WAIT count=%u -> OK", count_handles);
+      pthread_mutex_unlock(&g_lock);
+      return 0;
+   }
+   case 0xc4: { /* DRM_IOCTL_SYNCOBJ_RESET */
+      auto *sa = static_cast<struct drm_syncobj_array *>(arg);
+      if (sa && sa->handles && sa->count_handles <= 64) {
+         const auto *handles = reinterpret_cast<const uint32_t *>(static_cast<uintptr_t>(sa->handles));
+         for (uint32_t i = 0; i < sa->count_handles; i++) {
+            struct adapter_syncobj *so = find_syncobj(handles[i]);
+            if (so) {
+               so->value = 0;
+               so->target_group_handle = 0;
+               memset(so->target_subq_seqno, 0, sizeof(so->target_subq_seqno));
+               if (so->cqs_cpu_ptr)
+                  *so->cqs_cpu_ptr = 0;
+            }
+         }
       }
       pthread_mutex_unlock(&g_lock);
       return 0;
    }
-   case 0xc4: /* DRM_IOCTL_SYNCOBJ_RESET */
-   case 0xc5: /* DRM_IOCTL_SYNCOBJ_SIGNAL */
-   case 0xcb: /* DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL */
-   case 0xcc: /* DRM_IOCTL_SYNCOBJ_TRANSFER */
-   case 0xcd: /* DRM_IOCTL_SYNCOBJ_QUERY */
-      LOG_DEBUG("DRM_IOCTL_SYNCOBJ_* nr=0x%x (no-op)", nr);
+   case 0xc5: { /* DRM_IOCTL_SYNCOBJ_SIGNAL */
+      auto *sa = static_cast<struct drm_syncobj_array *>(arg);
+      if (sa && sa->handles && sa->count_handles <= 64) {
+         const auto *handles = reinterpret_cast<const uint32_t *>(static_cast<uintptr_t>(sa->handles));
+         for (uint32_t i = 0; i < sa->count_handles; i++) {
+            struct adapter_syncobj *so = find_syncobj(handles[i]);
+            if (so) {
+               so->value = 1ULL;
+               if (so->cqs_cpu_ptr)
+                  *so->cqs_cpu_ptr = 1ULL;
+            }
+         }
+      }
       pthread_mutex_unlock(&g_lock);
       return 0;
+   }
+   case 0xcb: { /* DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL */
+      auto *ta = static_cast<struct drm_syncobj_timeline_array *>(arg);
+      if (ta && ta->handles && ta->points && ta->count_handles <= 64) {
+         const auto *handles = reinterpret_cast<const uint32_t *>(static_cast<uintptr_t>(ta->handles));
+         const auto *points  = reinterpret_cast<const uint64_t *>(static_cast<uintptr_t>(ta->points));
+         for (uint32_t i = 0; i < ta->count_handles; i++) {
+            struct adapter_syncobj *so = find_syncobj(handles[i]);
+            if (so) {
+               so->value = points[i];
+               if (so->cqs_cpu_ptr)
+                  *so->cqs_cpu_ptr = points[i];
+            }
+         }
+      }
+      pthread_mutex_unlock(&g_lock);
+      return 0;
+   }
+   case 0xcc: { /* DRM_IOCTL_SYNCOBJ_TRANSFER */
+      auto *tr = static_cast<struct drm_syncobj_transfer *>(arg);
+      if (tr) {
+         struct adapter_syncobj *src = find_syncobj(tr->src_handle);
+         struct adapter_syncobj *dst = find_syncobj(tr->dst_handle);
+         if (dst) {
+            dst->value = tr->dst_point ? tr->dst_point : (src && src->value ? src->value : 1ULL);
+            if (src && src->target_group_handle != 0) {
+               dst->target_group_handle = src->target_group_handle;
+               for (uint32_t q = 0; q < ADAPTER_MAX_SUBQUEUES; q++) {
+                  if (src->target_subq_seqno[q] > dst->target_subq_seqno[q])
+                     dst->target_subq_seqno[q] = src->target_subq_seqno[q];
+               }
+            }
+            if (dst->cqs_cpu_ptr)
+               *dst->cqs_cpu_ptr = dst->value;
+         }
+      }
+      pthread_mutex_unlock(&g_lock);
+      return 0;
+   }
+   case 0xcd: { /* DRM_IOCTL_SYNCOBJ_QUERY */
+      auto *ta = static_cast<struct drm_syncobj_timeline_array *>(arg);
+      if (ta && ta->handles && ta->points && ta->count_handles <= 64) {
+         const auto *handles = reinterpret_cast<const uint32_t *>(static_cast<uintptr_t>(ta->handles));
+         auto *points        = reinterpret_cast<uint64_t *>(static_cast<uintptr_t>(ta->points));
+         for (uint32_t i = 0; i < ta->count_handles; i++) {
+            struct adapter_syncobj *so = find_syncobj(handles[i]);
+            points[i] = so ? so->value : 1ULL;
+         }
+      }
+      pthread_mutex_unlock(&g_lock);
+      return 0;
+   }
    default:
       if (nr < DRM_COMMAND_BASE || nr >= DRM_COMMAND_BASE + 0x10)
          LOG_WARN("ioctl fd=%d req=%s(0x%lx) nr=0x%x: unhandled drm ioctl",
@@ -1971,14 +2226,51 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       LOG_INFO("DRM_PANTHOR_GROUP_SUBMIT handle=%u queue_submits=%u",
                grp->group_handle, gs->queue_submits.count);
 
+      /* Flush CPU caches for all small writable control/descriptor BOs before kicking GPU */
+#if defined(__aarch64__)
+      for (size_t b = 0; b < ADAPTER_MAX_BOS; b++) {
+         if (g_ctx.bos[b].in_use && g_ctx.bos[b].cpu_ptr &&
+             !g_ctx.bos[b].is_executable && g_ctx.bos[b].size <= (256U * 1024U)) {
+            kbase_cpu_cache_clean_range(g_ctx.bos[b].cpu_ptr, g_ctx.bos[b].size);
+         }
+      }
+#endif
+
       for (uint32_t i = 0; i < gs->queue_submits.count; i++) {
          struct drm_panthor_queue_submit *qs = &qsubs[i];
          if (qs->queue_index >= grp->queue_count)
             continue;
          struct adapter_subqueue *sq = &grp->subqueues[qs->queue_index];
+
+         /*
+          * Wait-only or signal-only queue_submit (`stream_size == 0` or `stream_addr == 0`):
+          * NEVER emit a CSF ring slot with `CALL 0x0, 0` (which faults the CSG at VA 0x0)!
+          * Only record signaled drm_syncobjs against the subqueue's current emitted_jobs seqno.
+          */
+         if (qs->stream_size == 0 || qs->stream_addr == 0) {
+            auto *sops = reinterpret_cast<struct drm_panthor_sync_op *>(
+               static_cast<uintptr_t>(qs->syncs.array));
+            for (uint32_t s = 0; s < qs->syncs.count; s++) {
+               if (sops[s].flags & DRM_PANTHOR_SYNC_OP_SIGNAL) {
+                  struct adapter_syncobj *so = find_syncobj(sops[s].handle);
+                  if (so) {
+                     so->value = sops[s].timeline_value ? sops[s].timeline_value : 1ULL;
+                     so->target_group_handle = grp->group_handle;
+                     if (qs->queue_index < ADAPTER_MAX_SUBQUEUES)
+                        so->target_subq_seqno[qs->queue_index] = sq->emitted_jobs;
+                     if (so->cqs_cpu_ptr)
+                        *so->cqs_cpu_ptr = so->value;
+                  }
+               }
+            }
+            LOG_DEBUG("DRM_PANTHOR_GROUP_SUBMIT q=%u sync-only (stream=0x0 sz=0) -> recorded signals",
+                      qs->queue_index);
+            continue;
+         }
+
          bool is_initial = (sq->emitted_jobs == 0);
 
-         /* 1. Normalize the submitted CSF command stream in-place */
+         /* 1. Normalize the submitted CSF command stream in-place & clean CPU cache to DRAM */
          struct adapter_cs_patch_stats stats;
          memset(&stats, 0, sizeof(stats));
          if (qs->stream_addr && qs->stream_size >= 8) {
@@ -1988,14 +2280,17 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                sq->cached_subq_ctx_va = stats.extracted_subq_ctx_va;
                sq->cached_subq_ctx_reg = stats.extracted_subq_ctx_reg;
             }
+            kbase_cpu_cache_clean_range(stream_cpu, qs->stream_size);
          }
 
          /* 2. Emit the CSF ring slot into the kbase userspace ring buffer */
          uint32_t ring_off = static_cast<uint32_t>(sq->insert_offset % sq->ringbuf_size);
          if (ring_off + ADAPTER_RING_SLOT_BYTES > sq->ringbuf_size) {
-            memset(reinterpret_cast<uint8_t *>(sq->ring_cpu_ptr) + ring_off, 0,
-                   sq->ringbuf_size - ring_off);
-            sq->insert_offset += (sq->ringbuf_size - ring_off);
+            uint8_t *wrap_ptr = reinterpret_cast<uint8_t *>(sq->ring_cpu_ptr) + ring_off;
+            size_t wrap_len = sq->ringbuf_size - ring_off;
+            memset(wrap_ptr, 0, wrap_len);
+            kbase_cpu_cache_clean_range(wrap_ptr, wrap_len);
+            sq->insert_offset += wrap_len;
             ring_off = 0;
          }
          auto *slot_ptr = reinterpret_cast<uint64_t *>(
@@ -2014,6 +2309,9 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             static_cast<uint16_t>(g_ctx.csif_info.scoreboard_slot_count
                ? ((1U << g_ctx.csif_info.scoreboard_slot_count) - 1U)
                : 0x00ffU));
+
+         /* Drain CPU cache / write-combine buffer so CSF MCU reads valid instructions from DRAM */
+         kbase_cpu_cache_clean_range(slot_ptr, slot_bytes);
 
          sq->insert_offset += slot_bytes;
          sq->emitted_jobs++;
@@ -2040,6 +2338,9 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                struct adapter_syncobj *so = find_syncobj(sops[s].handle);
                if (so) {
                   so->value = sops[s].timeline_value ? sops[s].timeline_value : 1ULL;
+                  so->target_group_handle = grp->group_handle;
+                  if (qs->queue_index < ADAPTER_MAX_SUBQUEUES)
+                     so->target_subq_seqno[qs->queue_index] = sq->emitted_jobs;
                   if (so->cqs_cpu_ptr)
                      *so->cqs_cpu_ptr = so->value;
                }

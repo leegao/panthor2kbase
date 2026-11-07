@@ -439,12 +439,18 @@ static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
       switch (opcode) {
       case CSF_OP_NOP:
       case CSF_OP_SET_STATE:
+      case 27: /* HW_CSF_OP_SET_STATE (0x1b) */
+      case 28: /* HW_CSF_OP_SET_STATE_IMM32 (0x1c) */
       case CSF_OP_SET_SB_ENTRY:
+      case 23: /* HW_CSF_OP_SET_SB_ENTRY (0x17) */
       case CSF_OP_REQ_RESOURCE:
       case CSF_OP_WAIT:
       case CSF_OP_FLUSH_CACHE2:
       case CSF_OP_HEAP_SET:
+      case 48: /* HW_CSF_OP_HEAP_SET (0x30) */
       case CSF_OP_ERROR_BARRIER:
+      case CSF_OP_SYNC_WAIT32:
+      case CSF_OP_SYNC_WAIT64:
          break;
 
       case CSF_OP_MOVE48: {
@@ -480,14 +486,15 @@ static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
          break;
       }
 
-      case CSF_OP_HEAP_OPERATION: {
-         uint64_t mode = (insn >> 28) & 0x3ULL;
+      case CSF_OP_HEAP_OPERATION:
+      case 49: /* HW_CSF_OP_HEAP_OPERATION (0x31) */ {
+         uint64_t mode = (opcode == 49) ? ((insn >> 32) & 0x7ULL) : ((insn >> 28) & 0x3ULL);
          if (heap) {
             if (mode == 0)
                heap->vt_start++;
             else if (mode == 1)
                heap->vt_end++;
-            else if (mode == 2) {
+            else if (mode == 2 || mode == 3) {
                heap->frag_end++;
                if (heap->frag_end > heap->vt_end)
                   g_stats.oom_heap_stat_errors++;
@@ -496,12 +503,17 @@ static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
          break;
       }
 
-      case CSF_OP_SYNC_ADD32:
-      case CSF_OP_SYNC_SET32: {
+      case CSF_OP_SYNC_SET32:
+         /* Opcode 0x24 (36) is HW_CSF_OP_FLUSH_CACHE2 when low cache-mode bits [7:0] != 0 */
+         if ((insn & 0xffULL) != 0ULL)
+            break;
+         /* fallthrough */
+      case CSF_OP_SYNC_ADD32: {
          uint8_t addr_reg = (insn >> 40) & 0xffU;
          uint8_t val_reg = (insn >> 32) & 0xffU;
-         uint64_t scope = (insn >> 28) & 0x3ULL;
-         if (scope == CSF_SYNC_SCOPE_CSG)
+         uint64_t hw_scope = (insn >> 1) & 0x3ULL;
+         uint64_t leg_scope = (insn >> 28) & 0x3ULL;
+         if (hw_scope == 2ULL || (hw_scope == 0ULL && leg_scope == CSF_SYNC_SCOPE_CSG && ((insn >> 24) & 1ULL) == 0ULL && addr_reg < 60))
             g_stats.csg_scope_warnings++;
          if (addr_reg < 95 && val_reg < 96) {
             uint64_t sync_va = (cs_regs[addr_reg + 1] << 32) | cs_regs[addr_reg];
@@ -521,8 +533,9 @@ static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
       case CSF_OP_SYNC_SET64: {
          uint8_t addr_reg = (insn >> 40) & 0xffU;
          uint8_t val_reg = (insn >> 32) & 0xffU;
-         uint64_t scope = (insn >> 28) & 0x3ULL;
-         if (scope == CSF_SYNC_SCOPE_CSG)
+         uint64_t hw_scope = (insn >> 1) & 0x3ULL;
+         uint64_t leg_scope = (insn >> 28) & 0x3ULL;
+         if (hw_scope == 2ULL || (hw_scope == 0ULL && leg_scope == CSF_SYNC_SCOPE_CSG && ((insn >> 24) & 1ULL) == 0ULL && addr_reg < 60))
             g_stats.csg_scope_warnings++;
          if (addr_reg < 95 && val_reg < 95) {
             uint64_t sync_va = (cs_regs[addr_reg + 1] << 32) | cs_regs[addr_reg];
@@ -1266,4 +1279,54 @@ int mali_kbase_emu_export_trace_json(const char *path)
    fprintf(fp, "  ]\n}\n");
    fclose(fp);
    return 0;
+}
+
+
+/* Direct C API for AOT-translated libGLES_mali.so & r54p3_vulkan_icd integration */
+__attribute__((visibility("default")))
+int mali_kbase_emu_open_direct(const char *pathname, int flags)
+{
+   return open(pathname ? pathname : "/dev/mali0", flags | O_RDWR | O_CLOEXEC);
+}
+
+__attribute__((visibility("default")))
+int mali_kbase_emu_close_direct(int fd)
+{
+   pthread_mutex_lock(&g_emu_lock);
+   if (fd == g_kfile.fd && g_kfile.fd > 0) {
+      init_orig_syscalls();
+      orig_close(g_kfile.fd);
+      g_kfile.fd = -1;
+      g_kfile.state = EMU_KFILE_UNOPENED;
+   }
+   pthread_mutex_unlock(&g_emu_lock);
+   return 0;
+}
+
+__attribute__((visibility("default")))
+int mali_kbase_emu_ioctl_direct(int fd, unsigned long request, void *arg)
+{
+   pthread_mutex_lock(&g_emu_lock);
+   if (g_kfile.state == EMU_KFILE_UNOPENED) {
+      pthread_mutex_unlock(&g_emu_lock);
+      (void)mali_kbase_emu_open_direct("/dev/mali0", O_RDWR | O_CLOEXEC);
+      pthread_mutex_lock(&g_emu_lock);
+   }
+   int eff_fd = (fd == 100 || fd <= 0) ? g_kfile.fd : fd;
+   if (_IOC_TYPE(request) == KBASE_IOCTL_TYPE) {
+      unsigned int nr = _IOC_NR(request);
+      if (nr == 1 && g_kfile.state == EMU_KFILE_OPENED_NEED_VSN) {
+         g_kfile.state = EMU_KFILE_VSN_DONE;
+      } else if (nr != 0 && nr != 52 && nr != 1 && nr != 3 && g_kfile.state != EMU_KFILE_KCTX_READY) {
+         g_kfile.state = EMU_KFILE_KCTX_READY;
+         g_kfile.exec_va_initialized = true;
+         g_kfile.jit_initialized = true;
+      }
+   }
+   pthread_mutex_unlock(&g_emu_lock);
+   uint8_t scratch[256];
+   memset(scratch, 0, sizeof(scratch));
+   if (arg && _IOC_SIZE(request) <= sizeof(scratch))
+      memcpy(scratch, arg, _IOC_SIZE(request));
+   return ioctl(eff_fd, request, arg ? scratch : NULL);
 }

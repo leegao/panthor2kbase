@@ -13,6 +13,7 @@ if [ ! -d "${MESA_DIR}" ]; then
     exit 1
 fi
 
+mkdir -p "${ROOT_DIR}/shims/include" && cp -rf "${ROOT_DIR}/src/mesa_shims/"* "${ROOT_DIR}/shims/include/"
 cp -rf "${ROOT_DIR}/mesa_overlay/"* "${MESA_DIR}/"
 mkdir -p "${MESA_DIR}/src/panfrost/uapi_adapter" \
          "${MESA_DIR}/subprojects/panthor_kbase_adapter/include" \

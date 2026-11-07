@@ -38,7 +38,7 @@ cp -f "${ROOT_DIR}/src/adapter/panthor_kbase_adapter.h"  "${SHIMS_DIR}/include/"
 cp -f "${ROOT_DIR}/src/adapter/log.h"                    "${SHIMS_DIR}/include/"
 
 # Copy AOSP u_gralloc headers into shims/include
-U_GRALLOC_OVERLAY="${ROOT_DIR}/mesa_overlay/src/util/u_gralloc"
+U_GRALLOC_OVERLAY="${ROOT_DIR}/src/mesa_shims"
 if [ -d "${U_GRALLOC_OVERLAY}" ]; then
    cp -f "${U_GRALLOC_OVERLAY}/force_aosp_abi.h" "${SHIMS_DIR}/include/"
    for subdir in aidl android android-base cutils fmq gralloctypes hidl math ui utils; do

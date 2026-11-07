@@ -3,6 +3,7 @@ export MESON_WORKING_DIR="$PWD"
 
 export PATH="$MESON_WORKING_DIR/build-host/src/compiler/clc:$MESON_WORKING_DIR/build-host/src/compiler/spirv:$MESON_WORKING_DIR/build-host/src/panfrost/clc:$PATH"
 
+mkdir -p shims/include && cp -rf src/mesa_shims/* shims/include/
 cp -rf mesa_overlay/* mesa/
 mkdir -p mesa/src/panfrost/uapi_adapter \
          mesa/subprojects/panthor_kbase_adapter/include \
