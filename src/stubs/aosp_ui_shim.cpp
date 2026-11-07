@@ -15,7 +15,14 @@
 /* Explicit instantiation so std::__1::basic_string<char>::~basic_string() is
  * emitted as a weak symbol in libui.a without requiring /system/lib64/libc++.so
  */
-_LIBCPP_BEGIN_NAMESPACE_STD __attribute__((weak)) void __libcpp_verbose_abort(const char *, ...) { __builtin_trap(); } _LIBCPP_END_NAMESPACE_STD
+_LIBCPP_BEGIN_NAMESPACE_STD
+#if _LIBCPP_VERSION >= 190000
+    #define __VERBOSE_ABORT_NOEXCEPT _NOEXCEPT
+#else
+    #define __VERBOSE_ABORT_NOEXCEPT
+#endif
+__attribute__((weak)) void __libcpp_verbose_abort(const char *, ...) __VERBOSE_ABORT_NOEXCEPT { __builtin_trap(); }
+_LIBCPP_END_NAMESPACE_STD
 template class std::basic_string<char>;
 
 namespace android {

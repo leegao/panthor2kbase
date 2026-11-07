@@ -108,7 +108,7 @@ extern "C" void panthor2kbase_logv(panthor2kbase_log_level_t level, const char *
         indent = 32;
 
     FILE *fp = g_log_fp ? g_log_fp : stderr;
-    // pthread_mutex_lock(&g_log_lock);
+    pthread_mutex_lock(&g_log_lock);
 
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -121,7 +121,7 @@ extern "C" void panthor2kbase_logv(panthor2kbase_log_level_t level, const char *
     fputc('\n', fp);
     fflush(fp);
 
-    // pthread_mutex_unlock(&g_log_lock);
+    pthread_mutex_unlock(&g_log_lock);
 }
 
 extern "C" void panthor2kbase_log(panthor2kbase_log_level_t level, const char *fmt, ...)
