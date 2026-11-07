@@ -48,9 +48,10 @@ mkdir -p "$OUT_DIR" "$ROOT_DIR/bin"
 
 PASS_DRIVER="$ROOT_DIR/bin/mali_llvm_pass_driver"
 if [ ! -x "$PASS_DRIVER" ] || [ "$ROOT_DIR/src/mali_llvm_passes.cpp" -nt "$PASS_DRIVER" ]; then
+    LIB_LLVM="$(ls /usr/lib/x86_64-linux-gnu/libLLVM-*.so.1 -1 | head -1)"
     echo "[Build] Compiling 6-Pass C++ LLVM Lifter & Lowerer (src/mali_llvm_passes.cpp -> bin/mali_llvm_pass_driver)..."
     g++ -O3 "$ROOT_DIR/src/mali_llvm_passes.cpp" \
-        /usr/lib/x86_64-linux-gnu/libLLVM-15.so.1 \
+        $LIB_LLVM \
         -Wl,-rpath,/usr/lib/x86_64-linux-gnu \
         -o "$PASS_DRIVER"
 fi
