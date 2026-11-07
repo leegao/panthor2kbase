@@ -3,9 +3,9 @@
  *
  * Complete ARM Mali Kbase Kernel Driver UAPI Definitions (CSF r38p0 - r54p3)
  * Grounded in:
+ *  - MediaTek MT6878 mali-r44p1 drivers/gpu/arm/midgard/include/uapi/gpu/arm/midgard/csf/mali_base_csf_kernel.h
+ *  - MediaTek MT6878 mali-r44p1 drivers/gpu/arm/midgard/include/uapi/gpu/arm/midgard/csf/mali_kbase_csf_ioctl.h
  *  - Pixel GKI gpu/common/include/uapi/gpu/arm/midgard/mali_kbase_ioctl.h
- *  - Pixel GKI gpu/common/include/uapi/gpu/arm/midgard/csf/mali_kbase_csf_ioctl.h
- *  - Pixel GKI gpu/common/include/uapi/gpu/arm/midgard/mali_base_common_kernel.h
  *  - Binary verification against unstripped mali_kbase.ko (CSF v1.21, AArch64)
  */
 #ifndef MALI_KBASE_UAPI_H
@@ -75,6 +75,16 @@ extern "C" {
 #define BASE_CONTEXT_CREATE_FLAG_NONE                 0U
 #define BASE_CONTEXT_CCTX_EMBEDDED                    (1U << 0)
 #define BASE_CONTEXT_SYSTEM_MONITOR_SUBMIT_DISABLED   (1U << 1)
+#define BASE_CONTEXT_CSF_EVENT_THREAD                 (1U << 2)
+
+/* CSF CSI exception handler flags (mali_base_csf_kernel.h:145) */
+#define BASE_CSF_TILER_OOM_EXCEPTION_FLAG             (1U << 0)
+
+/* Queue Group Priorities (mali_base_csf_kernel.h:187) */
+#define BASE_QUEUE_GROUP_PRIORITY_HIGH                0U
+#define BASE_QUEUE_GROUP_PRIORITY_MEDIUM              1U
+#define BASE_QUEUE_GROUP_PRIORITY_LOW                 2U
+#define BASE_QUEUE_GROUP_PRIORITY_REALTIME            3U
 
 /* Special Mmap Handles (Page-Aligned Cookies in mali_base_common_kernel.h) */
 #define BASE_MEM_INVALID_HANDLE                (0ULL  << 12)
@@ -91,12 +101,19 @@ extern "C" {
 #define CS_USER_IO_OUTPUT_PAGE_OFFSET          0x2000UL
 #define CS_USER_IO_MMAP_SIZE                   (3UL * 4096UL)
 
-/* Offsets within USER_IO Pages */
+/* Offsets within USER_IO Pages (mali_kbase_csf_registers.h) */
 #define CS_USER_IO_DOORBELL_OFFSET             0x0000UL /* u32 write triggers doorbell */
 #define CS_USER_IO_CS_INSERT_OFFSET            0x1000UL /* u64 byte offset in ring */
 #define CS_USER_IO_CS_EXTRACT_INIT_OFFSET      0x1008UL /* u64 initial extract */
 #define CS_USER_IO_CS_EXTRACT_OFFSET           0x2000UL /* u64 current FW extract */
 #define CS_USER_IO_CS_ACTIVE_OFFSET            0x2008UL /* u32 active status */
+#define CS_USER_IO_CS_FAULT_OFFSET             0x2080UL /* u32 recoverable CS fault */
+#define CS_USER_IO_CS_FATAL_OFFSET             0x2084UL /* u32 fatal CS fault */
+#define CS_USER_IO_CS_FAULT_INFO_OFFSET        0x2088UL /* u64 fault info */
+#define CS_USER_IO_CS_FATAL_INFO_OFFSET        0x2090UL /* u64 fatal info */
+#define CS_USER_IO_CS_HEAP_VT_START_OFFSET     0x20c0UL /* u32 vt_start */
+#define CS_USER_IO_CS_HEAP_VT_END_OFFSET       0x20c4UL /* u32 vt_end */
+#define CS_USER_IO_CS_HEAP_FRAG_END_OFFSET     0x20ccUL /* u32 frag_end */
 
 /* ============================================================================
  * 2. GPU Property Keys (KBASE_IOCTL_GET_GPUPROPS TLV Encoding)
@@ -444,7 +461,7 @@ union kbase_ioctl_cs_queue_group_create_56 {
    } out;
 };
 
-/* 112-byte 1.25+ layout */
+/* 112-byte 1.19-1.25+ layout (verified in MT6878 mali_kbase_csf_ioctl.h:348) */
 union kbase_ioctl_cs_queue_group_create_112 {
    struct {
       __u64 tiler_mask;
@@ -474,6 +491,60 @@ union kbase_ioctl_cs_queue_group_create_112 {
 struct kbase_ioctl_cs_queue_group_term {
    __u8 group_handle;
    __u8 padding[7];
+};
+
+/* CSF Event / Error Notification read from /dev/mali0 (mali_base_csf_kernel.h:477-596) */
+enum base_gpu_queue_group_error_type {
+   BASE_GPU_QUEUE_GROUP_ERROR_FATAL = 0,
+   BASE_GPU_QUEUE_GROUP_QUEUE_ERROR_FATAL = 1,
+   BASE_GPU_QUEUE_GROUP_ERROR_TIMEOUT = 2,
+   BASE_GPU_QUEUE_GROUP_ERROR_TILER_HEAP_OOM = 3,
+   BASE_GPU_QUEUE_GROUP_ERROR_FATAL_COUNT = 4
+};
+
+enum base_csf_notification_type {
+   BASE_CSF_NOTIFICATION_EVENT = 0,
+   BASE_CSF_NOTIFICATION_GPU_QUEUE_GROUP_ERROR = 1,
+   BASE_CSF_NOTIFICATION_CPU_QUEUE_DUMP = 2,
+   BASE_CSF_NOTIFICATION_COUNT = 3
+};
+
+struct base_gpu_queue_group_error_fatal_payload {
+   __u64 sideband;
+   __u32 status;
+   __u32 padding;
+};
+
+struct base_gpu_queue_error_fatal_payload {
+   __u64 sideband;
+   __u32 status;
+   __u8 csi_index;
+   __u8 padding[3];
+};
+
+struct base_gpu_queue_group_error {
+   __u8 error_type;
+   __u8 padding[7];
+   union {
+      struct base_gpu_queue_group_error_fatal_payload fatal_group;
+      struct base_gpu_queue_error_fatal_payload fatal_queue;
+   } payload;
+};
+
+struct base_csf_notification {
+   __u8 type;
+   __u8 padding[7];
+   union {
+      struct {
+         __u8 handle;
+         __u8 padding[7];
+         struct base_gpu_queue_group_error error;
+      } csg_error;
+      struct {
+         __u8 cmd;
+      } dump;
+      __u8 align[56];
+   } payload;
 };
 
 typedef __u8 base_kcpu_queue_id;

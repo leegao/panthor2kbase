@@ -68,8 +68,11 @@ static void test_csf_normalizer_edge_cases(void)
    dummy[4] = ((uint64_t)CSF_OP_HEAP_OPERATION << 56) | (1ULL << 28);
    dummy[5] = ((uint64_t)CSF_OP_MOVE48 << 56);
 
+   dummy[6] = ((uint64_t)HW_CSF_OP_FINISH_FRAGMENT << 56) | (10ULL << 40) | (12ULL << 32) | 1ULL;
    panthor_kbase_normalize_cs_stream(dummy, sizeof(dummy), true, &stats);
-   assert(stats.sync_scope_upgrades == 2 && stats.heap_op_nops == 1);
+   assert(stats.sync_scope_upgrades == 2 && stats.heap_op_nops == 1 && stats.finish_frag_stat_clears == 1);
+   assert((dummy[6] & 1ULL) == 0ULL);
+   assert(strcmp(panthor_kbase_csf_opcode_name(HW_CSF_OP_FINISH_FRAGMENT), "FINISH_FRAGMENT") == 0);
    panthor_kbase_normalize_cs_stream(dummy, sizeof(dummy), false, NULL);
    printf("  -> CSF Bytecode Normalizer & RAII indent invariant: PASS\n");
 }

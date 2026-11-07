@@ -458,10 +458,8 @@ static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
 
       switch (opcode) {
       case CSF_OP_NOP:
-      case CSF_OP_SET_STATE:
       case 27: /* HW_CSF_OP_SET_STATE (0x1b) */
       case 28: /* HW_CSF_OP_SET_STATE_IMM32 (0x1c) */
-      case CSF_OP_SET_SB_ENTRY:
       case 23: /* HW_CSF_OP_SET_SB_ENTRY (0x17) */
       case CSF_OP_REQ_RESOURCE:
       case CSF_OP_WAIT:
@@ -501,6 +499,57 @@ static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
                g_stats.csf_calls_followed++;
                execute_csf_stream((const uint64_t *)(uintptr_t)target_va,
                                   target_sz, cs_regs, heap);
+            }
+         }
+         break;
+      }
+
+      case 11: /* HW_CSF_OP_FINISH_FRAGMENT (0x0b) */ {
+         if (heap && (insn & 1ULL) != 0ULL && ((insn >> 1) & 0x7fffULL) == 0ULL) {
+            heap->frag_end++;
+            if (heap->frag_end > heap->vt_end)
+               g_stats.oom_heap_stat_errors++;
+         }
+         break;
+      }
+
+      case 20: /* HW_CSF_OP_LOAD_MULTIPLE (0x14 = CSF_OP_SET_SB_ENTRY when mask==0) */ {
+         uint16_t mask = (uint16_t)((insn >> 16) & 0xffffU);
+         uint8_t base_reg = (uint8_t)((insn >> 48) & 0xffU);
+         uint8_t addr_reg = (uint8_t)((insn >> 40) & 0xffU);
+         int16_t imm_off = (int16_t)(insn & 0xffffU);
+         if (mask != 0 && addr_reg < 95 && base_reg < 96) {
+            uint64_t base_va = (cs_regs[addr_reg + 1] << 32) | cs_regs[addr_reg];
+            if (base_va >= 0x10000ULL) {
+               const uint32_t *src = (const uint32_t *)((const uint8_t *)(uintptr_t)base_va + imm_off);
+               uint32_t r_off = 0;
+               for (uint32_t b = 0; b < 16; b++) {
+                  if ((mask & (1U << b)) && (base_reg + r_off) < 96)
+                     cs_regs[base_reg + r_off] = src[r_off];
+                  if (mask & (1U << b))
+                     r_off++;
+               }
+            }
+         }
+         break;
+      }
+
+      case 21: /* HW_CSF_OP_STORE_MULTIPLE (0x15 = CSF_OP_SET_STATE when mask==0) */ {
+         uint16_t mask = (uint16_t)((insn >> 16) & 0xffffU);
+         uint8_t base_reg = (uint8_t)((insn >> 48) & 0xffU);
+         uint8_t addr_reg = (uint8_t)((insn >> 40) & 0xffU);
+         int16_t imm_off = (int16_t)(insn & 0xffffU);
+         if (mask != 0 && addr_reg < 95 && base_reg < 96) {
+            uint64_t base_va = (cs_regs[addr_reg + 1] << 32) | cs_regs[addr_reg];
+            if (base_va >= 0x10000ULL) {
+               uint32_t *dst = (uint32_t *)((uint8_t *)(uintptr_t)base_va + imm_off);
+               uint32_t r_off = 0;
+               for (uint32_t b = 0; b < 16; b++) {
+                  if ((mask & (1U << b)) && (base_reg + r_off) < 96)
+                     dst[r_off] = (uint32_t)cs_regs[base_reg + r_off];
+                  if (mask & (1U << b))
+                     r_off++;
+               }
             }
          }
          break;

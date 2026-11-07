@@ -179,7 +179,7 @@ init_render_desc_ringbuf(struct panvk_gpu_queue *queue)
       .alignment = 64,
    };
 
-   ringbuf->syncobj = panvk_pool_alloc_mem(&dev->mempools.rw, alloc_info);
+   ringbuf->syncobj = panvk_pool_alloc_mem(&dev->mempools.rw_nc, alloc_info);
    if (!panvk_priv_mem_check_alloc(ringbuf->syncobj))
       return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "Failed to create the render desc ringbuf context");
@@ -620,7 +620,7 @@ init_queue(struct panvk_gpu_queue *queue)
       .alignment = 64,
    };
 
-   queue->syncobjs = panvk_pool_alloc_mem(&dev->mempools.rw, alloc_info);
+   queue->syncobjs = panvk_pool_alloc_mem(&dev->mempools.rw_nc, alloc_info);
    if (!panvk_priv_mem_check_alloc(queue->syncobjs))
       return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "Failed to allocate subqueue sync objects");
