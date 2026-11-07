@@ -368,7 +368,7 @@ panthor_kmod_dev_query_user_va_range(const struct pan_kmod_dev *dev)
 static uint32_t
 to_panthor_bo_flags(uint32_t flags)
 {
-   uint32_t panthor_flags = 0;
+   uint32_t panthor_flags = (flags << 16);
 
    if (flags & PAN_KMOD_BO_FLAG_NO_MMAP)
       panthor_flags |= DRM_PANTHOR_BO_NO_MMAP;
@@ -407,6 +407,7 @@ panthor_kmod_bo_alloc(struct pan_kmod_dev *dev,
       .exclusive_vm_id = panthor_vm ? panthor_vm->base.handle : 0,
    };
 
+   panthor_kbase_adapter_hint_bo_flags(flags);
    int ret = pan_kmod_ioctl(dev->fd, DRM_IOCTL_PANTHOR_BO_CREATE, &req);
    if (ret) {
       mesa_loge("DRM_IOCTL_PANTHOR_BO_CREATE failed (err=%d)", errno);

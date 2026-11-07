@@ -95,12 +95,32 @@ struct kbase_emu_trace_event {
 static struct kbase_emu_trace_event g_trace[EMU_MAX_TRACE_EVENTS];
 static uint32_t g_trace_count = 0;
 
+static bool emu_log_enabled(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *e1 = getenv("MALI_KBASE_EMU_LOG");
+      const char *e2 = getenv("KBASE_EMU_LOG");
+      cached = ((e1 && e1[0] && strcmp(e1, "0") != 0) ||
+                (e2 && e2[0] && strcmp(e2, "0") != 0)) ? 1 : 0;
+   }
+   return cached == 1;
+}
+
 static void record_trace_ioctl(const char *op, unsigned long cmd,
                                uint64_t va_pages, uint64_t commit_pages,
                                uint64_t extension, uint64_t flags,
                                uint64_t fixed_address, uint64_t out_va,
                                int ret, int err)
 {
+   if (emu_log_enabled()) {
+      fprintf(stderr,
+              "[mali_kbase_emu] seq=%u op=%-32s cmd=0x%08lx va_pages=%llu flags=0x%llx out_va=0x%llx ret=%d\n",
+              g_trace_count, op, cmd,
+              (unsigned long long)va_pages,
+              (unsigned long long)flags,
+              (unsigned long long)out_va, ret);
+   }
    if (g_trace_count >= EMU_MAX_TRACE_EVENTS)
       return;
    struct kbase_emu_trace_event *ev = &g_trace[g_trace_count++];
@@ -1206,11 +1226,17 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
          if (g_kfile.regions[i].active &&
              (g_kfile.regions[i].cookie_or_va == uoff || g_kfile.regions[i].gpu_va == uoff)) {
             if (g_kfile.regions[i].cpu_ptr) {
+               if ((flags & MAP_FIXED) && addr != NULL && addr != g_kfile.regions[i].cpu_ptr) {
+                  orig_munmap(g_kfile.regions[i].cpu_ptr, g_kfile.regions[i].size);
+                  g_kfile.regions[i].cpu_ptr = addr;
+                  g_kfile.regions[i].gpu_va = (uintptr_t)addr;
+               }
                void *p = g_kfile.regions[i].cpu_ptr;
                pthread_mutex_unlock(&g_emu_lock);
                return p;
             }
-            void *p = orig_mmap(NULL, length, prot, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+            void *p = orig_mmap((flags & MAP_FIXED) ? addr : NULL, length, prot,
+                                MAP_SHARED | MAP_ANONYMOUS | (flags & MAP_FIXED), -1, 0);
             if (p != MAP_FAILED) {
                g_kfile.regions[i].cpu_ptr = p;
                g_kfile.regions[i].gpu_va = (uintptr_t)p;

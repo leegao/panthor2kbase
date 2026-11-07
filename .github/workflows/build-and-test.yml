@@ -57,3 +57,9 @@ jobs:
             artifacts/*.json
             build-host/*.so
             *.so
+
+      - name: Run Ludashi & PanProbe 36-Test Hardware/Emulator Verification Suite
+        run: |
+          ./build_all.sh
+          ./tests/test_ludashi_panvk_aot_and_host
+          ./tests/panprobe/panprobe_runner_suite

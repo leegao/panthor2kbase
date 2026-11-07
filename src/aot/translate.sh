@@ -64,13 +64,13 @@ echo "==========================================================================
 
 "$PASS_DRIVER" --lift-so "$SO_PATH" "$OUT_DIR"
 
-g++ -O3 -fno-strict-aliasing "$ROOT_DIR/src/mali_aot_runner.cpp" "$OUT_DIR/mali_mbs2_aot.o" "$ROOT_DIR/../../libmali_kbase_emu.so" -Wl,-rpath,"$ROOT_DIR/../.." -ldl -o "$OUT_DIR/mali_aot_runner"
-g++ -O3 -std=c++17 -fno-strict-aliasing -shared -fPIC "$ROOT_DIR/src/mali_vulkan_icd.cpp" "$OUT_DIR/mali_mbs2_aot.o" "$ROOT_DIR/../../libmali_kbase_emu.so" -Wl,-rpath,"$ROOT_DIR/../.." -ldl -lm -o "$OUT_DIR/libvulkan_mali_aot_icd.so"
+g++ -O3 -fno-strict-aliasing "$ROOT_DIR/src/mali_aot_runner.cpp" "$OUT_DIR/mali_mbs2_aot.o" -L"$ROOT_DIR/../.." -lmali_kbase_emu -Wl,-rpath,\$ORIGIN/../../..:\$ORIGIN -ldl -o "$OUT_DIR/mali_aot_runner"
+g++ -O3 -std=c++17 -fno-strict-aliasing -shared -fPIC "$ROOT_DIR/src/mali_vulkan_icd.cpp" "$OUT_DIR/mali_mbs2_aot.o" -L"$ROOT_DIR/../.." -lmali_kbase_emu -Wl,-rpath,\$ORIGIN/../../..:\$ORIGIN -ldl -lm -o "$OUT_DIR/libvulkan_mali_aot_icd.so"
 cat << JSON_EOF > "$OUT_DIR/mali_aot_icd.x86_64.json"
 {
     "file_format_version": "1.0.0",
     "ICD": {
-        "library_path": "$OUT_DIR/libvulkan_mali_aot_icd.so",
+        "library_path": "./libvulkan_mali_aot_icd.so",
         "api_version": "1.3.250"
     }
 }

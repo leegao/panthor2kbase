@@ -26,19 +26,37 @@ int main(int argc, char** argv) {
     const char* arg_icd = (argc > 1) ? argv[1] : nullptr;
     const char* arg_so  = (argc > 2) ? argv[2] : nullptr;
 
+    std::string exe_dir = ".";
+    {
+        char exe_buf[4096]{};
+        ssize_t n = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+        if (n > 0) {
+            exe_buf[n] = '\0';
+            char* slash = strrchr(exe_buf, '/');
+            if (slash) {
+                *slash = '\0';
+                exe_dir = exe_buf;
+            }
+        }
+    }
+
     if (arg_icd && arg_icd[0]) {
         char rp[4096]{};
         icd_path = realpath(arg_icd, rp) ? rp : arg_icd;
-    } else {
-        const char* cands[] = {
+    } else if (!getenv("VK_ICD_FILENAMES")) {
+        std::vector<std::string> cands = {
+            exe_dir + "/../build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json",
+            exe_dir + "/../r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json",
+            "src/aot/build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json",
             "build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json",
             "../build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json",
+            "src/aot/r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json",
             "r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json"
         };
-        for (const char* c : cands) {
-            if (access(c, R_OK) == 0) {
+        for (const std::string& c : cands) {
+            if (access(c.c_str(), R_OK) == 0) {
                 char rp[4096]{};
-                icd_path = realpath(c, rp) ? rp : c;
+                icd_path = realpath(c.c_str(), rp) ? rp : c;
                 break;
             }
         }
@@ -48,6 +66,19 @@ int main(int argc, char** argv) {
     }
     if (arg_so && arg_so[0]) {
         setenv("MALI_AOT_DRIVER_SO", arg_so, 1);
+    } else if (!getenv("MALI_AOT_DRIVER_SO")) {
+        std::vector<std::string> so_cands = {
+            exe_dir + "/../driver/r54p3-00eac0-6eda07/lib64/egl/libGLES_mali.so",
+            "src/aot/driver/r54p3-00eac0-6eda07/lib64/egl/libGLES_mali.so",
+            "driver/r54p3-00eac0-6eda07/lib64/egl/libGLES_mali.so"
+        };
+        for (const std::string& sc : so_cands) {
+            if (access(sc.c_str(), R_OK) == 0) {
+                char rp[4096]{};
+                setenv("MALI_AOT_DRIVER_SO", realpath(sc.c_str(), rp) ? rp : sc.c_str(), 1);
+                break;
+            }
+        }
     }
 
     std::cout << "================================================================================\n";
@@ -89,7 +120,7 @@ int main(int argc, char** argv) {
     uint32_t pd_count = 1;
     void* phys_dev = nullptr;
     rc = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(gipa(instance, "vkEnumeratePhysicalDevices"))(instance, &pd_count, &phys_dev);
-    assert(rc == 0 && phys_dev != nullptr);
+    assert((rc == 0 || rc == 5 /* VK_INCOMPLETE */) && phys_dev != nullptr);
 
     struct VkPhysicalDevicePropsHead {
         uint32_t apiVersion, driverVersion, vendorID, deviceID, deviceType;

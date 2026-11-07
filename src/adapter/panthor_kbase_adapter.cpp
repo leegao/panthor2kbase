@@ -140,6 +140,8 @@ struct adapter_bo {
    uint64_t gpu_va;
    void *cpu_ptr;
    size_t cpu_size;
+   void *gpu_mapping;
+   size_t gpu_mapping_size;
    void *alias_ptr;
    size_t alias_size;
    uint64_t alias_gpu_va;
@@ -196,6 +198,7 @@ static inline void kbase_cpu_cache_invalidate_range(const void *ptr, size_t size
 /* Subqueue state inside a CSG */
 struct adapter_subqueue {
    bool bound;
+   uint8_t kbase_group_handle;
    uint32_t csi_index;
    uint32_t ringbuf_size;
    uint64_t ring_gpu_va;
@@ -706,6 +709,16 @@ static struct adapter_bo *find_bo(uint32_t handle)
    return nullptr;
 }
 
+static struct adapter_bo *find_bo_by_va(uint64_t va)
+{
+   for (size_t i = 0; i < ADAPTER_MAX_BOS; i++) {
+      if (g_ctx.bos[i].in_use && g_ctx.bos[i].gpu_va != 0 &&
+          va >= g_ctx.bos[i].gpu_va && va < g_ctx.bos[i].gpu_va + g_ctx.bos[i].size)
+         return &g_ctx.bos[i];
+   }
+   return nullptr;
+}
+
 static struct adapter_syncobj *find_syncobj(uint32_t handle)
 {
    for (size_t i = 0; i < ADAPTER_MAX_SYNCOBJS; i++) {
@@ -753,19 +766,19 @@ uint64_t panthor_kbase_adapter_get_bo_gpu_va(uint32_t gem_handle)
  *     to `NOP` (0) so kbase's OOM handler never terminates the CSG on `frag_end > vt_end`.
  */
 /* Real Valhall v10.xml/v11.xml CSF hardware opcodes */
-static constexpr uint64_t HW_CSF_OP_SET_SB_ENTRY    = 23ULL; /* 0x17 */
-static constexpr uint64_t HW_CSF_OP_SET_STATE       = 27ULL; /* 0x1b */
-static constexpr uint64_t HW_CSF_OP_SET_STATE_IMM32 = 28ULL; /* 0x1c */
-static constexpr uint64_t HW_CSF_OP_CALL            = 32ULL; /* 0x20 */
-static constexpr uint64_t HW_CSF_OP_REQ_RESOURCE    = 34ULL; /* 0x22 */
-static constexpr uint64_t HW_CSF_OP_FLUSH_CACHE2    = 36ULL; /* 0x24 */
-static constexpr uint64_t HW_CSF_OP_SYNC_ADD32      = 37ULL; /* 0x25 */
-static constexpr uint64_t HW_CSF_OP_SYNC_SET32      = 38ULL; /* 0x26 */
-static constexpr uint64_t HW_CSF_OP_ERROR_BARRIER   = 47ULL; /* 0x2f */
-static constexpr uint64_t HW_CSF_OP_HEAP_SET        = 48ULL; /* 0x30 */
-static constexpr uint64_t HW_CSF_OP_HEAP_OPERATION  = 49ULL; /* 0x31 */
-static constexpr uint64_t HW_CSF_OP_SYNC_ADD64      = 51ULL; /* 0x33 */
-static constexpr uint64_t HW_CSF_OP_SYNC_SET64      = 52ULL; /* 0x34 */
+[[maybe_unused]] static constexpr uint64_t HW_CSF_OP_SET_SB_ENTRY    = 23ULL; /* 0x17 */
+[[maybe_unused]] static constexpr uint64_t HW_CSF_OP_SET_STATE       = 27ULL; /* 0x1b */
+[[maybe_unused]] static constexpr uint64_t HW_CSF_OP_SET_STATE_IMM32 = 28ULL; /* 0x1c */
+[[maybe_unused]] static constexpr uint64_t HW_CSF_OP_CALL            = 32ULL; /* 0x20 */
+[[maybe_unused]] static constexpr uint64_t HW_CSF_OP_REQ_RESOURCE    = 34ULL; /* 0x22 */
+[[maybe_unused]] static constexpr uint64_t HW_CSF_OP_FLUSH_CACHE2    = 36ULL; /* 0x24 */
+[[maybe_unused]] static constexpr uint64_t HW_CSF_OP_SYNC_ADD32      = 37ULL; /* 0x25 */
+[[maybe_unused]] static constexpr uint64_t HW_CSF_OP_SYNC_SET32      = 38ULL; /* 0x26 */
+[[maybe_unused]] static constexpr uint64_t HW_CSF_OP_ERROR_BARRIER   = 47ULL; /* 0x2f */
+[[maybe_unused]] static constexpr uint64_t HW_CSF_OP_HEAP_SET        = 48ULL; /* 0x30 */
+[[maybe_unused]] static constexpr uint64_t HW_CSF_OP_HEAP_OPERATION  = 49ULL; /* 0x31 */
+[[maybe_unused]] static constexpr uint64_t HW_CSF_OP_SYNC_ADD64      = 51ULL; /* 0x33 */
+[[maybe_unused]] static constexpr uint64_t HW_CSF_OP_SYNC_SET64      = 52ULL; /* 0x34 */
 
 void panthor_kbase_normalize_cs_stream(uint64_t *stream_cpu,
                                        uint32_t stream_size_bytes,
@@ -838,7 +851,7 @@ void panthor_kbase_normalize_cs_stream(uint64_t *stream_cpu,
        */
       if ((opcode == CSF_OP_SYNC_ADD32 || opcode == CSF_OP_SYNC_SET32 ||
            opcode == CSF_OP_SYNC_ADD64 || opcode == CSF_OP_SYNC_SET64) &&
-          (insn & 0xfeULL) == 0ULL && ((insn >> 16) & 0x0effULL) == 0ULL) {
+          (insn & 0xfeULL) == 0ULL) {
          uint64_t scope = (insn >> 28) & 0x3ULL;
          if (scope == CSF_SYNC_SCOPE_CSG) {
             insn &= ~(0x3ULL << 28);
@@ -883,19 +896,26 @@ size_t panthor_kbase_emit_ring_slot(uint64_t *ring_slot,
    uint32_t call_addr_reg = (cs_reg_count >= 64) ? (cs_reg_count - 4) : 60;
    uint32_t call_size_reg = call_addr_reg + 2;
    uint32_t flush_id_reg  = call_addr_reg + 2;
-   uint32_t subq_ctx_reg  = (cs_reg_count >= 96) ? 88 : 56;
+   /* On cs_reg_count == 96 (nr_kernel_registers = 4), cs_subqueue_ctx_reg is r90 (96 - 6 = 90 = 0x5a) */
+   uint32_t subq_ctx_reg  = (cs_reg_count >= 96) ? (cs_reg_count - 6) : 56;
    uint16_t sb_mask       = all_sb_mask ? all_sb_mask : 0x00ffU;
 
    if (arch_major >= 11) {
       /*
-       * v11.xml CS SET_STATE (opcode 27 = 0x1b):
-       *   bits [39:32] = State (1 = MALI_CS_SET_STATE_TYPE_SB_SEL_OTHER)
-       *   bits [47:40] = Source register (flush_id_reg = 0 = SB_ID(LS))
+       * v11.xml CS SET_STATE_IMM32 (opcode 28 = 0x1c):
+       * Verified against Ludashi panvk-kbase-android (kbase_subqueue_emit_job at 0x1aab340..0x1aab7a0)
+       * and patches/csf/007-gpu-queue-kbase.patch lines 520-528:
+       *   1. SET_STATE_IMM32(SB_SEL_ENDPOINT = 0, SB_ITER(0) = 3)
+       *   2. SET_STATE_IMM32(SB_MASK_WAIT    = 9, SB_WAIT_ITER(0) = 8)
+       *   3. SET_STATE_IMM32(SB_SEL_OTHER    = 1, SB_ID(LS) = 0)
+       *   4. SET_STATE_IMM32(SB_SEL_DEFERRED = 2, SB_ID(DEFERRED_SYNC) = 1)
+       *   5. SET_STATE_IMM32(SB_MASK_STREAM  = 8, 0xf0)
        */
-      ring_slot[idx++] = (CSF_OP_MOVE32 << 56) | (static_cast<uint64_t>(flush_id_reg) << 48) | 0ULL;
-      ring_slot[idx++] = (HW_CSF_OP_SET_STATE << 56) |
-                         (static_cast<uint64_t>(flush_id_reg) << 40) |
-                         (1ULL << 32);
+      ring_slot[idx++] = (HW_CSF_OP_SET_STATE_IMM32 << 56) | (0ULL << 32) | 0x03ULL;
+      ring_slot[idx++] = (HW_CSF_OP_SET_STATE_IMM32 << 56) | (9ULL << 32) | 0x08ULL;
+      ring_slot[idx++] = (HW_CSF_OP_SET_STATE_IMM32 << 56) | (1ULL << 32) | 0x00ULL;
+      ring_slot[idx++] = (HW_CSF_OP_SET_STATE_IMM32 << 56) | (2ULL << 32) | 0x01ULL;
+      ring_slot[idx++] = (HW_CSF_OP_SET_STATE_IMM32 << 56) | (8ULL << 32) | 0xf0ULL;
    } else {
       /* Keep CSF_OP_SET_SB_ENTRY at ring_slot[0] for v10 + unit_tests_edge_cases */
       ring_slot[idx++] = (CSF_OP_SET_SB_ENTRY << 56) | 2ULL;
@@ -917,13 +937,13 @@ size_t panthor_kbase_emit_ring_slot(uint64_t *ring_slot,
    }
 
    if (stream_size > 0 && stream_addr != 0) {
-      /* Pre-CALL cache flush: L2=CLEAN(1), LSC=CLEAN(1), Other=INVALIDATE(2), signal_slot=0 */
+      /* Pre-CALL cache flush: L2=CLEAN_INV(3), LSC=CLEAN_INV(3), Other=INVALIDATE(2) (0x233), signal_slot=0 */
       ring_slot[idx++] = (CSF_OP_MOVE32 << 56) | (static_cast<uint64_t>(flush_id_reg) << 48) |
                          static_cast<uint64_t>(latest_flush);
       ring_slot[idx++] = (HW_CSF_OP_FLUSH_CACHE2 << 56) |
                          (0ULL << 48) |
                          (static_cast<uint64_t>(flush_id_reg) << 40) |
-                         (2ULL << 8) | (1ULL << 4) | 1ULL;
+                         (2ULL << 8) | (3ULL << 4) | 3ULL;
       ring_slot[idx++] = (CSF_OP_WAIT << 56) | (1ULL << 16);
 
       /* Call command stream and wait for all scoreboard slots */
@@ -934,24 +954,17 @@ size_t panthor_kbase_emit_ring_slot(uint64_t *ring_slot,
       ring_slot[idx++] = (HW_CSF_OP_CALL << 56) | (static_cast<uint64_t>(call_addr_reg) << 40) |
                          (static_cast<uint64_t>(call_size_reg) << 32);
       ring_slot[idx++] = (CSF_OP_WAIT << 56) | (static_cast<uint64_t>(sb_mask) << 16);
-
-      /* Post-CALL cache flush: L2=CLEAN(1), LSC=CLEAN(1), Other=NONE(0), signal_slot=0 */
-      ring_slot[idx++] = (CSF_OP_MOVE32 << 56) | (static_cast<uint64_t>(flush_id_reg) << 48) | 0ULL;
-      ring_slot[idx++] = (HW_CSF_OP_FLUSH_CACHE2 << 56) |
-                         (0ULL << 48) |
-                         (static_cast<uint64_t>(flush_id_reg) << 40) |
-                         (1ULL << 4) | 1ULL;
-      ring_slot[idx++] = (CSF_OP_WAIT << 56) | (1ULL << 16);
    }
 
    /*
     * Increment subqueue seqno via v10.xml/v11.xml CS SYNC_ADD64 (opcode 51 = 0x33):
-    *   bit 0       = Error Propagate (0)
+    * Verified against Ludashi panvk-kbase-android (0x1aacdd4):
+    *   bit 0       = Error Propagate (1)
     *   bits [2:1]  = Scope (0 = MALI_CS_SYNC_SCOPE_SYSTEM)
     *   bits [31:16]= Wait Mask (0)
     *   bits [39:32]= Data register (call_size_reg)
     *   bits [47:40]= Address register (call_addr_reg)
-    *   bits [51:48]= Signal slot (0)
+    *   bits [51:48]= Signal slot (0 = SB_ID(LS))
     *   bit 52      = Defer Mode (0 = Defer Immediate)
     */
    ring_slot[idx++] = (CSF_OP_MOVE48 << 56) | (static_cast<uint64_t>(call_addr_reg) << 48) |
@@ -960,8 +973,8 @@ size_t panthor_kbase_emit_ring_slot(uint64_t *ring_slot,
    ring_slot[idx++] = (HW_CSF_OP_SYNC_ADD64 << 56) |
                       (0ULL << 48) |
                       (static_cast<uint64_t>(call_addr_reg) << 40) |
-                      (static_cast<uint64_t>(call_size_reg) << 32);
-   ring_slot[idx++] = (CSF_OP_WAIT << 56) | (1ULL << 16);
+                      (static_cast<uint64_t>(call_size_reg) << 32) |
+                      1ULL;
    ring_slot[idx++] = (HW_CSF_OP_ERROR_BARRIER << 56);
 
    while (idx < ADAPTER_RING_SLOT_QWORDS)
@@ -1283,10 +1296,12 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       if (bo) {
          void *alias_ptr = bo->alias_ptr;
          size_t alias_sz = bo->alias_size;
+         void *gpu_map_ptr = bo->gpu_mapping;
+         size_t gpu_map_sz = bo->gpu_mapping_size;
          void *unmap_ptr = (bo->cpu_ptr && bo->is_same_va) ? bo->cpu_ptr : nullptr;
          void *exec_cpu_ptr = (bo->cpu_ptr && !bo->is_same_va) ? bo->cpu_ptr : nullptr;
          size_t unmap_sz = bo->cpu_size;
-         uint64_t free_va = (!bo->is_same_va && bo->gpu_va) ? bo->gpu_va : 0;
+         uint64_t free_va = (!bo->is_same_va && !gpu_map_ptr && bo->gpu_va) ? bo->gpu_va : 0;
          uint32_t h = bo->gem_handle;
          uint64_t va = bo->gpu_va;
          if (bo->dmabuf_fd >= 0)
@@ -1295,6 +1310,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          pthread_mutex_unlock(&g_lock);
          if (alias_ptr && alias_sz > 0)
             real_munmap(alias_ptr, alias_sz);
+         if (gpu_map_ptr && gpu_map_ptr != unmap_ptr && gpu_map_ptr != exec_cpu_ptr && gpu_map_sz > 0)
+            real_munmap(gpu_map_ptr, gpu_map_sz);
          if (unmap_ptr) {
             real_munmap(unmap_ptr, unmap_sz);
          } else {
@@ -1382,9 +1399,17 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          return -1; // Propagate kernel errno to caller instead of creating a va=0 BO
       }
 
-      /* Establish GPU VA mapping for SAME_VA / NEED_MMAP imported dma-bufs */
+      /*
+       * Establish GPU VA mapping for SAME_VA / NEED_MMAP imported dma-bufs,
+       * while mapping CPU access (`bo->cpu_ptr`) directly from `fd_copy` (`dmabuf_fd`)
+       * at offset 0 (`kbase_kmod.c:134-138, 1503-1528`).
+       * On MediaTek kbase 1.21 (`imp.out.flags = 0x4500f`, `BASE_MEM_NEED_MMAP`),
+       * `mmap(mali_fd, imp.out.gpu_va)` ONLY sets up the GPU MMU page tables and
+       * cannot be used for CPU readback in `vulkan_wrapper` / `panvk` X11 WSI!
+       */
       uint64_t bo_sz = imp.out.va_pages ? (imp.out.va_pages * 4096ULL) : sz;
       uint64_t resolved_gpu_va = imp.out.gpu_va;
+      void *gpu_map_ptr = nullptr;
       void *imported_cpu_ptr = nullptr;
       if (imp.out.flags & (BASE_MEM_SAME_VA | BASE_MEM_NEED_MMAP)) {
          void *gpu_map = real_mmap(nullptr, static_cast<size_t>(bo_sz),
@@ -1392,9 +1417,18 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                                    g_ctx.mali_fd, static_cast<off_t>(imp.out.gpu_va));
          if (gpu_map != MAP_FAILED) {
             resolved_gpu_va = reinterpret_cast<uintptr_t>(gpu_map);
-            imported_cpu_ptr = gpu_map;
+            gpu_map_ptr = gpu_map;
          }
       }
+      if (fd_copy >= 0) {
+         void *dmabuf_cpu = real_mmap(nullptr, static_cast<size_t>(bo_sz),
+                                      PROT_READ | PROT_WRITE, MAP_SHARED,
+                                      fd_copy, 0);
+         if (dmabuf_cpu != MAP_FAILED)
+            imported_cpu_ptr = dmabuf_cpu;
+      }
+      if (!imported_cpu_ptr)
+         imported_cpu_ptr = gpu_map_ptr;
 
       for (size_t i = 0; i < ADAPTER_MAX_BOS; i++) {
          if (!g_ctx.bos[i].in_use) {
@@ -1403,13 +1437,16 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             bo->in_use = true;
             bo->gem_handle = g_ctx.next_gem_handle++;
             bo->size = bo_sz;
+            bo->kbase_flags = imp.out.flags;
             bo->gpu_va = resolved_gpu_va;
+            bo->gpu_mapping = gpu_map_ptr;
+            bo->gpu_mapping_size = gpu_map_ptr ? static_cast<size_t>(bo_sz) : 0;
             bo->cpu_ptr = imported_cpu_ptr;
             bo->cpu_size = static_cast<size_t>(bo_sz);
             bo->dmabuf_fd = fd_copy;
             bo->dmabuf_ino = have_stat ? static_cast<uint64_t>(st.st_ino) : 0;
             bo->is_imported = true;
-            bo->is_same_va = (imported_cpu_ptr != nullptr);
+            bo->is_same_va = (imported_cpu_ptr != nullptr && imported_cpu_ptr == gpu_map_ptr);
             ph->handle = bo->gem_handle;
             LOG_INFO("DRM_IOCTL_PRIME_FD_TO_HANDLE fd=%d -> KBASE_IOCTL_MEM_IMPORT va=0x%llx handle=%u",
                      ph->fd, static_cast<unsigned long long>(bo->gpu_va), bo->gem_handle);
@@ -1538,6 +1575,13 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                break;
          }
       }
+      /* Invalidate CPU cache on imported swapchain dma-buf BOs so WSI readback sees fresh GPU pixels */
+#if defined(__aarch64__)
+      for (size_t b = 0; b < ADAPTER_MAX_BOS; b++) {
+         if (g_ctx.bos[b].in_use && g_ctx.bos[b].is_imported && g_ctx.bos[b].cpu_ptr)
+            kbase_cpu_cache_invalidate_range(g_ctx.bos[b].cpu_ptr, g_ctx.bos[b].cpu_size);
+      }
+#endif
       LOG_DEBUG("DRM_IOCTL_SYNCOBJ_WAIT/TIMELINE_WAIT count=%u -> OK", count_handles);
       pthread_mutex_unlock(&g_lock);
       return 0;
@@ -1744,8 +1788,9 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
 
    case DRM_PANTHOR_BO_CREATE: {
       auto *bc = static_cast<struct drm_panthor_bo_create *>(arg);
-      uint32_t kmod_flags = g_tls_next_bo_kmod_flags;
+      uint32_t kmod_flags = g_tls_next_bo_kmod_flags | (bc->flags >> 16);
       g_tls_next_bo_kmod_flags = 0;
+      bc->flags &= 0xffffU;
 
       uint64_t aligned_sz = (bc->size + 4095ULL) & ~4095ULL;
       if (aligned_sz == 0)
@@ -1753,11 +1798,15 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       uint64_t pages = aligned_sz >> 12;
 
       /*
-       * Verified against mali_kbase.ko (kbase_mem_alloc at 0x1367c):
-       *  - Regular BOs use BASE_MEM_COHERENT_LOCAL (1<<11) | BASE_MEM_SAME_VA (1<<13).
+       * Verified against mali_kbase.ko (kbase_mem_alloc at 0x1367c) and
+       * panvk-kbase-android patches 082 & 085:
        *  - Executable BOs (PAN_KMOD_BO_FLAG_EXECUTABLE) use BASE_MEM_PROT_GPU_EX (1<<4)
        *    in EXEC_VA_ZONE, which MUST NOT set BASE_MEM_PROT_GPU_WR (W^X) or BASE_MEM_SAME_VA.
-       *  - NEVER set BASE_MEM_CSF_EVENT on general BOs.
+       *  - Small non-executable control/sync BOs (<= 64 KiB, e.g. queue->syncobjs,
+       *    render_desc_ringbuf.syncobj, VkEvent, gpu_prerast_arena) use BASE_MEM_CSF_EVENT
+       *    (without BASE_MEM_COHERENT_LOCAL) so mali_kbase.ko re-evaluates SYNC_WAIT32/64
+       *    on suspended/evicted CSGs!
+       *  - Larger regular BOs use BASE_MEM_COHERENT_LOCAL (1<<11) | BASE_MEM_SAME_VA (1<<13).
        */
       bool is_exec = (kmod_flags & ADAPTER_KMOD_BO_FLAG_EXECUTABLE) != 0;
       uint64_t kflags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
@@ -1767,14 +1816,22 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       } else {
          kflags |= BASE_MEM_PROT_GPU_WR | BASE_MEM_SAME_VA;
       }
-      if ((bc->flags & DRM_PANTHOR_BO_WB_MMAP) || (kmod_flags & ADAPTER_KMOD_BO_FLAG_WB_MMAP))
+      if (!is_exec && ((bc->flags & DRM_PANTHOR_BO_WB_MMAP) || (kmod_flags & ADAPTER_KMOD_BO_FLAG_WB_MMAP)))
          kflags |= BASE_MEM_CACHED_CPU;
       if (kmod_flags & ADAPTER_KMOD_BO_FLAG_GPU_UNCACHED)
          kflags |= BASE_MEM_UNCACHED_GPU;
 
       uint64_t out_flags = 0;
       uint64_t out_cookie_or_va = 0;
-      if (alloc_kbase_mem(g_ctx.mali_fd, pages, pages, 0, kflags, &out_flags, &out_cookie_or_va) < 0) {
+      int alloc_rc = -1;
+      if (!is_exec && aligned_sz <= 65536ULL) {
+         uint64_t ev_flags = (kflags & ~BASE_MEM_COHERENT_LOCAL) | BASE_MEM_CSF_EVENT;
+         alloc_rc = alloc_kbase_mem(g_ctx.mali_fd, pages, pages, 0, ev_flags, &out_flags, &out_cookie_or_va);
+         if (alloc_rc == 0)
+            kflags = ev_flags;
+      }
+      if (alloc_rc < 0 &&
+          alloc_kbase_mem(g_ctx.mali_fd, pages, pages, 0, kflags, &out_flags, &out_cookie_or_va) < 0) {
          LOG_ERROR("DRM_PANTHOR_BO_CREATE: alloc_kbase_mem(pages=%llu, flags=0x%llx) failed: %s",
                    static_cast<unsigned long long>(pages),
                    static_cast<unsigned long long>(kflags), strerror(errno));
@@ -1908,8 +1965,51 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          if (op_type == DRM_PANTHOR_VM_BIND_OP_TYPE_MAP) {
             struct adapter_bo *bo = find_bo(ops[i].bo_handle);
             if (bo) {
-               if (!(ops[i].flags & DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC))
-                  bo->kbase_flags |= BASE_MEM_PROT_GPU_EX;
+               if (((ops[i].flags & (DRM_PANTHOR_VM_BIND_OP_MAP_READONLY | DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC)) == DRM_PANTHOR_VM_BIND_OP_MAP_READONLY) && !bo->is_executable) {
+                  /*
+                   * Fallback if a shader BO was created without PAN_KMOD_BO_FLAG_EXECUTABLE
+                   * in DRM_PANTHOR_BO_CREATE and only marked executable (no MAP_NOEXEC)
+                   * at DRM_PANTHOR_VM_BIND time: reallocate in kbase EXEC_VA_ZONE with
+                   * BASE_MEM_PROT_GPU_EX and remap over bo->cpu_ptr with MAP_FIXED!
+                   */
+                  uint64_t pages = bo->size >> 12;
+                  uint64_t exec_kflags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
+                                         BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_EX |
+                                         BASE_MEM_COHERENT_LOCAL;
+                  uint64_t exec_out_flags = 0;
+                  uint64_t exec_gpu_va = 0;
+                  if (alloc_kbase_mem(g_ctx.mali_fd, pages, pages, 0, exec_kflags,
+                                      &exec_out_flags, &exec_gpu_va) == 0 &&
+                      exec_gpu_va != 0) {
+                     uint8_t *saved = nullptr;
+                     if (bo->cpu_ptr && bo->cpu_size > 0) {
+                        saved = static_cast<uint8_t *>(malloc(bo->cpu_size));
+                        if (saved)
+                           memcpy(saved, bo->cpu_ptr, bo->cpu_size);
+                     }
+                     void *new_cpu = real_mmap(bo->cpu_ptr, bo->cpu_size,
+                                               PROT_READ | PROT_WRITE,
+                                               MAP_SHARED | (bo->cpu_ptr ? MAP_FIXED : 0),
+                                               g_ctx.mali_fd,
+                                               static_cast<off_t>(exec_gpu_va));
+                     if (new_cpu != MAP_FAILED) {
+                        if (saved) {
+                           memcpy(new_cpu, saved, bo->cpu_size);
+                           kbase_cpu_cache_clean_range(new_cpu, bo->cpu_size);
+                        }
+                        bo->cpu_ptr = new_cpu;
+                        bo->gpu_va = exec_gpu_va;
+                        bo->kbase_cookie_or_va = exec_gpu_va;
+                        bo->kbase_flags = exec_out_flags ? exec_out_flags : exec_kflags;
+                        bo->is_executable = true;
+                        bo->is_same_va = false;
+                        LOG_INFO("DRM_PANTHOR_VM_BIND upgraded bo=%u to EXEC_VA va=0x%llx cpu=%p",
+                                 bo->gem_handle, static_cast<unsigned long long>(bo->gpu_va), bo->cpu_ptr);
+                     }
+                     if (saved)
+                        free(saved);
+                  }
+               }
                /* Always report the kbase-assigned GPU VA back to panthor_kmod / panvk */
                ops[i].va = bo->gpu_va + ops[i].bo_offset;
                LOG_INFO("DRM_PANTHOR_VM_BIND MAP bo=%u -> kbase_va=0x%llx",
@@ -2137,11 +2237,30 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             break;
          }
 
+         /*
+          * Create a dedicated 1-queue CSG for subqueues q > 0 (matching
+          * panvk-kbase-android's kbase_create_group in 007-gpu-queue-kbase.patch:1046-1116)
+          * so VT (q=0), FRAG (q=1), and COMPUTE (q=2) can be scheduled/evicted
+          * independently by mali_kbase.ko, falling back to grp->kbase_group_handle if full.
+          */
+         uint8_t subq_group_handle = grp->kbase_group_handle;
+         uint8_t subq_csi_index = static_cast<uint8_t>(q);
+         if (q > 0) {
+            union kbase_ioctl_cs_queue_group_create_1_6 sub_csg = csg;
+            sub_csg.in.cs_min = 1;
+            if (adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6, &sub_csg) == 0) {
+               subq_group_handle = sub_csg.out.group_handle;
+               subq_csi_index = 0;
+            }
+         }
+         sq->kbase_group_handle = subq_group_handle;
+         sq->csi_index = subq_csi_index;
+
          union kbase_ioctl_cs_queue_bind qbind;
          memset(&qbind, 0, sizeof(qbind));
          qbind.in.buffer_gpu_addr = sq->ring_gpu_va;
-         qbind.in.group_handle = grp->kbase_group_handle;
-         qbind.in.csi_index = static_cast<uint8_t>(q);
+         qbind.in.group_handle = subq_group_handle;
+         qbind.in.csi_index = subq_csi_index;
          if (adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_BIND, &qbind) < 0) {
             LOG_ERROR("DRM_PANTHOR_GROUP_CREATE: KBASE_IOCTL_CS_QUEUE_BIND failed for queue %u", q);
             ret = -1;
@@ -2188,6 +2307,13 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_TERMINATE, &qt);
                if (sq->ring_cpu_ptr)
                   real_munmap(sq->ring_cpu_ptr, sq->ringbuf_size);
+               if (sq->kbase_group_handle != 0 && sq->kbase_group_handle != grp->kbase_group_handle) {
+                  struct kbase_ioctl_cs_queue_group_term sgt = {
+                     .group_handle = sq->kbase_group_handle,
+                     .padding = {0}
+                  };
+                  adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_GROUP_TERMINATE, &sgt);
+               }
             }
          }
          struct kbase_ioctl_cs_queue_group_term gt = {
@@ -2226,16 +2352,17 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       LOG_INFO("DRM_PANTHOR_GROUP_SUBMIT handle=%u queue_submits=%u",
                grp->group_handle, gs->queue_submits.count);
 
-      /* Flush CPU caches for all small writable control/descriptor BOs before kicking GPU */
+      /* Flush CPU caches for all writable BOs (including shaders and imported dma-bufs) before kicking GPU */
 #if defined(__aarch64__)
       for (size_t b = 0; b < ADAPTER_MAX_BOS; b++) {
          if (g_ctx.bos[b].in_use && g_ctx.bos[b].cpu_ptr &&
-             !g_ctx.bos[b].is_executable && g_ctx.bos[b].size <= (256U * 1024U)) {
+             g_ctx.bos[b].size <= (4U * 1024U * 1024U)) {
             kbase_cpu_cache_clean_range(g_ctx.bos[b].cpu_ptr, g_ctx.bos[b].size);
          }
       }
 #endif
 
+      uint32_t touched_subqueues = 0;
       for (uint32_t i = 0; i < gs->queue_submits.count; i++) {
          struct drm_panthor_queue_submit *qs = &qsubs[i];
          if (qs->queue_index >= grp->queue_count)
@@ -2280,6 +2407,42 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                sq->cached_subq_ctx_va = stats.extracted_subq_ctx_va;
                sq->cached_subq_ctx_reg = stats.extracted_subq_ctx_reg;
             }
+            /* Also scan for CSF_OP_CALL (0x20) to secondary/meta CS streams and normalize + clean them */
+            {
+               uint32_t n_qwords = qs->stream_size / sizeof(uint64_t);
+               uint64_t reg_file[128] = {0};
+               for (uint32_t idx = 0; idx < n_qwords; idx++) {
+                  uint64_t insn = stream_cpu[idx];
+                  uint64_t op = (insn >> 56) & 0xffULL;
+                  if (op == CSF_OP_MOVE48) {
+                     uint8_t dst = static_cast<uint8_t>((insn >> 48) & 0x7fU);
+                     reg_file[dst] = insn & 0xffffffffffffULL;
+                  } else if (op == CSF_OP_MOVE32) {
+                     uint8_t dst = static_cast<uint8_t>((insn >> 48) & 0x7fU);
+                     reg_file[dst] = insn & 0xffffffffULL;
+                  } else if (op == CSF_OP_CALL) {
+                     uint8_t addr_reg = static_cast<uint8_t>((insn >> 40) & 0x7fU);
+                     uint8_t len_reg  = static_cast<uint8_t>((insn >> 32) & 0x7fU);
+                     uint64_t call_va = reg_file[addr_reg];
+                     uint32_t call_sz = static_cast<uint32_t>(reg_file[len_reg]);
+                     if (call_va != 0 && call_sz >= sizeof(uint64_t) && call_sz <= (1U << 20)) {
+                        struct adapter_bo *callee_bo = find_bo_by_va(call_va);
+                        if (callee_bo && callee_bo->cpu_ptr && callee_bo->cpu_ptr != MAP_FAILED) {
+                           uint64_t off = call_va - callee_bo->gpu_va;
+                           if (off + call_sz <= callee_bo->size) {
+                              auto *callee_cpu = reinterpret_cast<uint64_t *>(
+                                 reinterpret_cast<uint8_t *>(callee_bo->cpu_ptr) + off);
+                              struct adapter_cs_patch_stats sub_stats{};
+                              panthor_kbase_normalize_cs_stream(callee_cpu, call_sz, false, &sub_stats);
+                              stats.sync_scope_upgrades += sub_stats.sync_scope_upgrades;
+                              stats.heap_op_nops += sub_stats.heap_op_nops;
+                              kbase_cpu_cache_clean_range(callee_cpu, call_sz);
+                           }
+                        }
+                     }
+                  }
+               }
+            }
             kbase_cpu_cache_clean_range(stream_cpu, qs->stream_size);
          }
 
@@ -2315,22 +2478,9 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
 
          sq->insert_offset += slot_bytes;
          sq->emitted_jobs++;
+         touched_subqueues |= (1U << qs->queue_index);
 
-         /* 3. Publish CS_INSERT in USER_IO Input Page (+0x1000), ring Doorbell (+0x0000), and kick */
-         auto *input_page = reinterpret_cast<volatile uint64_t *>(
-             static_cast<uint8_t *>(sq->user_io_ptr) + CS_USER_IO_INPUT_PAGE_OFFSET);
-         auto *doorbell_page = reinterpret_cast<volatile uint32_t *>(
-            static_cast<uint8_t *>(sq->user_io_ptr) + CS_USER_IO_DOORBELL_OFFSET);
-
-         input_page[0] = sq->insert_offset;
-         __atomic_thread_fence(__ATOMIC_SEQ_CST);
-         doorbell_page[0] = 1U;
-         __atomic_thread_fence(__ATOMIC_SEQ_CST);
-
-         struct kbase_ioctl_cs_queue_kick kick = { .buffer_gpu_addr = sq->ring_gpu_va };
-         adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_KICK, &kick);
-
-         /* 4. Update signaled drm_syncobjs */
+         /* 3. Update signaled drm_syncobjs */
          auto *sops = reinterpret_cast<struct drm_panthor_sync_op *>(
             static_cast<uintptr_t>(qs->syncs.array));
          for (uint32_t s = 0; s < qs->syncs.count; s++) {
@@ -2347,7 +2497,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             }
          }
 
-         LOG_INFO("DRM_PANTHOR_GROUP_SUBMIT q=%u stream=0x%llx sz=%u sync_upgrades=%u heap_nops=%u -> KBASE_IOCTL_CS_QUEUE_KICK insert=%llu jobs=%llu",
+         LOG_INFO("DRM_PANTHOR_GROUP_SUBMIT q=%u stream=0x%llx sz=%u sync_upgrades=%u heap_nops=%u -> insert=%llu jobs=%llu",
                   qs->queue_index, static_cast<unsigned long long>(qs->stream_addr),
                   qs->stream_size, stats.sync_scope_upgrades,
                   stats.heap_op_nops, static_cast<unsigned long long>(sq->insert_offset),
@@ -2356,6 +2506,29 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                    qs->queue_index, static_cast<unsigned long long>(qs->stream_addr),
                    qs->stream_size, stats.sync_scope_upgrades,
                    stats.heap_op_nops, static_cast<unsigned long long>(sq->insert_offset));
+      }
+
+      /*
+       * 4. Phase 2 (Publish & Kick): After ALL subqueues' ring slots are emitted and
+       * cache-cleaned, publish CS_INSERT in USER_IO Input Page (+0x1000), ring Doorbell (+0x0000),
+       * and call KBASE_IOCTL_CS_QUEUE_KICK for each touched subqueue (`007-gpu-queue-kbase.patch:1878-1896`).
+       */
+      for (uint32_t q = 0; q < grp->queue_count; q++) {
+         if (!(touched_subqueues & (1U << q)))
+            continue;
+         struct adapter_subqueue *sq = &grp->subqueues[q];
+         auto *input_page = reinterpret_cast<volatile uint64_t *>(
+             static_cast<uint8_t *>(sq->user_io_ptr) + CS_USER_IO_INPUT_PAGE_OFFSET);
+         auto *doorbell_page = reinterpret_cast<volatile uint32_t *>(
+            static_cast<uint8_t *>(sq->user_io_ptr) + CS_USER_IO_DOORBELL_OFFSET);
+
+         input_page[0] = sq->insert_offset;
+         __atomic_thread_fence(__ATOMIC_SEQ_CST);
+         doorbell_page[0] = 1U;
+         __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+         struct kbase_ioctl_cs_queue_kick kick = { .buffer_gpu_addr = sq->ring_gpu_va };
+         adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_KICK, &kick);
       }
       break;
    }
@@ -2448,7 +2621,7 @@ int panthor_kbase_adapter_munmap(void *addr, size_t length)
     */
    for (size_t i = 0; i < ADAPTER_MAX_BOS; i++) {
       if (g_ctx.bos[i].in_use &&
-          (g_ctx.bos[i].cpu_ptr == addr || g_ctx.bos[i].alias_ptr == addr)) {
+          (g_ctx.bos[i].cpu_ptr == addr || g_ctx.bos[i].gpu_mapping == addr || g_ctx.bos[i].alias_ptr == addr)) {
          LOG_INFO("ADAPTER_MUNMAP_GUARD pinned BO=%u addr=%p len=%zu",
                   g_ctx.bos[i].gem_handle, addr, length);
          trace_log("ADAPTER_MUNMAP_GUARD pinned SAME_VA bo=%u addr=%p len=%zu\n",

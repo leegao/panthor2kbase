@@ -518,6 +518,16 @@ vkFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks
    }
 }
 
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex, VkQueue *pQueue)
+{
+   (void)queueFamilyIndex;
+   (void)queueIndex;
+   if (pQueue)
+      *pQueue = (VkQueue)device;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 vkQueueSubmit(VkQueue queue, uint32_t submitCount,
               const VkSubmitInfo *pSubmits, VkFence fence)
@@ -602,6 +612,8 @@ vkGetInstanceProcAddr(VkInstance instance, const char *pName)
       return (PFN_vkVoidFunction)vkUnmapMemory;
    if (strcmp(pName, "vkFreeMemory") == 0)
       return (PFN_vkVoidFunction)vkFreeMemory;
+   if (strcmp(pName, "vkGetDeviceQueue") == 0)
+      return (PFN_vkVoidFunction)vkGetDeviceQueue;
    if (strcmp(pName, "vkQueueSubmit") == 0)
       return (PFN_vkVoidFunction)vkQueueSubmit;
    return NULL;
