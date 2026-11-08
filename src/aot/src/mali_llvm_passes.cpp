@@ -394,6 +394,7 @@ public:
     uint64_t vk_dispatch_table_rva = 0;
     uint64_t vk_dispatch_table_count = 0;
     uint64_t vk_dispatch_table_stride = 0;
+    std::vector<std::pair<std::string, uint64_t>> vk_dispatch_entries;
 
     bool run(const std::string &so_path) {
         std::ifstream in(so_path, std::ios::binary);
@@ -548,6 +549,33 @@ private:
     }
 
     void applyRelocations() {
+        if (sections.count(".relr.dyn")) {
+            auto rsec = sections[".relr.dyn"];
+            uint64_t where = 0;
+            for (uint64_t pos = rsec.offset; pos + 8 <= rsec.offset + rsec.size; pos += 8) {
+                uint64_t entry = readU64(raw, pos);
+                if ((entry & 1ULL) == 0) {
+                    where = entry;
+                    if (where + 8 <= elf.size()) {
+                        uint64_t val = readU64(elf, where) & 0xFFFFFFFFFFFFULL;
+                        writeU64(elf, where, val);
+                    }
+                    where += 8;
+                } else {
+                    uint64_t bitmap = entry >> 1;
+                    for (unsigned b = 0; b < 63; ++b) {
+                        if ((bitmap >> b) & 1ULL) {
+                            uint64_t slot = where + b * 8ULL;
+                            if (slot + 8 <= elf.size()) {
+                                uint64_t val = readU64(elf, slot) & 0xFFFFFFFFFFFFULL;
+                                writeU64(elf, slot, val);
+                            }
+                        }
+                    }
+                    where += 63ULL * 8ULL;
+                }
+            }
+        }
         if (!sections.count(".rela.dyn")) return;
         auto sec = sections[".rela.dyn"];
         if (sec.size >= 4 && std::memcmp(&raw[sec.offset], "APS2", 4) == 0) {
@@ -679,6 +707,26 @@ private:
                                 vk_dispatch_table_rva = start;
                                 vk_dispatch_table_stride = stride;
                                 vk_dispatch_table_count = (end - start) / stride + 1;
+                                for (uint64_t idx = 0; idx < vk_dispatch_table_count; ++idx) {
+                                    uint64_t epos = vk_dispatch_table_rva + idx * vk_dispatch_table_stride;
+                                    uint64_t s_va = readU64(elf, epos) & 0xFFFFFFFFFFFFULL;
+                                    if (s_va >= ro.addr && s_va < ro.addr + ro.size) {
+                                        std::string vname(reinterpret_cast<const char *>(&elf[s_va]));
+                                        uint64_t c40 = (vk_dispatch_table_stride >= 48 && epos + 48 <= elf.size())
+                                                           ? (readU64(elf, epos + 40) & 0xFFFFFFFFFFFFULL)
+                                                           : 0ULL;
+                                        uint64_t c32 = (epos + 40 <= elf.size())
+                                                           ? (readU64(elf, epos + 32) & 0xFFFFFFFFFFFFULL)
+                                                           : 0ULL;
+                                        uint64_t fva = 0;
+                                        if (c40 != 0 && findFuncStart(c40) != 0) fva = findFuncStart(c40);
+                                        else if (c32 != 0 && findFuncStart(c32) != 0) fva = findFuncStart(c32);
+                                        if (fva != 0 && !vname.empty()) {
+                                            addr_by_name[vname] = fva;
+                                            vk_dispatch_entries.push_back({vname, fva});
+                                        }
+                                    }
+                                }
                                 break;
                             }
                         }
@@ -1043,6 +1091,27 @@ private:
                             uint64_t ptr_val = readU64(elf, got_addr) & 0xFFFFFFFFFFFFULL;
                             if (func_by_addr.count(ptr_val) && !visited.count(ptr_val)) q.push_back(ptr_val);
                         }
+                    }
+                }
+            }
+        }
+        // Also include all discovered Vulkan 1.3 dispatch table entrypoints (all 456 vk* functions in r54p3 / 362 in r44p1)
+        for (const auto &vk_ent : vk_dispatch_entries) {
+            uint64_t faddr = findFuncStart(vk_ent.second);
+            if (faddr == 0) faddr = vk_ent.second;
+            if (!isExecAddr(faddr)) continue;
+            visited.insert(faddr);
+            uint64_t fsize = func_by_addr.count(faddr) ? func_by_addr[faddr].second : 4;
+            if (fsize == 0) fsize = 4;
+            for (uint64_t off = 0; off < fsize; off += 4) {
+                uint64_t pc = faddr + off;
+                uint32_t insn = readU32(elf, pc);
+                unsigned top6 = (insn >> 26) & 0x3F;
+                if (top6 == 0x25 || top6 == 0x05) {
+                    int64_t imm26 = sext64(insn & 0x3FFFFFFU, 26);
+                    uint64_t target = static_cast<uint64_t>(static_cast<int64_t>(pc) + (imm26 << 2));
+                    if (plt_map.count(target)) {
+                        closure_plts[target] = plt_map[target];
                     }
                 }
             }
@@ -2769,6 +2838,22 @@ public:
         emit("ret i64 " + std::to_string(loader.vk_dispatch_table_stride));
         emitRaw("}\n");
 
+        emitRaw("define i64 @aot_get_lifted_vk_entrypoint_count() #0 {");
+        emit("ret i64 " + std::to_string(loader.vk_dispatch_entries.size()));
+        emitRaw("}\n");
+
+        std::set<std::string> emitted_aot_wrappers;
+        for (const auto &vk_ent : loader.vk_dispatch_entries) {
+            uint64_t rva = loader.findFuncStart(vk_ent.second);
+            if (rva == 0) rva = vk_ent.second;
+            if (func_set.count(rva) && emitted_aot_wrappers.insert(vk_ent.first).second) {
+                emitRaw(std::string("define void @aot_") + vk_ent.first + "(ptr %cpu) #0 {");
+                emit("call void @aot_sub_" + hex8(rva) + "(ptr %cpu)");
+                emit("ret void");
+                emitRaw("}\n");
+            }
+        }
+
         for (const char *sym : {
                  "cmpbe_v2_deserialize_MBS2_to_C",
                  "cmpbe_v2_init_options",
@@ -2845,9 +2930,9 @@ public:
                  "kbase_kcpu_queue_delete",
                  "kbase_kcpu_queue_enqueue",
              }) {
-            if (loader.addr_by_name.count(sym)) {
+            if (loader.addr_by_name.count(sym) && !emitted_aot_wrappers.count(sym)) {
                 uint64_t rva = loader.findFuncStart(loader.addr_by_name.at(sym));
-                if (func_set.count(rva)) {
+                if (func_set.count(rva) && emitted_aot_wrappers.insert(sym).second) {
                     emitRaw(std::string("define void @aot_") + sym + "(ptr %cpu) #0 {");
                     emit("call void @aot_sub_" + hex8(rva) + "(ptr %cpu)");
                     emit("ret void");

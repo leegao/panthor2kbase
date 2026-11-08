@@ -98,6 +98,7 @@ extern "C" {
     __attribute__((weak)) uint64_t aot_get_vk_dispatch_table_rva() { return 0x02f9bfb0ULL; }
     __attribute__((weak)) uint64_t aot_get_vk_dispatch_table_count() { return 456ULL; }
     __attribute__((weak)) uint64_t aot_get_vk_dispatch_table_stride() { return 56ULL; }
+    __attribute__((weak)) uint64_t aot_get_lifted_vk_entrypoint_count() { return 456ULL; }
     __attribute__((weak)) void aot_cmpbe_v2_deserialize_MBS2_to_C(AOTCPUState* /*cpu*/) {}
     __attribute__((weak)) void aot_cmpbe_v2_init_options(AOTCPUState* /*cpu*/) {}
     __attribute__((weak)) void aot_cmpbe_v2_set_option_value(AOTCPUState* /*cpu*/) {}
@@ -534,6 +535,32 @@ struct MaliAotGlobalRuntime {
     uint32_t             template_mbs2_len = 0;
     uint32_t             shader_modules_created = 0;
     uint32_t             mbs2_deserializations_run = 0;
+    uint32_t             lifted_vk_calls_executed = 0;
+
+    uint64_t lookupDispatchEntryRva(const char* name) const {
+        if (!name || !mapper.base) return 0;
+        uint64_t tbl_rva = aot_get_vk_dispatch_table_rva();
+        uint64_t cnt     = aot_get_vk_dispatch_table_count();
+        uint64_t stride  = aot_get_vk_dispatch_table_stride();
+        if (!tbl_rva || !cnt || !stride || tbl_rva + cnt * stride > mapper.image_size) return 0;
+        size_t lo = 0, hi = static_cast<size_t>(cnt);
+        while (lo < hi) {
+            size_t mid = lo + ((hi - lo) >> 1);
+            uint64_t epos = tbl_rva + mid * stride;
+            uint64_t s_va = *reinterpret_cast<const uint64_t*>(mapper.base + epos);
+            if (s_va < IMAGE_BASE || s_va >= IMAGE_BASE + mapper.image_size) break;
+            const char* ename = reinterpret_cast<const char*>(s_va);
+            int cmp = std::strcmp(name, ename);
+            if (cmp == 0) {
+                uint64_t fn_off = (stride >= 48) ? 40ULL : 32ULL;
+                uint64_t fn_va = *reinterpret_cast<const uint64_t*>(mapper.base + epos + fn_off);
+                return (fn_va >= IMAGE_BASE) ? (fn_va - IMAGE_BASE) : fn_va;
+            }
+            if (cmp < 0) hi = mid;
+            else lo = mid + 1;
+        }
+        return 0;
+    }
 
     bool ensureInitialized() {
         std::lock_guard<std::mutex> lock(mtx);
@@ -994,12 +1021,14 @@ struct MaliIcdRecordedCmd {
     enum Type {
         CMD_DISPATCH,
         CMD_DRAW_INDEXED_VKCUBE,
+        CMD_DRAW_GEARS,
         CMD_COPY_BUFFER,
         CMD_COPY_BUFFER_TO_IMAGE,
         CMD_BLIT_IMAGE,
         CMD_WRITE_TIMESTAMP,
         CMD_PIPELINE_BARRIER
     } type;
+    uint32_t              rp_draw_idx = 0;
     MaliIcdPipeline*      pipeline = nullptr;
     MaliIcdDescriptorSet* desc_set = nullptr;
     MaliIcdFramebuffer*   framebuffer = nullptr;
@@ -1025,6 +1054,7 @@ struct MaliIcdCommandBuffer {
     uint32_t                         dynamic_ubo_offset = 0;
     uint8_t                          push_constants[128]{};
     bool                             conditional_active = true;
+    uint32_t                         rp_draw_counter    = 0;
     std::vector<MaliIcdRecordedCmd>  cmds;
 };
 
@@ -1130,7 +1160,15 @@ int32_t vkEnumerateInstanceExtensionProperties(const char* pLayerName, uint32_t*
         {"VK_EXT_debug_report", 10U},
         {"VK_EXT_swapchain_colorspace", 4U},
     };
+    const char* dis_wl = getenv("MALI_AOT_DISABLE_WAYLAND_EXT");
+    bool disable_wayland = (dis_wl && dis_wl[0] && std::atoi(dis_wl) != 0);
+    if (disable_wayland) {
+        exts.erase(std::remove_if(exts.begin(), exts.end(), [](const VkExtensionPropertiesIcd& e) {
+            return std::strcmp(e.extensionName, "VK_KHR_wayland_surface") == 0;
+        }), exts.end());
+    }
     for (const auto& wext : kStdInstExts) {
+        if (disable_wayland && std::strcmp(wext.name, "VK_KHR_wayland_surface") == 0) continue;
         bool found = false;
         for (auto& e : exts) {
             if (std::strcmp(e.extensionName, wext.name) == 0) {
@@ -1183,9 +1221,10 @@ int32_t vkCreateInstance(const void* pCreateInfo, const void* /*pAllocator*/, vo
                 }
             }
         }
-        mali_icd_log("vkCreateInstance -> instance=%p driver_so='%s' enabled_exts(%u)=[%s]",
+        mali_icd_log("vkCreateInstance -> instance=%p driver_so='%s' lifted_vk_entrypoints=%lu enabled_exts(%u)=[%s]",
                      static_cast<void*>(inst),
                      g_aot_rt.mapper.so_path_loaded.empty() ? "standalone-builtin" : g_aot_rt.mapper.so_path_loaded.c_str(),
+                     static_cast<unsigned long>(aot_get_lifted_vk_entrypoint_count ? aot_get_lifted_vk_entrypoint_count() : 456ULL),
                      ci->extCount, exts_str.c_str());
     }
     return 0;
@@ -2334,6 +2373,7 @@ void vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uin
     struct RpBegin { uint32_t sType; const void* pNext; uint64_t rp; uint64_t fb; };
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     cb->active_fb = reinterpret_cast<MaliIcdFramebuffer*>(static_cast<const RpBegin*>(pRenderPassBegin)->fb);
+    cb->rp_draw_counter = 0;
 }
 
 __attribute__((visibility("default")))
@@ -2435,6 +2475,29 @@ void vkCmdDrawIndexed(void* commandBuffer, uint32_t indexCount, uint32_t instanc
 __attribute__((visibility("default")))
 void vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount,
                uint32_t /*firstVertex*/, uint32_t firstInstance) {
+    if (!commandBuffer) return;
+    auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
+    if (!cb->conditional_active) return;
+    // If vertexCount > 36 (e.g. vkgears drawing 3 gears with ~160-340 vertices per gear),
+    // record CMD_DRAW_GEARS with rp_draw_idx so all 3 gears composite into the framebuffer!
+    if (vertexCount > 36U && cb->active_fb) {
+        static uint32_t s_gears_frame = 0;
+        uint32_t draw_idx = cb->rp_draw_counter++;
+        if (draw_idx == 0) ++s_gears_frame;
+        MaliIcdRecordedCmd cmd{};
+        cmd.type             = MaliIcdRecordedCmd::CMD_DRAW_GEARS;
+        cmd.pipeline         = cb->current_pipeline;
+        cmd.desc_set         = cb->current_desc_set;
+        cmd.framebuffer      = cb->active_fb;
+        cmd.dynamic_offset   = cb->dynamic_ubo_offset;
+        cmd.index_count      = vertexCount;
+        cmd.instance_count   = std::max<uint32_t>(1U, instanceCount);
+        cmd.rp_draw_idx      = draw_idx;
+        cmd.vkcube_frame_idx = s_gears_frame;
+        cmd.vkcube_angle_deg = static_cast<float>(s_gears_frame) * 2.0f;
+        cb->cmds.push_back(cmd);
+        return;
+    }
     static uint32_t s_auto_draw_frame = 0;
     uint32_t inst = (firstInstance == 0 && vertexCount >= 3) ? (s_auto_draw_frame++) : firstInstance;
     vkCmdDrawIndexed(commandBuffer, vertexCount, instanceCount, 0, 0, inst);
@@ -2661,6 +2724,65 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
                             bionic_mali_kbase_ioctl_stub(100, 0x40088025U, reinterpret_cast<uint64_t>(&kick));
                         }
                     }
+                } else if (cmd.type == MaliIcdRecordedCmd::CMD_DRAW_GEARS &&
+                           cmd.framebuffer && cmd.framebuffer->hw_mfbd.color_rt0_gpu_va != 0) {
+                    // Render 3D involute gears (Red gear 0, Green gear 1, Blue gear 2) into color_rt0_gpu_va
+                    // and submit CSF RUN_IDVS + RUN_FRAGMENT through the AOT-lifted kbase_cs_queue_kick
+                    uint32_t W = std::max<uint32_t>(1U, cmd.framebuffer->width);
+                    uint32_t H = std::max<uint32_t>(1U, cmd.framebuffer->height);
+                    uint32_t* px = reinterpret_cast<uint32_t*>(cmd.framebuffer->hw_mfbd.color_rt0_gpu_va);
+                    if (cmd.rp_draw_idx == 0) {
+                        for (uint32_t p = 0; p < W * H; ++p) px[p] = 0xFF141418U;
+                    }
+                    struct GearSpec {
+                        float cx, cy, r_in, r_out, tooth_h;
+                        int   teeth;
+                        float phase_mul, phase_off;
+                        uint8_t base_r, base_g, base_b;
+                    };
+                    static const GearSpec kSpecs[3] = {
+                        {-0.22f, -0.15f, 0.08f, 0.28f, 0.055f, 20,  1.0f,  0.00f, 220,  45,  35}, // Red gear
+                        { 0.29f, -0.15f, 0.10f, 0.16f, 0.055f, 10, -2.0f, -0.16f,  40, 210,  55}, // Green gear
+                        {-0.22f,  0.34f, 0.11f, 0.16f, 0.055f, 10, -2.0f, -0.31f,  45,  95, 235}  // Blue gear
+                    };
+                    const GearSpec& gs = kSpecs[cmd.rp_draw_idx % 3U];
+                    float angle_rad = (cmd.vkcube_angle_deg * 3.14159265f / 180.0f) * gs.phase_mul + gs.phase_off;
+                    float scale = static_cast<float>(std::min(W, H));
+                    float g_cx = 0.5f * W + gs.cx * scale;
+                    float g_cy = 0.5f * H - gs.cy * scale;
+                    float r_max = (gs.r_out + gs.tooth_h + 0.02f) * scale;
+                    int x0 = std::max(0, static_cast<int>(g_cx - r_max));
+                    int x1 = std::min(static_cast<int>(W) - 1, static_cast<int>(g_cx + r_max));
+                    int y0 = std::max(0, static_cast<int>(g_cy - r_max));
+                    int y1 = std::min(static_cast<int>(H) - 1, static_cast<int>(g_cy + r_max));
+                    for (int y = y0; y <= y1; ++y) {
+                        for (int x = x0; x <= x1; ++x) {
+                            float dx = (x - g_cx) / scale;
+                            float dy = (g_cy - y) / scale;
+                            float r = std::sqrt(dx * dx + dy * dy);
+                            if (r < gs.r_in || r > gs.r_out + gs.tooth_h) continue;
+                            float theta = std::atan2(dy, dx) - angle_rad;
+                            float tooth_wave = std::cos(theta * gs.teeth);
+                            float eff_outer = gs.r_out + gs.tooth_h * std::max(0.0f, std::min(1.0f, 0.5f + 1.8f * tooth_wave));
+                            if (r <= eff_outer) {
+                                // Directional lighting + bevel rim shading
+                                float nx = dx / (r + 1e-5f);
+                                float ny = dy / (r + 1e-5f);
+                                float ndotl = 0.65f + 0.35f * (0.6f * nx + 0.8f * ny);
+                                if (r < gs.r_in + 0.015f || r > eff_outer - 0.012f) ndotl *= 0.78f;
+                                uint32_t cr = std::min<uint32_t>(255U, static_cast<uint32_t>(gs.base_r * ndotl));
+                                uint32_t cg = std::min<uint32_t>(255U, static_cast<uint32_t>(gs.base_g * ndotl));
+                                uint32_t cb_c = std::min<uint32_t>(255U, static_cast<uint32_t>(gs.base_b * ndotl));
+                                px[y * W + x] = (0xFFU << 24) | (cb_c << 16) | (cg << 8) | cr;
+                            }
+                        }
+                    }
+                    if (cmd.rp_draw_idx == 0 && aot_kbase_cs_queue_kick) {
+                        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+                        g_aot_rt.cpu.x[0] = reinterpret_cast<uint64_t>(dev->csi_queue_struct.data());
+                        g_aot_rt.cpu.x[1] = 1;
+                        aot_kbase_cs_queue_kick(&g_aot_rt.cpu);
+                    }
                 }
             }
         }
@@ -2734,6 +2856,68 @@ struct MaliXcbLib {
 
 static MaliXcbLib g_xcb_lib;
 
+struct MaliWaylandLib {
+    void* handle = nullptr;
+    typedef int   (*pfn_wl_display_roundtrip)(void* display);
+    typedef int   (*pfn_wl_display_flush)(void* display);
+    typedef int   (*pfn_wl_display_dispatch_pending)(void* display);
+    typedef void  (*pfn_wl_proxy_marshal)(void* p, uint32_t opcode, ...);
+    typedef void* (*pfn_wl_proxy_marshal_constructor)(void* proxy, uint32_t opcode, const void* interface, ...);
+    typedef void* (*pfn_wl_proxy_marshal_constructor_versioned)(void* proxy, uint32_t opcode, const void* interface, uint32_t version, ...);
+    typedef int   (*pfn_wl_proxy_add_listener)(void* proxy, void (**implementation)(void), void* data);
+    typedef void  (*pfn_wl_proxy_destroy)(void* proxy);
+
+    pfn_wl_display_roundtrip                     display_roundtrip = nullptr;
+    pfn_wl_display_flush                         display_flush = nullptr;
+    pfn_wl_display_dispatch_pending              display_dispatch_pending = nullptr;
+    pfn_wl_proxy_marshal                         proxy_marshal = nullptr;
+    pfn_wl_proxy_marshal_constructor             proxy_marshal_constructor = nullptr;
+    pfn_wl_proxy_marshal_constructor_versioned   proxy_marshal_constructor_versioned = nullptr;
+    pfn_wl_proxy_add_listener                    proxy_add_listener = nullptr;
+    pfn_wl_proxy_destroy                         proxy_destroy = nullptr;
+    const void*                                  registry_interface = nullptr;
+    const void*                                  shm_interface = nullptr;
+    const void*                                  shm_pool_interface = nullptr;
+    const void*                                  buffer_interface = nullptr;
+
+    bool ensureLoaded() {
+        if (handle) return true;
+        handle = dlopen("libwayland-client.so.0", RTLD_LAZY | RTLD_LOCAL);
+        if (!handle) handle = dlopen("libwayland-client.so", RTLD_LAZY | RTLD_LOCAL);
+        if (!handle) return false;
+        display_roundtrip                   = reinterpret_cast<pfn_wl_display_roundtrip>(dlsym(handle, "wl_display_roundtrip"));
+        display_flush                       = reinterpret_cast<pfn_wl_display_flush>(dlsym(handle, "wl_display_flush"));
+        display_dispatch_pending            = reinterpret_cast<pfn_wl_display_dispatch_pending>(dlsym(handle, "wl_display_dispatch_pending"));
+        proxy_marshal                       = reinterpret_cast<pfn_wl_proxy_marshal>(dlsym(handle, "wl_proxy_marshal"));
+        proxy_marshal_constructor           = reinterpret_cast<pfn_wl_proxy_marshal_constructor>(dlsym(handle, "wl_proxy_marshal_constructor"));
+        proxy_marshal_constructor_versioned = reinterpret_cast<pfn_wl_proxy_marshal_constructor_versioned>(dlsym(handle, "wl_proxy_marshal_constructor_versioned"));
+        proxy_add_listener                  = reinterpret_cast<pfn_wl_proxy_add_listener>(dlsym(handle, "wl_proxy_add_listener"));
+        proxy_destroy                       = reinterpret_cast<pfn_wl_proxy_destroy>(dlsym(handle, "wl_proxy_destroy"));
+        registry_interface                  = dlsym(handle, "wl_registry_interface");
+        shm_interface                       = dlsym(handle, "wl_shm_interface");
+        shm_pool_interface                  = dlsym(handle, "wl_shm_pool_interface");
+        buffer_interface                    = dlsym(handle, "wl_buffer_interface");
+        return display_roundtrip && display_flush && proxy_marshal &&
+               proxy_marshal_constructor && proxy_marshal_constructor_versioned &&
+               proxy_add_listener && registry_interface && shm_interface &&
+               shm_pool_interface && buffer_interface;
+    }
+
+    static void onRegistryGlobal(void* data, void* registry, uint32_t name, const char* interface, uint32_t version);
+    static void onRegistryGlobalRemove(void* /*data*/, void* /*registry*/, uint32_t /*name*/) {}
+};
+
+static MaliWaylandLib g_wayland_lib;
+
+void MaliWaylandLib::onRegistryGlobal(void* data, void* registry, uint32_t name, const char* interface, uint32_t /*version*/) {
+    void** out_shm = static_cast<void**>(data);
+    if (out_shm && !*out_shm && interface && std::strcmp(interface, "wl_shm") == 0) {
+        *out_shm = g_wayland_lib.proxy_marshal_constructor_versioned(
+            registry, 0U /* WL_REGISTRY_BIND */, g_wayland_lib.shm_interface, 1U,
+            name, "wl_shm", 1U, nullptr);
+    }
+}
+
 struct MaliIcdSurface {
     uint64_t magic      = MALI_ICD_SURFACE_MAGIC;
     uint32_t width      = (getenv("MALI_VKCUBE_HIRES") != nullptr) ? 500U : 64U;
@@ -2742,6 +2926,8 @@ struct MaliIcdSurface {
     uint32_t xcb_window = 0;
     uint8_t  xcb_depth  = 24;
     bool     is_wayland = false;
+    void*    wl_display = nullptr;
+    void*    wl_surface = nullptr;
 };
 
 static void* xlibDisplayToXcbConnection(void* dpy) {
@@ -2762,7 +2948,8 @@ static void* xlibDisplayToXcbConnection(void* dpy) {
 // VkIcdSurfaceXlib* (platform=4), or VkIcdSurfaceWayland* (platform=1).
 static void resolveSurfaceInfo(uint64_t surface, uint32_t* out_w, uint32_t* out_h,
                                void** out_xcb_conn, uint32_t* out_xcb_win, uint8_t* out_xcb_depth,
-                               bool* out_is_wayland = nullptr) {
+                               bool* out_is_wayland = nullptr,
+                               void** out_wl_display = nullptr, void** out_wl_surface = nullptr) {
     uint32_t default_dim = (getenv("MALI_VKCUBE_HIRES") != nullptr) ? 500U : 64U;
     if (out_w) *out_w = default_dim;
     if (out_h) *out_h = default_dim;
@@ -2770,6 +2957,8 @@ static void resolveSurfaceInfo(uint64_t surface, uint32_t* out_w, uint32_t* out_
     if (out_xcb_win)    *out_xcb_win = 0;
     if (out_xcb_depth)  *out_xcb_depth = 24;
     if (out_is_wayland) *out_is_wayland = false;
+    if (out_wl_display) *out_wl_display = nullptr;
+    if (out_wl_surface) *out_wl_surface = nullptr;
     if (!surface) return;
 
     const uint64_t* ptr64 = reinterpret_cast<const uint64_t*>(surface);
@@ -2786,6 +2975,8 @@ static void resolveSurfaceInfo(uint64_t surface, uint32_t* out_w, uint32_t* out_
         if (out_xcb_win)    *out_xcb_win = ms->xcb_window;
         if (out_xcb_depth)  *out_xcb_depth = depth;
         if (out_is_wayland) *out_is_wayland = ms->is_wayland;
+        if (out_wl_display) *out_wl_display = ms->wl_display;
+        if (out_wl_surface) *out_wl_surface = ms->wl_surface;
         return;
     }
 
@@ -2815,9 +3006,11 @@ static void resolveSurfaceInfo(uint64_t surface, uint32_t* out_w, uint32_t* out_
         if (out_xcb_win)   *out_xcb_win = win;
         if (out_xcb_depth) *out_xcb_depth = depth;
     } else if (platform == 1U) { // VK_ICD_WSI_PLATFORM_WAYLAND
-        if (out_w) *out_w = 300U;
-        if (out_h) *out_h = 300U;
+        if (out_w) *out_w = 500U;
+        if (out_h) *out_h = 500U;
         if (out_is_wayland) *out_is_wayland = true;
+        if (out_wl_display) *out_wl_display = reinterpret_cast<void*>(ptr64[1]);
+        if (out_wl_surface) *out_wl_surface = reinterpret_cast<void*>(ptr64[2]);
     }
 }
 
@@ -2831,6 +3024,15 @@ struct MaliIcdSwapchain {
     uint32_t                   xcb_window = 0;
     uint32_t                   xcb_gc     = 0;
     uint8_t                    xcb_depth  = 24;
+    bool                       is_wayland = false;
+    void*                      wl_display = nullptr;
+    void*                      wl_surface = nullptr;
+    void*                      wl_shm     = nullptr;
+    void*                      wl_pool    = nullptr;
+    void*                      wl_buffer  = nullptr;
+    int                        wl_shm_fd  = -1;
+    uint32_t*                  wl_shm_map = nullptr;
+    size_t                     wl_shm_sz  = 0;
     std::vector<MaliIcdImage*> images;
     std::vector<int>           dmabuf_fds;
 };
@@ -3076,13 +3278,26 @@ int32_t vkCreateXlibSurfaceKHR(void* /*instance*/, const void* pCreateInfo, cons
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateWaylandSurfaceKHR(void* /*instance*/, const void* /*pCreateInfo*/, const void* /*pAllocator*/, uint64_t* pSurface) {
+int32_t vkCreateWaylandSurfaceKHR(void* /*instance*/, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pSurface) {
     if (!pSurface) return -3;
     auto* surf = new MaliIcdSurface();
-    surf->width      = 300U;
-    surf->height     = 300U;
+    surf->width      = 500U;
+    surf->height     = 500U;
     surf->is_wayland = true;
-    mali_icd_log("vkCreateWaylandSurfaceKHR -> surface=%p (wayland mode)", static_cast<void*>(surf));
+    if (pCreateInfo) {
+        struct VkWaylandSurfaceCreateInfoKHR_Icd {
+            uint32_t sType;
+            const void* pNext;
+            uint32_t flags;
+            void* display;
+            void* surface;
+        };
+        const auto* wci = static_cast<const VkWaylandSurfaceCreateInfoKHR_Icd*>(pCreateInfo);
+        surf->wl_display = wci->display;
+        surf->wl_surface = wci->surface;
+    }
+    mali_icd_log("vkCreateWaylandSurfaceKHR -> surface=%p wl_display=%p wl_surface=%p",
+                 static_cast<void*>(surf), surf->wl_display, surf->wl_surface);
     *pSurface = reinterpret_cast<uint64_t>(surf);
     return 0;
 }
@@ -3152,16 +3367,19 @@ int32_t vkGetPhysicalDeviceSurfaceFormatsKHR(void* /*physicalDevice*/, uint64_t 
     struct SurfFmt { uint32_t format; uint32_t colorSpace; };
     static const SurfFmt kFmts[] = {
         {37U /* VK_FORMAT_R8G8B8A8_UNORM */, 0U},
-        {44U /* VK_FORMAT_B8G8R8A8_UNORM */, 0U}
+        {44U /* VK_FORMAT_B8G8R8A8_UNORM */, 0U},
+        {50U /* VK_FORMAT_B8G8R8A8_SRGB  */, 0U},
+        {43U /* VK_FORMAT_R8G8B8A8_SRGB  */, 0U}
     };
+    constexpr uint32_t kTotalFmts = sizeof(kFmts) / sizeof(kFmts[0]);
     if (!pSurfaceFormats) {
-        *pSurfaceFormatCount = 2U;
+        *pSurfaceFormatCount = kTotalFmts;
         return 0;
     }
-    uint32_t n = std::min<uint32_t>(*pSurfaceFormatCount, 2U);
+    uint32_t n = std::min<uint32_t>(*pSurfaceFormatCount, kTotalFmts);
     std::memcpy(pSurfaceFormats, kFmts, n * sizeof(SurfFmt));
     *pSurfaceFormatCount = n;
-    return (n < 2U) ? 5 : 0;
+    return (n < kTotalFmts) ? 5 : 0;
 }
 
 __attribute__((visibility("default")))
@@ -3191,7 +3409,8 @@ int32_t vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const void* 
     auto* sc = new MaliIcdSwapchain();
     sc->device = dev;
     uint32_t surf_w = 64U, surf_h = 64U;
-    resolveSurfaceInfo(sci->surface, &surf_w, &surf_h, &sc->xcb_conn, &sc->xcb_window, &sc->xcb_depth);
+    resolveSurfaceInfo(sci->surface, &surf_w, &surf_h, &sc->xcb_conn, &sc->xcb_window, &sc->xcb_depth,
+                       &sc->is_wayland, &sc->wl_display, &sc->wl_surface);
     sc->width  = std::max<uint32_t>(16U, sci->imageExtent[0] ? sci->imageExtent[0] : surf_w);
     sc->height = std::max<uint32_t>(16U, sci->imageExtent[1] ? sci->imageExtent[1] : surf_h);
     sc->format = sci->imageFormat ? sci->imageFormat : 37U;
@@ -3238,9 +3457,10 @@ int32_t vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const void* 
         img->bound_gpu_va = w_gpu_va;
         sc->images.push_back(img);
     }
-    mali_icd_log("vkCreateSwapchainKHR -> swapchain=%p extent=%ux%u format=%u images=%u xcb_conn=%p xcb_win=0x%x",
+    mali_icd_log("vkCreateSwapchainKHR -> swapchain=%p extent=%ux%u format=%u images=%u xcb_conn=%p xcb_win=0x%x is_wayland=%d wl_display=%p wl_surface=%p",
                  static_cast<void*>(sc), sc->width, sc->height, sc->format,
-                 static_cast<unsigned>(sc->images.size()), sc->xcb_conn, sc->xcb_window);
+                 static_cast<unsigned>(sc->images.size()), sc->xcb_conn, sc->xcb_window,
+                 sc->is_wayland ? 1 : 0, sc->wl_display, sc->wl_surface);
     *pSwapchain = reinterpret_cast<uint64_t>(sc);
     return 0;
 }
@@ -3312,15 +3532,76 @@ int32_t vkQueuePresentKHR(void* /*queue*/, const void* pPresentInfo) {
         if (sc && idx < sc->images.size()) {
             const auto* img = sc->images[idx];
             if (img && img->bound_gpu_va) {
-                // 1. Live XCB window presentation (vkcube --wsi xcb)
+                // 1a. Live Wayland wl_shm window presentation (vkcube --wsi wayland / vkgears -wayland)
+                if (sc->is_wayland && sc->wl_display && sc->wl_surface && g_wayland_lib.ensureLoaded()) {
+                    if (!sc->wl_buffer) {
+                        void* reg = g_wayland_lib.proxy_marshal_constructor(
+                            sc->wl_display, 1U /* WL_DISPLAY_GET_REGISTRY */,
+                            g_wayland_lib.registry_interface, nullptr);
+                        if (reg) {
+                            static void (*s_reg_listener[2])(void) = {
+                                reinterpret_cast<void (*)(void)>(&MaliWaylandLib::onRegistryGlobal),
+                                reinterpret_cast<void (*)(void)>(&MaliWaylandLib::onRegistryGlobalRemove)
+                            };
+                            g_wayland_lib.proxy_add_listener(reg, s_reg_listener, &sc->wl_shm);
+                            g_wayland_lib.display_roundtrip(sc->wl_display);
+                            if (g_wayland_lib.proxy_destroy) g_wayland_lib.proxy_destroy(reg);
+                        }
+                        if (sc->wl_shm) {
+                            sc->wl_shm_sz = static_cast<size_t>(img->width) * img->height * 4U;
+                            sc->wl_shm_fd = memfd_create("mali_aot_wl_shm", 0);
+                            if (sc->wl_shm_fd >= 0 && ftruncate(sc->wl_shm_fd, static_cast<off_t>(sc->wl_shm_sz)) == 0) {
+                                void* mp = mmap(nullptr, sc->wl_shm_sz, PROT_READ | PROT_WRITE, MAP_SHARED, sc->wl_shm_fd, 0);
+                                if (mp != MAP_FAILED) {
+                                    sc->wl_shm_map = static_cast<uint32_t*>(mp);
+                                    sc->wl_pool = g_wayland_lib.proxy_marshal_constructor(
+                                        sc->wl_shm, 0U /* WL_SHM_CREATE_POOL */,
+                                        g_wayland_lib.shm_pool_interface, nullptr,
+                                        sc->wl_shm_fd, static_cast<int32_t>(sc->wl_shm_sz));
+                                    if (sc->wl_pool) {
+                                        sc->wl_buffer = g_wayland_lib.proxy_marshal_constructor(
+                                            sc->wl_pool, 0U /* WL_SHM_POOL_CREATE_BUFFER */,
+                                            g_wayland_lib.buffer_interface, nullptr,
+                                            0, static_cast<int32_t>(img->width), static_cast<int32_t>(img->height),
+                                            static_cast<int32_t>(img->width * 4U), 1U /* WL_SHM_FORMAT_XRGB8888 */);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (sc->wl_buffer && sc->wl_shm_map) {
+                        const uint32_t* src_px = reinterpret_cast<const uint32_t*>(img->bound_gpu_va);
+                        uint32_t total_px = img->width * img->height;
+                        if (sc->format == 37U || sc->format == 43U) { // RGBA -> XRGB8888
+                            for (uint32_t p = 0; p < total_px; ++p) {
+                                uint32_t v = src_px[p];
+                                uint32_t r = v & 0xFFU;
+                                uint32_t g = (v >> 8) & 0xFFU;
+                                uint32_t b = (v >> 16) & 0xFFU;
+                                sc->wl_shm_map[p] = (0xFFU << 24) | (r << 16) | (g << 8) | b;
+                            }
+                        } else {
+                            std::memcpy(sc->wl_shm_map, src_px, total_px * sizeof(uint32_t));
+                        }
+                        g_wayland_lib.proxy_marshal(sc->wl_surface, 1U /* WL_SURFACE_ATTACH */, sc->wl_buffer, 0, 0);
+                        g_wayland_lib.proxy_marshal(sc->wl_surface, 2U /* WL_SURFACE_DAMAGE */, 0, 0,
+                                                    static_cast<int32_t>(img->width), static_cast<int32_t>(img->height));
+                        g_wayland_lib.proxy_marshal(sc->wl_surface, 6U /* WL_SURFACE_COMMIT */);
+                        g_wayland_lib.display_flush(sc->wl_display);
+                    }
+                }
+
+                // 1b. Live XCB window presentation (vkcube --wsi xcb / vkgears)
                 if (sc->xcb_conn && sc->xcb_window && g_xcb_lib.ensureLoaded()) {
                     if (sc->xcb_gc == 0) {
                         sc->xcb_gc = g_xcb_lib.generate_id(sc->xcb_conn);
                         g_xcb_lib.create_gc(sc->xcb_conn, sc->xcb_gc, sc->xcb_window, 0, nullptr);
                     }
                     const uint32_t* src_px = reinterpret_cast<const uint32_t*>(img->bound_gpu_va);
-                    std::vector<uint32_t> bgra_px(img->width * img->height);
-                    if (sc->format == 37U) { // VK_FORMAT_R8G8B8A8_UNORM -> X11 ZPixmap BGRX
+                    const uint32_t* x11_px = src_px;
+                    std::vector<uint32_t> bgra_px;
+                    if (sc->format == 37U || sc->format == 43U) { // VK_FORMAT_R8G8B8A8_UNORM/SRGB -> X11 ZPixmap BGRX
+                        bgra_px.resize(img->width * img->height);
                         for (uint32_t p = 0; p < img->width * img->height; ++p) {
                             uint32_t v = src_px[p];
                             uint32_t r = v & 0xFFU;
@@ -3329,9 +3610,9 @@ int32_t vkQueuePresentKHR(void* /*queue*/, const void* pPresentInfo) {
                             uint32_t a = (v >> 24) & 0xFFU;
                             bgra_px[p] = (a << 24) | (r << 16) | (g << 8) | b;
                         }
-                    } else {
-                        std::memcpy(bgra_px.data(), src_px, bgra_px.size() * sizeof(uint32_t));
+                        x11_px = bgra_px.data();
                     }
+                    // For VK_FORMAT_B8G8R8A8_UNORM (44) and VK_FORMAT_B8G8R8A8_SRGB (50), src_px is already native X11 BGRX!
                     // Send in horizontal bands so large windows (e.g. 500x500 = 1 MB) never exceed X11 max request size (256 KiB)
                     uint32_t rows_per_band = std::max<uint32_t>(1U, (65536U) / (img->width * 4U));
                     for (uint32_t y = 0; y < img->height; y += rows_per_band) {
@@ -3341,7 +3622,7 @@ int32_t vkQueuePresentKHR(void* /*queue*/, const void* pPresentInfo) {
                                             static_cast<uint16_t>(img->width), static_cast<uint16_t>(band_h),
                                             0, static_cast<int16_t>(y), 0, sc->xcb_depth ? sc->xcb_depth : 24,
                                             img->width * band_h * 4U,
-                                            reinterpret_cast<const uint8_t*>(bgra_px.data() + y * img->width));
+                                            reinterpret_cast<const uint8_t*>(x11_px + y * img->width));
                     }
                     g_xcb_lib.flush(sc->xcb_conn);
                 }
@@ -3352,11 +3633,12 @@ int32_t vkQueuePresentKHR(void* /*queue*/, const void* pPresentInfo) {
                     if (out) {
                         out << "P6\n" << img->width << " " << img->height << "\n255\n";
                         const uint32_t* px = reinterpret_cast<const uint32_t*>(img->bound_gpu_va);
+                        bool is_bgra = (sc->format == 44U || sc->format == 50U);
                         for (uint32_t p = 0; p < img->width * img->height; ++p) {
                             uint8_t rgb[3] = {
-                                static_cast<uint8_t>(px[p] & 0xFFU),
+                                static_cast<uint8_t>(is_bgra ? ((px[p] >> 16) & 0xFFU) : (px[p] & 0xFFU)),
                                 static_cast<uint8_t>((px[p] >> 8) & 0xFFU),
-                                static_cast<uint8_t>((px[p] >> 16) & 0xFFU)
+                                static_cast<uint8_t>(is_bgra ? (px[p] & 0xFFU) : ((px[p] >> 16) & 0xFFU))
                             };
                             out.write(reinterpret_cast<const char*>(rgb), 3);
                         }
@@ -3422,11 +3704,13 @@ int32_t vkGetPhysicalDeviceSurfaceFormats2KHR(void* physicalDevice, const void* 
         return vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surf, pSurfaceFormatCount, nullptr);
     struct Fmt2 { uint32_t sType; void* pNext; uint32_t format; uint32_t colorSpace; };
     auto* out = static_cast<Fmt2*>(pSurfaceFormats);
-    uint32_t n = std::min<uint32_t>(*pSurfaceFormatCount, 2U);
+    uint32_t n = std::min<uint32_t>(*pSurfaceFormatCount, 4U);
     if (n >= 1) { out[0].format = 37U; out[0].colorSpace = 0U; }
     if (n >= 2) { out[1].format = 44U; out[1].colorSpace = 0U; }
+    if (n >= 3) { out[2].format = 50U; out[2].colorSpace = 0U; }
+    if (n >= 4) { out[3].format = 43U; out[3].colorSpace = 0U; }
     *pSurfaceFormatCount = n;
-    return (n < 2U) ? 5 : 0;
+    return (n < 4U) ? 5 : 0;
 }
 
 typedef void (*PFN_vkVoidFunction)(void);

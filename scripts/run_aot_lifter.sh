@@ -111,7 +111,7 @@ for p in props:
         ICD_DIR="$(dirname "$ICD_JSON")"
         export MALI_AOT_ICD_LOG="${MALI_AOT_ICD_LOG:-1}"
         if [ -n "${DISPLAY:-}" ]; then
-            env -u WAYLAND_DISPLAY \
+            env -u WAYLAND_DISPLAY MALI_AOT_DISABLE_WAYLAND_EXT=1 \
                 LD_LIBRARY_PATH="$ICD_DIR:$ROOT_DIR:${LD_LIBRARY_PATH:-}" \
                 VK_DRIVER_FILES="$ICD_JSON" \
                 VK_ICD_FILENAMES="$ICD_JSON" \
@@ -163,7 +163,7 @@ for p in props:
         # `getenv("WAYLAND_DISPLAY") == NULL` and apps connect via XCB/XWayland), or
         # preserve a non-empty WAYLAND_DISPLAY when DISPLAY is unset or --wayland is used.
         if [ "$WSI_PREF" = "x11" ] || { [ "$WSI_PREF" = "auto" ] && [ -n "${DISPLAY:-}" ]; }; then
-            exec env -u WAYLAND_DISPLAY "$@"
+            exec env -u WAYLAND_DISPLAY MALI_AOT_DISABLE_WAYLAND_EXT=1 "$@"
         elif [ -n "${WAYLAND_DISPLAY:-}" ]; then
             exec "$@"
         elif command -v xvfb-run >/dev/null 2>&1; then

@@ -1,5 +1,7 @@
-#undef NDEBUG
 #define _GNU_SOURCE
+#include <pthread.h>
+#include <sys/mman.h>
+#undef NDEBUG
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -605,6 +607,190 @@ static void test_ringbuffer_multi_wrap_600_jobs(void)
    printf("  -> 600-Job Multi-Wrap CSF Ringbuffer Stress Test (Jobs 205 & 410 wrap boundaries): PASS\n");
 }
 
+
+struct bcn_race_thread_ctx {
+   int drm_fd;
+   uint32_t group_handle;
+   uint32_t sync_handle;
+   uint64_t cs_va;
+   volatile int wait_started;
+   volatile int submit_done;
+};
+
+static void *bcn_producer_thread(void *arg)
+{
+   struct bcn_race_thread_ctx *ctx = (struct bcn_race_thread_ctx *)arg;
+   while (!ctx->wait_started)
+      usleep(100);
+   /* Sleep 3ms to guarantee bcn_layer cleanup thread is already inside DRM_IOCTL_SYNCOBJ_WAIT
+    * on the unsignaled staging_fence BEFORE QueueSubmit runs! */
+   usleep(3000);
+
+   struct drm_panthor_sync_op sop = {
+      .flags = DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_SYNCOBJ | DRM_PANTHOR_SYNC_OP_SIGNAL,
+      .handle = ctx->sync_handle,
+      .timeline_value = 0,
+   };
+   struct drm_panthor_queue_submit qsub = {
+      .queue_index = 0,
+      .stream_size = 16,
+      .stream_addr = ctx->cs_va,
+      .latest_flush = 1,
+      .syncs = DRM_PANTHOR_OBJ_ARRAY(1, &sop),
+   };
+   struct drm_panthor_group_submit gsub = {
+      .group_handle = ctx->group_handle,
+      .pad = 0,
+      .queue_submits = DRM_PANTHOR_OBJ_ARRAY(1, &qsub),
+   };
+   ctx->submit_done = 1;
+   assert(panthor_kbase_adapter_ioctl(ctx->drm_fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &gsub) == 0);
+   return NULL;
+}
+
+static void test_dice_a_million_syncobj_wait_and_bcn_layer_race(void)
+{
+   int drm_fd = panthor_kbase_adapter_open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+   assert(drm_fd >= 0);
+
+   /* 1. Verify unsignaled syncobj returns -1 (ETIME) on timeout_nsec=0 (not 0/VK_SUCCESS!) */
+   uint32_t unsig = 0;
+   assert(drmSyncobjCreate(drm_fd, 0, &unsig) == 0);
+   assert(unsig != 0);
+   assert(drmSyncobjWait(drm_fd, &unsig, 1, 0, 0, NULL) == -1);
+   assert(errno == ETIME);
+   uint64_t pt1 = 1;
+   assert(drmSyncobjTimelineWait(drm_fd, &unsig, &pt1, 1, 0, 0, NULL) == -1);
+   assert(errno == ETIME);
+
+   /* 2. Verify EXPORT_SYNC_FILE on unsignaled syncobj returns -1 (EINVAL) */
+   struct drm_syncobj_handle sh = {
+      .handle = unsig,
+      .flags = DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE,
+      .fd = -1,
+   };
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &sh) == -1);
+   assert(errno == EINVAL);
+
+   /* 3. Verify 0xCB (DRM_IOCTL_SYNCOBJ_QUERY) vs 0xCD (DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL) */
+   uint64_t queried_pt = 999;
+   assert(drmSyncobjQuery(drm_fd, &unsig, &queried_pt, 1) == 0);
+   assert(queried_pt == 0ULL);
+   uint64_t sig_pt = 42ULL;
+   assert(drmSyncobjTimelineSignal(drm_fd, &unsig, &sig_pt, 1) == 0);
+   assert(drmSyncobjQuery(drm_fd, &unsig, &queried_pt, 1) == 0);
+   assert(queried_pt == 42ULL);
+   assert(drmSyncobjWait(drm_fd, &unsig, 1, 0, 0, NULL) == 0);
+   assert(drmSyncobjTimelineWait(drm_fd, &unsig, &sig_pt, 1, 0, 0, NULL) == 0);
+
+   /* 4. Verify DRM_IOCTL_SYNCOBJ_RESET resets back to unsignaled and wait(timeout=0) returns -1 */
+   assert(drmSyncobjReset(drm_fd, &unsig, 1) == 0);
+   assert(drmSyncobjWait(drm_fd, &unsig, 1, 0, 0, NULL) == -1);
+   assert(errno == ETIME);
+
+   /* 5. Reproduce bcn_layer_QueueSubmit multi-threaded race:
+    *    Thread B calls drmSyncobjWait(unsig, timeout=INT64_MAX) BEFORE Thread A submits GPU work! */
+   struct drm_panthor_vm_create vmc = { .flags = 0 };
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_VM_CREATE, &vmc) == 0);
+   struct drm_panthor_queue_create qcreq[3];
+   memset(qcreq, 0, sizeof(qcreq));
+   for (int q = 0; q < 3; q++) {
+      qcreq[q].priority = 1;
+      qcreq[q].ringbuf_size = 65536;
+   }
+   struct drm_panthor_group_create gc;
+   memset(&gc, 0, sizeof(gc));
+   gc.queues = (struct drm_panthor_obj_array)DRM_PANTHOR_OBJ_ARRAY(3, qcreq);
+   gc.max_compute_cores = 4;
+   gc.max_fragment_cores = 4;
+   gc.max_tiler_cores = 1;
+   gc.compute_core_mask = 0xf;
+   gc.fragment_core_mask = 0xf;
+   gc.tiler_core_mask = 0x1;
+   gc.vm_id = vmc.id;
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_GROUP_CREATE, &gc) == 0);
+
+   struct drm_panthor_bo_create boc = { .size = 4096, .flags = 0, .exclusive_vm_id = vmc.id };
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_BO_CREATE, &boc) == 0);
+   struct drm_panthor_bo_mmap_offset bmo = { .handle = boc.handle };
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET, &bmo) == 0);
+   uint64_t *cs_cpu = (uint64_t *)panthor_kbase_adapter_mmap(
+      NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, drm_fd, (off_t)bmo.offset);
+   assert(cs_cpu != MAP_FAILED);
+   struct drm_panthor_vm_bind_op bop = {
+      .flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP,
+      .bo_handle = boc.handle,
+      .bo_offset = 0,
+      .va = (uint64_t)(uintptr_t)cs_cpu,
+      .size = 4096,
+   };
+   struct drm_panthor_vm_bind vmb = {
+      .vm_id = vmc.id,
+      .flags = 0,
+      .ops = DRM_PANTHOR_OBJ_ARRAY(1, &bop),
+   };
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_VM_BIND, &vmb) == 0);
+   cs_cpu[0] = ((uint64_t)0x01 << 56) | ((uint64_t)60 << 48) | 0x5fffe00000ULL;
+   cs_cpu[1] = 0ULL;
+
+   struct bcn_race_thread_ctx rctx = {
+      .drm_fd = drm_fd,
+      .group_handle = gc.group_handle,
+      .sync_handle = unsig,
+      .cs_va = (uint64_t)(uintptr_t)cs_cpu,
+      .wait_started = 0,
+      .submit_done = 0,
+   };
+   pthread_t prod_tid;
+   assert(pthread_create(&prod_tid, NULL, bcn_producer_thread, &rctx) == 0);
+   rctx.wait_started = 1;
+   assert(drmSyncobjWait(drm_fd, &unsig, 1, INT64_MAX, 0, NULL) == 0);
+   assert(rctx.submit_done == 1);
+   pthread_join(prod_tid, NULL);
+
+   /* 6. Verify sync-only submit propagates waited subqueue seqnos across all subqueues */
+   uint32_t sync2 = 0;
+   assert(drmSyncobjCreate(drm_fd, 0, &sync2) == 0);
+   struct drm_panthor_sync_op sync_ops[2] = {
+      {
+         .flags = DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_SYNCOBJ | DRM_PANTHOR_SYNC_OP_WAIT,
+         .handle = unsig,
+         .timeline_value = 0,
+      },
+      {
+         .flags = DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ | DRM_PANTHOR_SYNC_OP_SIGNAL,
+         .handle = sync2,
+         .timeline_value = 7ULL,
+      },
+   };
+   struct drm_panthor_queue_submit sync_only_qsub = {
+      .queue_index = 2, /* COMPUTE subqueue waiting on VT subqueue's unsig syncobj */
+      .stream_size = 0,
+      .stream_addr = 0,
+      .latest_flush = 0,
+      .syncs = DRM_PANTHOR_OBJ_ARRAY(2, sync_ops),
+   };
+   struct drm_panthor_group_submit sync_only_gsub = {
+      .group_handle = gc.group_handle,
+      .pad = 0,
+      .queue_submits = DRM_PANTHOR_OBJ_ARRAY(1, &sync_only_qsub),
+   };
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &sync_only_gsub) == 0);
+   uint64_t q2_pt = 0;
+   assert(drmSyncobjQuery(drm_fd, &sync2, &q2_pt, 1) == 0);
+   assert(q2_pt == 7ULL);
+
+   assert(drmSyncobjDestroy(drm_fd, sync2) == 0);
+   assert(drmSyncobjDestroy(drm_fd, unsig) == 0);
+   assert(drmCloseBufferHandle(drm_fd, boc.handle) == 0);
+   struct drm_panthor_group_destroy gd = { .group_handle = gc.group_handle };
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_GROUP_DESTROY, &gd) == 0);
+   struct drm_panthor_vm_destroy vmd = { .id = vmc.id };
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_VM_DESTROY, &vmd) == 0);
+   assert(panthor_kbase_adapter_close(drm_fd) == 0);
+   printf("  -> Dice a Million Unsignaled SYNCOBJ_WAIT, 0xCB/0xCD UAPI & bcn_layer Race Test: PASS\n");
+}
+
 int main(void)
 {
    printf("[Unit Tests] Running edge cases, mali_kbase.ko flag invariants, and RAII logging suite...\n");
@@ -617,6 +803,7 @@ int main(void)
    test_u_gralloc_wsi_modifier_and_dmabuf_sync_resilience();
    test_kbase_mem_alias_csf_event_xor_and_shareability_invariants();
    test_ringbuffer_multi_wrap_600_jobs();
+   test_dice_a_million_syncobj_wait_and_bcn_layer_race();
    printf("[Unit Tests] ALL EDGE CASES PASSED!\n");
    return 0;
 }
