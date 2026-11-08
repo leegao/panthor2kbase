@@ -63,7 +63,10 @@ int main(int argc, char** argv) {
     }
     if (!icd_path.empty()) {
         setenv("VK_ICD_FILENAMES", icd_path.c_str(), 1);
+        setenv("VK_DRIVER_FILES", icd_path.c_str(), 1);
     }
+    setenv("NODEVICE_SELECT", "1", 0);
+    setenv("VK_LOADER_LAYERS_DISABLE", "~implicit~", 0);
     if (arg_so && arg_so[0]) {
         setenv("MALI_AOT_DRIVER_SO", arg_so, 1);
     } else if (!getenv("MALI_AOT_DRIVER_SO")) {

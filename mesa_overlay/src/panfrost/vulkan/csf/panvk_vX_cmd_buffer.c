@@ -242,8 +242,8 @@ panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
          for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++) {
             struct cs_builder *b = &cmdbuf->state.cs[i].builder;
             if (b->cur_chunk.buffer.cpu != NULL || b->cur_chunk.pos != 0) {
-               b->pre_epilogue_chunk = b->cur_chunk;
-               b->has_pre_epilogue_chunk = (b->cur_chunk.buffer.cpu != NULL);
+               if (!b->invalid && b->cur_chunk.buffer.gpu == b->root_chunk.buffer.gpu)
+                  b->discard_instr_slot = (1ULL << 62) | (uint64_t)b->cur_chunk.pos;
                finish_cs(cmdbuf, i);
             }
          }
@@ -276,8 +276,8 @@ panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
           * 64 KiB CS BO or submit a redundant job to DRM_PANTHOR_GROUP_SUBMIT. */
          cs_end(b);
       } else {
-         b->pre_epilogue_chunk = b->cur_chunk;
-         b->has_pre_epilogue_chunk = (b->cur_chunk.buffer.cpu != NULL);
+         if (!b->invalid && b->cur_chunk.buffer.gpu == b->root_chunk.buffer.gpu)
+            b->discard_instr_slot = (1ULL << 62) | (uint64_t)b->cur_chunk.pos;
          finish_cs(cmdbuf, i);
          if (!cs_is_valid(b)) {
             cs_end(b);

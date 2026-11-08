@@ -382,7 +382,7 @@ static bool is_csf_breadcrumbs_enabled()
    static int cached = -1;
    if (cached < 0) {
       const char *env = getenv("PANTHOR_ADAPTER_CSF_BREADCRUMBS");
-      cached = (!env || !env[0] || atoi(env) != 0) ? 1 : 0;
+      cached = (!env || !env[0] || atoi(env) != 0) ? 0 : 0;
    }
    return cached != 0;
 }
@@ -2931,7 +2931,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             static uint64_t stall_dump_ns = UINT64_MAX;
             if (stall_dump_ns == UINT64_MAX) {
                const char *s_env = getenv("PANTHOR_ADAPTER_STALL_DUMP_MS");
-               uint64_t ms = (s_env && *s_env) ? strtoull(s_env, nullptr, 0) : 100ULL;
+               uint64_t ms = (s_env && *s_env) ? strtoull(s_env, nullptr, 0) : 200ULL;
                stall_dump_ns = ms * 1000000ULL;
             }
             if (grp && stall_dump_ns > 0ULL && (now_ns - last_diag_ns >= stall_dump_ns)) {

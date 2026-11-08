@@ -43,7 +43,7 @@ static const char *const g_level_names[PANTHOR2KBASE_LOG_LEVEL_COUNT] = {
 static panthor2kbase_log_level_t panthor2kbase_parse_level(const char *s)
 {
     if (!s || !s[0])
-        return PANTHOR2KBASE_LOG_INFO;
+        return PANTHOR2KBASE_LOG_WARN;
 
     /* Numeric form: 0..4 */
     char *end = nullptr;

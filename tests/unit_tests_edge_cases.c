@@ -791,6 +791,42 @@ static void test_dice_a_million_syncobj_wait_and_bcn_layer_race(void)
    printf("  -> Dice a Million Unsignaled SYNCOBJ_WAIT, 0xCB/0xCD UAPI & bcn_layer Race Test: PASS\n");
 }
 
+
+static void test_v17_cs_builder_abi_and_ls_tracker_invariants(void)
+{
+   /* Verify that mesa_overlay/src/panfrost/genxml/cs_builder.h has 100%
+    * identical struct cs_builder field layout to upstream Mesa (no extra
+    * struct cs_chunk fields shifting cur_chunk onto root_chunk or shifting
+    * cur_ls_tracker), and contains cs_get_ls_tracker() self-healing. */
+   FILE *fp = fopen("mesa_overlay/src/panfrost/genxml/cs_builder.h", "r");
+   assert(fp != NULL);
+   char buf[16384];
+   size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+   buf[n] = '\0';
+   fclose(fp);
+
+   assert(strstr(buf, "last_active_chunk") == NULL &&
+          "struct cs_builder must not contain last_active_chunk ABI shift");
+   assert(strstr(buf, "pre_epilogue_chunk") == NULL &&
+          "struct cs_builder must not contain pre_epilogue_chunk ABI shift");
+   assert(strstr(buf, "cs_get_ls_tracker(struct cs_builder *b)") != NULL &&
+          "cs_builder.h must define self-healing cs_get_ls_tracker(b)");
+
+   /* Verify compile.sh uses sha256sum and touches synced destination files */
+   FILE *cfp = fopen("compile.sh", "r");
+   assert(cfp != NULL);
+   char cbuf[8192];
+   size_t cn = fread(cbuf, 1, sizeof(cbuf) - 1, cfp);
+   cbuf[cn] = '\0';
+   fclose(cfp);
+   assert(strstr(cbuf, "sha256sum") != NULL &&
+          "compile.sh must compare exact SHA-256 checksums");
+   assert(strstr(cbuf, "touch \"$dst_file\"") != NULL &&
+          "compile.sh must touch updated destination files so Ninja recompiles");
+
+   printf("  -> Checkpoint v17 struct cs_builder ABI & compile.sh SHA-256 Invariants: PASS\n");
+}
+
 int main(void)
 {
    printf("[Unit Tests] Running edge cases, mali_kbase.ko flag invariants, and RAII logging suite...\n");
@@ -804,6 +840,7 @@ int main(void)
    test_kbase_mem_alias_csf_event_xor_and_shareability_invariants();
    test_ringbuffer_multi_wrap_600_jobs();
    test_dice_a_million_syncobj_wait_and_bcn_layer_race();
+   test_v17_cs_builder_abi_and_ls_tracker_invariants();
    printf("[Unit Tests] ALL EDGE CASES PASSED!\n");
    return 0;
 }

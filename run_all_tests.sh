@@ -35,6 +35,7 @@ echo "==========================================================================
 ./src/aot/bin/vkcube
 ./src/aot/bin/vkcube src/aot/r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json
 ./tests/test_wayland_and_vkgears_e2e
+./build/test_dxvk_aot_layers_e2e
 
 echo "================================================================================"
 echo " [Suite 5/8] Khronos 20 Vulkan-Samples Compliance Harness (System Loader)      "

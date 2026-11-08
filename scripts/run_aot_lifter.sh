@@ -2,9 +2,9 @@
 # ============================================================================
 # scripts/run_aot_lifter.sh
 # Unified CLI Driver & Guidance Tool for Static AArch64-to-LLVM/C++ Binary
-# Lifting, Bionic-to-glibc Stub Generation, XCB/Display vkcube WSI, Generic
-# x86-64 Vulkan Application Execution, vulkaninfo Introspection, and CSF Stall
-# Forensic Analysis.
+# Lifting, Bionic-to-glibc Stub Generation, XCB/Wayland/Display vkcube WSI,
+# Generic x86-64 Vulkan Application Execution, vulkaninfo Introspection, DXVK
+# 1.10.3 + bcn_layer + compat_layer Execution, and CSF Stall Forensic Analysis.
 # ============================================================================
 set -euo pipefail
 
@@ -20,36 +20,38 @@ Usage:
   ./scripts/run_aot_lifter.sh <command> [options]
 
 Commands:
-  --help                   Show this detailed command reference and examples.
-  --gen-stubs              Auto-generate Bionic-to-glibc PLT hooks (mali_stubs_*_hook)
-                           and system property tables from host glibc headers and
-                           libhybris-arlinux into src/aot/generated/mali_bionic_stubs_autogen.h.
-  --inspect-props [so]     Extract and list all Android __system_property_get keys
-                           referenced by an AArch64 driver binary (default: libGLES_mali.r44p1.so).
-  --lift-so <path.so>      Lift an AArch64 Android ELF64 .so (libGLES_mali.so or
-                           libvulkan_panfrost.so) in conformance-first mode (--no-opt-passes,
-                           with zero custom IR optimization passes; only clang -O2 runs at codegen).
-  --vulkaninfo             Run driver-accurate Vulkan physical-device, extension (170 exts),
-                           queue-family, memory-type, and pNext (DriverProperties) introspection
-                           against the AOT-lifted libvulkan_mali_aot_icd.so.
-  --run-vkcube-xcb         Run Khronos vkcube against libvulkan_mali_aot_icd.so using XCB/X11 WSI
-                           (env -u WAYLAND_DISPLAY VK_ICD_FILENAMES=.../mali_aot_icd.x86_64.json vkcube --wsi xcb)
-                           or headless display fallback when DISPLAY is unset.
+  --help                        Show this detailed command reference and examples.
+  --gen-stubs                   Auto-generate Bionic-to-glibc PLT hooks (mali_stubs_*_hook)
+                                and system property tables from host glibc headers and
+                                libhybris-arlinux into src/aot/generated/mali_bionic_stubs_autogen.h.
+  --inspect-props [so]          Extract and list all Android __system_property_get keys
+                                referenced by an AArch64 driver binary (default: libGLES_mali.r44p1.so).
+  --lift-so <path.so>           Lift an AArch64 Android ELF64 .so (libGLES_mali.so or
+                                libvulkan_panfrost.so) in conformance-first mode (--no-opt-passes,
+                                with --hook-Vulkan-calls).
+  --vulkaninfo                  Run driver-accurate Vulkan physical-device, extension (170+ exts),
+                                queue-family, memory-type, and pNext (DriverProperties) introspection
+                                against the AOT-lifted libvulkan_mali_aot_icd.so.
+  --run-vkcube-xcb [frames]     Run Khronos vkcube against libvulkan_mali_aot_icd.so using XCB/X11 WSI
+                                (or headless display fallback when DISPLAY is unset).
+  --run-vkcube-wayland [frames] Run Khronos vkcube against libvulkan_mali_aot_icd.so using Wayland WSI
+                                (VK_KHR_wayland_surface + wl_shm_pool buffer presentation).
   --run-app [--wayland|--x11] <cmd> [args...]
-                           Run ANY generic x86-64 Vulkan application (e.g., vkgears, vulkaninfo,
-                           vkmark, SaschaWillems demos, or custom binaries) against the AOT-lifted
-                           libvulkan_mali_aot_icd.so ICD with full WSI & ICD diagnostic logging.
-                           Note: Uses `env -u WAYLAND_DISPLAY` when X11 `DISPLAY` is available so
-                           apps like `vkgears` do not see an empty `WAYLAND_DISPLAY=""` string and
-                           fail in `wl_display_connect()`. Pass `--wayland` to keep `WAYLAND_DISPLAY`.
-  --run-panvk-app <cmd>    Run ANY generic x86-64 Vulkan application against the host-compiled
-                           patched Mesa PanVK ICD (with libmali_kbase_emu.so + libpanthor_kbase_adapter.so).
-  --run-40-samples         Run the expanded 40 Khronos Vulkan-Samples + PanProbe compliance suite
-                           against libvulkan_mali_aot_icd.so via the system libvulkan.so.1 loader.
-  --decode-csf <log.txt>   Decode CSF ring/stream instructions, breadcrumbs, and fault snapshots
-                           from a captured Winlator log file.
-  --analyze-stall <log>    Run the CSF Ringbuffer Wrap, Breadcrumb & Stall Forensic Analyzer
-                           (scripts/analyze_csf_stall_log.py) on a captured Winlator log.
+                                Run ANY generic x86-64 Vulkan application (e.g., vkgears, vulkaninfo,
+                                vkcube, vkmark, SaschaWillems demos, or custom binaries) against the
+                                AOT-lifted libvulkan_mali_aot_icd.so ICD with full WSI & ICD logging.
+                                Automatically detects `--wsi wayland` in application arguments and
+                                preserves WAYLAND_DISPLAY and VK_KHR_wayland_surface.
+  --run-panvk-app <cmd>         Run ANY generic x86-64 Vulkan application against the host-compiled
+                                patched Mesa PanVK ICD (with libmali_kbase_emu.so + libpanthor_kbase_adapter.so).
+  --run-dxvk [args...]          Run DXVK 1.10.3 + bcn_layer + compat_layer on AOT-lifted libGLES_mali.so
+                                (delegates to ./scripts/run_dxvk_aot.sh; supports --test / --self-test).
+  --run-40-samples              Run the expanded 40 Khronos Vulkan-Samples + PanProbe compliance suite
+                                against libvulkan_mali_aot_icd.so via the system libvulkan.so.1 loader.
+  --decode-csf <log.txt>        Decode CSF ring/stream instructions, breadcrumbs, and fault snapshots
+                                from a captured Winlator log file.
+  --analyze-stall <log>         Run the CSF Ringbuffer Wrap, Breadcrumb & Stall Forensic Analyzer
+                                (scripts/analyze_csf_stall_log.py) on a captured Winlator log.
 ================================================================================
 HELP
 }
@@ -81,6 +83,17 @@ resolve_active_icd_json() {
     echo "$default_json"
 }
 
+ensure_aot_icd_built() {
+    local icd_json
+    icd_json="$(resolve_active_icd_json)"
+    local icd_dir
+    icd_dir="$(dirname "$icd_json")"
+    if [ ! -f "$icd_dir/libvulkan_mali_aot_icd.so" ]; then
+        echo "[AOT Runner] libvulkan_mali_aot_icd.so not found; building via ./src/aot/translate.sh..." >&2
+        "$ROOT_DIR/src/aot/translate.sh"
+    fi
+}
+
 case "$CMD" in
     --gen-stubs)
         python3 scripts/gen_bionic_glibc_stubs.py
@@ -99,29 +112,63 @@ for p in props:
         ;;
     --lift-so)
         SO_PATH="${1:-src/aot/libGLES_mali.so}"
-        echo "[AOT Lifter] Lifting $SO_PATH in conformance-first mode (--no-opt-passes)..."
+        echo "[AOT Lifter] Lifting $SO_PATH in conformance-first mode (--no-opt-passes --hook-Vulkan-calls)..."
         ./src/aot/translate.sh "$SO_PATH"
         ;;
     --vulkaninfo)
+        ensure_aot_icd_built
         ICD_JSON="$(resolve_active_icd_json)"
         VK_DRIVER_FILES="$ICD_JSON" VK_ICD_FILENAMES="$ICD_JSON" ./src/aot/bin/test_vulkan_samples_compliance | grep -E "Active PhysicalDevice|vulkaninfo pNext"
         ;;
     --run-vkcube-xcb)
+        ensure_aot_icd_built
         ICD_JSON="$(resolve_active_icd_json)"
         ICD_DIR="$(dirname "$ICD_JSON")"
         export MALI_AOT_ICD_LOG="${MALI_AOT_ICD_LOG:-1}"
+        export NODEVICE_SELECT="${NODEVICE_SELECT:-1}"
+        export VK_LOADER_LAYERS_DISABLE="${VK_LOADER_LAYERS_DISABLE:-~implicit~}"
+        VKCUBE_BIN="./src/aot/bin/vkcube_khronos"
+        if [ ! -x "$VKCUBE_BIN" ] && command -v vkcube >/dev/null 2>&1; then
+            VKCUBE_BIN="$(command -v vkcube)"
+        fi
         if [ -n "${DISPLAY:-}" ]; then
             env -u WAYLAND_DISPLAY MALI_AOT_DISABLE_WAYLAND_EXT=1 \
                 LD_LIBRARY_PATH="$ICD_DIR:$ROOT_DIR:${LD_LIBRARY_PATH:-}" \
                 VK_DRIVER_FILES="$ICD_JSON" \
                 VK_ICD_FILENAMES="$ICD_JSON" \
-                ./src/aot/bin/vkcube_khronos --wsi xcb --c "${1:-10}"
+                "$VKCUBE_BIN" --wsi xcb --c "${1:-10}"
         else
             MALI_VKCUBE_HIRES=1 \
                 LD_LIBRARY_PATH="$ICD_DIR:$ROOT_DIR:${LD_LIBRARY_PATH:-}" \
                 VK_DRIVER_FILES="$ICD_JSON" \
                 VK_ICD_FILENAMES="$ICD_JSON" \
                 ./src/aot/bin/vkcube_khronos --wsi display --c "${1:-10}"
+        fi
+        ;;
+    --run-vkcube-wayland)
+        ensure_aot_icd_built
+        ICD_JSON="$(resolve_active_icd_json)"
+        ICD_DIR="$(dirname "$ICD_JSON")"
+        export MALI_AOT_ICD_LOG="${MALI_AOT_ICD_LOG:-1}"
+        export NODEVICE_SELECT="${NODEVICE_SELECT:-1}"
+        export VK_LOADER_LAYERS_DISABLE="${VK_LOADER_LAYERS_DISABLE:-~implicit~}"
+        VKCUBE_BIN="./src/aot/bin/vkcube_khronos"
+        if [ ! -x "$VKCUBE_BIN" ] && command -v vkcube >/dev/null 2>&1; then
+            VKCUBE_BIN="$(command -v vkcube)"
+        fi
+        if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -x "$VKCUBE_BIN" ]; then
+            env -u MALI_AOT_DISABLE_WAYLAND_EXT \
+                LD_LIBRARY_PATH="$ICD_DIR:$ROOT_DIR:${LD_LIBRARY_PATH:-}" \
+                VK_DRIVER_FILES="$ICD_JSON" \
+                VK_ICD_FILENAMES="$ICD_JSON" \
+                "$VKCUBE_BIN" --wsi wayland --c "${1:-10}"
+        else
+            echo "[AOT Runner] WAYLAND_DISPLAY is unset; running built-in Wayland compositor + vkcube WSI test (./tests/test_wayland_and_vkgears_e2e)..." >&2
+            env -u MALI_AOT_DISABLE_WAYLAND_EXT \
+                LD_LIBRARY_PATH="$ICD_DIR:$ROOT_DIR:${LD_LIBRARY_PATH:-}" \
+                VK_DRIVER_FILES="$ICD_JSON" \
+                VK_ICD_FILENAMES="$ICD_JSON" \
+                ./tests/test_wayland_and_vkgears_e2e
         fi
         ;;
     --run-app)
@@ -137,6 +184,22 @@ for p in props:
             echo "[ERROR] --run-app requires a command (e.g. ./scripts/run_aot_lifter.sh --run-app vkgears)" >&2
             exit 1
         fi
+        # Inspect application arguments for explicit `--wsi wayland` or `--wayland`
+        # so `--run-app /usr/bin/vkcube --wsi wayland` automatically preserves
+        # WAYLAND_DISPLAY and VK_KHR_wayland_surface!
+        prev_arg=""
+        for a in "$@"; do
+            if [ "$a" = "--wayland" ] || [ "$a" = "--wsi=wayland" ]; then
+                WSI_PREF="wayland"
+            elif [ "$prev_arg" = "--wsi" ] && [ "$a" = "wayland" ]; then
+                WSI_PREF="wayland"
+            elif [ "$prev_arg" = "--wsi" ] && { [ "$a" = "xcb" ] || [ "$a" = "xlib" ] || [ "$a" = "x11" ]; }; then
+                WSI_PREF="x11"
+            fi
+            prev_arg="$a"
+        done
+
+        ensure_aot_icd_built
         ICD_JSON="$(resolve_active_icd_json)"
         ICD_DIR="$(dirname "$ICD_JSON")"
         export MALI_AOT_ICD_LOG="${MALI_AOT_ICD_LOG:-1}"
@@ -159,15 +222,13 @@ for p in props:
         echo "   MALI_AOT_ICD_LOG : $MALI_AOT_ICD_LOG" >&2
         echo "================================================================================" >&2
 
-        # CRITICAL FIX: Never pass `WAYLAND_DISPLAY=` (which sets WAYLAND_DISPLAY=""
-        # as a non-NULL empty string in environ, causing apps like `vkgears` that test
-        # `if (getenv("WAYLAND_DISPLAY"))` to pick Wayland and abort with
-        # `failed to connect to display` when `wl_display_connect(NULL)` fails on "").
-        # Instead, use `env -u WAYLAND_DISPLAY` when X11 DISPLAY is available (so
-        # `getenv("WAYLAND_DISPLAY") == NULL` and apps connect via XCB/XWayland), or
-        # preserve a non-empty WAYLAND_DISPLAY when DISPLAY is unset or --wayland is used.
-        if [ "$WSI_PREF" = "x11" ] || { [ "$WSI_PREF" = "auto" ] && [ -n "${DISPLAY:-}" ]; }; then
-            exec env -u WAYLAND_DISPLAY MALI_AOT_DISABLE_WAYLAND_EXT=1 "$@"
+        if [ "$WSI_PREF" = "wayland" ]; then
+            exec env -u MALI_AOT_DISABLE_WAYLAND_EXT "$@"
+        elif [ "$WSI_PREF" = "x11" ] || { [ "$WSI_PREF" = "auto" ] && [ -n "${DISPLAY:-}" ]; }; then
+            # Unset WAYLAND_DISPLAY when using X11/XCB so apps like vkgears choose
+            # xcb_wsi_interface(), while keeping VK_KHR_wayland_surface advertised
+            # in vkEnumerateInstanceExtensionProperties unless explicitly disabled.
+            exec env -u WAYLAND_DISPLAY "$@"
         elif [ -n "${WAYLAND_DISPLAY:-}" ]; then
             exec "$@"
         elif command -v xvfb-run >/dev/null 2>&1; then
@@ -194,6 +255,7 @@ for p in props:
         fi
         ;;
     --run-40-samples)
+        ensure_aot_icd_built
         ICD_JSON="$(resolve_active_icd_json)"
         VK_DRIVER_FILES="$ICD_JSON" VK_ICD_FILENAMES="$ICD_JSON" ./src/aot/bin/test_vulkan_samples_compliance
         ;;

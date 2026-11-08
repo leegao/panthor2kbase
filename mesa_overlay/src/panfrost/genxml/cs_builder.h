@@ -196,17 +196,6 @@ struct cs_builder {
    /* Current CS chunk. */
    struct cs_chunk cur_chunk;
 
-   /* Saved last active CS chunk when cs_end() was called, allowing seamless
-    * post-EndCommandBuffer instruction injection by layers (e.g. BCnLayer). */
-   struct cs_chunk last_active_chunk;
-
-   /* Saved CS chunk position right before EndCommandBuffer epilogue
-    * (finish_queries / flush_sync_points / finish_cs), so post-EndCommandBuffer
-    * layer injections rewind over the premature epilogue instead of leaving a
-    * mid-stream finish_cs in the middle of the command buffer. */
-   struct cs_chunk pre_epilogue_chunk;
-   bool has_pre_epilogue_chunk;
-
    /* Current load/store tracker. */
    struct cs_load_store_tracker *cur_ls_tracker;
 
@@ -262,6 +251,14 @@ cs_builder_init(struct cs_builder *b, const struct cs_builder_conf *conf,
    b->conf.nr_kernel_registers = MAX2(b->conf.nr_kernel_registers, 3);
 
    b->blocks.instrs = UTIL_DYNARRAY_INIT;
+}
+
+static inline struct cs_load_store_tracker *
+cs_get_ls_tracker(struct cs_builder *b)
+{
+   if (unlikely(b->cur_ls_tracker == NULL))
+      b->cur_ls_tracker = &b->root_ls_tracker;
+   return b->cur_ls_tracker;
 }
 
 static inline void
@@ -574,19 +571,22 @@ cs_reserve_instrs(struct cs_builder *b, uint32_t num_instrs)
          return false;
       }
    } else if (unlikely(!b->cur_chunk.buffer.cpu)) {
-      /* Reopen finalized builder if a layer or post-EndCommandBuffer hook
-       * appends instructions after cs_end() was already called. Prefer rewinding
-       * to pre_epilogue_chunk so the command buffer never retains a mid-stream
-       * finish_cs / flush_sync_points epilogue before the newly appended ops. */
-      if (b->has_pre_epilogue_chunk && b->pre_epilogue_chunk.buffer.cpu != NULL) {
-         b->cur_chunk = b->pre_epilogue_chunk;
-         b->has_pre_epilogue_chunk = false;
-         if (b->root_chunk.buffer.gpu == b->cur_chunk.buffer.gpu)
-            b->root_chunk.size = b->cur_chunk.pos;
-      } else if (b->last_active_chunk.buffer.cpu != NULL) {
-         b->cur_chunk = b->last_active_chunk;
+      /* Reopen finalized root chunk if a layer or post-EndCommandBuffer hook
+       * appends instructions after cs_end() was already called. When
+       * discard_instr_slot holds a saved pre-epilogue pos tag (bit 62 set),
+       * rewind over the premature epilogue so finish_cs is re-emitted once at
+       * the true end of the command stream. */
+      b->cur_chunk.buffer = b->root_chunk.buffer;
+      if (!b->invalid && (b->discard_instr_slot & (1ULL << 62))) {
+         uint32_t saved_pos = (uint32_t)(b->discard_instr_slot & 0xffffffffULL);
+         b->discard_instr_slot = 0;
+         if (saved_pos <= b->root_chunk.size) {
+            b->cur_chunk.pos = saved_pos;
+            b->root_chunk.size = saved_pos;
+         } else {
+            b->cur_chunk.pos = b->root_chunk.size;
+         }
       } else {
-         b->cur_chunk.buffer = b->root_chunk.buffer;
          b->cur_chunk.pos = b->root_chunk.size;
       }
    }
@@ -806,7 +806,6 @@ cs_end(struct cs_builder *b)
    }
 
    if (b->cur_chunk.buffer.cpu != NULL) {
-      b->last_active_chunk = b->cur_chunk;
       cs_wrap_chunk(b);
    }
 
@@ -992,7 +991,7 @@ cs_load_ip_to(struct cs_builder *b, struct cs_index dest)
 static inline void
 cs_wait_slots(struct cs_builder *b, unsigned wait_mask)
 {
-   struct cs_load_store_tracker *ls_tracker = b->cur_ls_tracker;
+   struct cs_load_store_tracker *ls_tracker = cs_get_ls_tracker(b);
    assert(ls_tracker != NULL);
 
    cs_emit(b, WAIT, I) {
@@ -1019,7 +1018,7 @@ cs_wait_slot(struct cs_builder *b, unsigned slot)
 static inline void
 cs_flush_load_to(struct cs_builder *b, struct cs_index to, uint16_t mask)
 {
-   struct cs_load_store_tracker *ls_tracker = b->cur_ls_tracker;
+   struct cs_load_store_tracker *ls_tracker = cs_get_ls_tracker(b);
    assert(ls_tracker != NULL);
 
    unsigned count = util_last_bit(mask);
@@ -1037,7 +1036,7 @@ cs_flush_load_to(struct cs_builder *b, struct cs_index to, uint16_t mask)
 static inline void
 cs_flush_loads(struct cs_builder *b)
 {
-   struct cs_load_store_tracker *ls_tracker = b->cur_ls_tracker;
+   struct cs_load_store_tracker *ls_tracker = cs_get_ls_tracker(b);
    assert(ls_tracker != NULL);
 
    if (!BITSET_IS_EMPTY(ls_tracker->pending_loads))
@@ -1047,7 +1046,7 @@ cs_flush_loads(struct cs_builder *b)
 static inline void
 cs_flush_stores(struct cs_builder *b)
 {
-   struct cs_load_store_tracker *ls_tracker = b->cur_ls_tracker;
+   struct cs_load_store_tracker *ls_tracker = cs_get_ls_tracker(b);
    assert(ls_tracker != NULL);
 
    if (ls_tracker->pending_stores)
@@ -1224,7 +1223,7 @@ cs_if_start(struct cs_builder *b, struct cs_if_else *if_else,
    cs_label_init(&if_else->end_label);
    cs_branch_label(b, &if_else->end_label, cs_invert_cond(cond), val);
 
-   if_else->orig_ls_state = b->cur_ls_tracker;
+   if_else->orig_ls_state = cs_get_ls_tracker(b);
    if_else->ls_state = *if_else->orig_ls_state;
    b->cur_ls_tracker = &if_else->ls_state;
 
@@ -1365,7 +1364,7 @@ cs_while_start(struct cs_builder *b, struct cs_loop *loop,
 
    /* The loops ls tracker only needs to track the actual loop body, not the
     * check to skip the whole body. */
-   loop->orig_ls_state = b->cur_ls_tracker;
+   loop->orig_ls_state = cs_get_ls_tracker(b);
    loop->orig_ls_state_copy = *loop->orig_ls_state;
    loop->ls_state = *loop->orig_ls_state;
    b->cur_ls_tracker = &loop->ls_state;
@@ -1453,8 +1452,8 @@ cs_maybe_start(struct cs_builder *b, struct cs_maybe_state *state)
 
    /* store the original ls_tracker state so that we can revert to it after
     * the maybe-block */
-   state->orig_ls_state = b->cur_ls_tracker;
-   state->ls_state = *b->cur_ls_tracker;
+   state->orig_ls_state = cs_get_ls_tracker(b);
+   state->ls_state = *state->orig_ls_state;
    b->cur_ls_tracker = &state->ls_state;
 
    return state;
@@ -2169,7 +2168,7 @@ cs_load_to(struct cs_builder *b, struct cs_index dest, struct cs_index address,
 
    for (unsigned i = 0; i < count; i++) {
       if (mask & BITFIELD_BIT(i))
-         BITSET_SET(b->cur_ls_tracker->pending_loads, base_reg + i);
+         BITSET_SET(cs_get_ls_tracker(b)->pending_loads, base_reg + i);
    }
 }
 
@@ -2202,7 +2201,7 @@ cs_store(struct cs_builder *b, struct cs_index data, struct cs_index address,
    }
 
    for (unsigned i = 0; i < count; i++) {
-      b->cur_ls_tracker->pending_stores |= mask & BITFIELD_BIT(i);
+      cs_get_ls_tracker(b)->pending_stores |= mask & BITFIELD_BIT(i);
    }
 }
 
@@ -2493,7 +2492,7 @@ cs_match_start(struct cs_builder *b, struct cs_match *match,
    *match = (struct cs_match){
       .val = val,
       .scratch_reg = scratch_reg,
-      .orig_ls_state = b->cur_ls_tracker,
+      .orig_ls_state = cs_get_ls_tracker(b),
    };
 
    cs_block_start(b, &match->block);

@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ $# -lt 1 ]; then
-    echo "Usage: $0 <path/to/libGLES_mali.so> [output_dir]"
-    exit 1
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$ROOT_DIR/../.." && pwd)"
+
+DEFAULT_SO="$ROOT_DIR/libGLES_mali.so"
+if [ ! -f "$DEFAULT_SO" ] && [ -f "$ROOT_DIR/driver/r54p3-00eac0-6eda07/lib64/egl/libGLES_mali.so" ]; then
+    DEFAULT_SO="$ROOT_DIR/driver/r54p3-00eac0-6eda07/lib64/egl/libGLES_mali.so"
 fi
 
-SO_PATH="$(realpath "$1")"
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-if [ ! -f "$SO_PATH" ]; then
-    echo "[ERROR] File not found: $SO_PATH"
-    exit 1
+SO_ARG="${1:-$DEFAULT_SO}"
+SO_PATH=""
+if [ -f "$SO_ARG" ]; then
+    SO_PATH="$(realpath "$SO_ARG")"
 fi
 
 # Auto-detect installed host libLLVM shared library across Arch, Ubuntu, Debian, Fedora (LLVM 14..22+)
@@ -51,8 +52,9 @@ else
     echo "[WARN] No host libLLVM*.so* detected in standard paths; mali_llvm_pass_driver will probe via dlopen()."
 fi
 
-# Verify ELF64 EM_AARCH64 and extract unique <driver_version>-<build_id_short> tag
-ELF_TAG="$(python3 -c '
+ELF_TAG="r54p3-00eac0-6eda07"
+if [ -n "$SO_PATH" ] && [ -f "$SO_PATH" ]; then
+    ELF_TAG="$(python3 -c '
 import struct, re, sys
 with open(sys.argv[1], "rb") as f:
     raw = f.read()
@@ -75,9 +77,10 @@ for i in range(e_shnum):
 print(f"{ver}{bid}")
 ' "$SO_PATH")"
 
-if [ "$ELF_TAG" = "INVALID" ]; then
-    echo "[ERROR] $SO_PATH is not a 64-bit AArch64 (ELF64 EM_AARCH64) binary."
-    exit 1
+    if [ "$ELF_TAG" = "INVALID" ]; then
+        echo "[ERROR] $SO_PATH is not a 64-bit AArch64 (ELF64 EM_AARCH64) binary."
+        exit 1
+    fi
 fi
 
 OUT_DIR="${2:-$ROOT_DIR/build/$ELF_TAG}"
@@ -99,16 +102,42 @@ fi
 
 echo "================================================================================"
 echo " Mali 64-Bit AArch64 -> x86-64 Linux C++ LLVM 6-Pass AOT Translation Pipeline"
-echo " Input Binary   : $SO_PATH"
+echo " Input Binary   : ${SO_PATH:-(prebuilt $OUT_DIR/mali_mbs2_aot.o)}"
 echo " Driver Build   : $ELF_TAG (64-bit ELF64 EM_AARCH64)"
 echo " Host libLLVM   : ${MALI_HOST_LIBLLVM:-dynamic dlopen}"
 echo " Output Dir     : $OUT_DIR"
 echo "================================================================================"
 
-"$PASS_DRIVER" --lift-so "$SO_PATH" "$OUT_DIR"
+if [ -n "$SO_PATH" ] && [ -f "$SO_PATH" ]; then
+    "$PASS_DRIVER" --lift-so "$SO_PATH" "$OUT_DIR" --hook-Vulkan-calls
+elif [ ! -f "$OUT_DIR/mali_mbs2_aot.o" ]; then
+    echo "[ERROR] Neither input $SO_ARG nor prebuilt $OUT_DIR/mali_mbs2_aot.o found."
+    exit 1
+fi
 
-g++ -O3 -fno-strict-aliasing "$ROOT_DIR/src/mali_aot_runner.cpp" "$OUT_DIR/mali_mbs2_aot.o" -L"$ROOT_DIR/../.." -lmali_kbase_emu -Wl,-rpath,\$ORIGIN/../../..:\$ORIGIN -ldl -o "$OUT_DIR/mali_aot_runner"
-g++ -O3 -std=c++17 -fno-strict-aliasing -shared -fPIC -Wl,-Bsymbolic -Wl,-Bsymbolic-functions "$ROOT_DIR/src/mali_vulkan_icd.cpp" "$OUT_DIR/mali_mbs2_aot.o" -L"$ROOT_DIR/../.." -lmali_kbase_emu -Wl,-rpath,\$ORIGIN/../../..:\$ORIGIN -ldl -lm -o "$OUT_DIR/libvulkan_mali_aot_icd.so"
+EXTRA_AOT_OBJS=()
+if [ -f "$OUT_DIR/mali_lifted_16384.o" ]; then
+    EXTRA_AOT_OBJS+=("$OUT_DIR/mali_lifted_16384.o")
+fi
+
+# NOTE: $OUT_DIR is at src/aot/build/<tag> (4 directory levels below $REPO_ROOT).
+# Including both $ORIGIN/../../../.. and $ORIGIN/../../.. in DT_RUNPATH ensures
+# libmali_kbase_emu.so at repo root is ALWAYS found whether invoked via
+# ./src/aot/bin/vkcube, ./scripts/run_aot_lifter.sh, or system libvulkan.so.1.
+RPATH_FLAGS="-Wl,-rpath,\$ORIGIN/../../../..:\$ORIGIN/../../..:\$ORIGIN:$REPO_ROOT"
+
+g++ -O3 -fno-strict-aliasing -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
+    "$ROOT_DIR/src/mali_aot_runner.cpp" "$OUT_DIR/mali_mbs2_aot.o" "${EXTRA_AOT_OBJS[@]}" \
+    -L"$REPO_ROOT" -lmali_kbase_emu $RPATH_FLAGS -ldl -lpthread \
+    -o "$OUT_DIR/mali_aot_runner"
+
+g++ -O3 -std=c++17 -fno-strict-aliasing -shared -fPIC \
+    -Wl,-Bsymbolic -Wl,-Bsymbolic-functions \
+    -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
+    "$ROOT_DIR/src/mali_vulkan_icd.cpp" "$OUT_DIR/mali_mbs2_aot.o" "${EXTRA_AOT_OBJS[@]}" \
+    -L"$REPO_ROOT" -lmali_kbase_emu $RPATH_FLAGS -ldl -lm -lpthread \
+    -o "$OUT_DIR/libvulkan_mali_aot_icd.so"
+
 if [ "${MALI_AOT_KEEP_LL:-0}" != "1" ]; then
     rm -f "$OUT_DIR/mali_mbs2_unopt.ll" "$OUT_DIR/mali_mbs2_opt.ll"
 fi
@@ -124,8 +153,6 @@ JSON_EOF
 
 echo "================================================================================"
 echo " [SUCCESS] 64-Bit C++ LLVM AOT Translation Complete!"
-echo "   Unoptimized IR : $OUT_DIR/mali_mbs2_unopt.ll"
-echo "   Optimized IR   : $OUT_DIR/mali_mbs2_opt.ll"
 echo "   x86-64 Object  : $OUT_DIR/mali_mbs2_aot.o"
 echo "   Runner Binary  : $OUT_DIR/mali_aot_runner"
 echo "   Vulkan ICD     : $OUT_DIR/libvulkan_mali_aot_icd.so"
