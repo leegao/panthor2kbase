@@ -72,6 +72,7 @@ Testing/
 re_scripts/
 artifacts/*
 !artifacts/.gitkeep
+!src/aot/libGLES_mali.so
 unit_tests_edge_cases
 run_vulkan_samples_and_equivalence_suite
 test_runtime_hook_unpatched
