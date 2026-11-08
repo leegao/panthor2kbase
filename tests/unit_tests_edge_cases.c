@@ -501,6 +501,97 @@ static void test_kbase_mem_alias_csf_event_xor_and_shareability_invariants(void)
    printf("  -> KBASE_IOCTL_MEM_ALIAS CSF_EVENT XOR & Idempotent CS Normalizer: PASS\n");
 }
 
+static void test_ringbuffer_multi_wrap_600_jobs(void)
+{
+   int drm_fd = panthor_kbase_adapter_open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+   assert(drm_fd >= 0);
+
+   struct drm_panthor_vm_create vmc = { .flags = 0, .user_va_range = (1ULL << 47) };
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_VM_CREATE, &vmc) == 0);
+
+   struct drm_panthor_queue_create q_defs[3];
+   memset(q_defs, 0, sizeof(q_defs));
+   for (int i = 0; i < 3; i++) {
+      q_defs[i].priority = 1;
+      q_defs[i].ringbuf_size = 65536;
+   }
+   struct drm_panthor_group_create gc;
+   memset(&gc, 0, sizeof(gc));
+   gc.queues = (struct drm_panthor_obj_array){
+      .count = 3,
+      .stride = sizeof(struct drm_panthor_queue_create),
+      .array = (uint64_t)(uintptr_t)q_defs,
+   };
+   gc.max_compute_cores = 2;
+   gc.max_fragment_cores = 2;
+   gc.max_tiler_cores = 1;
+   gc.priority = PANTHOR_GROUP_PRIORITY_HIGH;
+   gc.compute_core_mask = 0x3;
+   gc.fragment_core_mask = 0x3;
+   gc.tiler_core_mask = 0x1;
+   gc.vm_id = vmc.id;
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_GROUP_CREATE, &gc) == 0);
+   assert(gc.group_handle != 0);
+
+   uint32_t sync_handle = 0;
+   assert(drmSyncobjCreate(drm_fd, 0, &sync_handle) == 0);
+
+   /* Allocate a minimal 64-byte CS stream BO */
+   struct drm_panthor_bo_create boc = {
+      .size = 4096,
+      .flags = 0,
+      .exclusive_vm_id = vmc.id,
+   };
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_BO_CREATE, &boc) == 0);
+   struct drm_panthor_bo_mmap_offset mmo = { .handle = boc.handle };
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET, &mmo) == 0);
+   uint64_t *cs_cpu = (uint64_t *)panthor_kbase_adapter_mmap(
+      NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, drm_fd, (off_t)mmo.offset);
+   assert(cs_cpu != MAP_FAILED && cs_cpu != NULL);
+   cs_cpu[0] = 0ULL; /* NOP */
+   cs_cpu[1] = 0ULL; /* NOP */
+
+   /*
+    * Submit 600 consecutive jobs on VT(0) (600 * 320B = 192,000B > 2 * 65536B),
+    * crossing the 64 KiB boundary at Job 205 (65,280B) and Job 409/410 (130,880B),
+    * and verify DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT succeeds on every single job!
+    */
+   for (uint64_t job = 1; job <= 600; job++) {
+      struct drm_panthor_sync_op sop = {
+         .flags = DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ | DRM_PANTHOR_SYNC_OP_SIGNAL,
+         .handle = sync_handle,
+         .timeline_value = job,
+      };
+      struct drm_panthor_queue_submit qsub = {
+         .queue_index = 0,
+         .stream_size = 16,
+         .stream_addr = (uint64_t)(uintptr_t)cs_cpu,
+         .latest_flush = 1,
+         .syncs = DRM_PANTHOR_OBJ_ARRAY(1, &sop),
+      };
+      struct drm_panthor_group_submit gsub = {
+         .group_handle = gc.group_handle,
+         .pad = 0,
+         .queue_submits = DRM_PANTHOR_OBJ_ARRAY(1, &qsub),
+      };
+      assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &gsub) == 0);
+      uint64_t pt = 0;
+      assert(drmSyncobjTimelineWait(drm_fd, &sync_handle, &pt, 1, 100000000ULL, 0, NULL) == 0);
+   }
+
+   /* Also verify panthor_kbase_dump_csf_diagnostics outputs the flight recorder cleanly */
+   panthor_kbase_dump_csf_diagnostics("unit_test_600_jobs_wrap_verification");
+
+   assert(drmSyncobjDestroy(drm_fd, sync_handle) == 0);
+   assert(drmCloseBufferHandle(drm_fd, boc.handle) == 0);
+   struct drm_panthor_group_destroy gd = { .group_handle = gc.group_handle };
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_GROUP_DESTROY, &gd) == 0);
+   struct drm_panthor_vm_destroy vmd = { .id = vmc.id };
+   assert(panthor_kbase_adapter_ioctl(drm_fd, DRM_IOCTL_PANTHOR_VM_DESTROY, &vmd) == 0);
+   assert(panthor_kbase_adapter_close(drm_fd) == 0);
+   printf("  -> 600-Job Multi-Wrap CSF Ringbuffer Stress Test (Jobs 205 & 410 wrap boundaries): PASS\n");
+}
+
 int main(void)
 {
    printf("[Unit Tests] Running edge cases, mali_kbase.ko flag invariants, and RAII logging suite...\n");
@@ -512,6 +603,7 @@ int main(void)
    test_panvk_auto_va_ringbuf_and_tracebuf_integration();
    test_u_gralloc_wsi_modifier_and_dmabuf_sync_resilience();
    test_kbase_mem_alias_csf_event_xor_and_shareability_invariants();
+   test_ringbuffer_multi_wrap_600_jobs();
    printf("[Unit Tests] ALL EDGE CASES PASSED!\n");
    return 0;
 }

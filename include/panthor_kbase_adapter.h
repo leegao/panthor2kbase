@@ -130,19 +130,22 @@ extern "C" {
 #define ADAPTER_SEQNO_STREAM_PROGRESS_OFFSET 48U  /* u64: written inside CS stream (in diag_bo) */
 
 /* Offset in event_bo where per-group redirected PanVK syncobjs & ringbuf syncs are stored */
-#define ADAPTER_EVENT_BO_SYNCOBJS_BASE_OFFSET 0x2000U
+#define ADAPTER_EVENT_BO_SYNCOBJS_BASE_OFFSET 0x8000U
 #define ADAPTER_EVENT_BO_GROUP_STRIDE         0x0200U /* 512B per group (8 x 64B cache lines) */
 
 /* Ring buffer configuration */
-#define ADAPTER_RINGBUF_SIZE      (64U * 1024U)
-#define ADAPTER_RING_SLOT_QWORDS  24U
-#define ADAPTER_RING_SLOT_BYTES   (ADAPTER_RING_SLOT_QWORDS * sizeof(uint64_t))
-#define ADAPTER_MAX_SUBQUEUES     4U
-#define ADAPTER_MAX_BOS           1024U
-#define ADAPTER_MAX_SYNCOBJS      512U
-#define ADAPTER_MAX_GROUPS        32U
-#define ADAPTER_MAX_HEAPS         32U
-#define ADAPTER_MAX_VIRTUAL_FDS   64U
+#define ADAPTER_RINGBUF_SIZE          (64U * 1024U)
+#define ADAPTER_RING_SLOT_QWORDS      24U
+#define ADAPTER_RING_SLOT_BYTES       (ADAPTER_RING_SLOT_QWORDS * sizeof(uint64_t))
+#define ADAPTER_RING_SLOT_MAX_QWORDS  64U
+#define ADAPTER_RING_SLOT_MAX_BYTES   (ADAPTER_RING_SLOT_MAX_QWORDS * sizeof(uint64_t))
+#define ADAPTER_FLIGHT_LOG_ENTRIES    16U
+#define ADAPTER_MAX_SUBQUEUES         4U
+#define ADAPTER_MAX_BOS               2048U
+#define ADAPTER_MAX_SYNCOBJS          1024U
+#define ADAPTER_MAX_GROUPS            32U
+#define ADAPTER_MAX_HEAPS             32U
+#define ADAPTER_MAX_VIRTUAL_FDS       64U
 
 /* Public entrypoints usable by direct Mesa kmod patch and tests */
 int panthor_kbase_adapter_open(const char *path, int flags);

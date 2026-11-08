@@ -215,11 +215,25 @@ static inline void kbase_cpu_cache_invalidate_range(const void *ptr, size_t size
 }
 
 /* Subqueue state inside a CSG */
+struct adapter_flight_entry {
+   uint64_t job_seqno;
+   uint32_t ring_off;
+   uint32_t slot_bytes;
+   uint32_t wrap_nop_bytes;
+   uint64_t insert_before;
+   uint64_t insert_after;
+   uint64_t extract_at_submit;
+   uint64_t stream_va;
+   uint32_t stream_size;
+   uint64_t submit_ts_ns;
+};
+
 struct adapter_subqueue {
    bool bound;
    uint8_t kbase_group_handle;
    uint32_t csi_index;
    uint32_t ringbuf_size;
+   uint32_t ring_alloc_size;
    uint64_t ring_gpu_va;
    uint64_t *ring_cpu_ptr;
    void *user_io_ptr; /* 3 * 4096 bytes: page 0 Doorbell, page 1 Input, page 2 Output */
@@ -237,6 +251,7 @@ struct adapter_subqueue {
    uint32_t last_ring_slot_bytes;
    uint64_t job_stream_va[64];
    uint32_t job_stream_size[64];
+   struct adapter_flight_entry flight_log[ADAPTER_FLIGHT_LOG_ENTRIES];
 };
 
 /* Scheduling group state */
@@ -796,8 +811,8 @@ static int init_kbase_context(struct adapter_ctx *ctx, int mali_fd)
                        BASE_MEM_SAME_VA | BASE_MEM_CSF_EVENT;
    uint64_t ev_out_flags = 0;
    uint64_t ev_cookie = 0;
-   if (alloc_kbase_mem(mali_fd, 16, 16, 0, ev_flags, &ev_out_flags, &ev_cookie) == 0) {
-      ctx->event_bo_size = 16 * 4096;
+   if (alloc_kbase_mem(mali_fd, 32, 32, 0, ev_flags, &ev_out_flags, &ev_cookie) == 0) {
+      ctx->event_bo_size = 32 * 4096;
       ctx->event_bo_cpu = static_cast<uint8_t *>(
          real_mmap(nullptr, ctx->event_bo_size, PROT_READ | PROT_WRITE,
                    MAP_SHARED, mali_fd, static_cast<off_t>(ev_cookie)));
@@ -1248,7 +1263,9 @@ void panthor_kbase_dump_csf_diagnostics(const char *reason)
 
          const char *stage = "IDLE/COMPLETE";
          if (seqno_val < sq->emitted_jobs) {
-            if (cs_extract < cs_insert && pre_call < sq->emitted_jobs)
+            if (cs_extract >= cs_insert && post_call >= sq->emitted_jobs && post_wait < sq->emitted_jobs)
+               stage = "RING_WRAP_TRUNCATION_ANOMALY (CS_EXTRACT==CS_INSERT after POST_CALL without POST_WAIT/SEQNO)";
+            else if (cs_extract < cs_insert && pre_call < sq->emitted_jobs)
                stage = "BLOCKED_BEFORE_CALL (ringbuffer/REQ_RESOURCE/FLUSH_CACHE2 or CSG off-slot)";
             else if (pre_call >= sq->emitted_jobs && post_call < sq->emitted_jobs)
                stage = "BLOCKED_INSIDE_CS_STREAM (SYNC_WAIT32/64 or WAIT inside command buffer)";
@@ -1270,9 +1287,11 @@ void panthor_kbase_dump_csf_diagnostics(const char *reason)
                   static_cast<unsigned long long>(post_call),
                   static_cast<unsigned long long>(post_wait),
                   static_cast<unsigned long long>(stream_prog));
-         LOG_WARN("          CS_INSERT=%llu CS_EXTRACT=%llu(init=%llu) CS_ACTIVE=%u heap(vt_s=%u vt_e=%u frag_e=%u) -> %s",
+         LOG_WARN("          CS_INSERT=%llu(ring_off=%u) CS_EXTRACT=%llu(ring_off=%u, init=%llu) CS_ACTIVE=%u heap(vt_s=%u vt_e=%u frag_e=%u) -> %s",
                   static_cast<unsigned long long>(cs_insert),
+                  sq->ringbuf_size ? static_cast<unsigned>(cs_insert % sq->ringbuf_size) : 0U,
                   static_cast<unsigned long long>(cs_extract),
+                  sq->ringbuf_size ? static_cast<unsigned>(cs_extract % sq->ringbuf_size) : 0U,
                   static_cast<unsigned long long>(cs_extract_init),
                   cs_active, heap_vt_start, heap_vt_end, heap_frag_end, stage);
 
@@ -1286,29 +1305,91 @@ void panthor_kbase_dump_csf_diagnostics(const char *reason)
                       static_cast<unsigned long long>(cs_fatal_info));
          }
 
-         /* Inspect subqueue context (syncobjs & render.desc_ringbuf) */
+         /* Inspect subqueue context (syncobjs, render.desc_ringbuf & tiler_oom_ctx) */
          if (sq->cached_subq_ctx_va != 0) {
-            auto *ctx_u64 = static_cast<uint64_t *>(resolve_gpu_va_to_cpu(sq->cached_subq_ctx_va, 64));
+            auto *ctx_u64 = static_cast<uint64_t *>(resolve_gpu_va_to_cpu(sq->cached_subq_ctx_va, 80));
             if (ctx_u64) {
                kbase_cpu_cache_invalidate_range(ctx_u64, 128);
                uint64_t syncobjs_va = ctx_u64[0];
+               uint64_t rb_sync_va  = ctx_u64[3];
+               uint64_t rb_addr_va  = ctx_u64[4];
+               uint64_t tiler_hp_va = ctx_u64[5];
                auto *so_u64 = static_cast<uint64_t *>(resolve_gpu_va_to_cpu(syncobjs_va, 48));
+               uint32_t rb_sync_val = 0;
+               if (rb_sync_va != 0) {
+                  auto *rb_u32 = static_cast<uint32_t *>(resolve_gpu_va_to_cpu(rb_sync_va, 4));
+                  if (rb_u32) {
+                     kbase_cpu_cache_invalidate_range(rb_u32, 64);
+                     rb_sync_val = rb_u32[0];
+                  }
+               }
                if (so_u64) {
                   kbase_cpu_cache_invalidate_range(so_u64, 64);
-                  LOG_WARN("          queue->syncobjs(0x%llx): VT={seq=%llu,err=0x%llx} FRAG={seq=%llu,err=0x%llx} COMP={seq=%llu,err=0x%llx}",
+                  LOG_WARN("          queue->syncobjs(0x%llx): VT={seq=%llu,err=0x%llx} FRAG={seq=%llu,err=0x%llx} COMP={seq=%llu,err=0x%llx} desc_rb_sync(0x%llx)=0x%x(addr=0x%llx) heap=0x%llx",
                            static_cast<unsigned long long>(syncobjs_va),
                            static_cast<unsigned long long>(so_u64[0]),
                            static_cast<unsigned long long>(so_u64[1]),
                            static_cast<unsigned long long>(so_u64[2]),
                            static_cast<unsigned long long>(so_u64[3]),
                            static_cast<unsigned long long>(so_u64[4]),
-                           static_cast<unsigned long long>(so_u64[5]));
+                           static_cast<unsigned long long>(so_u64[5]),
+                           static_cast<unsigned long long>(rb_sync_va),
+                           rb_sync_val,
+                           static_cast<unsigned long long>(rb_addr_va),
+                           static_cast<unsigned long long>(tiler_hp_va));
                }
             }
          }
 
-         /* Disassemble active/unfinished command stream (for seqno_val + 1) or last submitted stream */
+         /* Dump recent ringbuffer flight recorder entries for this subqueue */
+         if (sq->emitted_jobs > 0) {
+            uint64_t now_ts = get_monotonic_ns();
+            uint64_t start_j = (sq->emitted_jobs > 6) ? (sq->emitted_jobs - 5) : 1;
+            LOG_WARN("          Ringbuffer Flight Recorder (last %llu jobs on %s, ring_size=%u):",
+                     static_cast<unsigned long long>(sq->emitted_jobs - start_j + 1),
+                     sq_names[q], sq->ringbuf_size);
+            for (uint64_t j = start_j; j <= sq->emitted_jobs; j++) {
+               const struct adapter_flight_entry *fe = &sq->flight_log[j % ADAPTER_FLIGHT_LOG_ENTRIES];
+               if (fe->job_seqno != j)
+                  continue;
+               double age_ms = (now_ts >= fe->submit_ts_ns)
+                                  ? (static_cast<double>(now_ts - fe->submit_ts_ns) / 1e6)
+                                  : 0.0;
+               LOG_WARN("            job=%llu ring_off=%u..%u (%uB, wrap_nop=%uB) insert=%llu->%llu extract_at_sub=%llu stream=0x%llx(%uB) age=%.2fms",
+                        static_cast<unsigned long long>(fe->job_seqno),
+                        fe->ring_off, fe->ring_off + fe->slot_bytes, fe->slot_bytes,
+                        fe->wrap_nop_bytes,
+                        static_cast<unsigned long long>(fe->insert_before),
+                        static_cast<unsigned long long>(fe->insert_after),
+                        static_cast<unsigned long long>(fe->extract_at_submit),
+                        static_cast<unsigned long long>(fe->stream_va),
+                        fe->stream_size, age_ms);
+            }
+         }
+
+         /* Disassemble primary ringbuffer slot & active/unfinished secondary CS stream */
          uint64_t active_job = seqno_val + 1;
+         if (seqno_val < sq->emitted_jobs && sq->ring_cpu_ptr) {
+            const struct adapter_flight_entry *afe = &sq->flight_log[active_job % ADAPTER_FLIGHT_LOG_ENTRIES];
+            if (afe->job_seqno == active_job &&
+                afe->ring_off + afe->slot_bytes <= sq->ring_alloc_size) {
+               const auto *ring_qwords = reinterpret_cast<const uint64_t *>(
+                  reinterpret_cast<const uint8_t *>(sq->ring_cpu_ptr) + afe->ring_off);
+               uint32_t rq_count = afe->slot_bytes / 8;
+               LOG_WARN("          Primary Ringbuffer Slot (job=%llu) on %s (ring_va=0x%llx+0x%x, %u insns):",
+                        static_cast<unsigned long long>(active_job), sq_names[q],
+                        static_cast<unsigned long long>(sq->ring_gpu_va),
+                        afe->ring_off, rq_count);
+               for (uint32_t r_idx = 0; r_idx < rq_count && r_idx < 64; r_idx++) {
+                  char rdis[160];
+                  decode_csf_insn(ring_qwords[r_idx], rdis, sizeof(rdis));
+                  LOG_WARN("            [ring+%02u] off=%u: 0x%016llx  %s",
+                           r_idx, afe->ring_off + r_idx * 8,
+                           static_cast<unsigned long long>(ring_qwords[r_idx]), rdis);
+               }
+            }
+         }
+
          uint64_t dump_va = (seqno_val < sq->emitted_jobs && sq->job_stream_va[active_job & 63U] != 0)
                                ? sq->job_stream_va[active_job & 63U]
                                : sq->last_stream_va;
@@ -1324,12 +1405,98 @@ void panthor_kbase_dump_csf_diagnostics(const char *reason)
                         static_cast<unsigned long long>(active_job),
                         sq_names[q],
                         static_cast<unsigned long long>(dump_va), n_insns);
+               uint64_t shadow_regs[128] = {0};
+               if (sq->cached_subq_ctx_va != 0) {
+                  uint8_t creg = sq->cached_subq_ctx_reg ? sq->cached_subq_ctx_reg : 90U;
+                  if (creg + 1 < 128) {
+                     shadow_regs[creg]     = sq->cached_subq_ctx_va & 0xffffffffULL;
+                     shadow_regs[creg + 1] = sq->cached_subq_ctx_va >> 32;
+                  }
+               }
                for (uint32_t idx = 0; idx < n_insns && idx < 256; idx++) {
+                  uint64_t insn = cs_ptr[idx];
+                  uint8_t op = static_cast<uint8_t>((insn >> 56) & 0xffU);
                   char dis[160];
-                  decode_csf_insn(cs_ptr[idx], dis, sizeof(dis));
-                  LOG_WARN("            [%02u] +0x%03x: 0x%016llx  %s",
+                  decode_csf_insn(insn, dis, sizeof(dis));
+                  char extra[160];
+                  extra[0] = '\0';
+
+                  if (op == HW_CSF_OP_MOVE48) {
+                     uint8_t rd = static_cast<uint8_t>((insn >> 48) & 0x7fU);
+                     uint64_t imm = insn & 0xffffffffffffULL;
+                     if (rd + 1 < 128) {
+                        shadow_regs[rd]     = imm & 0xffffffffULL;
+                        shadow_regs[rd + 1] = imm >> 32;
+                     }
+                  } else if (op == HW_CSF_OP_MOVE32) {
+                     uint8_t rd = static_cast<uint8_t>((insn >> 48) & 0x7fU);
+                     if (rd < 128)
+                        shadow_regs[rd] = insn & 0xffffffffULL;
+                  } else if (op == HW_CSF_OP_ADD_IMM32) {
+                     uint8_t rd = static_cast<uint8_t>((insn >> 48) & 0x7fU);
+                     uint8_t rs = static_cast<uint8_t>((insn >> 40) & 0x7fU);
+                     int32_t imm = static_cast<int32_t>(insn & 0xffffffffULL);
+                     if (rd < 128 && rs < 128)
+                        shadow_regs[rd] = static_cast<uint32_t>(shadow_regs[rs] + imm);
+                  } else if (op == HW_CSF_OP_ADD_IMM64) {
+                     uint8_t rd = static_cast<uint8_t>((insn >> 48) & 0x7fU);
+                     uint8_t rs = static_cast<uint8_t>((insn >> 40) & 0x7fU);
+                     int32_t imm = static_cast<int32_t>(insn & 0xffffffffULL);
+                     if (rd + 1 < 128 && rs + 1 < 128) {
+                        uint64_t base_v = (shadow_regs[rs + 1] << 32) | (shadow_regs[rs] & 0xffffffffULL);
+                        uint64_t res_v = static_cast<uint64_t>( static_cast<int64_t>(base_v) + imm );
+                        shadow_regs[rd]     = res_v & 0xffffffffULL;
+                        shadow_regs[rd + 1] = res_v >> 32;
+                     }
+                  } else if (op == HW_CSF_OP_LOAD_MULTIPLE) {
+                     uint8_t base_r = static_cast<uint8_t>((insn >> 48) & 0x7fU);
+                     uint8_t addr_r = static_cast<uint8_t>((insn >> 40) & 0x7fU);
+                     uint16_t mask  = static_cast<uint16_t>((insn >> 16) & 0xffffU);
+                     int16_t off    = static_cast<int16_t>(insn & 0xffffU);
+                     if (addr_r + 1 < 128) {
+                        uint64_t src_va = ((shadow_regs[addr_r + 1] << 32) | (shadow_regs[addr_r] & 0xffffffffULL)) + off;
+                        const auto *src_u32 = static_cast<const uint32_t *>(resolve_gpu_va_to_cpu(src_va, 64));
+                        if (src_u32) {
+                           uint32_t m_idx = 0;
+                           for (uint32_t b = 0; b < 16; b++) {
+                              if (mask & (1U << b)) {
+                                 if (base_r + b < 128)
+                                    shadow_regs[base_r + b] = src_u32[m_idx];
+                                 m_idx++;
+                              }
+                           }
+                        }
+                     }
+                  } else if (op == HW_CSF_OP_SYNC_WAIT32 || op == HW_CSF_OP_SYNC_WAIT64) {
+                     uint8_t addr_r = static_cast<uint8_t>((insn >> 40) & 0x7fU);
+                     uint8_t ref_r  = static_cast<uint8_t>((insn >> 32) & 0x7fU);
+                     if (addr_r + 1 < 128 && ref_r < 128) {
+                        uint64_t w_va = (shadow_regs[addr_r + 1] << 32) | (shadow_regs[addr_r] & 0xffffffffULL);
+                        if (op == HW_CSF_OP_SYNC_WAIT32) {
+                           uint32_t ref_v = static_cast<uint32_t>(shadow_regs[ref_r]);
+                           auto *w_ptr = static_cast<uint32_t *>(resolve_gpu_va_to_cpu(w_va, 4));
+                           if (w_ptr) {
+                              kbase_cpu_cache_invalidate_range(w_ptr, 64);
+                              snprintf(extra, sizeof(extra), "  <-- [target_va=0x%llx live_mem=%u ref=%u]",
+                                       static_cast<unsigned long long>(w_va), w_ptr[0], ref_v);
+                           }
+                        } else if (ref_r + 1 < 128) {
+                           uint64_t ref_v = (shadow_regs[ref_r + 1] << 32) | (shadow_regs[ref_r] & 0xffffffffULL);
+                           auto *w_ptr = static_cast<uint64_t *>(resolve_gpu_va_to_cpu(w_va, 8));
+                           if (w_ptr) {
+                              kbase_cpu_cache_invalidate_range(w_ptr, 64);
+                              snprintf(extra, sizeof(extra), "  <-- [target_va=0x%llx live_mem=%llu ref=%llu]",
+                                       static_cast<unsigned long long>(w_va),
+                                       static_cast<unsigned long long>(w_ptr[0]),
+                                       static_cast<unsigned long long>(ref_v));
+                           }
+                        }
+                     }
+                  }
+
+                  LOG_WARN("            [%02u] +0x%03x: 0x%016llx  %s%s",
                            idx, idx * 8,
-                           static_cast<unsigned long long>(cs_ptr[idx]), dis);
+                           static_cast<unsigned long long>(insn), dis, extra);
                }
             }
          }
@@ -3125,25 +3292,26 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          struct adapter_subqueue *sq = &grp->subqueues[q];
          sq->csi_index = q;
          sq->ringbuf_size = ADAPTER_RINGBUF_SIZE;
+         sq->ring_alloc_size = ADAPTER_RINGBUF_SIZE + 4096U; /* +4 KiB trailing guard page */
 
          uint64_t rflags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
                            BASE_MEM_PROT_GPU_RD | BASE_MEM_SAME_VA | BASE_MEM_COHERENT_LOCAL;
          uint64_t rout_flags = 0;
          uint64_t rcookie = 0;
-         if (alloc_kbase_mem(g_ctx.mali_fd, ADAPTER_RINGBUF_SIZE >> 12,
-                             ADAPTER_RINGBUF_SIZE >> 12, 0, rflags, &rout_flags, &rcookie) < 0) {
+         uint64_t rpages = sq->ring_alloc_size >> 12;
+         if (alloc_kbase_mem(g_ctx.mali_fd, rpages, rpages, 0, rflags, &rout_flags, &rcookie) < 0) {
             LOG_ERROR("DRM_PANTHOR_GROUP_CREATE: ring alloc failed for queue %u", q);
             ret = -1;
             break;
          }
-         void *rcpu = real_mmap(nullptr, ADAPTER_RINGBUF_SIZE, PROT_READ | PROT_WRITE,
+         void *rcpu = real_mmap(nullptr, sq->ring_alloc_size, PROT_READ | PROT_WRITE,
                                 MAP_SHARED, g_ctx.mali_fd, static_cast<off_t>(rcookie));
          if (rcpu == MAP_FAILED) {
             LOG_ERROR("DRM_PANTHOR_GROUP_CREATE: ring mmap failed for queue %u", q);
             ret = -1;
             break;
          }
-         memset(rcpu, 0, ADAPTER_RINGBUF_SIZE);
+         memset(rcpu, 0, sq->ring_alloc_size);
          sq->ring_cpu_ptr = static_cast<uint64_t *>(rcpu);
          sq->ring_gpu_va = reinterpret_cast<uintptr_t>(rcpu);
 
@@ -3233,7 +3401,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                struct kbase_ioctl_cs_queue_terminate qt = { .buffer_gpu_addr = sq->ring_gpu_va };
                adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_TERMINATE, &qt);
                if (sq->ring_cpu_ptr)
-                  real_munmap(sq->ring_cpu_ptr, sq->ringbuf_size);
+                  real_munmap(sq->ring_cpu_ptr, sq->ring_alloc_size ? sq->ring_alloc_size : sq->ringbuf_size);
                if (sq->kbase_group_handle != 0 && sq->kbase_group_handle != grp->kbase_group_handle) {
                   struct kbase_ioctl_cs_queue_group_term sgt = {
                      .group_handle = sq->kbase_group_handle,
@@ -3464,12 +3632,13 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          }
 
          /* 2. Ensure the 64 KiB ring buffer has space (never overwrite unextracted CSF commands) */
+         uint64_t extract_at_sub = 0;
          if (sq->user_io_ptr) {
             const auto *out_u64 = reinterpret_cast<const volatile uint64_t *>(
                static_cast<const uint8_t *>(sq->user_io_ptr) + CS_USER_IO_OUTPUT_PAGE_OFFSET);
             for (unsigned wait_ring = 0; wait_ring < 500; wait_ring++) {
-               uint64_t cs_extract = out_u64[0];
-               if ((sq->insert_offset + ADAPTER_RING_SLOT_BYTES * 2) - cs_extract <= sq->ringbuf_size)
+               extract_at_sub = out_u64[0];
+               if ((sq->insert_offset + ADAPTER_RING_SLOT_MAX_BYTES * 2) - extract_at_sub <= sq->ringbuf_size)
                   break;
                struct kbase_ioctl_cs_queue_kick kick = { .buffer_gpu_addr = sq->ring_gpu_va };
                adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_KICK, &kick);
@@ -3477,21 +3646,18 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             }
          }
 
-         /* 3. Emit the CSF ring slot into the kbase userspace ring buffer */
-         uint32_t ring_off = static_cast<uint32_t>(sq->insert_offset % sq->ringbuf_size);
-         if (ring_off + ADAPTER_RING_SLOT_BYTES > sq->ringbuf_size) {
-            uint8_t *wrap_ptr = reinterpret_cast<uint8_t *>(sq->ring_cpu_ptr) + ring_off;
-            size_t wrap_len = sq->ringbuf_size - ring_off;
-            memset(wrap_ptr, 0, wrap_len);
-            kbase_cpu_cache_clean_range(wrap_ptr, wrap_len);
-            sq->insert_offset += wrap_len;
-            ring_off = 0;
-         }
-         auto *slot_ptr = reinterpret_cast<uint64_t *>(
-            reinterpret_cast<uint8_t *>(sq->ring_cpu_ptr) + ring_off);
+         /*
+          * 3. Stage the CSF ring slot into `staged_slot` first to obtain the exact `slot_bytes`
+          *    (192B without breadcrumbs, 320B with breadcrumbs), then check whether
+          *    `ring_off + slot_bytes > sq->ringbuf_size` BEFORE writing to `sq->ring_cpu_ptr`!
+          *    This prevents any ring slot from straddling the 64 KiB ringbuffer boundary
+          *    (which caused Job 410 at ring_off=65344 to overflow bytes 192..319 past 65536).
+          */
          uint64_t next_job_seqno = sq->emitted_jobs + 1;
+         uint64_t staged_slot[ADAPTER_RING_SLOT_MAX_QWORDS];
+         memset(staged_slot, 0, sizeof(staged_slot));
          size_t slot_bytes = panthor_kbase_emit_ring_slot_ex(
-            slot_ptr,
+            staged_slot,
             g_ctx.arch_major,
             g_ctx.csif_info.cs_reg_count,
             qs->queue_index,
@@ -3507,6 +3673,24 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             next_job_seqno,
             breadcrumbs);
 
+         uint64_t insert_before = sq->insert_offset;
+         uint32_t ring_off = static_cast<uint32_t>(sq->insert_offset % sq->ringbuf_size);
+         size_t wrap_nop_bytes = 0;
+         if (ring_off + slot_bytes > sq->ringbuf_size) {
+            uint8_t *wrap_ptr = reinterpret_cast<uint8_t *>(sq->ring_cpu_ptr) + ring_off;
+            wrap_nop_bytes = sq->ringbuf_size - ring_off;
+            memset(wrap_ptr, 0, wrap_nop_bytes);
+            kbase_cpu_cache_clean_range(wrap_ptr, wrap_nop_bytes);
+            sq->insert_offset += wrap_nop_bytes;
+            LOG_DEBUG("DRM_PANTHOR_GROUP_SUBMIT q=%u job=%llu ring wrap at off=%u (+%zu > %u): NOP-padded %zuB -> ring_off=0",
+                      qs->queue_index, static_cast<unsigned long long>(next_job_seqno),
+                      ring_off, slot_bytes, sq->ringbuf_size, wrap_nop_bytes);
+            ring_off = 0;
+         }
+         auto *slot_ptr = reinterpret_cast<uint64_t *>(
+            reinterpret_cast<uint8_t *>(sq->ring_cpu_ptr) + ring_off);
+         memcpy(slot_ptr, staged_slot, slot_bytes);
+
          /* Drain CPU cache / write-combine buffer so CSF MCU reads valid instructions from DRAM */
          kbase_cpu_cache_clean_range(slot_ptr, slot_bytes);
 
@@ -3518,6 +3702,18 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          sq->last_ring_slot_bytes = static_cast<uint32_t>(slot_bytes);
          sq->insert_offset += slot_bytes;
          sq->emitted_jobs = next_job_seqno;
+
+         struct adapter_flight_entry *fe = &sq->flight_log[next_job_seqno % ADAPTER_FLIGHT_LOG_ENTRIES];
+         fe->job_seqno = next_job_seqno;
+         fe->ring_off = ring_off;
+         fe->slot_bytes = static_cast<uint32_t>(slot_bytes);
+         fe->wrap_nop_bytes = static_cast<uint32_t>(wrap_nop_bytes);
+         fe->insert_before = insert_before;
+         fe->insert_after = sq->insert_offset;
+         fe->extract_at_submit = extract_at_sub;
+         fe->stream_va = qs->stream_addr;
+         fe->stream_size = qs->stream_size;
+         fe->submit_ts_ns = get_monotonic_ns();
          touched_subqueues |= (1U << qs->queue_index);
 
          /* 4. Update signaled drm_syncobjs */

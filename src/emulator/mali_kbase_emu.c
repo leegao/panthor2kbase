@@ -1110,14 +1110,20 @@ int ioctl(int fd, unsigned long request, ...)
                uint64_t cs_insert = *(volatile uint64_t *)(uio + CS_USER_IO_INPUT_PAGE_OFFSET);
                uint64_t cs_extract = g_kfile.queues[i].extract_offset;
                if (cs_insert > cs_extract) {
-                  uint32_t ring_off = (uint32_t)(cs_extract % g_kfile.queues[i].buffer_size);
-                  uint32_t bytes = (uint32_t)(cs_insert - cs_extract);
+                  uint32_t buf_sz = g_kfile.queues[i].buffer_size;
+                  uint64_t cur = cs_extract;
                   uint64_t cs_regs[96];
                   memset(cs_regs, 0, sizeof(cs_regs));
                   struct emu_tiler_heap *heap = g_kfile.heaps[0].active ? &g_kfile.heaps[0] : NULL;
-                  execute_csf_stream(
-                     (const uint64_t *)((const uint8_t *)(uintptr_t)qk->buffer_gpu_addr + ring_off),
-                     bytes, cs_regs, heap);
+                  while (cur < cs_insert && buf_sz > 0) {
+                     uint32_t ring_off = (uint32_t)(cur % buf_sz);
+                     uint64_t rem = cs_insert - cur;
+                     uint32_t chunk = (ring_off + rem > buf_sz) ? (buf_sz - ring_off) : (uint32_t)rem;
+                     execute_csf_stream(
+                        (const uint64_t *)((const uint8_t *)(uintptr_t)qk->buffer_gpu_addr + ring_off),
+                        chunk, cs_regs, heap);
+                     cur += chunk;
+                  }
                   g_kfile.queues[i].extract_offset = cs_insert;
                   *(volatile uint64_t *)(uio + CS_USER_IO_OUTPUT_PAGE_OFFSET) = cs_insert;
                }

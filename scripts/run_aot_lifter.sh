@@ -2,9 +2,9 @@
 # ============================================================================
 # scripts/run_aot_lifter.sh
 # Unified CLI Driver & Guidance Tool for Static AArch64-to-LLVM/C++ Binary
-# Lifting, Bionic-to-glibc Stub Generation, XCB/Display vkcube WSI, vulkaninfo
-# Introspection, and 40-Sample + PanProbe Compliance Testing.
-# (Addresses Doc 18 Comment doco.RSWY0VtAij-YjN-cZ79deA)
+# Lifting, Bionic-to-glibc Stub Generation, XCB/Display vkcube WSI, Generic
+# x86-64 Vulkan Application Execution, vulkaninfo Introspection, and CSF Stall
+# Forensic Analysis.
 # ============================================================================
 set -euo pipefail
 
@@ -35,10 +35,17 @@ Commands:
   --run-vkcube-xcb         Run Khronos vkcube against libvulkan_mali_aot_icd.so using XCB/X11 WSI
                            (WAYLAND_DISPLAY= VK_ICD_FILENAMES=.../mali_aot_icd.x86_64.json vkcube --wsi xcb)
                            or headless display fallback when DISPLAY is unset.
+  --run-app <cmd> [args]   Run ANY generic x86-64 Vulkan application (e.g., vulkaninfo, vkmark,
+                           SaschaWillems demos, or custom binaries) against the AOT-lifted
+                           libvulkan_mali_aot_icd.so ICD.
+  --run-panvk-app <cmd>    Run ANY generic x86-64 Vulkan application against the host-compiled
+                           patched Mesa PanVK ICD (with libmali_kbase_emu.so + libpanthor_kbase_adapter.so).
   --run-40-samples         Run the expanded 40 Khronos Vulkan-Samples + PanProbe compliance suite
                            against libvulkan_mali_aot_icd.so via the system libvulkan.so.1 loader.
   --decode-csf <log.txt>   Decode CSF ring/stream instructions, breadcrumbs, and fault snapshots
                            from a captured Winlator log file.
+  --analyze-stall <log>    Run the CSF Ringbuffer Wrap, Breadcrumb & Stall Forensic Analyzer
+                           (scripts/analyze_csf_stall_log.py) on a captured Winlator log.
 ================================================================================
 HELP
 }
@@ -86,12 +93,26 @@ for p in props:
                 ./src/aot/bin/vkcube_khronos --wsi display --c "${1:-10}"
         fi
         ;;
+    --run-app)
+        ICD_JSON="$ROOT_DIR/src/aot/build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json"
+        WAYLAND_DISPLAY= LD_LIBRARY_PATH="$ROOT_DIR/src/aot/build/r54p3-00eac0-6eda07:$ROOT_DIR:${LD_LIBRARY_PATH:-}" \
+            VK_ICD_FILENAMES="$ICD_JSON" "$@"
+        ;;
+    --run-panvk-app)
+        PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1 \
+            LD_PRELOAD="$ROOT_DIR/libmali_kbase_emu.so:$ROOT_DIR/libpanthor_kbase_adapter.so" \
+            LD_LIBRARY_PATH="$ROOT_DIR:${LD_LIBRARY_PATH:-}" \
+            "$@"
+        ;;
     --run-40-samples)
         ICD_JSON="$ROOT_DIR/src/aot/build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json"
         VK_ICD_FILENAMES="$ICD_JSON" ./src/aot/bin/test_vulkan_samples_compliance
         ;;
     --decode-csf)
         python3 scripts/decode_csf_breadcrumbs_and_dump.py "$@"
+        ;;
+    --analyze-stall)
+        python3 scripts/analyze_csf_stall_log.py "$@"
         ;;
     *)
         echo "Unknown command: $CMD" >&2
