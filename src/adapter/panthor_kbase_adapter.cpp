@@ -126,6 +126,7 @@ static thread_local uint32_t g_tls_next_bo_kmod_flags = 0;
 [[maybe_unused]] constexpr uint32_t ADAPTER_KMOD_BO_FLAG_IMPORTED        = (1U << 4);
 [[maybe_unused]] constexpr uint32_t ADAPTER_KMOD_BO_FLAG_GPU_UNCACHED    = (1U << 5);
 [[maybe_unused]] constexpr uint32_t ADAPTER_KMOD_BO_FLAG_WB_MMAP         = (1U << 6);
+[[maybe_unused]] constexpr uint32_t ADAPTER_KMOD_BO_FLAG_CSF_EVENT       = (1U << 7);
 
 static void trace_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void trace_log(const char *fmt, ...)
@@ -224,6 +225,8 @@ struct adapter_subqueue {
    uint64_t emitted_jobs;
    uint64_t seqno_gpu_va;
    volatile uint64_t *seqno_cpu_ptr;
+   uint64_t diag_gpu_va;
+   volatile uint64_t *diag_cpu_ptr;
    uint64_t cached_subq_ctx_va;
    uint8_t cached_subq_ctx_reg;
    uint64_t last_stream_va;
@@ -246,6 +249,8 @@ struct adapter_group {
    uint32_t fatal_queues;
    struct adapter_subqueue subqueues[ADAPTER_MAX_SUBQUEUES];
    uint64_t active_tiler_heap_ctx_va;
+   uint64_t redirected_syncobjs_va;
+   uint64_t redirected_ringbuf_sync_va;
 };
 
 /* Tiler heap state */
@@ -282,10 +287,15 @@ struct adapter_ctx {
    bool has_kcpu_queue;
    int stream_fd;
 
-   /* CSF Event BO backing syncobjs & subqueue 64-byte breadcrumb cells */
+   /* CSF Event BO (BASE_MEM_CSF_EVENT) backing ONLY CQS/SYNC_ADD/SYNC_WAIT cells */
    uint64_t event_bo_gpu_va;
    uint8_t *event_bo_cpu;
    size_t event_bo_size;
+
+   /* Coherent Local Diagnostic BO (BASE_MEM_COHERENT_LOCAL) backing STORE_MULTIPLE breadcrumbs */
+   uint64_t diag_bo_gpu_va;
+   uint8_t *diag_bo_cpu;
+   size_t diag_bo_size;
 
    uint32_t next_vm_id;
    uint32_t next_gem_handle;
@@ -796,6 +806,29 @@ static int init_kbase_context(struct adapter_ctx *ctx, int mali_fd)
       }
    }
 
+   /*
+    * Step 10b: Allocate separate BASE_MEM_COHERENT_LOCAL diag_bo for STORE_MULTIPLE
+    * breadcrumbs so LS stores never touch the BASE_MEM_CSF_EVENT cache lines in event_bo!
+    */
+   uint64_t diag_flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
+                         BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
+                         BASE_MEM_SAME_VA | BASE_MEM_COHERENT_LOCAL;
+   uint64_t diag_out_flags = 0;
+   uint64_t diag_cookie = 0;
+   if (alloc_kbase_mem(mali_fd, 4, 4, 0, diag_flags, &diag_out_flags, &diag_cookie) == 0) {
+      ctx->diag_bo_size = 4 * 4096;
+      ctx->diag_bo_cpu = static_cast<uint8_t *>(
+         real_mmap(nullptr, ctx->diag_bo_size, PROT_READ | PROT_WRITE,
+                   MAP_SHARED, mali_fd, static_cast<off_t>(diag_cookie)));
+      if (ctx->diag_bo_cpu != MAP_FAILED) {
+         ctx->diag_bo_gpu_va = reinterpret_cast<uintptr_t>(ctx->diag_bo_cpu);
+         memset(ctx->diag_bo_cpu, 0, ctx->diag_bo_size);
+         kbase_cpu_cache_clean_range(ctx->diag_bo_cpu, ctx->diag_bo_size);
+      } else {
+         ctx->diag_bo_cpu = nullptr;
+      }
+   }
+
    ctx->mmu_info.page_size_bitmap = 0x1000ULL; /* 4KB base page size for SAME_VA */
    ctx->next_vm_id = 1;
    ctx->next_gem_handle = 1;
@@ -823,8 +856,12 @@ static const char *cs_fault_exception_name(uint8_t exc)
    case 0x59: return "TILE_RANGE_FAULT";
    case 0x5a: return "ADDR_RANGE_FAULT";
    case 0x5b: return "IMPRECISE_FAULT";
+   case 0x60: return "OUT_OF_MEMORY (TILER_OOM)";
    case 0x69: return "RESOURCE_EVICTION_TIMEOUT";
-   case 0x88: return "TILER_OOM_OR_ITER_FAULT";
+   case 0x80: return "GPU_BUS_FAULT";
+   case 0x88: return "GPU_SHAREABILITY_FAULT";
+   case 0x89: return "SYSTEM_SHAREABILITY_FAULT";
+   case 0x8a: return "GPU_CACHE_WB_BUS_FAULT";
    case 0xc0: case 0xc1: case 0xc2: case 0xc3: case 0xc4:
       return "MMU_TRANSLATION_FAULT";
    case 0xc8: case 0xc9: case 0xca: case 0xcb:
@@ -1190,14 +1227,19 @@ void panthor_kbase_dump_csf_diagnostics(const char *reason)
          uint64_t seqno_val = 0, seqno_err = 0, ls_copy = 0;
          uint64_t pre_call = 0, post_call = 0, post_wait = 0, stream_prog = 0;
          if (sq->seqno_cpu_ptr) {
+            kbase_cpu_cache_invalidate_range(const_cast<uint64_t *>(sq->seqno_cpu_ptr), 64);
             const auto *cell = reinterpret_cast<const volatile uint64_t *>(sq->seqno_cpu_ptr);
             seqno_val   = cell[ADAPTER_SEQNO_VALUE_OFFSET / 8];
             seqno_err   = cell[ADAPTER_SEQNO_ERROR_OFFSET / 8];
-            ls_copy     = cell[ADAPTER_SEQNO_LS_COPY_OFFSET / 8];
-            pre_call    = cell[ADAPTER_SEQNO_PRE_CALL_OFFSET / 8];
-            post_call   = cell[ADAPTER_SEQNO_POST_CALL_OFFSET / 8];
-            post_wait   = cell[ADAPTER_SEQNO_POST_WAIT_OFFSET / 8];
-            stream_prog = cell[ADAPTER_SEQNO_STREAM_PROGRESS_OFFSET / 8];
+         }
+         const volatile uint64_t *dcell = sq->diag_cpu_ptr ? sq->diag_cpu_ptr : sq->seqno_cpu_ptr;
+         if (dcell) {
+            kbase_cpu_cache_invalidate_range(const_cast<uint64_t *>(dcell), 64);
+            ls_copy     = dcell[ADAPTER_SEQNO_LS_COPY_OFFSET / 8];
+            pre_call    = dcell[ADAPTER_SEQNO_PRE_CALL_OFFSET / 8];
+            post_call   = dcell[ADAPTER_SEQNO_POST_CALL_OFFSET / 8];
+            post_wait   = dcell[ADAPTER_SEQNO_POST_WAIT_OFFSET / 8];
+            stream_prog = dcell[ADAPTER_SEQNO_STREAM_PROGRESS_OFFSET / 8];
          }
 
          const char *stage = "IDLE/COMPLETE";
@@ -1270,7 +1312,7 @@ void panthor_kbase_dump_csf_diagnostics(const char *reason)
                LOG_WARN("          Last CS stream on %s (va=0x%llx, %u insns):",
                         sq_names[q],
                         static_cast<unsigned long long>(sq->last_stream_va), n_insns);
-               for (uint32_t idx = 0; idx < n_insns && idx < 48; idx++) {
+               for (uint32_t idx = 0; idx < n_insns && idx < 256; idx++) {
                   char dis[160];
                   decode_csf_insn(cs_ptr[idx], dis, sizeof(dis));
                   LOG_WARN("            [%02u] +0x%03x: 0x%016llx  %s",
@@ -1330,9 +1372,25 @@ void panthor_kbase_normalize_cs_stream(uint64_t *stream_cpu,
    if (stats)
       stats->total_instructions = count;
 
+   /* Track whether SB_ID(DEFERRED_SYNC) (slot 1) could have an unretired
+    * asynchronous SYNC_ADD/SET in flight on this stream (doco._zve6aI38CdoizoSSnm2oA):
+    * Starts true at command buffer entry (in case a prior command buffer on the
+    * same CSI stream left a deferred sync in flight), clears whenever any
+    * instruction waits on MALI_PANVK_SB_MASK_DEFERRED_SYNC (slot 1), and sets
+    * whenever SYNC_ADD32/64 or SYNC_SET32/64 signals slot 1. */
+   bool may_have_unwaited_deferred_sync = true;
+   const uint64_t def_wait_bit = static_cast<uint64_t>(MALI_PANVK_SB_MASK_DEFERRED_SYNC)
+                                 << MALI_CSF_INS_WAIT_WAIT_MASK_SHIFT;
+
    for (uint32_t i = 0; i < count; i++) {
       uint64_t insn = stream_cpu[i];
       uint64_t opcode = (insn >> 56) & 0xffULL;
+
+      if ((opcode == MALI_CSF_OP_WAIT || opcode == MALI_CSF_OP_FINISH_FRAGMENT ||
+           opcode == MALI_CSF_OP_FLUSH_CACHE2) &&
+          (insn & def_wait_bit) != 0ULL) {
+         may_have_unwaited_deferred_sync = false;
+      }
 
       if (is_initial_submit && i == 0 && opcode == CSF_OP_MOVE48) {
          uint8_t dest_reg = static_cast<uint8_t>((insn >> 48) & 0xffU);
@@ -1347,19 +1405,70 @@ void panthor_kbase_normalize_cs_stream(uint64_t *stream_cpu,
        * 1. Real Valhall v10.xml/v11.xml SYNC_ADD32 (37=0x25), SYNC_SET32 (38=0x26),
        *    SYNC_ADD64 (51=0x33), SYNC_SET64 (52=0x34):
        *    In genxml v10.xml/v11.xml, `Scope` is at bits [2:1] (`0 = System`, `2 = CSG`),
-       *    while bits [31:16] are `Wait Mask` (16-bit scoreboard wait mask).
-       *    NEVER set bits 29 or 24 inside `Wait Mask` on real hardware streams!
+       *    `Data` register is at bits [39:32], `Address` register is at bits [47:40],
+       *    and `Wait Mask` is at bits [31:16].
+       *    CRITICAL: Always `continue` for real hardware SYNC_ADD/SET instructions
+       *    (`((insn >> 32) & 0xffffULL) != 0ULL`) even when `hw_scope` is already `0`
+       *    (e.g. when a command buffer is resubmitted), so they NEVER fall through to
+       *    the legacy synthetic test-vector path and never corrupt `Wait Mask` to 0x2100!
        */
-      if (opcode == HW_CSF_OP_SYNC_ADD32 || opcode == HW_CSF_OP_SYNC_SET32 ||
-          opcode == HW_CSF_OP_SYNC_ADD64 || opcode == HW_CSF_OP_SYNC_SET64) {
-         uint64_t hw_scope = (insn >> 1) & 0x3ULL;
-         if (hw_scope == HW_CSF_SYNC_SCOPE_CSG /* 2 = MALI_CS_SYNC_SCOPE_CSG */) {
-            insn &= ~(0x3ULL << 1); /* Rewrite to 0 = MALI_CS_SYNC_SCOPE_SYSTEM */
+      if (opcode == MALI_CSF_OP_SYNC_ADD32 || opcode == MALI_CSF_OP_SYNC_SET32 ||
+          opcode == MALI_CSF_OP_SYNC_ADD64 || opcode == MALI_CSF_OP_SYNC_SET64) {
+         if ((insn & def_wait_bit) != 0ULL)
+            may_have_unwaited_deferred_sync = false;
+         uint64_t sig_slot = (insn >> MALI_CSF_INS_SYNC_ADD32_SIGNAL_SLOT_SHIFT) & 0xfULL;
+         if (sig_slot == 1ULL /* SB_ID(DEFERRED_SYNC) */)
+            may_have_unwaited_deferred_sync = true;
+         uint64_t hw_scope = (insn & MALI_CSF_INS_SYNC_ADD32_SCOPE_MASK) >>
+                             MALI_CSF_INS_SYNC_ADD32_SCOPE_SHIFT;
+         if (hw_scope == MALI_CS_SYNC_SCOPE_CSG /* 2 = CSG */) {
+            insn &= ~MALI_CSF_INS_SYNC_ADD32_SCOPE_MASK; /* 0 = System */
             stream_cpu[i] = insn;
             if (stats)
                stats->sync_scope_upgrades++;
             continue;
          }
+         if (((insn >> 40) & 0xffULL) >= 64ULL)
+            continue;
+      }
+
+      /*
+       * 1b. Real Valhall v10.xml/v11.xml FLUSH_CACHE2 (36=0x24):
+       *     Opcode 0x24 is FLUSH_CACHE2 in hardware (and CSF_OP_SYNC_SET32 only in legacy
+       *     synthetic unit-test vectors where bits [47:32] and [11:0] are 0).
+       *     Always `continue` on real FLUSH_CACHE2 so `Wait Mask` is never corrupted!
+       */
+      if (opcode == MALI_CSF_OP_FLUSH_CACHE2 &&
+          (((insn >> 32) & 0xffffULL) != 0ULL || (insn & 0xfffULL) != 0ULL)) {
+         continue;
+      }
+
+      /*
+       * 1c. Real Valhall v10.xml/v11.xml SYNC_WAIT32 (39=0x27) & SYNC_WAIT64 (53=0x35):
+       *     Drain `SB_ID(DEFERRED_SYNC)` (scoreboard slot 1) before entering any
+       *     cross-subqueue SYNC_WAIT32/64 (panvk-kbase-android Patch 0134), 100% outside
+       *     `mesa_overlay`! In `cs_builder.h`, `cs_src64(b, addr)` always emits a
+       *     `WAIT` (0x03) on `SB_ID(LS)` (slot 0) 1..3 instructions before `SYNC_WAIT32/64`.
+       *     We OR `MALI_PANVK_SB_MASK_DEFERRED_SYNC` (bit 1 -> 0x00020000) into that `WAIT`.
+       */
+      if ((opcode == MALI_CSF_OP_SYNC_WAIT32 || opcode == MALI_CSF_OP_SYNC_WAIT64) &&
+          ((insn >> 32) & 0xffffULL) != 0ULL) {
+         if (may_have_unwaited_deferred_sync) {
+            uint32_t min_j = (i >= 4U) ? (i - 4U) : 0U;
+            for (uint32_t j = i; j > min_j; j--) {
+               uint64_t prev = stream_cpu[j - 1U];
+               if (((prev >> 56) & 0xffULL) == MALI_CSF_OP_WAIT) {
+                  if ((prev & def_wait_bit) == 0ULL) {
+                     stream_cpu[j - 1U] = prev | def_wait_bit;
+                     if (stats)
+                        stats->deferred_sync_waits++;
+                  }
+                  may_have_unwaited_deferred_sync = false;
+                  break;
+               }
+            }
+         }
+         continue;
       }
 
       /*
@@ -1367,15 +1476,18 @@ void panthor_kbase_normalize_cs_stream(uint64_t *stream_cpu,
        *    `Operation` is at bits [34:32] (`0 = VT_START`, `1 = VT_END`, `3 = FRAG_COMPLETED`)
        *    and `Wait Mask` is at bits [31:16]. Rewrite non-VT_START heap ops to WAIT/NOP.
        */
-      if (opcode == HW_CSF_OP_HEAP_OPERATION) {
-         uint64_t hw_mode = (insn >> 32) & 0x7ULL;
-         if (hw_mode != 0) {
-            uint64_t wait_mask = insn & (0xffffULL << 16);
-            stream_cpu[i] = wait_mask ? ((CSF_OP_WAIT << 56) | wait_mask) : 0ULL;
+      if (opcode == MALI_CSF_OP_HEAP_OPERATION) {
+         uint64_t hw_mode = (insn & MALI_CSF_INS_HEAP_OPERATION_OPERATION_MASK) >>
+                            MALI_CSF_INS_HEAP_OPERATION_OPERATION_SHIFT;
+         if (hw_mode != MALI_CS_HEAP_OPERATION_VERTEX_TILER_STARTED) {
+            uint64_t wait_mask = insn & MALI_CSF_INS_HEAP_OPERATION_WAIT_MASK_MASK;
+            stream_cpu[i] = wait_mask ? ((MALI_CSF_OP_WAIT << 56) | wait_mask) : 0ULL;
             if (stats)
                stats->heap_op_nops++;
             continue;
          }
+         if (((insn >> 28) & 0x3ULL) == 0ULL)
+            continue;
       }
 
       /*
@@ -1386,10 +1498,10 @@ void panthor_kbase_normalize_cs_stream(uint64_t *stream_cpu,
        *    terminates the queue group! Clearing bit 0 recycles the tiler heap
        *    chunks (`first_heap_chunk..last_heap_chunk`) without incrementing `frag_end`.
        */
-      if (opcode == HW_CSF_OP_FINISH_FRAGMENT &&
-          (insn & 1ULL) != 0ULL &&
+      if (opcode == MALI_CSF_OP_FINISH_FRAGMENT &&
+          (insn & MALI_CSF_INS_FINISH_FRAGMENT_INCREMENT_FRAGMENT_COMPLETED_MASK) != 0ULL &&
           ((insn >> 1) & 0x7fffULL) == 0ULL) {
-         insn &= ~1ULL;
+         insn &= ~MALI_CSF_INS_FINISH_FRAGMENT_INCREMENT_FRAGMENT_COMPLETED_MASK;
          stream_cpu[i] = insn;
          if (stats)
             stats->finish_frag_stat_clears++;
@@ -1397,12 +1509,12 @@ void panthor_kbase_normalize_cs_stream(uint64_t *stream_cpu,
       }
 
       /*
-       * 4. Legacy/synthetic test vector normalization (only when low byte is 0..1 and
-       *    not a real FLUSH_CACHE2 with L2/LSC flush mode bits [7:0] != 0):
+       * 4. Legacy/synthetic test vector normalization (only when registers bits [47:32] == 0):
        */
       if ((opcode == CSF_OP_SYNC_ADD32 || opcode == CSF_OP_SYNC_SET32 ||
            opcode == CSF_OP_SYNC_ADD64 || opcode == CSF_OP_SYNC_SET64) &&
-          (insn & 0xfeULL) == 0ULL) {
+          ((insn >> 40) & 0xffULL) < 64ULL &&
+          (opcode != CSF_OP_SYNC_SET32 || (insn & 0xffULL) == 0ULL)) {
          uint64_t scope = (insn >> 28) & 0x3ULL;
          if (scope == CSF_SYNC_SCOPE_CSG) {
             insn &= ~(0x3ULL << 28);
@@ -1449,6 +1561,19 @@ size_t panthor_kbase_emit_ring_slot_ex(uint64_t *ring_slot,
    /* On cs_reg_count == 96 (nr_kernel_registers = 4), cs_subqueue_ctx_reg is r90 (96 - 6 = 90 = 0x5a) */
    uint32_t subq_ctx_reg  = (cs_reg_count >= 96) ? (cs_reg_count - 6) : 56;
    uint16_t sb_mask       = all_sb_mask ? all_sb_mask : 0x00ffU;
+
+   /*
+    * Resolve diagnostic breadcrumb target VA:
+    * When g_ctx.diag_bo_gpu_va is allocated (BASE_MEM_COHERENT_LOCAL), ALWAYS write
+    * STORE_MULTIPLE breadcrumbs (`pre_call`, `post_call`, `post_wait`, `ls_copy`) into
+    * `diag_bo` instead of `event_bo` (BASE_MEM_CSF_EVENT) so we never mix Non-Shareable
+    * LS stores and Shareable `SYNC_ADD64.system` atomics on the same 64-byte L2 cache line!
+    */
+   uint64_t diag_va = seqno_gpu_va;
+   if (g_ctx.diag_bo_gpu_va != 0 && seqno_gpu_va >= g_ctx.event_bo_gpu_va &&
+       seqno_gpu_va < g_ctx.event_bo_gpu_va + g_ctx.event_bo_size) {
+      diag_va = g_ctx.diag_bo_gpu_va + (seqno_gpu_va - g_ctx.event_bo_gpu_va);
+   }
 
    auto emit_store64_imm = [&](uint64_t dst_va, uint64_t val, int16_t offset) {
       ring_slot[idx++] = (CSF_OP_MOVE48 << 56) | (static_cast<uint64_t>(call_addr_reg) << 48) |
@@ -1499,8 +1624,8 @@ size_t panthor_kbase_emit_ring_slot_ex(uint64_t *ring_slot,
                          (2ULL << 8) | (3ULL << 4) | 3ULL;
       ring_slot[idx++] = (CSF_OP_WAIT << 56) | (1ULL << 16);
 
-      if (emit_breadcrumbs && seqno_gpu_va != 0 && job_seqno != 0)
-         emit_store64_imm(seqno_gpu_va, job_seqno, ADAPTER_SEQNO_PRE_CALL_OFFSET);
+      if (emit_breadcrumbs && diag_va != 0 && job_seqno != 0)
+         emit_store64_imm(diag_va, job_seqno, ADAPTER_SEQNO_PRE_CALL_OFFSET);
 
       /* Call command stream */
       ring_slot[idx++] = (CSF_OP_MOVE48 << 56) | (static_cast<uint64_t>(call_addr_reg) << 48) |
@@ -1510,14 +1635,16 @@ size_t panthor_kbase_emit_ring_slot_ex(uint64_t *ring_slot,
       ring_slot[idx++] = (HW_CSF_OP_CALL << 56) | (static_cast<uint64_t>(call_addr_reg) << 40) |
                          (static_cast<uint64_t>(call_size_reg) << 32);
 
-      if (emit_breadcrumbs && seqno_gpu_va != 0 && job_seqno != 0)
-         emit_store64_imm(seqno_gpu_va, job_seqno, ADAPTER_SEQNO_POST_CALL_OFFSET);
+      if (emit_breadcrumbs && diag_va != 0 && job_seqno != 0)
+         emit_store64_imm(diag_va, job_seqno, ADAPTER_SEQNO_POST_CALL_OFFSET);
 
       /* Wait for all scoreboard slots */
       ring_slot[idx++] = (CSF_OP_WAIT << 56) | (static_cast<uint64_t>(sb_mask) << 16);
 
-      if (emit_breadcrumbs && seqno_gpu_va != 0 && job_seqno != 0)
-         emit_store64_imm(seqno_gpu_va, job_seqno, ADAPTER_SEQNO_POST_WAIT_OFFSET);
+      if (emit_breadcrumbs && diag_va != 0 && job_seqno != 0) {
+         emit_store64_imm(diag_va, job_seqno, ADAPTER_SEQNO_POST_WAIT_OFFSET);
+         emit_store64_imm(diag_va, job_seqno, ADAPTER_SEQNO_LS_COPY_OFFSET);
+      }
    }
 
    /*
@@ -1527,9 +1654,10 @@ size_t panthor_kbase_emit_ring_slot_ex(uint64_t *ring_slot,
     *   bits [31:16]= Wait Mask (0)
     *   bits [39:32]= Data register (call_size_reg)
     *   bits [47:40]= Address register (call_addr_reg)
-    *   bits [51:48]= Signal slot (1 = SB_ID(DEFERRED_SYNC))
+    *   bits [51:48]= Signal slot (0)
     *   bit 52      = Defer Mode (0 = Defer Immediate)
-    * Followed by WAIT #(1 << 1) and ERROR_BARRIER (0x2f).
+    * Followed by ERROR_BARRIER (0x2f) and 64-byte cacheline NOP padding (Patch 007).
+    * Never emit LOAD_MULTIPLE/STORE_MULTIPLE on `seqno_gpu_va` (`event_bo`)!
     */
    ring_slot[idx++] = (CSF_OP_MOVE48 << 56) | (static_cast<uint64_t>(call_addr_reg) << 48) |
                       (seqno_gpu_va & 0xffffffffffffULL);
@@ -1539,24 +1667,12 @@ size_t panthor_kbase_emit_ring_slot_ex(uint64_t *ring_slot,
                       (static_cast<uint64_t>(call_addr_reg) << 40) |
                       (static_cast<uint64_t>(call_size_reg) << 32) |
                       1ULL;
-   if (emit_breadcrumbs)
-      ring_slot[idx++] = (CSF_OP_WAIT << 56) | (1ULL << 16);
    ring_slot[idx++] = (HW_CSF_OP_ERROR_BARRIER << 56);
 
-   if (emit_breadcrumbs && seqno_gpu_va != 0 && job_seqno != 0) {
-      ring_slot[idx++] = (HW_CSF_OP_LOAD_MULTIPLE << 56) |
-                         (static_cast<uint64_t>(call_size_reg) << 48) |
-                         (static_cast<uint64_t>(call_addr_reg) << 40) |
-                         (0x3ULL << 16) | 0ULL;
-      ring_slot[idx++] = (CSF_OP_WAIT << 56) | (1ULL << 16);
-      ring_slot[idx++] = (HW_CSF_OP_STORE_MULTIPLE << 56) |
-                         (static_cast<uint64_t>(call_size_reg) << 48) |
-                         (static_cast<uint64_t>(call_addr_reg) << 40) |
-                         (0x3ULL << 16) | ADAPTER_SEQNO_LS_COPY_OFFSET;
-      ring_slot[idx++] = (CSF_OP_WAIT << 56) | (1ULL << 16);
-   }
-
    while (idx < ADAPTER_RING_SLOT_QWORDS)
+      ring_slot[idx++] = 0ULL;
+   /* Always pad ring entries to a multiple of 64 bytes (8 qwords) for the CSF prefetcher */
+   while ((idx & 7U) != 0U)
       ring_slot[idx++] = 0ULL;
 
    return idx * sizeof(uint64_t);
@@ -2182,12 +2298,19 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                   }
                }
 
-               /* Dump CSF progress diagnostics every 1000ms if a job is taking unusually long */
-               if (now_ns - last_diag_ns >= 1000000000ULL) {
+               /* Configurable stall diagnostic threshold via PANTHOR_ADAPTER_STALL_DUMP_MS
+                * (default 100 ms; 0 disables periodic stall dumps). */
+               static uint64_t stall_dump_ns = UINT64_MAX;
+               if (stall_dump_ns == UINT64_MAX) {
+                  const char *s_env = getenv("PANTHOR_ADAPTER_STALL_DUMP_MS");
+                  uint64_t ms = (s_env && *s_env) ? strtoull(s_env, nullptr, 0) : 100ULL;
+                  stall_dump_ns = ms * 1000000ULL;
+               }
+               if (stall_dump_ns > 0ULL && (now_ns - last_diag_ns >= stall_dump_ns)) {
                   last_diag_ns = now_ns;
                   dumped_stall = true;
                   pthread_mutex_unlock(&g_lock);
-                  panthor_kbase_dump_csf_diagnostics("SYNCOBJ_WAIT > 1000ms slow progress");
+                  panthor_kbase_dump_csf_diagnostics("SYNCOBJ_WAIT stall threshold exceeded");
                   pthread_mutex_lock(&g_lock);
                   grp = find_group(target_grp_id);
                   if (!grp)
@@ -2195,7 +2318,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                }
 
                if (elapsed_ns >= caller_budget_ns) {
-                  if (!dumped_stall && elapsed_ns >= 250000000ULL) {
+                  if (!dumped_stall && stall_dump_ns > 0ULL && elapsed_ns >= stall_dump_ns) {
                      pthread_mutex_unlock(&g_lock);
                      panthor_kbase_dump_csf_diagnostics("SYNCOBJ_WAIT timeout");
                      pthread_mutex_lock(&g_lock);
@@ -2469,13 +2592,22 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       uint64_t out_cookie_or_va = 0;
       int alloc_rc = -1;
       /*
-       * Allocate non-executable control/sync BOs <= 256 KiB (including queue->syncobjs,
-       * render_desc_ringbuf.syncobj, VkEvent, and subqueue contexts) with BASE_MEM_CSF_EVENT
-       * so mali_kbase.ko maintains a permanent kernel mapping and re-evaluates SYNC_WAIT32/64
-       * on suspended/evicted CSGs!
+       * CRITICAL INVARIANT (mali_kbase_mem.c:2505, 2515 & mali_kbase_mem_linux.c:2080):
+       * On non-CPU-coherent SoCs (MT6878 where system_coherency == COHERENCY_NONE == 31),
+       * `BASE_MEM_CSF_EVENT` strips `KBASE_REG_GPU_CACHED` and `KBASE_REG_SHARE_IN`, mapping
+       * the BO in the GPU MMU as Non-Shareable (`SH=00`, `AS_MEMATTR_INDEX_NON_CACHEABLE`).
+       * Setting `BASE_MEM_CSF_EVENT` on general BOs causes:
+       *   1. `KBASE_IOCTL_MEM_ALIAS` (`kbase_mem_alias`) to fail with `-ENOMEM` (`errno=12`)
+       *      because `!(aliasing_reg->flags & KBASE_REG_GPU_CACHED)`.
+       *   2. `GPU_SHAREABILITY_FAULT` (`0x88`, `status=0x00c00488`) in the L2 cache when
+       *      a cache line is accessed with both Shareable and Non-Shareable transactions.
+       * Therefore, ONLY set `BASE_MEM_CSF_EVENT` when `ADAPTER_KMOD_BO_FLAG_CSF_EVENT` is
+       * explicitly requested; all PanVK subqueue/ringbuf syncobjs are redirected into
+       * `g_ctx.event_bo` automatically during `DRM_PANTHOR_GROUP_SUBMIT`!
        */
-      if (!is_exec && (aligned_sz <= (2ULL * 1024ULL * 1024ULL) || (kmod_flags & ADAPTER_KMOD_BO_FLAG_GPU_UNCACHED) != 0)) {
-         uint64_t ev_flags = (kflags & ~BASE_MEM_COHERENT_LOCAL) | BASE_MEM_CSF_EVENT;
+      if (!is_exec && (kmod_flags & ADAPTER_KMOD_BO_FLAG_CSF_EVENT) != 0) {
+         uint64_t ev_flags = (kflags & ~(BASE_MEM_COHERENT_LOCAL | BASE_MEM_CACHED_CPU | BASE_MEM_UNCACHED_GPU)) |
+                             BASE_MEM_CSF_EVENT;
          alloc_rc = alloc_kbase_mem(g_ctx.mali_fd, pages, pages, 0, ev_flags, &out_flags, &out_cookie_or_va);
          if (alloc_rc == 0)
             kflags = ev_flags;
@@ -2573,7 +2705,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             for (unsigned attempt = 0; attempt < 16; attempt++) {
                union kbase_ioctl_mem_alias alias_req;
                memset(&alias_req, 0, sizeof(alias_req));
-               alias_req.in.flags = BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR | BASE_MEM_PROT_CPU_RD;
+               alias_req.in.flags = BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
+                                    BASE_MEM_PROT_CPU_RD | BASE_MEM_COHERENT_LOCAL;
                alias_req.in.stride = page_cnt;
                alias_req.in.nents = 2;
                alias_req.in.aliasing_info = reinterpret_cast<uintptr_t>(ai);
@@ -2973,6 +3106,13 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             memset(g_ctx.event_bo_cpu + seq_off, 0, ADAPTER_SEQNO_CELL_STRIDE);
             kbase_cpu_cache_clean_range(g_ctx.event_bo_cpu + seq_off, ADAPTER_SEQNO_CELL_STRIDE);
          }
+         if (g_ctx.diag_bo_cpu) {
+            size_t diag_off = q * ADAPTER_SEQNO_CELL_STRIDE;
+            sq->diag_gpu_va = g_ctx.diag_bo_gpu_va + diag_off;
+            sq->diag_cpu_ptr = reinterpret_cast<volatile uint64_t *>(g_ctx.diag_bo_cpu + diag_off);
+            memset(g_ctx.diag_bo_cpu + diag_off, 0, ADAPTER_SEQNO_CELL_STRIDE);
+            kbase_cpu_cache_clean_range(g_ctx.diag_bo_cpu + diag_off, ADAPTER_SEQNO_CELL_STRIDE);
+         }
       }
 
       gc->group_handle = grp->group_handle;
@@ -3099,6 +3239,70 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             if (is_initial && stats.extracted_subq_ctx_va) {
                sq->cached_subq_ctx_va = stats.extracted_subq_ctx_va;
                sq->cached_subq_ctx_reg = stats.extracted_subq_ctx_reg;
+
+               /*
+                * Zero-`mesa_overlay` CSF_EVENT Syncobj Redirection:
+                * Upstream PanVK sub-allocates `queue->syncobjs` (at offset +0 of
+                * `struct panvk_cs_subqueue_context`) and `render.desc_ringbuf.syncobj`
+                * (at offset +24) inside `dev->mempools.rw` (a 2 MiB `BASE_MEM_COHERENT_LOCAL` BO).
+                * On Kbase (`mali_kbase_mem_linux.c:133` & `mtk_platform_qinspect.c:67`),
+                * cross-subqueue `SYNC_WAIT32/64` and `SYNC_ADD32/64.system` words must live
+                * in `BASE_MEM_CSF_EVENT` memory (`g_ctx.event_bo`) on isolated 64-byte cache lines
+                * that are never touched by `LOAD_MULTIPLE`/`STORE_MULTIPLE`.
+                * Redirect `subq_ctx->syncobjs` and `subq_ctx->render.desc_ringbuf.syncobj`
+                * in-place into dedicated 64-byte-aligned cells in `g_ctx.event_bo`!
+                */
+               if (g_ctx.event_bo_cpu &&
+                   g_ctx.event_bo_size >= ADAPTER_EVENT_BO_SYNCOBJS_BASE_OFFSET +
+                                          ADAPTER_MAX_GROUPS * ADAPTER_EVENT_BO_GROUP_STRIDE) {
+                  auto *subq_ctx_u64 = static_cast<uint64_t *>(
+                     resolve_gpu_va_to_cpu(sq->cached_subq_ctx_va, 64));
+                  if (subq_ctx_u64) {
+                     uint32_t g_slot = (grp->group_handle > 0)
+                                          ? ((grp->group_handle - 1U) % ADAPTER_MAX_GROUPS)
+                                          : 0U;
+                     size_t grp_ev_off = ADAPTER_EVENT_BO_SYNCOBJS_BASE_OFFSET +
+                                         g_slot * ADAPTER_EVENT_BO_GROUP_STRIDE;
+                     if (grp->redirected_syncobjs_va == 0) {
+                        uint8_t *ev_sync_cpu = g_ctx.event_bo_cpu + grp_ev_off;
+                        memset(ev_sync_cpu, 0, 256);
+                        auto *ev_sync_u64 = reinterpret_cast<uint64_t *>(ev_sync_cpu);
+                        /* Copy initial values from original queue->syncobjs if valid, ensuring seqno >= 1 */
+                        uint64_t orig_syncobjs_va = subq_ctx_u64[MALI_PANVK_SUBQ_CTX_SYNCOBJS_OFFSET / 8];
+                        auto *orig_sync_u64 = static_cast<const uint64_t *>(
+                           resolve_gpu_va_to_cpu(orig_syncobjs_va, 48));
+                        for (uint32_t s_idx = 0; s_idx < 3; s_idx++) {
+                           uint64_t init_seq = orig_sync_u64 ? orig_sync_u64[s_idx * 2] : 1ULL;
+                           ev_sync_u64[s_idx * 2]     = (init_seq != 0ULL) ? init_seq : 1ULL;
+                           ev_sync_u64[s_idx * 2 + 1] = 0ULL;
+                        }
+                        /* Also initialize tessellation free sync at +128 to 1 (Patch 082) */
+                        *reinterpret_cast<uint32_t *>(ev_sync_cpu + 128) = 1U;
+                        kbase_cpu_cache_clean_range(ev_sync_cpu, 256);
+                        grp->redirected_syncobjs_va = g_ctx.event_bo_gpu_va + grp_ev_off;
+                     }
+                     subq_ctx_u64[MALI_PANVK_SUBQ_CTX_SYNCOBJS_OFFSET / 8] = grp->redirected_syncobjs_va;
+
+                     uint64_t orig_rb_sync_va = subq_ctx_u64[MALI_PANVK_SUBQ_CTX_RINGBUF_SYNCOBJ_OFFSET / 8];
+                     if (orig_rb_sync_va != 0) {
+                        if (grp->redirected_ringbuf_sync_va == 0) {
+                           uint8_t *ev_rb_cpu = g_ctx.event_bo_cpu + grp_ev_off + 256;
+                           memset(ev_rb_cpu, 0, 64);
+                           auto *orig_rb_u32 = static_cast<const uint32_t *>(
+                              resolve_gpu_va_to_cpu(orig_rb_sync_va, 8));
+                           uint32_t init_rb = (orig_rb_u32 && orig_rb_u32[0] != 0)
+                                                 ? orig_rb_u32[0]
+                                                 : MALI_PANVK_RENDER_DESC_RINGBUF_SIZE;
+                           *reinterpret_cast<uint32_t *>(ev_rb_cpu) = init_rb;
+                           kbase_cpu_cache_clean_range(ev_rb_cpu, 64);
+                           grp->redirected_ringbuf_sync_va = g_ctx.event_bo_gpu_va + grp_ev_off + 256;
+                        }
+                        subq_ctx_u64[MALI_PANVK_SUBQ_CTX_RINGBUF_SYNCOBJ_OFFSET / 8] =
+                           grp->redirected_ringbuf_sync_va;
+                     }
+                     kbase_cpu_cache_clean_range(subq_ctx_u64, 64);
+                  }
+               }
             }
             /* Also scan for CSF_OP_CALL (0x20) to secondary/meta CS streams and normalize + clean them */
             {

@@ -1,0 +1,2470 @@
+{
+  "provenance": {
+    "mesa_genxml_v10": "src/panfrost/genxml/v10.xml",
+    "mesa_genxml_v11": "src/panfrost/genxml/v11.xml",
+    "kbase_r44p1_mem_c": "gpu/gpu_mali/mali_avalon/mali-r44p1/drivers/gpu/arm/midgard/mali_kbase_mem.c",
+    "kbase_r44p1_mem_linux_c": "gpu/gpu_mali/mali_avalon/mali-r44p1/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c",
+    "kbase_r44p1_mmu_aarch64_c": "gpu/gpu_mali/mali_avalon/mali-r44p1/drivers/gpu/arm/midgard/mmu/mali_kbase_mmu_mode_aarch64.c",
+    "kbase_r44p1_csf_c": "gpu/gpu_mali/mali_avalon/mali-r44p1/drivers/gpu/arm/midgard/csf/mali_kbase_csf.c",
+    "kbase_r44p1_jm_kernel_h": "gpu/gpu_mali/mali_avalon/mali-r44p1/drivers/gpu/arm/midgard/include/uapi/gpu/arm/midgard/jm/mali_base_jm_kernel.h",
+    "kbase_r44p1_csf_registers_h": "gpu/gpu_mali/mali_avalon/mali-r44p1/drivers/gpu/arm/midgard/csf/mali_kbase_csf_registers.h"
+  },
+  "csf_enums": {
+    "CS Condition": {
+      "Lequal": 0,
+      "Greater": 1,
+      "Equal": 2,
+      "Nequal": 3,
+      "Less": 4,
+      "Gequal": 5,
+      "Always": 6
+    },
+    "CS State": {
+      "Timestamp": 0,
+      "Cycle count": 1,
+      "Disjoint count": 2,
+      "Error status": 3
+    },
+    "CS Heap Operation": {
+      "Vertex/Tiler Started": 0,
+      "Vertex/Tiler Completed": 1,
+      "Fragment Completed": 3
+    },
+    "CS Flush Mode": {
+      "None": 0,
+      "Clean": 1,
+      "Clean and invalidate": 3
+    },
+    "CS Other Flush Mode": {
+      "None": 0,
+      "Invalidate": 2
+    },
+    "CS Sync Scope": {
+      "System": 0,
+      "CSG": 2
+    },
+    "CS Exception Type": {
+      "Tiler OOM": 2
+    },
+    "CS Opcode": {
+      "NOP": 0,
+      "MOVE48": 1,
+      "MOVE32": 2,
+      "WAIT": 3,
+      "RUN_COMPUTE": 4,
+      "RUN_IDVS": 6,
+      "RUN_FRAGMENT": 7,
+      "RUN_FULLSCREEN": 8,
+      "FINISH_TILING": 9,
+      "FINISH_FRAGMENT": 11,
+      "ADD_IMMEDIATE32": 16,
+      "ADD_IMMEDIATE64": 17,
+      "COMPARE_SELECT32": 18,
+      "LOGIC_OP32": 19,
+      "LOAD_MULTIPLE": 20,
+      "STORE_MULTIPLE": 21,
+      "BRANCH": 22,
+      "SET_SB_ENTRY": 23,
+      "PROGRESS_WAIT": 24,
+      "SET_EXCEPTION_HANDLER": 25,
+      "NEXT_SB_ENTRY": 26,
+      "SET_STATE": 27,
+      "SET_STATE_IMM32": 28,
+      "SHARED_SB_INC": 30,
+      "SHARED_SB_DEC": 31,
+      "CALL": 32,
+      "JUMP": 33,
+      "REQ_RESOURCE": 34,
+      "FLUSH_CACHE2": 36,
+      "SYNC_ADD32": 37,
+      "SYNC_SET32": 38,
+      "SYNC_WAIT32": 39,
+      "STORE_STATE": 40,
+      "PROT_REGION": 41,
+      "PROGRESS_STORE": 42,
+      "PROGRESS_LOAD": 43,
+      "RUN_COMPUTE_INDIRECT": 44,
+      "ERROR_BARRIER": 47,
+      "HEAP_SET": 48,
+      "HEAP_OPERATION": 49,
+      "TRACE_POINT": 50,
+      "SYNC_ADD64": 51,
+      "SYNC_SET64": 52,
+      "SYNC_WAIT64": 53
+    },
+    "CS Progress Increment": {
+      "No Increment": 0,
+      "Increment": 1
+    },
+    "CS Defer Mode": {
+      "Defer Immediate": 0,
+      "Defer Indirect": 1
+    },
+    "CS Compute Resources": {
+      "No Compute": 0,
+      "Compute": 1
+    },
+    "CS Fragment Resources": {
+      "No Fragment": 0,
+      "Fragment": 1
+    },
+    "CS Tiler Resources": {
+      "No Tiler": 0,
+      "Tiler": 1
+    },
+    "CS IDVS Resources": {
+      "No IDVS": 0,
+      "IDVS": 1
+    },
+    "CS RT Resources": {
+      "No Ray Tracing": 0,
+      "Ray Tracing": 1
+    },
+    "CS Tiler Map Enable": {
+      "No TEM": 0,
+      "TEM": 1
+    },
+    "CS Sync Error Propagate": {
+      "Clear": 0,
+      "Propagate": 1
+    },
+    "CS Wait Mode": {
+      "Immediate": 0,
+      "Indirect": 1
+    },
+    "CS Logic Op": {
+      "CLEAR": 0,
+      "AND": 1,
+      "AND_A_NB": 2,
+      "MOV_A": 3,
+      "AND_NA_B": 4,
+      "MOV_B": 5,
+      "XOR": 6,
+      "OR": 7,
+      "NOR": 8,
+      "XNOR": 9,
+      "NOT_B": 10,
+      "OR_A_NB": 11,
+      "NOT_A": 12,
+      "OR_NA_B": 13,
+      "NAND": 14,
+      "SET": 15
+    },
+    "CS Logic Op Index": {
+      "Direct": 0,
+      "Index": 1
+    },
+    "CS Next SB Entry Format": {
+      "Index": 0,
+      "Mask": 1
+    },
+    "CS Scoreboard Type": {
+      "No Change": 0,
+      "Endpoint": 1,
+      "Other": 2,
+      "Deferred": 3
+    },
+    "CS Set State Type": {
+      "SB Sel Endpoint": 0,
+      "SB Sel Other": 1,
+      "SB Sel Deferred": 2,
+      "SB Mask Stream": 8,
+      "SB Mask Wait": 9
+    },
+    "CS Shared SB Increment Defer Mode": {
+      "Defer Immediate": 0,
+      "Defer Indirect": 1
+    }
+  },
+  "csf_instructions": {
+    "NOP": {
+      "opcode": 0,
+      "fields": [
+        {
+          "name": "Metadata payload",
+          "start": 0,
+          "size": 48,
+          "type": "hex",
+          "default": null
+        },
+        {
+          "name": "Metadata type",
+          "start": 48,
+          "size": 8,
+          "type": "hex",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "NOP"
+        }
+      ],
+      "source": "v11.xml:struct[CS NOP]"
+    },
+    "MOVE48": {
+      "opcode": 1,
+      "fields": [
+        {
+          "name": "Immediate",
+          "start": 0,
+          "size": 48,
+          "type": "hex",
+          "default": null
+        },
+        {
+          "name": "Destination",
+          "start": 48,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "MOVE48"
+        }
+      ],
+      "source": "v11.xml:struct[CS MOVE48]"
+    },
+    "MOVE32": {
+      "opcode": 2,
+      "fields": [
+        {
+          "name": "Immediate",
+          "start": 0,
+          "size": 32,
+          "type": "hex",
+          "default": null
+        },
+        {
+          "name": "Destination",
+          "start": 48,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "MOVE32"
+        }
+      ],
+      "source": "v11.xml:struct[CS MOVE32]"
+    },
+    "WAIT": {
+      "opcode": 3,
+      "fields": [
+        {
+          "name": "Wait Mask",
+          "start": 16,
+          "size": 16,
+          "type": "hex",
+          "default": null
+        },
+        {
+          "name": "Progress Increment",
+          "start": 32,
+          "size": 1,
+          "type": "CS Progress Increment",
+          "default": "No Increment"
+        },
+        {
+          "name": "Wait Mode",
+          "start": 33,
+          "size": 1,
+          "type": "CS Wait Mode",
+          "default": "Immediate"
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "WAIT"
+        }
+      ],
+      "source": "v11.xml:struct[CS WAIT]"
+    },
+    "RUN_COMPUTE": {
+      "opcode": 4,
+      "fields": [
+        {
+          "name": "Task Increment",
+          "start": 0,
+          "size": 14,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Task Axis",
+          "start": 14,
+          "size": 2,
+          "type": "Task Axis",
+          "default": null
+        },
+        {
+          "name": "Progress Increment",
+          "start": 32,
+          "size": 1,
+          "type": "CS Progress Increment",
+          "default": "No Increment"
+        },
+        {
+          "name": "SRT Select",
+          "start": 40,
+          "size": 2,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "SPD Select",
+          "start": 42,
+          "size": 2,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "TSD Select",
+          "start": 44,
+          "size": 2,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "FAU Select",
+          "start": 46,
+          "size": 2,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "RUN_COMPUTE"
+        }
+      ],
+      "source": "v11.xml:struct[CS RUN_COMPUTE]"
+    },
+    "RUN_IDVS": {
+      "opcode": 6,
+      "fields": [
+        {
+          "name": "Flags Override",
+          "start": 0,
+          "size": 32,
+          "type": "hex",
+          "default": null
+        },
+        {
+          "name": "Progress Increment",
+          "start": 32,
+          "size": 1,
+          "type": "CS Progress Increment",
+          "default": "No Increment"
+        },
+        {
+          "name": "Malloc enable",
+          "start": 33,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "Draw ID register enable",
+          "start": 34,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "Varying SRT select",
+          "start": 35,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "Varying FAU select",
+          "start": 36,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "Varying TSD select",
+          "start": 37,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "Fragment SRT select",
+          "start": 38,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "Fragment TSD select",
+          "start": 39,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "Draw ID",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "RUN_IDVS"
+        }
+      ],
+      "source": "v11.xml:struct[CS RUN_IDVS]"
+    },
+    "RUN_FRAGMENT": {
+      "opcode": 7,
+      "fields": [
+        {
+          "name": "Enable TEM",
+          "start": 0,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "Tile Order",
+          "start": 4,
+          "size": 4,
+          "type": "Tile Render Order",
+          "default": null
+        },
+        {
+          "name": "Progress Increment",
+          "start": 32,
+          "size": 1,
+          "type": "CS Progress Increment",
+          "default": "No Increment"
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "RUN_FRAGMENT"
+        }
+      ],
+      "source": "v11.xml:struct[CS RUN_FRAGMENT]"
+    },
+    "RUN_FULLSCREEN": {
+      "opcode": 8,
+      "fields": [
+        {
+          "name": "Flags Override",
+          "start": 0,
+          "size": 32,
+          "type": "hex",
+          "default": null
+        },
+        {
+          "name": "Progress Increment",
+          "start": 32,
+          "size": 1,
+          "type": "CS Progress Increment",
+          "default": "No Increment"
+        },
+        {
+          "name": "DCD",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Tiler Flags2 Enable",
+          "start": 55,
+          "size": 1,
+          "type": "bool",
+          "default": "1"
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "RUN_FULLSCREEN"
+        }
+      ],
+      "source": "v11.xml:struct[CS RUN_FULLSCREEN]"
+    },
+    "FINISH_TILING": {
+      "opcode": 9,
+      "fields": [
+        {
+          "name": "Progress Increment",
+          "start": 32,
+          "size": 1,
+          "type": "CS Progress Increment",
+          "default": "No Increment"
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "FINISH_TILING"
+        }
+      ],
+      "source": "v11.xml:struct[CS FINISH_TILING]"
+    },
+    "FINISH_FRAGMENT": {
+      "opcode": 11,
+      "fields": [
+        {
+          "name": "Increment Fragment Completed",
+          "start": 0,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "Wait Mask",
+          "start": 16,
+          "size": 16,
+          "type": "hex",
+          "default": null
+        },
+        {
+          "name": "Last Heap Chunk",
+          "start": 32,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "First Heap Chunk",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Signal slot",
+          "start": 48,
+          "size": 4,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Defer Mode",
+          "start": 52,
+          "size": 1,
+          "type": "CS Defer Mode",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "FINISH_FRAGMENT"
+        }
+      ],
+      "source": "v11.xml:struct[CS FINISH_FRAGMENT]"
+    },
+    "ADD_IMM32": {
+      "opcode": 16,
+      "fields": [
+        {
+          "name": "Immediate",
+          "start": 0,
+          "size": 32,
+          "type": "int",
+          "default": null
+        },
+        {
+          "name": "Source",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Destination",
+          "start": 48,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "ADD_IMMEDIATE32"
+        }
+      ],
+      "source": "v11.xml:struct[CS ADD_IMM32]"
+    },
+    "ADD_IMM64": {
+      "opcode": 17,
+      "fields": [
+        {
+          "name": "Immediate",
+          "start": 0,
+          "size": 32,
+          "type": "int",
+          "default": null
+        },
+        {
+          "name": "Source",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Destination",
+          "start": 48,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "ADD_IMMEDIATE64"
+        }
+      ],
+      "source": "v11.xml:struct[CS ADD_IMM64]"
+    },
+    "UMIN32": {
+      "opcode": 18,
+      "fields": [
+        {
+          "name": "Source 1",
+          "start": 32,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Source 0",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Destination",
+          "start": 48,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "COMPARE_SELECT32"
+        }
+      ],
+      "source": "v11.xml:struct[CS UMIN32]"
+    },
+    "LOGIC_OP32": {
+      "opcode": 19,
+      "fields": [
+        {
+          "name": "Mode",
+          "start": 0,
+          "size": 4,
+          "type": "CS Logic Op",
+          "default": null
+        },
+        {
+          "name": "Index",
+          "start": 4,
+          "size": 1,
+          "type": "CS Logic Op Index",
+          "default": "DIRECT"
+        },
+        {
+          "name": "Source 1",
+          "start": 32,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Source 0",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Destination",
+          "start": 48,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "LOGIC_OP32"
+        }
+      ],
+      "source": "v11.xml:struct[CS LOGIC_OP32]"
+    },
+    "LOAD_MULTIPLE": {
+      "opcode": 20,
+      "fields": [
+        {
+          "name": "Offset",
+          "start": 0,
+          "size": 16,
+          "type": "int",
+          "default": null
+        },
+        {
+          "name": "Mask",
+          "start": 16,
+          "size": 16,
+          "type": "hex",
+          "default": null
+        },
+        {
+          "name": "Address",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Base Register",
+          "start": 48,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "LOAD_MULTIPLE"
+        }
+      ],
+      "source": "v11.xml:struct[CS LOAD_MULTIPLE]"
+    },
+    "STORE_MULTIPLE": {
+      "opcode": 21,
+      "fields": [
+        {
+          "name": "Offset",
+          "start": 0,
+          "size": 16,
+          "type": "int",
+          "default": null
+        },
+        {
+          "name": "Mask",
+          "start": 16,
+          "size": 16,
+          "type": "hex",
+          "default": null
+        },
+        {
+          "name": "Address",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Base Register",
+          "start": 48,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "STORE_MULTIPLE"
+        }
+      ],
+      "source": "v11.xml:struct[CS STORE_MULTIPLE]"
+    },
+    "BRANCH": {
+      "opcode": 22,
+      "fields": [
+        {
+          "name": "Offset",
+          "start": 0,
+          "size": 16,
+          "type": "int",
+          "default": null
+        },
+        {
+          "name": "Condition",
+          "start": 28,
+          "size": 4,
+          "type": "CS Condition",
+          "default": null
+        },
+        {
+          "name": "Value",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "BRANCH"
+        }
+      ],
+      "source": "v11.xml:struct[CS BRANCH]"
+    },
+    "SET_SB_ENTRY": {
+      "opcode": 23,
+      "fields": [
+        {
+          "name": "Endpoint entry",
+          "start": 0,
+          "size": 4,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Other Entry",
+          "start": 4,
+          "size": 4,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "SET_SB_ENTRY"
+        }
+      ],
+      "source": "v11.xml:struct[CS SET_SB_ENTRY]"
+    },
+    "PROGRESS_WAIT": {
+      "opcode": 24,
+      "fields": [
+        {
+          "name": "Queue",
+          "start": 0,
+          "size": 5,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Source",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "PROGRESS_WAIT"
+        }
+      ],
+      "source": "v11.xml:struct[CS PROGRESS_WAIT]"
+    },
+    "SET_EXCEPTION_HANDLER": {
+      "opcode": 25,
+      "fields": [
+        {
+          "name": "Exception Type",
+          "start": 0,
+          "size": 8,
+          "type": "CS Exception Type",
+          "default": "Tiler OOM"
+        },
+        {
+          "name": "Length",
+          "start": 32,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Address",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "SET_EXCEPTION_HANDLER"
+        }
+      ],
+      "source": "v11.xml:struct[CS SET_EXCEPTION_HANDLER]"
+    },
+    "NEXT_SB_ENTRY": {
+      "opcode": 26,
+      "fields": [
+        {
+          "name": "SB Type",
+          "start": 32,
+          "size": 4,
+          "type": "CS Scoreboard Type",
+          "default": "No Change"
+        },
+        {
+          "name": "Format",
+          "start": 36,
+          "size": 1,
+          "type": "CS Next SB Entry Format",
+          "default": "Index"
+        },
+        {
+          "name": "Destination",
+          "start": 48,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "NEXT_SB_ENTRY"
+        }
+      ],
+      "source": "v11.xml:struct[CS NEXT_SB_ENTRY]"
+    },
+    "SET_STATE": {
+      "opcode": 27,
+      "fields": [
+        {
+          "name": "State",
+          "start": 32,
+          "size": 8,
+          "type": "CS Set State Type",
+          "default": null
+        },
+        {
+          "name": "Source",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "SET_STATE"
+        }
+      ],
+      "source": "v11.xml:struct[CS SET_STATE]"
+    },
+    "SET_STATE_IMM32": {
+      "opcode": 28,
+      "fields": [
+        {
+          "name": "Value",
+          "start": 0,
+          "size": 32,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "State",
+          "start": 32,
+          "size": 8,
+          "type": "CS Set State Type",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "SET_STATE_IMM32"
+        }
+      ],
+      "source": "v11.xml:struct[CS SET_STATE_IMM32]"
+    },
+    "SHARED_SB_INC": {
+      "opcode": 30,
+      "fields": [
+        {
+          "name": "SB Mask",
+          "start": 16,
+          "size": 16,
+          "type": "hex",
+          "default": null
+        },
+        {
+          "name": "Progress Increment",
+          "start": 32,
+          "size": 1,
+          "type": "CS Progress Increment",
+          "default": "No Increment"
+        },
+        {
+          "name": "Shared Entry",
+          "start": 48,
+          "size": 4,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Defer Mode",
+          "start": 52,
+          "size": 1,
+          "type": "CS Shared SB Increment Defer Mode",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "SHARED_SB_INC"
+        }
+      ],
+      "source": "v11.xml:struct[CS SHARED_SB_INC]"
+    },
+    "SHARED_SB_DEC": {
+      "opcode": 31,
+      "fields": [
+        {
+          "name": "Progress Increment",
+          "start": 32,
+          "size": 1,
+          "type": "CS Progress Increment",
+          "default": "No Increment"
+        },
+        {
+          "name": "Shared Entry",
+          "start": 48,
+          "size": 4,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "SHARED_SB_DEC"
+        }
+      ],
+      "source": "v11.xml:struct[CS SHARED_SB_DEC]"
+    },
+    "CALL": {
+      "opcode": 32,
+      "fields": [
+        {
+          "name": "Length",
+          "start": 32,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Address",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "CALL"
+        }
+      ],
+      "source": "v11.xml:struct[CS CALL]"
+    },
+    "JUMP": {
+      "opcode": 33,
+      "fields": [
+        {
+          "name": "Length",
+          "start": 32,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Address",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "JUMP"
+        }
+      ],
+      "source": "v11.xml:struct[CS JUMP]"
+    },
+    "REQ_RESOURCE": {
+      "opcode": 34,
+      "fields": [
+        {
+          "name": "Compute",
+          "start": 0,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "Fragment",
+          "start": 1,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "Tiler",
+          "start": 2,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "IDVS",
+          "start": 3,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "RT",
+          "start": 4,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "REQ_RESOURCE"
+        }
+      ],
+      "source": "v11.xml:struct[CS REQ_RESOURCE]"
+    },
+    "FLUSH_CACHE2": {
+      "opcode": 36,
+      "fields": [
+        {
+          "name": "L2 Flush Mode",
+          "start": 0,
+          "size": 4,
+          "type": "CS Flush Mode",
+          "default": null
+        },
+        {
+          "name": "LSC Flush Mode",
+          "start": 4,
+          "size": 4,
+          "type": "CS Flush Mode",
+          "default": null
+        },
+        {
+          "name": "Other Flush Mode",
+          "start": 8,
+          "size": 4,
+          "type": "CS Other Flush Mode",
+          "default": null
+        },
+        {
+          "name": "Wait Mask",
+          "start": 16,
+          "size": 16,
+          "type": "hex",
+          "default": null
+        },
+        {
+          "name": "Latest Flush ID",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Signal slot",
+          "start": 48,
+          "size": 4,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Defer Mode",
+          "start": 52,
+          "size": 1,
+          "type": "CS Defer Mode",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "FLUSH_CACHE2"
+        }
+      ],
+      "source": "v11.xml:struct[CS FLUSH_CACHE2]"
+    },
+    "SYNC_ADD32": {
+      "opcode": 37,
+      "fields": [
+        {
+          "name": "Error Propagate",
+          "start": 0,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "Scope",
+          "start": 1,
+          "size": 2,
+          "type": "CS Sync Scope",
+          "default": null
+        },
+        {
+          "name": "Wait Mask",
+          "start": 16,
+          "size": 16,
+          "type": "hex",
+          "default": null
+        },
+        {
+          "name": "Data",
+          "start": 32,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Address",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Signal slot",
+          "start": 48,
+          "size": 4,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Defer Mode",
+          "start": 52,
+          "size": 1,
+          "type": "CS Defer Mode",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "SYNC_ADD32"
+        }
+      ],
+      "source": "v11.xml:struct[CS SYNC_ADD32]"
+    },
+    "SYNC_SET32": {
+      "opcode": 38,
+      "fields": [
+        {
+          "name": "Error Propagate",
+          "start": 0,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "Scope",
+          "start": 1,
+          "size": 2,
+          "type": "CS Sync Scope",
+          "default": null
+        },
+        {
+          "name": "Wait Mask",
+          "start": 16,
+          "size": 16,
+          "type": "hex",
+          "default": null
+        },
+        {
+          "name": "Data",
+          "start": 32,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Address",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Signal slot",
+          "start": 48,
+          "size": 4,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Defer Mode",
+          "start": 52,
+          "size": 1,
+          "type": "CS Defer Mode",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "SYNC_SET32"
+        }
+      ],
+      "source": "v11.xml:struct[CS SYNC_SET32]"
+    },
+    "SYNC_WAIT32": {
+      "opcode": 39,
+      "fields": [
+        {
+          "name": "Error Reject",
+          "start": 0,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "Condition",
+          "start": 28,
+          "size": 4,
+          "type": "CS Condition",
+          "default": null
+        },
+        {
+          "name": "Data",
+          "start": 32,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Address",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "SYNC_WAIT32"
+        }
+      ],
+      "source": "v11.xml:struct[CS SYNC_WAIT32]"
+    },
+    "STORE_STATE": {
+      "opcode": 40,
+      "fields": [
+        {
+          "name": "Offset",
+          "start": 0,
+          "size": 16,
+          "type": "int",
+          "default": null
+        },
+        {
+          "name": "Wait Mask",
+          "start": 16,
+          "size": 16,
+          "type": "hex",
+          "default": null
+        },
+        {
+          "name": "State",
+          "start": 32,
+          "size": 8,
+          "type": "CS State",
+          "default": null
+        },
+        {
+          "name": "Address",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Signal slot",
+          "start": 48,
+          "size": 4,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Defer Mode",
+          "start": 52,
+          "size": 1,
+          "type": "CS Defer Mode",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "STORE_STATE"
+        }
+      ],
+      "source": "v11.xml:struct[CS STORE_STATE]"
+    },
+    "PROT_REGION": {
+      "opcode": 41,
+      "fields": [
+        {
+          "name": "Size",
+          "start": 0,
+          "size": 16,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "PROT_REGION"
+        }
+      ],
+      "source": "v11.xml:struct[CS PROT_REGION]"
+    },
+    "PROGRESS_STORE": {
+      "opcode": 42,
+      "fields": [
+        {
+          "name": "Source",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "PROGRESS_STORE"
+        }
+      ],
+      "source": "v11.xml:struct[CS PROGRESS_STORE]"
+    },
+    "PROGRESS_LOAD": {
+      "opcode": 43,
+      "fields": [
+        {
+          "name": "Destination",
+          "start": 48,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "PROGRESS_LOAD"
+        }
+      ],
+      "source": "v11.xml:struct[CS PROGRESS_LOAD]"
+    },
+    "RUN_COMPUTE_INDIRECT": {
+      "opcode": 44,
+      "fields": [
+        {
+          "name": "Workgroups Per Task",
+          "start": 0,
+          "size": 16,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Progress Increment",
+          "start": 32,
+          "size": 1,
+          "type": "CS Progress Increment",
+          "default": "No Increment"
+        },
+        {
+          "name": "SRT Select",
+          "start": 40,
+          "size": 2,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "SPD Select",
+          "start": 42,
+          "size": 2,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "TSD Select",
+          "start": 44,
+          "size": 2,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "FAU Select",
+          "start": 46,
+          "size": 2,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "RUN_COMPUTE_INDIRECT"
+        }
+      ],
+      "source": "v11.xml:struct[CS RUN_COMPUTE_INDIRECT]"
+    },
+    "ERROR_BARRIER": {
+      "opcode": 47,
+      "fields": [
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "ERROR_BARRIER"
+        }
+      ],
+      "source": "v11.xml:struct[CS ERROR_BARRIER]"
+    },
+    "HEAP_SET": {
+      "opcode": 48,
+      "fields": [
+        {
+          "name": "Address",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "HEAP_SET"
+        }
+      ],
+      "source": "v11.xml:struct[CS HEAP_SET]"
+    },
+    "HEAP_OPERATION": {
+      "opcode": 49,
+      "fields": [
+        {
+          "name": "Wait Mask",
+          "start": 16,
+          "size": 16,
+          "type": "hex",
+          "default": null
+        },
+        {
+          "name": "Operation",
+          "start": 32,
+          "size": 3,
+          "type": "CS Heap Operation",
+          "default": null
+        },
+        {
+          "name": "Signal slot",
+          "start": 48,
+          "size": 4,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Defer Mode",
+          "start": 52,
+          "size": 1,
+          "type": "CS Defer Mode",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "HEAP_OPERATION"
+        }
+      ],
+      "source": "v11.xml:struct[CS HEAP_OPERATION]"
+    },
+    "TRACE_POINT": {
+      "opcode": 50,
+      "fields": [
+        {
+          "name": "Wait Mask",
+          "start": 16,
+          "size": 16,
+          "type": "hex",
+          "default": null
+        },
+        {
+          "name": "Base Register",
+          "start": 32,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Register count",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Signal slot",
+          "start": 48,
+          "size": 4,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Defer Mode",
+          "start": 52,
+          "size": 1,
+          "type": "CS Defer Mode",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "TRACE_POINT"
+        }
+      ],
+      "source": "v11.xml:struct[CS TRACE_POINT]"
+    },
+    "SYNC_ADD64": {
+      "opcode": 51,
+      "fields": [
+        {
+          "name": "Error Propagate",
+          "start": 0,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "Scope",
+          "start": 1,
+          "size": 2,
+          "type": "CS Sync Scope",
+          "default": null
+        },
+        {
+          "name": "Wait Mask",
+          "start": 16,
+          "size": 16,
+          "type": "hex",
+          "default": null
+        },
+        {
+          "name": "Data",
+          "start": 32,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Address",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Signal slot",
+          "start": 48,
+          "size": 4,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Defer Mode",
+          "start": 52,
+          "size": 1,
+          "type": "CS Defer Mode",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "SYNC_ADD64"
+        }
+      ],
+      "source": "v11.xml:struct[CS SYNC_ADD64]"
+    },
+    "SYNC_SET64": {
+      "opcode": 52,
+      "fields": [
+        {
+          "name": "Error Propagate",
+          "start": 0,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "Scope",
+          "start": 1,
+          "size": 2,
+          "type": "CS Sync Scope",
+          "default": null
+        },
+        {
+          "name": "Wait Mask",
+          "start": 16,
+          "size": 16,
+          "type": "hex",
+          "default": null
+        },
+        {
+          "name": "Data",
+          "start": 32,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Address",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Signal slot",
+          "start": 48,
+          "size": 4,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Defer Mode",
+          "start": 52,
+          "size": 1,
+          "type": "CS Defer Mode",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "SYNC_SET64"
+        }
+      ],
+      "source": "v11.xml:struct[CS SYNC_SET64]"
+    },
+    "SYNC_WAIT64": {
+      "opcode": 53,
+      "fields": [
+        {
+          "name": "Error Reject",
+          "start": 0,
+          "size": 1,
+          "type": "bool",
+          "default": null
+        },
+        {
+          "name": "Condition",
+          "start": 28,
+          "size": 4,
+          "type": "CS Condition",
+          "default": null
+        },
+        {
+          "name": "Data",
+          "start": 32,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Address",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "SYNC_WAIT64"
+        }
+      ],
+      "source": "v11.xml:struct[CS SYNC_WAIT64]"
+    },
+    "MOVE_REG32": {
+      "opcode": 19,
+      "fields": [
+        {
+          "name": "Mode",
+          "start": 0,
+          "size": 4,
+          "type": "CS Logic Op",
+          "default": "MOV_A"
+        },
+        {
+          "name": "Index",
+          "start": 4,
+          "size": 1,
+          "type": "CS Logic Op Index",
+          "default": "DIRECT"
+        },
+        {
+          "name": "Source",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Destination",
+          "start": 48,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "LOGIC_OP32"
+        }
+      ],
+      "source": "v11.xml:struct[CS MOVE_REG32]"
+    },
+    "AND32": {
+      "opcode": 19,
+      "fields": [
+        {
+          "name": "Mode",
+          "start": 0,
+          "size": 4,
+          "type": "CS Logic Op",
+          "default": "AND"
+        },
+        {
+          "name": "Index",
+          "start": 4,
+          "size": 1,
+          "type": "CS Logic Op Index",
+          "default": "DIRECT"
+        },
+        {
+          "name": "Source 1",
+          "start": 32,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Source 0",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Destination",
+          "start": 48,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "LOGIC_OP32"
+        }
+      ],
+      "source": "v11.xml:struct[CS AND32]"
+    },
+    "XOR32": {
+      "opcode": 19,
+      "fields": [
+        {
+          "name": "Mode",
+          "start": 0,
+          "size": 4,
+          "type": "CS Logic Op",
+          "default": "XOR"
+        },
+        {
+          "name": "Index",
+          "start": 4,
+          "size": 1,
+          "type": "CS Logic Op Index",
+          "default": "DIRECT"
+        },
+        {
+          "name": "Source 1",
+          "start": 32,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Source 0",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Destination",
+          "start": 48,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "LOGIC_OP32"
+        }
+      ],
+      "source": "v11.xml:struct[CS XOR32]"
+    },
+    "OR32": {
+      "opcode": 19,
+      "fields": [
+        {
+          "name": "Mode",
+          "start": 0,
+          "size": 4,
+          "type": "CS Logic Op",
+          "default": "OR"
+        },
+        {
+          "name": "Index",
+          "start": 4,
+          "size": 1,
+          "type": "CS Logic Op Index",
+          "default": "DIRECT"
+        },
+        {
+          "name": "Source 1",
+          "start": 32,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Source 0",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Destination",
+          "start": 48,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "LOGIC_OP32"
+        }
+      ],
+      "source": "v11.xml:struct[CS OR32]"
+    },
+    "NOT32": {
+      "opcode": 19,
+      "fields": [
+        {
+          "name": "Mode",
+          "start": 0,
+          "size": 4,
+          "type": "CS Logic Op",
+          "default": "NOT_A"
+        },
+        {
+          "name": "Index",
+          "start": 4,
+          "size": 1,
+          "type": "CS Logic Op Index",
+          "default": "DIRECT"
+        },
+        {
+          "name": "Source",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Destination",
+          "start": 48,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "LOGIC_OP32"
+        }
+      ],
+      "source": "v11.xml:struct[CS NOT32]"
+    },
+    "BIT_SET32": {
+      "opcode": 19,
+      "fields": [
+        {
+          "name": "Mode",
+          "start": 0,
+          "size": 4,
+          "type": "CS Logic Op",
+          "default": "OR"
+        },
+        {
+          "name": "Index",
+          "start": 4,
+          "size": 1,
+          "type": "CS Logic Op Index",
+          "default": "INDEX"
+        },
+        {
+          "name": "Source 1",
+          "start": 32,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Source 0",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Destination",
+          "start": 48,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "LOGIC_OP32"
+        }
+      ],
+      "source": "v11.xml:struct[CS BIT_SET32]"
+    },
+    "BIT_CLEAR32": {
+      "opcode": 19,
+      "fields": [
+        {
+          "name": "Mode",
+          "start": 0,
+          "size": 4,
+          "type": "CS Logic Op",
+          "default": "AND_A_NB"
+        },
+        {
+          "name": "Index",
+          "start": 4,
+          "size": 1,
+          "type": "CS Logic Op Index",
+          "default": "INDEX"
+        },
+        {
+          "name": "Source 1",
+          "start": 32,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Source 0",
+          "start": 40,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Destination",
+          "start": 48,
+          "size": 8,
+          "type": "uint",
+          "default": null
+        },
+        {
+          "name": "Opcode",
+          "start": 56,
+          "size": 8,
+          "type": "CS Opcode",
+          "default": "LOGIC_OP32"
+        }
+      ],
+      "source": "v11.xml:struct[CS BIT_CLEAR32]"
+    }
+  },
+  "csf_exception_types": {
+    "NONE": {
+      "code": 0,
+      "source": "mali_base_jm_kernel.h:695"
+    },
+    "DONE": {
+      "code": 1,
+      "source": "mali_base_jm_kernel.h:696"
+    },
+    "TERMINATED": {
+      "code": 4,
+      "source": "mali_base_jm_kernel.h:698"
+    },
+    "KABOOM": {
+      "code": 5,
+      "source": "mali_base_jm_kernel.h:700"
+    },
+    "EUREKA": {
+      "code": 6,
+      "source": "mali_base_jm_kernel.h:701"
+    },
+    "ACTIVE": {
+      "code": 8,
+      "source": "mali_base_jm_kernel.h:702"
+    },
+    "CS_RESOURCE_TERMINATED": {
+      "code": 15,
+      "source": "mali_base_jm_kernel.h:704"
+    },
+    "CS_CONFIG_FAULT": {
+      "code": 64,
+      "source": "mali_base_jm_kernel.h:707"
+    },
+    "CS_UNRECOVERABLE": {
+      "code": 65,
+      "source": "mali_base_jm_kernel.h:708"
+    },
+    "CS_ENDPOINT_FAULT": {
+      "code": 68,
+      "source": "mali_base_jm_kernel.h:709"
+    },
+    "CS_BUS_FAULT": {
+      "code": 72,
+      "source": "mali_base_jm_kernel.h:710"
+    },
+    "CS_INVALID_INSTRUCTION": {
+      "code": 73,
+      "source": "mali_base_jm_kernel.h:711"
+    },
+    "CS_CALL_STACK_OVERFLOW": {
+      "code": 74,
+      "source": "mali_base_jm_kernel.h:712"
+    },
+    "CS_INHERIT_FAULT": {
+      "code": 75,
+      "source": "mali_base_jm_kernel.h:713"
+    },
+    "INSTR_INVALID_PC": {
+      "code": 80,
+      "source": "mali_base_jm_kernel.h:716"
+    },
+    "INSTR_INVALID_ENC": {
+      "code": 81,
+      "source": "mali_base_jm_kernel.h:717"
+    },
+    "INSTR_BARRIER_FAULT": {
+      "code": 85,
+      "source": "mali_base_jm_kernel.h:719"
+    },
+    "DATA_INVALID_FAULT": {
+      "code": 88,
+      "source": "mali_base_jm_kernel.h:721"
+    },
+    "TILE_RANGE_FAULT": {
+      "code": 89,
+      "source": "mali_base_jm_kernel.h:722"
+    },
+    "ADDR_RANGE_FAULT": {
+      "code": 90,
+      "source": "mali_base_jm_kernel.h:723"
+    },
+    "IMPRECISE_FAULT": {
+      "code": 91,
+      "source": "mali_base_jm_kernel.h:724"
+    },
+    "OUT_OF_MEMORY": {
+      "code": 96,
+      "source": "mali_base_jm_kernel.h:726"
+    },
+    "GPU_BUS_FAULT": {
+      "code": 128,
+      "source": "mali_base_jm_kernel.h:794"
+    },
+    "GPU_SHAREABILITY_FAULT": {
+      "code": 136,
+      "source": "mali_base_jm_kernel.h:798",
+      "description": "A cache has detected that the same line has been accessed as both shareable and non-shareable memory from inside the GPU."
+    },
+    "SYSTEM_SHAREABILITY_FAULT": {
+      "code": 137,
+      "source": "mali_base_jm_kernel.h:802",
+      "description": "A cache has detected that the same line has been accessed as both shareable and non-shareable memory from outside the GPU."
+    },
+    "GPU_CACHE_WB_BUS_FAULT": {
+      "code": 138,
+      "source": "mali_base_jm_kernel.h:806"
+    },
+    "TRANSLATION_FAULT_0": {
+      "code": 192,
+      "source": "mali_base_jm_kernel.h:811"
+    },
+    "TRANSLATION_FAULT_1": {
+      "code": 193,
+      "source": "mali_base_jm_kernel.h:812"
+    },
+    "TRANSLATION_FAULT_2": {
+      "code": 194,
+      "source": "mali_base_jm_kernel.h:813"
+    },
+    "TRANSLATION_FAULT_3": {
+      "code": 195,
+      "source": "mali_base_jm_kernel.h:814"
+    },
+    "TRANSLATION_FAULT_4": {
+      "code": 196,
+      "source": "mali_base_jm_kernel.h:815"
+    },
+    "PERMISSION_FAULT_0": {
+      "code": 200,
+      "source": "mali_base_jm_kernel.h:816"
+    },
+    "ACCESS_FLAG_0": {
+      "code": 216,
+      "source": "mali_base_jm_kernel.h:822"
+    },
+    "ADDRESS_SIZE_FAULT_IN": {
+      "code": 224,
+      "source": "mali_base_jm_kernel.h:828"
+    },
+    "MEMORY_ATTRIBUTE_FAULT_0": {
+      "code": 232,
+      "source": "mali_base_jm_kernel.h:834"
+    }
+  },
+  "csf_user_io_offsets": {
+    "CS_INSERT_LO": {
+      "page": 1,
+      "offset": 0,
+      "source": "mali_kbase_csf_registers.h:112"
+    },
+    "CS_TILER_HEAP_START_LO": {
+      "page": 1,
+      "offset": 64,
+      "source": "mali_kbase_csf_registers.h:122"
+    },
+    "CS_TILER_HEAP_END_LO": {
+      "page": 1,
+      "offset": 72,
+      "source": "mali_kbase_csf_registers.h:126"
+    },
+    "CS_EXTRACT_LO": {
+      "page": 2,
+      "offset": 0,
+      "source": "mali_kbase_csf_registers.h:144"
+    },
+    "CS_ACTIVE": {
+      "page": 2,
+      "offset": 4,
+      "source": "mali_kbase_csf_registers.h:148"
+    },
+    "CS_FAULT": {
+      "page": 2,
+      "offset": 8,
+      "source": "mali_kbase_csf_registers.h:158"
+    },
+    "CS_FATAL": {
+      "page": 2,
+      "offset": 16,
+      "source": "mali_kbase_csf_registers.h:160"
+    },
+    "CS_FAULT_INFO_LO": {
+      "page": 2,
+      "offset": 24,
+      "source": "mali_kbase_csf_registers.h:162"
+    },
+    "CS_FATAL_INFO_LO": {
+      "page": 2,
+      "offset": 32,
+      "source": "mali_kbase_csf_registers.h:166"
+    },
+    "CS_HEAP_ADDRESS_LO": {
+      "page": 2,
+      "offset": 64,
+      "source": "mali_kbase_csf_registers.h:170"
+    },
+    "CS_HEAP_VT_START": {
+      "page": 2,
+      "offset": 72,
+      "source": "mali_kbase_csf_registers.h:174"
+    },
+    "CS_HEAP_VT_END": {
+      "page": 2,
+      "offset": 76,
+      "source": "mali_kbase_csf_registers.h:176"
+    },
+    "CS_HEAP_FRAG_END": {
+      "page": 2,
+      "offset": 80,
+      "source": "mali_kbase_csf_registers.h:178"
+    }
+  },
+  "kbase_memory_rules": [
+    {
+      "id": "MEM_RULE_01_VALID_PROTECTION",
+      "source": "mali_kbase_mem.c:2362 (kbase_check_alloc_flags)",
+      "constraint": "(flags & (BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR | BASE_MEM_PROT_GPU_EX)) != 0",
+      "description": "At least one CPU or GPU protection bit must be set."
+    },
+    {
+      "id": "MEM_RULE_02_WX_EXCLUSION",
+      "source": "mali_kbase_mem.c:2366 (kbase_check_alloc_flags)",
+      "constraint": "!((flags & BASE_MEM_PROT_GPU_EX) && (flags & BASE_MEM_PROT_GPU_WR))",
+      "description": "GPU executable pages cannot be GPU writable (W^X)."
+    },
+    {
+      "id": "MEM_RULE_03_SAME_VA_NO_GPU_EX",
+      "source": "mali_kbase_reg_track.c:551",
+      "constraint": "!((flags & BASE_MEM_SAME_VA) && (flags & BASE_MEM_PROT_GPU_EX))",
+      "description": "Executable BOs live in EXEC_VA_ZONE (1ULL << 47) and cannot use BASE_MEM_SAME_VA."
+    },
+    {
+      "id": "MEM_RULE_04_COHERENT_SYSTEM_REQUIRES_SHARE_BOTH",
+      "source": "mali_kbase_mem.c:2372 (kbase_check_alloc_flags)",
+      "constraint": "!(flags & BASE_MEM_COHERENT_SYSTEM) || kbdev->system_coherency == COHERENCY_ACE",
+      "description": "BASE_MEM_COHERENT_SYSTEM is rejected on non-ACE SoCs (such as MT6878 where system_coherency == COHERENCY_NONE == 31)."
+    },
+    {
+      "id": "MEM_RULE_05_CSF_EVENT_NO_COHERENT_LOCAL",
+      "source": "mali_kbase_mem_linux.c:544 (kbase_mem_alloc)",
+      "constraint": "!((flags & BASE_MEM_CSF_EVENT) && (flags & (BASE_MEM_COHERENT_LOCAL | BASE_MEM_COHERENT_SYSTEM_REQUIRED)))",
+      "description": "BASE_MEM_CSF_EVENT cannot be combined with BASE_MEM_COHERENT_LOCAL or BASE_MEM_COHERENT_SYSTEM_REQUIRED."
+    },
+    {
+      "id": "MEM_RULE_06_CSF_EVENT_REQUIRES_SAME_VA_CPU_RW",
+      "source": "mali_kbase_mem_linux.c:538 (kbase_mem_alloc)",
+      "constraint": "!(flags & BASE_MEM_CSF_EVENT) || ((flags & (BASE_MEM_SAME_VA | BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR)) == (BASE_MEM_SAME_VA | BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR))",
+      "description": "BASE_MEM_CSF_EVENT requires BASE_MEM_SAME_VA | BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR and rejects GROW_ON_GPF, TILER_ALIGN_TOP, PROTECTED, andUNCACHED_GPU."
+    },
+    {
+      "id": "MEM_RULE_07_CSF_EVENT_STRIPS_GPU_CACHED_AND_SHARE_IN",
+      "source": "mali_kbase_mem.c:2500-2516 (kbase_set_custom_flags)",
+      "constraint": "On non-CPU-coherent SoCs (!kbase_device_is_cpu_coherent), BASE_MEM_CSF_EVENT clears KBASE_REG_GPU_CACHED and KBASE_REG_SHARE_IN | KBASE_REG_SHARE_BOTH, setting AS_MEMATTR_INDEX_NON_CACHEABLE.",
+      "description": "Consequently, BASE_MEM_CSF_EVENT BOs cannot be aliased via KBASE_IOCTL_MEM_ALIAS and must never be accessed with mixed shareability (e.g. LOAD_MULTIPLE/STORE_MULTIPLE + SYNC_ADD.system on the same 64B cache line)."
+    },
+    {
+      "id": "MEM_RULE_08_MEM_ALIAS_REQUIRES_GPU_CACHED",
+      "source": "mali_kbase_mem_linux.c:2076-2085 (kbase_mem_alias)",
+      "constraint": "(aliasing_reg->flags & KBASE_REG_GPU_CACHED) != 0 && !(aliasing_reg->flags & KBASE_REG_DONT_NEED) && !(aliasing_reg->flags & KBASE_REG_GROWABLE)",
+      "description": "KBASE_IOCTL_MEM_ALIAS rejects any target BO that lacks KBASE_REG_GPU_CACHED (including any BASE_MEM_CSF_EVENT or BASE_MEM_UNCACHED_GPU BO) with -ENOMEM (errno=12)."
+    }
+  ]
+}

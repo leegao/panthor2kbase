@@ -8,6 +8,7 @@
 #include "../include/r54p3_icd_types.hpp"
 #include <algorithm>
 #include <cmath>
+#include <dlfcn.h>
 #include <cstdio>
 
 namespace mali_r54p3 {
@@ -391,6 +392,22 @@ __attribute__((visibility("default")))
 void vkGetPhysicalDeviceProperties2(void* physicalDevice, void* pProperties2) {
     if (!pProperties2) return;
     vkGetPhysicalDeviceProperties(physicalDevice, static_cast<uint8_t*>(pProperties2) + 16);
+    struct VkBaseOutStructure { uint32_t sType; VkBaseOutStructure* pNext; };
+    for (auto* ext = static_cast<VkBaseOutStructure*>(pProperties2)->pNext; ext != nullptr; ext = ext->pNext) {
+        if (ext->sType == 1000196000U || ext->sType == 52U) {
+            uint8_t* dst = reinterpret_cast<uint8_t*>(ext);
+            *reinterpret_cast<uint32_t*>(dst + 16) = 9U; // VK_DRIVER_ID_ARM_PROPRIETARY
+            std::snprintf(reinterpret_cast<char*>(dst + 20), 256, "Arm Proprietary (Decompiled r54p3 libGLES_mali.so)");
+            std::snprintf(reinterpret_cast<char*>(dst + 276), 256, "r54p3-00eac0-6eda07");
+            dst[532] = 1; dst[533] = 3; dst[534] = 8; dst[535] = 2;
+        } else if (ext->sType == 1000094000U) {
+            uint32_t* dst = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(ext) + 16);
+            dst[0] = 16U;
+            dst[1] = 0x3FU;
+            dst[2] = 0x1FFU;
+            dst[3] = 1U;
+        }
+    }
 }
 
 __attribute__((visibility("default")))
@@ -1414,10 +1431,116 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
 }
 
 
-struct R54p3Surface {
-    uint32_t width  = (getenv("MALI_VKCUBE_HIRES") != nullptr) ? 500U : 64U;
-    uint32_t height = (getenv("MALI_VKCUBE_HIRES") != nullptr) ? 500U : 64U;
+static constexpr uint64_t R54P3_SURFACE_MAGIC = 0x5552465235345033ULL;
+
+struct R54p3XcbLib {
+    void* handle = nullptr;
+    typedef uint32_t (*pfn_xcb_generate_id)(void* c);
+    typedef struct { unsigned int sequence; } xcb_void_cookie_t;
+    typedef struct { unsigned int sequence; } xcb_get_geometry_cookie_t;
+    struct xcb_get_geometry_reply_t {
+        uint8_t  response_type;
+        uint8_t  depth;
+        uint16_t sequence;
+        uint32_t length;
+        uint32_t root;
+        int16_t  x, y;
+        uint16_t width, height;
+        uint16_t border_width;
+        uint8_t  pad0[2];
+    };
+    typedef xcb_get_geometry_cookie_t (*pfn_xcb_get_geometry)(void* c, uint32_t drawable);
+    typedef xcb_get_geometry_reply_t* (*pfn_xcb_get_geometry_reply)(void* c, xcb_get_geometry_cookie_t cookie, void** e);
+    typedef xcb_void_cookie_t (*pfn_xcb_create_gc)(void* c, uint32_t cid, uint32_t drawable, uint32_t value_mask, const void* value_list);
+    typedef xcb_void_cookie_t (*pfn_xcb_put_image)(void* c, uint8_t format, uint32_t drawable, uint32_t gc,
+                                                   uint16_t width, uint16_t height, int16_t dst_x, int16_t dst_y,
+                                                   uint8_t left_pad, uint8_t depth, uint32_t data_len, const uint8_t* data);
+    typedef int (*pfn_xcb_flush)(void* c);
+
+    pfn_xcb_generate_id        generate_id = nullptr;
+    pfn_xcb_get_geometry       get_geometry = nullptr;
+    pfn_xcb_get_geometry_reply get_geometry_reply = nullptr;
+    pfn_xcb_create_gc          create_gc = nullptr;
+    pfn_xcb_put_image          put_image = nullptr;
+    pfn_xcb_flush              flush = nullptr;
+
+    bool ensureLoaded() {
+        if (handle) return true;
+        handle = dlopen("libxcb.so.1", RTLD_LAZY | RTLD_LOCAL);
+        if (!handle) handle = dlopen("libxcb.so", RTLD_LAZY | RTLD_LOCAL);
+        if (!handle) return false;
+        generate_id        = reinterpret_cast<pfn_xcb_generate_id>(dlsym(handle, "xcb_generate_id"));
+        get_geometry       = reinterpret_cast<pfn_xcb_get_geometry>(dlsym(handle, "xcb_get_geometry"));
+        get_geometry_reply = reinterpret_cast<pfn_xcb_get_geometry_reply>(dlsym(handle, "xcb_get_geometry_reply"));
+        create_gc          = reinterpret_cast<pfn_xcb_create_gc>(dlsym(handle, "xcb_create_gc"));
+        put_image          = reinterpret_cast<pfn_xcb_put_image>(dlsym(handle, "xcb_put_image"));
+        flush              = reinterpret_cast<pfn_xcb_flush>(dlsym(handle, "xcb_flush"));
+        return generate_id && get_geometry && get_geometry_reply && create_gc && put_image && flush;
+    }
+
+    bool queryWindowGeometry(void* conn, uint32_t win, uint32_t* out_w, uint32_t* out_h, uint8_t* out_depth) {
+        if (!conn || !win || !ensureLoaded()) return false;
+        auto cookie = get_geometry(conn, win);
+        auto* reply = get_geometry_reply(conn, cookie, nullptr);
+        if (!reply) return false;
+        if (out_w && reply->width > 0)  *out_w = reply->width;
+        if (out_h && reply->height > 0) *out_h = reply->height;
+        if (out_depth && reply->depth > 0) *out_depth = reply->depth;
+        std::free(reply);
+        return true;
+    }
 };
+
+static R54p3XcbLib g_r54_xcb_lib;
+
+struct R54p3Surface {
+    uint64_t magic      = R54P3_SURFACE_MAGIC;
+    uint32_t width      = (getenv("MALI_VKCUBE_HIRES") != nullptr) ? 500U : 64U;
+    uint32_t height     = (getenv("MALI_VKCUBE_HIRES") != nullptr) ? 500U : 64U;
+    void*    xcb_conn   = nullptr;
+    uint32_t xcb_window = 0;
+    uint8_t  xcb_depth  = 24;
+};
+
+static void resolveR54SurfaceInfo(uint64_t surface, uint32_t* out_w, uint32_t* out_h,
+                                  void** out_xcb_conn, uint32_t* out_xcb_win, uint8_t* out_xcb_depth) {
+    uint32_t default_dim = (getenv("MALI_VKCUBE_HIRES") != nullptr) ? 500U : 64U;
+    if (out_w) *out_w = default_dim;
+    if (out_h) *out_h = default_dim;
+    if (out_xcb_conn)  *out_xcb_conn = nullptr;
+    if (out_xcb_win)   *out_xcb_win = 0;
+    if (out_xcb_depth) *out_xcb_depth = 24;
+    if (!surface) return;
+
+    const uint64_t* ptr64 = reinterpret_cast<const uint64_t*>(surface);
+    if (ptr64[0] == R54P3_SURFACE_MAGIC) {
+        const auto* ms = reinterpret_cast<const R54p3Surface*>(surface);
+        uint32_t w = ms->width, h = ms->height;
+        uint8_t depth = ms->xcb_depth;
+        if (ms->xcb_conn && ms->xcb_window) {
+            g_r54_xcb_lib.queryWindowGeometry(ms->xcb_conn, ms->xcb_window, &w, &h, &depth);
+        }
+        if (out_w) *out_w = w;
+        if (out_h) *out_h = h;
+        if (out_xcb_conn)  *out_xcb_conn = ms->xcb_conn;
+        if (out_xcb_win)   *out_xcb_win = ms->xcb_window;
+        if (out_xcb_depth) *out_xcb_depth = depth;
+        return;
+    }
+    uint32_t platform = *reinterpret_cast<const uint32_t*>(surface);
+    if (platform == 3U) {
+        void* conn = reinterpret_cast<void*>(ptr64[1]);
+        uint32_t win = *reinterpret_cast<const uint32_t*>(surface + 16);
+        uint32_t w = 500U, h = 500U;
+        uint8_t depth = 24U;
+        g_r54_xcb_lib.queryWindowGeometry(conn, win, &w, &h, &depth);
+        if (out_w) *out_w = w;
+        if (out_h) *out_h = h;
+        if (out_xcb_conn)  *out_xcb_conn = conn;
+        if (out_xcb_win)   *out_xcb_win = win;
+        if (out_xcb_depth) *out_xcb_depth = depth;
+    }
+}
 
 struct R54p3Swapchain {
     vulkan::Device*             device = nullptr;
@@ -1425,6 +1548,10 @@ struct R54p3Swapchain {
     uint32_t                    height = 64;
     uint32_t                    format = 37;
     uint32_t                    next_image_idx = 0;
+    void*                       xcb_conn   = nullptr;
+    uint32_t                    xcb_window = 0;
+    uint32_t                    xcb_gc     = 0;
+    uint8_t                     xcb_depth  = 24;
     std::vector<vulkan::Image*> images;
     std::vector<int>            dmabuf_fds;
 };
@@ -1614,15 +1741,42 @@ int32_t vkCreateHeadlessSurfaceEXT(void* /*instance*/, const void* /*pCreateInfo
 __attribute__((visibility("default")))
 int32_t vkCreateDisplayPlaneSurfaceKHR(void* i, const void* ci, const void* a, uint64_t* s) { return vkCreateHeadlessSurfaceEXT(i, ci, a, s); }
 __attribute__((visibility("default")))
-int32_t vkCreateXcbSurfaceKHR(void* i, const void* ci, const void* a, uint64_t* s) { return vkCreateHeadlessSurfaceEXT(i, ci, a, s); }
+int32_t vkCreateXcbSurfaceKHR(void* /*i*/, const void* ci, const void* /*a*/, uint64_t* s) {
+    if (!s) return -3;
+    auto* surf = new R54p3Surface();
+    if (ci) {
+        struct VkXcbSurfaceCreateInfoKHR_Icd { uint32_t sType; const void* pNext; uint32_t flags; void* connection; uint32_t window; };
+        const auto* xci = static_cast<const VkXcbSurfaceCreateInfoKHR_Icd*>(ci);
+        surf->xcb_conn   = xci->connection;
+        surf->xcb_window = xci->window;
+        uint32_t w = 500U, h = 500U;
+        uint8_t depth = 24U;
+        if (g_r54_xcb_lib.queryWindowGeometry(surf->xcb_conn, surf->xcb_window, &w, &h, &depth)) {
+            surf->width     = w;
+            surf->height    = h;
+            surf->xcb_depth = depth;
+        }
+    }
+    *s = reinterpret_cast<uint64_t>(surf);
+    return 0;
+}
 __attribute__((visibility("default")))
 int32_t vkCreateXlibSurfaceKHR(void* i, const void* ci, const void* a, uint64_t* s) { return vkCreateHeadlessSurfaceEXT(i, ci, a, s); }
 __attribute__((visibility("default")))
 int32_t vkCreateWaylandSurfaceKHR(void* i, const void* ci, const void* a, uint64_t* s) { return vkCreateHeadlessSurfaceEXT(i, ci, a, s); }
+__attribute__((visibility("default")))
+uint32_t vkGetPhysicalDeviceXcbPresentationSupportKHR(void*, uint32_t, void*, uint32_t) { return 1U; }
+__attribute__((visibility("default")))
+uint32_t vkGetPhysicalDeviceXlibPresentationSupportKHR(void*, uint32_t, void*, uint64_t) { return 1U; }
+__attribute__((visibility("default")))
+uint32_t vkGetPhysicalDeviceWaylandPresentationSupportKHR(void*, uint32_t, void*) { return 1U; }
 
 __attribute__((visibility("default")))
 void vkDestroySurfaceKHR(void* /*instance*/, uint64_t surface, const void* /*pAllocator*/) {
-    delete reinterpret_cast<R54p3Surface*>(surface);
+    if (!surface) return;
+    if (*reinterpret_cast<const uint64_t*>(surface) == R54P3_SURFACE_MAGIC) {
+        delete reinterpret_cast<R54p3Surface*>(surface);
+    }
 }
 
 __attribute__((visibility("default")))
@@ -1635,9 +1789,8 @@ int32_t vkGetPhysicalDeviceSurfaceSupportKHR(void* /*pd*/, uint32_t /*qfi*/, uin
 __attribute__((visibility("default")))
 int32_t vkGetPhysicalDeviceSurfaceCapabilitiesKHR(void* /*pd*/, uint64_t surface, void* pSurfaceCapabilities) {
     if (!pSurfaceCapabilities) return -3;
-    auto* surf = reinterpret_cast<R54p3Surface*>(surface);
-    uint32_t w = surf ? surf->width : 64U;
-    uint32_t h = surf ? surf->height : 64U;
+    uint32_t w = 64U, h = 64U;
+    resolveR54SurfaceInfo(surface, &w, &h, nullptr, nullptr, nullptr);
     struct SurfCaps {
         uint32_t minImageCount, maxImageCount;
         uint32_t currentExtent[2], minImageExtent[2], maxImageExtent[2];
@@ -1693,8 +1846,10 @@ int32_t vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const void* 
     const auto* sci = static_cast<const SwapchainCreateInfo*>(pCreateInfo);
     auto* sc = new R54p3Swapchain();
     sc->device = dev;
-    sc->width  = std::max<uint32_t>(16U, sci->imageExtent[0]);
-    sc->height = std::max<uint32_t>(16U, sci->imageExtent[1]);
+    uint32_t surf_w = 64U, surf_h = 64U;
+    resolveR54SurfaceInfo(sci->surface, &surf_w, &surf_h, &sc->xcb_conn, &sc->xcb_window, &sc->xcb_depth);
+    sc->width  = std::max<uint32_t>(16U, sci->imageExtent[0] ? sci->imageExtent[0] : surf_w);
+    sc->height = std::max<uint32_t>(16U, sci->imageExtent[1] ? sci->imageExtent[1] : surf_h);
     sc->format = sci->imageFormat ? sci->imageFormat : 37U;
     uint32_t img_count = std::max<uint32_t>(2U, sci->minImageCount);
     uint64_t byte_sz = std::max<uint64_t>(4096ULL, (uint64_t(sc->width) * sc->height * 4ULL + 4095ULL) & ~4095ULL);
@@ -1774,6 +1929,33 @@ int32_t vkQueuePresentKHR(void* /*queue*/, const void* pPresentInfo) {
     };
     const auto* pi = static_cast<const PresInfo*>(pPresentInfo);
     for (uint32_t i = 0; i < pi->swapchainCount; ++i) {
+        auto* sc = reinterpret_cast<R54p3Swapchain*>(pi->pSwapchains[i]);
+        uint32_t idx = pi->pImageIndices ? pi->pImageIndices[i] : 0U;
+        if (sc && idx < sc->images.size() && sc->xcb_conn && sc->xcb_window && g_r54_xcb_lib.ensureLoaded()) {
+            const auto* img = sc->images[idx];
+            if (img && img->bound_gpu_va) {
+                if (sc->xcb_gc == 0) {
+                    sc->xcb_gc = g_r54_xcb_lib.generate_id(sc->xcb_conn);
+                    g_r54_xcb_lib.create_gc(sc->xcb_conn, sc->xcb_gc, sc->xcb_window, 0, nullptr);
+                }
+                const uint32_t* src_px = reinterpret_cast<const uint32_t*>(img->bound_gpu_va);
+                std::vector<uint32_t> bgra_px(img->width * img->height);
+                for (uint32_t p = 0; p < img->width * img->height; ++p) {
+                    uint32_t v = src_px[p];
+                    bgra_px[p] = (v & 0xFF00FF00U) | ((v & 0xFFU) << 16) | ((v >> 16) & 0xFFU);
+                }
+                uint32_t rows_per_band = std::max<uint32_t>(1U, 65536U / (img->width * 4U));
+                for (uint32_t y = 0; y < img->height; y += rows_per_band) {
+                    uint32_t band_h = std::min<uint32_t>(rows_per_band, img->height - y);
+                    g_r54_xcb_lib.put_image(sc->xcb_conn, 2, sc->xcb_window, sc->xcb_gc,
+                                            static_cast<uint16_t>(img->width), static_cast<uint16_t>(band_h),
+                                            0, static_cast<int16_t>(y), 0, sc->xcb_depth ? sc->xcb_depth : 24,
+                                            img->width * band_h * 4U,
+                                            reinterpret_cast<const uint8_t*>(bgra_px.data() + y * img->width));
+                }
+                g_r54_xcb_lib.flush(sc->xcb_conn);
+            }
+        }
         if (pi->pResults) pi->pResults[i] = 0;
     }
     return 0;
@@ -1920,9 +2102,9 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(void* instance, const char* pName) {
     if (std::strcmp(pName, "vkDestroyInstance") == 0)                      return reinterpret_cast<PFN_vkVoidFunction>(&vkDestroyInstance);
     if (std::strcmp(pName, "vkEnumeratePhysicalDevices") == 0)             return reinterpret_cast<PFN_vkVoidFunction>(&vkEnumeratePhysicalDevices);
     if (std::strcmp(pName, "vkGetPhysicalDeviceProperties") == 0)          return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceProperties);
-    if (std::strcmp(pName, "vkGetPhysicalDeviceProperties2") == 0)         return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceProperties2);
+    if (std::strcmp(pName, "vkGetPhysicalDeviceProperties2") == 0 || std::strcmp(pName, "vkGetPhysicalDeviceProperties2KHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceProperties2);
     if (std::strcmp(pName, "vkGetPhysicalDeviceFeatures") == 0)            return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceFeatures);
-    if (std::strcmp(pName, "vkGetPhysicalDeviceFeatures2") == 0)           return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceFeatures2);
+    if (std::strcmp(pName, "vkGetPhysicalDeviceFeatures2") == 0 || std::strcmp(pName, "vkGetPhysicalDeviceFeatures2KHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceFeatures2);
     if (std::strcmp(pName, "vkGetPhysicalDeviceQueueFamilyProperties") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceQueueFamilyProperties);
     if (std::strcmp(pName, "vkGetPhysicalDeviceMemoryProperties") == 0)    return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceMemoryProperties);
     if (std::strcmp(pName, "vkGetPhysicalDeviceFormatProperties") == 0)    return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceFormatProperties);
@@ -1945,6 +2127,9 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(void* instance, const char* pName) {
     if (std::strcmp(pName, "vkCmdEndDebugUtilsLabelEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdEndDebugUtilsLabelEXT);
     if (std::strcmp(pName, "vkCreateDisplayPlaneSurfaceKHR") == 0)         return reinterpret_cast<PFN_vkVoidFunction>(&vkCreateDisplayPlaneSurfaceKHR);
     if (std::strcmp(pName, "vkCreateXcbSurfaceKHR") == 0)                  return reinterpret_cast<PFN_vkVoidFunction>(&vkCreateXcbSurfaceKHR);
+    if (std::strcmp(pName, "vkGetPhysicalDeviceXcbPresentationSupportKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceXcbPresentationSupportKHR);
+    if (std::strcmp(pName, "vkGetPhysicalDeviceXlibPresentationSupportKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceXlibPresentationSupportKHR);
+    if (std::strcmp(pName, "vkGetPhysicalDeviceWaylandPresentationSupportKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceWaylandPresentationSupportKHR);
     if (std::strcmp(pName, "vkCreateXlibSurfaceKHR") == 0)                 return reinterpret_cast<PFN_vkVoidFunction>(&vkCreateXlibSurfaceKHR);
     if (std::strcmp(pName, "vkCreateWaylandSurfaceKHR") == 0)              return reinterpret_cast<PFN_vkVoidFunction>(&vkCreateWaylandSurfaceKHR);
     if (std::strcmp(pName, "vkDestroySurfaceKHR") == 0)                    return reinterpret_cast<PFN_vkVoidFunction>(&vkDestroySurfaceKHR);

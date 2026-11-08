@@ -399,6 +399,108 @@ static void test_u_gralloc_wsi_modifier_and_dmabuf_sync_resilience(void)
    printf("  -> u_gralloc WSI Linear Probe & DMA-BUF Sync File Resilience: PASS\n");
 }
 
+
+static void test_kbase_mem_alias_csf_event_xor_and_shareability_invariants(void)
+{
+   printf("  -> Testing KBASE_IOCTL_MEM_ALIAS CSF_EVENT XOR, idempotent CS normalization & zero-overlay syncobj redirection...\n");
+   int mali_fd = open("/dev/mali0", O_RDWR | O_CLOEXEC);
+   assert(mali_fd >= 0);
+   struct kbase_ioctl_version_check vc = { .major = 1, .minor = 21 };
+   assert(ioctl(mali_fd, KBASE_IOCTL_VERSION_CHECK, &vc) == 0);
+   struct kbase_ioctl_set_flags sf = { .create_flags = 2 };
+   assert(ioctl(mali_fd, KBASE_IOCTL_SET_FLAGS, &sf) == 0);
+   struct kbase_ioctl_mem_jit_init ji = { .va_pages = 0x100000, .max_allocations = 255, .trim_level = 100 };
+   assert(ioctl(mali_fd, KBASE_IOCTL_MEM_JIT_INIT, &ji) == 0);
+   void *tp = mmap(NULL, 4096, PROT_READ, MAP_SHARED, mali_fd, (off_t)BASE_MEM_MAP_TRACKING_HANDLE);
+   assert(tp != MAP_FAILED);
+
+   /* 1. Allocate a BASE_MEM_CSF_EVENT BO and verify KBASE_IOCTL_MEM_ALIAS rejects it with ENOMEM (mali_kbase_mem_linux.c:2080) */
+   union kbase_ioctl_mem_alloc ev_alloc;
+   memset(&ev_alloc, 0, sizeof(ev_alloc));
+   ev_alloc.in.va_pages = 16;
+   ev_alloc.in.commit_pages = 16;
+   ev_alloc.in.flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
+                       BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
+                       BASE_MEM_SAME_VA | BASE_MEM_CSF_EVENT;
+   assert(ioctl(mali_fd, KBASE_IOCTL_MEM_ALLOC, &ev_alloc) == 0);
+   void *ev_ptr = mmap(NULL, 16 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mali_fd, (off_t)ev_alloc.out.gpu_va);
+   assert(ev_ptr != MAP_FAILED);
+
+   struct base_mem_aliasing_info bad_ai[2] = {
+      { .handle = (uint64_t)(uintptr_t)ev_ptr, .offset = 0, .length = 16 },
+      { .handle = (uint64_t)(uintptr_t)ev_ptr, .offset = 0, .length = 16 },
+   };
+   union kbase_ioctl_mem_alias bad_alias;
+   memset(&bad_alias, 0, sizeof(bad_alias));
+   bad_alias.in.flags = BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR | BASE_MEM_PROT_CPU_RD | BASE_MEM_COHERENT_LOCAL;
+   bad_alias.in.stride = 16;
+   bad_alias.in.nents = 2;
+   bad_alias.in.aliasing_info = (uint64_t)(uintptr_t)bad_ai;
+   errno = 0;
+   assert(ioctl(mali_fd, KBASE_IOCTL_MEM_ALIAS, &bad_alias) == -1);
+   assert(errno == ENOMEM);
+
+   /* 2. Allocate a BASE_MEM_COHERENT_LOCAL (GPU-cached) BO and verify KBASE_IOCTL_MEM_ALIAS succeeds */
+   union kbase_ioctl_mem_alloc reg_alloc;
+   memset(&reg_alloc, 0, sizeof(reg_alloc));
+   reg_alloc.in.va_pages = 16;
+   reg_alloc.in.commit_pages = 16;
+   reg_alloc.in.flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
+                        BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
+                        BASE_MEM_SAME_VA | BASE_MEM_COHERENT_LOCAL;
+   assert(ioctl(mali_fd, KBASE_IOCTL_MEM_ALLOC, &reg_alloc) == 0);
+   void *reg_ptr = mmap(NULL, 16 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mali_fd, (off_t)reg_alloc.out.gpu_va);
+   assert(reg_ptr != MAP_FAILED);
+
+   struct base_mem_aliasing_info ok_ai[2] = {
+      { .handle = (uint64_t)(uintptr_t)reg_ptr, .offset = 0, .length = 16 },
+      { .handle = (uint64_t)(uintptr_t)reg_ptr, .offset = 0, .length = 16 },
+   };
+   union kbase_ioctl_mem_alias ok_alias;
+   memset(&ok_alias, 0, sizeof(ok_alias));
+   ok_alias.in.flags = BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR | BASE_MEM_PROT_CPU_RD | BASE_MEM_COHERENT_LOCAL;
+   ok_alias.in.stride = 16;
+   ok_alias.in.nents = 2;
+   ok_alias.in.aliasing_info = (uint64_t)(uintptr_t)ok_ai;
+   assert(ioctl(mali_fd, KBASE_IOCTL_MEM_ALIAS, &ok_alias) == 0);
+   assert(ok_alias.out.gpu_va != 0);
+
+   munmap(reg_ptr, 16 * 4096);
+   munmap(ev_ptr, 16 * 4096);
+   munmap(tp, 4096);
+   close(mali_fd);
+
+   /* 3. Verify idempotent panthor_kbase_normalize_cs_stream on real Valhall v11 instructions */
+   uint64_t hw_stream[7] = {
+      0x0300000000010000ULL, /* [0] WAIT mask=0x0001 (SB_ID(LS)) before SYNC_WAIT32 */
+      0x2700424410000000ULL, /* [1] SYNC_WAIT32 addr=r66 ref=r68 cond=GT(1) */
+      0x2500424400000004ULL, /* [2] SYNC_ADD32 addr=r66 data=r68 wait=0x0000 scope=CSG(2) */
+      0x2400420000000200ULL, /* [3] FLUSH_CACHE2 flush_reg=r66 wait=0x0000 mode=0x200 */
+      0x3301424400040005ULL, /* [4] SYNC_ADD64 addr=r66 data=r68 wait=0x0004 sig_slot=1 scope=CSG(2) err_prop=1 */
+      0x3100000100040000ULL, /* [5] HEAP_OPERATION mode=VT_END(1) wait=0x0004 */
+      0x0b004644003f0001ULL, /* [6] FINISH_FRAGMENT first=r70 last=r68 wait=0x003f inc_frag=1 */
+   };
+   struct adapter_cs_patch_stats st1, st2;
+   panthor_kbase_normalize_cs_stream(hw_stream, sizeof(hw_stream), false, &st1);
+   assert(hw_stream[0] == 0x0300000000030000ULL); /* Upgraded WAIT mask=0x0001 -> 0x0003 (LS | DEFERRED_SYNC) */
+   assert(hw_stream[1] == 0x2700424410000000ULL);
+   assert(hw_stream[2] == 0x2500424400000000ULL); /* Scope CSG(2)->SYSTEM(0), wait_mask stays 0x0000! */
+   assert(hw_stream[3] == 0x2400420000000200ULL); /* FLUSH_CACHE2 wait_mask stays 0x0000! */
+   assert(hw_stream[4] == 0x3301424400040001ULL); /* Scope CSG(2)->SYSTEM(0), wait_mask stays 0x0004! */
+   assert(hw_stream[5] == 0x0300000000040000ULL); /* HEAP_OP VT_END -> WAIT mask=0x0004 */
+   assert(hw_stream[6] == 0x0b004644003f0000ULL); /* FINISH_FRAGMENT bit 0 cleared! */
+   assert(st1.sync_scope_upgrades == 2 && st1.deferred_sync_waits == 1 && st1.finish_frag_stat_clears == 1);
+
+   /* Second pass (resubmitted command buffer): MUST be 100% idempotent and never write 0x21000000! */
+   panthor_kbase_normalize_cs_stream(hw_stream, sizeof(hw_stream), false, &st2);
+   assert(hw_stream[0] == 0x0300000000030000ULL);
+   assert(hw_stream[2] == 0x2500424400000000ULL);
+   assert(hw_stream[3] == 0x2400420000000200ULL);
+   assert(hw_stream[4] == 0x3301424400040001ULL);
+   assert(st2.sync_scope_upgrades == 0 && st2.deferred_sync_waits == 0);
+   printf("  -> KBASE_IOCTL_MEM_ALIAS CSF_EVENT XOR & Idempotent CS Normalizer: PASS\n");
+}
+
 int main(void)
 {
    printf("[Unit Tests] Running edge cases, mali_kbase.ko flag invariants, and RAII logging suite...\n");
@@ -409,6 +511,7 @@ int main(void)
    test_kms_and_libdrm_wrappers();
    test_panvk_auto_va_ringbuf_and_tracebuf_integration();
    test_u_gralloc_wsi_modifier_and_dmabuf_sync_resilience();
+   test_kbase_mem_alias_csf_event_xor_and_shareability_invariants();
    printf("[Unit Tests] ALL EDGE CASES PASSED!\n");
    return 0;
 }

@@ -151,18 +151,47 @@ public:
             // Probe host hardware Vulkan ICDs first (RADV, ANV, NVIDIA), then fall back to Mesa Lavapipe
             const char* host_candidates[] = {
                 "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so",
+                "/usr/lib/libvulkan_radeon.so",
+                "/usr/lib64/libvulkan_radeon.so",
                 "/usr/lib/x86_64-linux-gnu/libvulkan_intel.so",
+                "/usr/lib/libvulkan_intel.so",
+                "/usr/lib64/libvulkan_intel.so",
                 "/usr/lib/x86_64-linux-gnu/libvulkan_intel_hasvk.so",
-                "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so"
+                "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so",
+                "/usr/lib/libvulkan_lvp.so",
+                "/usr/lib64/libvulkan_lvp.so",
+                "libvulkan_lvp.so"
             };
             for (const char* cand : host_candidates) {
                 if (tryOpenBackendIcdLibrary(cand)) break;
             }
         } else {
-            // Default / "llvmpipe" / "lvp": load Mesa Lavapipe ICD directly without touching VK_ICD_FILENAMES
-            if (!tryOpenBackendIcdLibrary("/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so")) {
+            // Default / "llvmpipe" / "lvp": probe all distro paths (Debian/Ubuntu, Arch, Fedora) directly
+            // without clobbering the process-wide VK_ICD_FILENAMES environment variable!
+            const char* lvp_candidates[] = {
+                "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so",
+                "/usr/lib/libvulkan_lvp.so",
+                "/usr/lib64/libvulkan_lvp.so",
+                "libvulkan_lvp.so"
+            };
+            bool opened_lvp = false;
+            for (const char* cand : lvp_candidates) {
+                if (tryOpenBackendIcdLibrary(cand)) {
+                    opened_lvp = true;
+                    break;
+                }
+            }
+            if (!opened_lvp) {
+                const char* prev_icd = getenv("VK_ICD_FILENAMES");
+                std::string saved_icd = prev_icd ? prev_icd : "";
                 setenv("VK_ICD_FILENAMES", "/usr/share/vulkan/icd.d/lvp_icd.x86_64.json", 1);
-                if (!tryOpenBackendIcdLibrary("libvulkan.so.1")) return false;
+                bool ok = tryOpenBackendIcdLibrary("libvulkan.so.1");
+                if (!saved_icd.empty()) {
+                    setenv("VK_ICD_FILENAMES", saved_icd.c_str(), 1);
+                } else {
+                    unsetenv("VK_ICD_FILENAMES");
+                }
+                if (!ok) return false;
             }
         }
         if (!vk_lib || !gipa || !instance || !phys_dev) return false;

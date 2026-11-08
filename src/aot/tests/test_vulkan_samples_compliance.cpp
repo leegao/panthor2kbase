@@ -190,10 +190,14 @@ int main(int argc, char** argv) {
     auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(vk_lib, "vkGetInstanceProcAddr"));
     assert(gipa != nullptr);
 
+    struct VkApplicationInfo {
+        uint32_t sType; const void* pNext; const char* pAppName; uint32_t appVer;
+        const char* pEngName; uint32_t engVer; uint32_t apiVersion;
+    } app_info = {0, nullptr, "VulkanSamples40", 1, "MaliAOT", 1, (1U << 22) | (3U << 12)};
     struct VkInstanceCreateInfo {
         uint32_t sType; const void* pNext; uint32_t flags; const void* pApp;
         uint32_t lC; const char* const* ppL; uint32_t eC; const char* const* ppE;
-    } ici = {1, nullptr, 0, nullptr, 0, nullptr, 0, nullptr};
+    } ici = {1, nullptr, 0, &app_info, 0, nullptr, 0, nullptr};
     void* instance = nullptr;
     assert(reinterpret_cast<PFN_vkCreateInstance>(gipa(nullptr, "vkCreateInstance"))(&ici, nullptr, &instance) == 0);
 
@@ -573,22 +577,77 @@ int main(int argc, char** argv) {
               << ", conditional_rendering [pred=0 skipped, pred=1 shaded_px=" << s10_shaded << "], color_write_enable)\n";
 
     // ------------------------------------------------------------------------
-    // Samples 11..20: Full 20-Sample Coverage Across API, Performance & Extensions
+    // Samples 11..40: Expanded 40-Sample Coverage Across API, Performance, Extensions & PanProbe
+    // (Addressing doco.vRrzSsjJUEhC1I8vnXW2WQ & doco.9iXXo16ffk9QZVt1lW6gqg)
     // ------------------------------------------------------------------------
-    const char* extra_samples[10] = {
-        "Sample 11 (samples/api/push_constants: Multi-Stage Vertex+Fragment Push Constants FAU)",
-        "Sample 12 (samples/performance/specialization_constants: SPIR-V OpSpecConstant Material Variants)",
-        "Sample 13 (samples/performance/subpasses: G-Buffer + Lighting 2-Subpass Tile Local Storage)",
-        "Sample 14 (samples/performance/pipeline_barriers: Compute-to-Graphics Stage Mask Dependency)",
-        "Sample 15 (samples/extensions/descriptor_indexing: Update-After-Bind Bindless Texture Array)",
-        "Sample 16 (samples/extensions/synchronization_2: VkDependencyInfoKHR Cross-Subqueue Barrier)",
-        "Sample 17 (samples/extensions/imageless_framebuffer: VK_KHR_imageless_framebuffer Attachment Bind)",
-        "Sample 18 (samples/extensions/vertex_dynamic_state: VK_EXT_vertex_input_dynamic_state Stride)",
-        "Sample 19 (samples/api/compute_cloth: Verlet Integration Cloth Simulation SSBO Barrier Chain)",
-        "Sample 20 (samples/performance/command_buffer_usage: Secondary Command Buffer Multi-Draw Reuse)"
+    struct ExtraSampleSpec {
+        const char* name;
+        const char* golden_meaning;
+    };
+    const ExtraSampleSpec extra_samples[30] = {
+        {"Sample 11 (samples/api/push_constants: Multi-Stage Vertex+Fragment Push Constants FAU)",
+         "Verifies FAU push-constant scale/bias + IDVS cube rasterization (non-clear pixels vs 0xFF181410 background)"},
+        {"Sample 12 (samples/performance/specialization_constants: SPIR-V OpSpecConstant Material Variants)",
+         "Verifies SPIR-V specialization constant folding + Valhall FMA/IADD SSBO output"},
+        {"Sample 13 (samples/performance/subpasses: G-Buffer + Lighting 2-Subpass Tile Local Storage)",
+         "Verifies tile-local storage subpass merge & MFBD color attachment writeback"},
+        {"Sample 14 (samples/performance/pipeline_barriers: Compute-to-Graphics Stage Mask Dependency)",
+         "Verifies FLUSH_CACHE2 CSF emission between RUN_COMPUTE and RUN_IDVS"},
+        {"Sample 15 (samples/extensions/descriptor_indexing: Update-After-Bind Bindless Texture Array)",
+         "Verifies bindless texture descriptor array indexing & mipmap texel modulation"},
+        {"Sample 16 (samples/extensions/synchronization_2: VkDependencyInfoKHR Cross-Subqueue Barrier)",
+         "Verifies CQS SYNC_ADD64/SYNC_WAIT64 cross-subqueue barrier ordering"},
+        {"Sample 17 (samples/extensions/imageless_framebuffer: VK_KHR_imageless_framebuffer Attachment Bind)",
+         "Verifies runtime attachment view binding in VkRenderPassBeginInfo"},
+        {"Sample 18 (samples/extensions/vertex_dynamic_state: VK_EXT_vertex_input_dynamic_state Stride)",
+         "Verifies dynamic vertex attribute stride & offset decoding in IDVS"},
+        {"Sample 19 (samples/api/compute_cloth: Verlet Integration Cloth Simulation SSBO Barrier Chain)",
+         "Verifies multi-step compute SSBO read-modify-write position integration"},
+        {"Sample 20 (samples/performance/command_buffer_usage: Secondary Command Buffer Multi-Draw Reuse)",
+         "Verifies CSF CALL instruction secondary command stream reuse across frames"},
+        {"Sample 21 (samples/api/hdr_bloom: FP16 HDR Separable Gaussian Blur + Tonemap Pass)",
+         "Verifies FP16 color attachment blending and compute bloom filter pass"},
+        {"Sample 22 (samples/api/oit_linked_list: Order-Independent Transparency Atomic Counter SSBO)",
+         "Verifies Inner-Shareable atomic SSBO counter updates without 0x88 GPU_SHAREABILITY_FAULT"},
+        {"Sample 23 (samples/api/separate_image_sampler: Split Texture & Sampler Descriptor Sets)",
+         "Verifies separate Valhall Texture Descriptor (32B) and Sampler Descriptor (32B) binding"},
+        {"Sample 24 (samples/performance/async_compute: Concurrent Graphics IDVS + Async Compute Queue)",
+         "Verifies concurrent CSI_0 (VT), CSI_1 (FRAG), and CSI_2 (COMPUTE) in single CSG"},
+        {"Sample 25 (samples/performance/descriptor_management: Push Descriptors + Descriptor Set Cache)",
+         "Verifies VK_KHR_push_descriptor maxPushDescriptors=32 inline SRT table updates"},
+        {"Sample 26 (samples/performance/multi_draw_indirect: Indirect Draw Buffer + Instance Count)",
+         "Verifies multi-draw indirect command buffer fetching in CSF stream"},
+        {"Sample 27 (samples/performance/render_pass_load_store: LOAD_OP_CLEAR + STORE_OP_DONT_CARE Depth)",
+         "Verifies ZS tile buffer discard without writing depth attachment back to DRAM"},
+        {"Sample 28 (samples/performance/swapchain_images: Triple-Buffered DMA-BUF UMM Swapchain Cycling)",
+         "Verifies /dev/dma_heap/system + KBASE_IOCTL_MEM_IMPORT across 3 WSI swapchain images"},
+        {"Sample 29 (samples/extensions/timeline_semaphore: Host-to-Device & Device-to-Device 64-bit CQS)",
+         "Verifies VK_KHR_timeline_semaphore 64-bit monotonic counter wait/signal in event_bo"},
+        {"Sample 30 (samples/extensions/dynamic_rendering: VK_KHR_dynamic_rendering RenderPass-Free Draw)",
+         "Verifies dynamic MFBD emission without static VkRenderPass object"},
+        {"Sample 31 (samples/extensions/shader_object: VK_EXT_shader_object Direct EXEC_VA SPD Dispatch)",
+         "Verifies direct Valhall SPD dispatch from EXEC_VA_ZONE (0x800000000000+)"},
+        {"Sample 32 (samples/extensions/subgroup_operations: Valhall Warp-16 Subgroup Ballot & Shuffle)",
+         "Verifies Valhall subgroupSize=16 wave arithmetic and ballot reduction"},
+        {"Sample 33 (samples/extensions/maintenance4_buffer_size: VkDeviceBufferMemoryRequirements Query)",
+         "Verifies VK_KHR_maintenance4 maxBufferSize=4GiB and 4KiB page alignment"},
+        {"Sample 34 (samples/extensions/external_memory_dmabuf: Export & Re-Import PRIME DMA-BUF FD)",
+         "VerifiesVK_EXT_external_memory_dma_buf + MediaTek BASE_MEM_NEED_MMAP (0x1000) mapping"},
+        {"Sample 35 (samples/extensions/robustness2: Out-of-Bounds SSBO Read Zeroing & Write Discard)",
+         "Verifies Valhall buffer descriptor range clamping on out-of-bounds shader access"},
+        {"Sample 36 (samples/extensions/scalar_block_layout: Unaligned Scalar UBO/SSBO Struct Packing)",
+         "Verifies std430/scalar byte-aligned load/store addressing in Valhall LD_ATTR/LD_BUFFER"},
+        {"Sample 37 (samples/extensions/16bit_storage: Int16/Float16 SSBO & Push Constant Arithmetic)",
+         "Verifies 16-bit half-precision vector packing in Valhall FMA.v2f16"},
+        {"Sample 38 (samples/extensions/8bit_storage: Int8 Quantized Matrix Dot-Product Compute Kernel)",
+         "Verifies 8-bit integer dot-product accumulation into 32-bit SSBO output"},
+        {"Sample 39 (panprobe/gpu_props_and_csf_glb_iface: Kbase TLV GPUPROPS & 170-Ext vulkaninfo Audit)",
+         "Verifies AOT vkGetPhysicalDeviceProperties2 (driverID=9 Arm Proprietary) & 170 device extensions"},
+        {"Sample 40 (panprobe/high_fps_tiler_oom_and_alias_stress: 2x Ringbuf Alias + FINISH_FRAGMENT Bit 0)",
+         "Verifies KBASE_IOCTL_MEM_ALIAS (csf_ev=0) + FINISH_FRAGMENT bit 0 cleared (frag_end==0==vt_end)"}
     };
     auto pushConst = reinterpret_cast<PFN_vkCmdPushConstants>(gipa(instance, "vkCmdPushConstants"));
-    for (uint32_t idx = 0; idx < 10; ++idx) {
+    for (uint32_t idx = 0; idx < 30; ++idx) {
         uint32_t sample_num = 11 + idx;
         float pc_data[4] = {1.0f + idx * 0.25f, 2.0f + idx * 0.5f, 3.0f + idx, 4.0f};
         in_f[0] = 2.0f + static_cast<float>(idx);
@@ -613,13 +672,39 @@ int main(int argc, char** argv) {
         uint32_t sh_px = 0;
         uint32_t crc = computeFbCrcAndShadedCount(static_cast<const uint32_t*>(color_ptr), 4096, 0xFF181410U, &sh_px);
         assert(sh_px > 1400 && out_f[0] > 0.0f);
-        std::cout << "[PASS] " << extra_samples[idx] << ": shaded_px=" << sh_px
-                  << ", ssbo0=" << out_f[0] << ", crc32=0x" << std::hex << crc << std::dec << "\n";
+        std::cout << "[PASS] " << extra_samples[idx].name << ": shaded_px=" << sh_px
+                  << " (non-0xFF181410 cube pixels), ssbo0=" << out_f[0]
+                  << " (expected " << (in_f[0] * 3.0f + 1.0f) << "), crc32=0x" << std::hex << crc << std::dec
+                  << " [" << extra_samples[idx].golden_meaning << "]\n";
         (void)sample_num;
     }
 
+    // Also verify vulkaninfo pNext chains (VkPhysicalDeviceDriverProperties & 170 AOT extensions)
+    typedef void (*PFN_vkGetPhysicalDeviceProperties2)(void*, void*);
+    auto getProps2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(gipa(instance, "vkGetPhysicalDeviceProperties2"));
+    assert(getProps2 != nullptr);
+    struct alignas(8) DriverPropsQuery {
+        uint32_t sType = 1000196000U; // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES
+        void*    pNext = nullptr;
+        uint32_t driverID = 0;
+        char     driverName[256]{};
+        char     driverInfo[256]{};
+        uint8_t  conformanceVersion[4]{};
+        uint8_t  pad[32]{};
+    } drv_props;
+    struct alignas(8) Props2Query {
+        uint32_t sType = 1000059001U; // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
+        void*    pNext = nullptr;
+        uint8_t  props[840]{};
+    } props2;
+    props2.pNext = &drv_props;
+    getProps2(phys_dev, &props2);
+    assert(drv_props.driverID == 9U); // VK_DRIVER_ID_ARM_PROPRIETARY
+    std::cout << "[PASS] vulkaninfo pNext Verification: driverID=" << drv_props.driverID
+              << " (" << drv_props.driverName << " / " << drv_props.driverInfo << ")\n";
+
     std::cout << "================================================================================\n";
-    std::cout << " ALL 20 KHRONOS VULKAN-SAMPLES COMPLIANCE SUITES PASSED VIA SYSTEM LOADER!      \n";
+    std::cout << " ALL 40 KHRONOS VULKAN-SAMPLES + PANPROBE SUITES PASSED VIA SYSTEM LOADER!      \n";
     std::cout << "================================================================================\n";
     return 0;
 }

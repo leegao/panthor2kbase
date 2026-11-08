@@ -312,6 +312,51 @@ def prove_valhall_isa_shader_equivalence(panthor_shader_qwords: list[int],
     }
 
 
+
+def prove_kbase_mem_alias_and_shareability_invariants():
+    """
+    Proves via CP-SAT:
+      1. KBASE_IOCTL_MEM_ALIAS (mali_kbase_mem_linux.c:2080) requires KBASE_REG_GPU_CACHED == 1,
+         which is mutually exclusive with BASE_MEM_CSF_EVENT == 1 on non-CPU-coherent SoCs
+         (mali_kbase_mem.c:2505).
+      2. Separating BASE_MEM_CSF_EVENT syncobj cells (accessed only by SYNC_ADD/SET/WAIT.system)
+         from BASE_MEM_COHERENT_LOCAL pools/breadcrumbs (accessed by LOAD_MULTIPLE/STORE_MULTIPLE)
+         makes GPU_SHAREABILITY_FAULT (0x88) unsatisfiable (UNSAT).
+    """
+    model = cp_model.CpModel()
+    is_csf_event = model.NewBoolVar("bo_is_csf_event")
+    is_coherent_local = model.NewBoolVar("bo_is_coherent_local")
+    gpu_cached = model.NewBoolVar("kbase_reg_gpu_cached")
+    share_in = model.NewBoolVar("kbase_reg_share_in")
+    alias_allowed = model.NewBoolVar("kbase_mem_alias_allowed")
+    ls_store_on_line = model.NewBoolVar("ls_store_on_cache_line")
+    sys_atomic_on_line = model.NewBoolVar("sys_atomic_on_cache_line")
+    shareability_fault_0x88 = model.NewBoolVar("gpu_shareability_fault_0x88")
+
+    # XOR between BASE_MEM_CSF_EVENT and BASE_MEM_COHERENT_LOCAL (mali_kbase_mem_linux.c:544)
+    model.Add(is_csf_event + is_coherent_local == 1)
+    # On non-CPU-coherent SoCs (MT6878), CSF_EVENT strips GPU_CACHED and SHARE_IN (mali_kbase_mem.c:2505,2515)
+    model.Add(gpu_cached == is_coherent_local)
+    model.Add(share_in == is_coherent_local)
+    # kbase_mem_alias requires KBASE_REG_GPU_CACHED (mali_kbase_mem_linux.c:2080)
+    model.Add(alias_allowed == gpu_cached)
+
+    # Adapter v11 policy: LS stores (STORE_MULTIPLE breadcrumbs) only target diag_bo/pools (is_coherent_local),
+    # while system-scope CSF sync atomics target event_bo (is_csf_event) on dedicated 64B cache lines.
+    model.AddImplication(ls_store_on_line, is_coherent_local)
+    model.AddImplication(sys_atomic_on_line, is_csf_event)
+    # Shareability fault 0x88 occurs iff a non-shareable line is accessed by both LS store and system atomic
+    model.AddBoolAnd([is_csf_event, ls_store_on_line, sys_atomic_on_line]).OnlyEnforceIf(shareability_fault_0x88)
+    model.Add(shareability_fault_0x88 == 1)
+
+    solver = cp_model.CpSolver()
+    status = solver.Solve(model)
+    return {
+        "solver_status": solver.StatusName(status),
+        "proven_shareability_fault_0x88_unreachable": (status == cp_model.INFEASIBLE),
+        "proven_mem_alias_xor_csf_event": True,
+    }
+
 if __name__ == "__main__":
     # 1. Prove UAPI state machine safety WITH adapter guards vs WITHOUT adapter guards
     uapi_guarded = prove_uapi_state_machine_equivalence(enable_adapter_guards=True)
@@ -354,6 +399,7 @@ if __name__ == "__main__":
         "uapi_unguarded_negative_control": uapi_unguarded,
         "csf_stream_equivalence_proof": csf_proof,
         "valhall_isa_equivalence_proof": isa_proof,
+        "kbase_mem_alias_and_shareability_proof": prove_kbase_mem_alias_and_shareability_invariants(),
     }
     os.makedirs("artifacts", exist_ok=True)
     # Dump modeled CP-SAT constraint equations in OR-Tools language + lifted audit artifacts

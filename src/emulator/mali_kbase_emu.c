@@ -965,9 +965,39 @@ int ioctl(int fd, unsigned long request, ...)
          return 0;
       case 21: { /* KBASE_IOCTL_MEM_ALIAS */
          union kbase_ioctl_mem_alias *al = (union kbase_ioctl_mem_alias *)arg;
+         /* Enforce kbase_mem_alias (mali_kbase_mem_linux.c:2022-2085) flag & target invariants */
+         if ((al->in.flags & (BASE_MEM_CSF_EVENT | BASE_MEM_PROT_GPU_EX |
+                              BASE_MEM_GROW_ON_GPF | BASE_MEM_COHERENT_SYSTEM)) != 0 ||
+             al->in.nents == 0 || al->in.stride == 0) {
+            pthread_mutex_unlock(&g_emu_lock);
+            errno = EINVAL;
+            return -1;
+         }
+         if (al->in.aliasing_info != 0) {
+            const struct base_mem_aliasing_info *ai =
+               (const struct base_mem_aliasing_info *)(uintptr_t)al->in.aliasing_info;
+            for (uint64_t k = 0; k < al->in.nents; k++) {
+               struct emu_mem_region *treg = NULL;
+               for (size_t r = 0; r < 512; r++) {
+                  if (g_kfile.regions[r].active &&
+                      (g_kfile.regions[r].gpu_va == ai[k].handle ||
+                       g_kfile.regions[r].cookie_or_va == ai[k].handle)) {
+                     treg = &g_kfile.regions[r];
+                     break;
+                  }
+               }
+               /* mali_kbase_mem_linux.c:2080: if (!(aliasing_reg->flags & KBASE_REG_GPU_CACHED)) goto bad_handle;
+                * On non-CPU-coherent SoCs (mali_kbase_mem.c:2505), BASE_MEM_CSF_EVENT clears KBASE_REG_GPU_CACHED! */
+               if (!treg ||
+                   (treg->flags & (BASE_MEM_CSF_EVENT | BASE_MEM_UNCACHED_GPU |
+                                   BASE_MEM_GROW_ON_GPF | BASE_MEM_DONT_NEED)) != 0) {
+                  pthread_mutex_unlock(&g_emu_lock);
+                  errno = ENOMEM;
+                  return -1;
+               }
+            }
+         }
          uint64_t total_pages = al->in.stride * al->in.nents;
-         if (total_pages == 0)
-            total_pages = 16;
          for (size_t i = 0; i < 512; i++) {
             if (!g_kfile.regions[i].active) {
                struct emu_mem_region *reg = &g_kfile.regions[i];

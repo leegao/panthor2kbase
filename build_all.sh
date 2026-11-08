@@ -67,6 +67,13 @@ g++ -std=c++20 -O2 -Isrc/aot/include src/aot/tests/test_vulkan_samples_complianc
 g++ -std=c++17 -O2 src/aot/tests/test_vulkan_icd_client.cpp \
     -o src/aot/bin/test_vulkan_icd_client -ldl -lpthread
 
+if [ -f src/aot/r54p3_vulkan_icd/src/r54p3_vulkan_icd.cpp ]; then
+    g++ -O2 -std=c++17 -fPIC -shared -Isrc/aot/r54p3_vulkan_icd/include \
+        src/aot/r54p3_vulkan_icd/src/r54p3_vulkan_icd.cpp \
+        -L. -lmali_kbase_emu -Wl,-rpath,'$ORIGIN/../../../..:$ORIGIN' -ldl -lpthread \
+        -o src/aot/r54p3_vulkan_icd/lib/libr54p3_vulkan_icd.so
+fi
+
 if [ -f src/aot/build/r54p3-00eac0-6eda07/mali_mbs2_aot.o ]; then
     g++ -O3 -std=c++17 -fno-strict-aliasing -shared -fPIC -Isrc/aot/include \
         src/aot/src/mali_vulkan_icd.cpp src/aot/build/r54p3-00eac0-6eda07/mali_mbs2_aot.o \
