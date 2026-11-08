@@ -42,7 +42,7 @@ struct VkCubeFrameStats {
 
 class HostLvpipeVulkanExecutor {
 public:
-    static constexpr size_t kBufferCapacityBytes = 65536; // 64 KiB (supports up to 128x128 RGBA8 framebuffers)
+    static constexpr size_t kBufferCapacityBytes = 4 * 1024 * 1024; // 4 MiB (supports up to 1024x1024 RGBA8 WSI surfaces)
 
     typedef void (*PFN_vkVoidFunction)(void);
     typedef PFN_vkVoidFunction (*PFN_vkGetInstanceProcAddr)(void*, const char*);
@@ -357,7 +357,9 @@ public:
         reinterpret_cast<PFN_vkBeginCommandBuffer>(gipa(instance, "vkBeginCommandBuffer"))(cmd_buf, &cbbi);
         reinterpret_cast<PFN_vkCmdBindPipeline>(gipa(instance, "vkCmdBindPipeline"))(cmd_buf, 1 /* VK_PIPELINE_BIND_POINT_COMPUTE */, pipeline);
         reinterpret_cast<PFN_vkCmdBindDescriptorSets>(gipa(instance, "vkCmdBindDescriptorSets"))(cmd_buf, 1, pipeline_layout, 0, 1, &desc_set, 0, nullptr);
-        reinterpret_cast<PFN_vkCmdDispatch>(gipa(instance, "vkCmdDispatch"))(cmd_buf, wg_x, wg_y, wg_z);
+        uint32_t max_wg_x = static_cast<uint32_t>(kBufferCapacityBytes / 16);
+        uint32_t safe_wg_x = (wg_x == 0) ? 1 : ((wg_x > max_wg_x) ? max_wg_x : wg_x);
+        reinterpret_cast<PFN_vkCmdDispatch>(gipa(instance, "vkCmdDispatch"))(cmd_buf, safe_wg_x, wg_y ? wg_y : 1, wg_z ? wg_z : 1);
         reinterpret_cast<PFN_vkEndCommandBuffer>(gipa(instance, "vkEndCommandBuffer"))(cmd_buf);
 
         struct VkSubmitInfo {

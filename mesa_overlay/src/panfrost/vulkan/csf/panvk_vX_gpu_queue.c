@@ -22,6 +22,9 @@
 #include "util/log.h"
 #include "vk_drm_syncobj.h"
 #include "vk_log.h"
+#include <pthread.h>
+
+static pthread_mutex_t g_panvk_submit_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define MIN_DESC_TRACEBUF_SIZE (128 * 1024)
 #define DEFAULT_DESC_TRACEBUF_SIZE (2 * 1024 * 1024)
@@ -1372,6 +1375,8 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
       return panvk_queue_vm_bind(vk_queue, vk_submit, queue->syncobj_handle);
    }
 
+   pthread_mutex_lock(&g_panvk_submit_lock);
+
    panvk_queue_submit_init(&submit, vk_queue);
    panvk_queue_submit_init_storage(&submit, vk_submit, &stack_storage);
    panvk_queue_submit_init_utrace(&submit, vk_submit);
@@ -1389,6 +1394,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
 
 out:
    panvk_queue_submit_cleanup_storage(&submit, &stack_storage);
+   pthread_mutex_unlock(&g_panvk_submit_lock);
    return result;
 }
 

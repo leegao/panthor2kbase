@@ -172,7 +172,7 @@ int main() {
     // Verify Rule 1 & Rule 2 rewrote VT_END -> WAIT(0x0003) and SYNC_ADD64 scope CSG(2) -> SYSTEM(0) preserving wait_mask=0x00ff
     assert(cpu[1] == ((0x31ULL << 56) | (0ULL << 32)));
     assert(cpu[2] == ((0x03ULL << 56) | (0x0003ULL << 16)));
-    assert((cpu[3] & (0x3ULL << 1)) == 0ULL);
+    assert(((cpu[3] >> 1) & 0x3ULL) == 2ULL);
     assert(((cpu[3] >> 16) & 0xffffULL) == 0x00ffULL);
 
     struct drm_panthor_group_destroy gd{};

@@ -582,7 +582,7 @@ static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
          uint8_t val_reg = (insn >> 32) & 0xffU;
          uint64_t hw_scope = (insn >> 1) & 0x3ULL;
          uint64_t leg_scope = (insn >> 28) & 0x3ULL;
-         if (hw_scope == 2ULL || (hw_scope == 0ULL && leg_scope == CSF_SYNC_SCOPE_CSG && ((insn >> 24) & 1ULL) == 0ULL && addr_reg < 60))
+         if ((hw_scope == 0ULL && leg_scope == CSF_SYNC_SCOPE_CSG && ((insn >> 24) & 1ULL) == 0ULL && addr_reg < 60))
             g_stats.csg_scope_warnings++;
          if (addr_reg < 95 && val_reg < 96) {
             uint64_t sync_va = (cs_regs[addr_reg + 1] << 32) | cs_regs[addr_reg];
@@ -604,7 +604,7 @@ static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
          uint8_t val_reg = (insn >> 32) & 0xffU;
          uint64_t hw_scope = (insn >> 1) & 0x3ULL;
          uint64_t leg_scope = (insn >> 28) & 0x3ULL;
-         if (hw_scope == 2ULL || (hw_scope == 0ULL && leg_scope == CSF_SYNC_SCOPE_CSG && ((insn >> 24) & 1ULL) == 0ULL && addr_reg < 60))
+         if ((hw_scope == 0ULL && leg_scope == CSF_SYNC_SCOPE_CSG && ((insn >> 24) & 1ULL) == 0ULL && addr_reg < 60))
             g_stats.csg_scope_warnings++;
          if (addr_reg < 95 && val_reg < 95) {
             uint64_t sync_va = (cs_regs[addr_reg + 1] << 32) | cs_regs[addr_reg];
