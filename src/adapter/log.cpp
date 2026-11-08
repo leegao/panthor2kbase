@@ -91,8 +91,11 @@ extern "C" void panthor2kbase_log_init(void)
     panthor2kbase_log_level = panthor2kbase_parse_level(level_s);
 
     const char *path = getenv("PANTHOR2KBASE_LOG_PATH");
-    if (path && path[0])
+    if (path && path[0]) {
         g_log_fp = fopen(path, "a");
+        if (g_log_fp)
+            setvbuf(g_log_fp, nullptr, _IOFBF, 65536);
+    }
 }
 
 extern "C" void panthor2kbase_logv(panthor2kbase_log_level_t level, const char *fmt, va_list ap)
@@ -119,7 +122,15 @@ extern "C" void panthor2kbase_logv(panthor2kbase_log_level_t level, const char *
             indent * 2, "");
     vfprintf(fp, fmt, ap);
     fputc('\n', fp);
-    fflush(fp);
+    static uint32_t s_log_line_cnt = 0;
+    static int s_sync_flush = -1;
+    if (s_sync_flush < 0) {
+        const char *sf = getenv("PANTHOR2KBASE_LOG_SYNC_FLUSH");
+        s_sync_flush = (sf && sf[0] && atoi(sf) != 0) ? 1 : 0;
+    }
+    ++s_log_line_cnt;
+    if (s_sync_flush || level <= PANTHOR2KBASE_LOG_INFO || (s_log_line_cnt & 63U) == 0U)
+        fflush(fp);
 
     pthread_mutex_unlock(&g_log_lock);
 }

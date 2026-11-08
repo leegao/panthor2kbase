@@ -207,6 +207,32 @@ size_t panthor_kbase_emit_ring_slot_ex(uint64_t *ring_slot,
 const char *panthor_kbase_csf_opcode_name(uint8_t opcode);
 void panthor_kbase_dump_csf_diagnostics(const char *reason);
 
+/* Periodic Performance, Latency & Resource Telemetry Snapshot */
+struct adapter_telemetry_snapshot {
+   uint64_t total_group_submits;
+   uint64_t total_subqueue_jobs[ADAPTER_MAX_SUBQUEUES];
+   uint64_t completed_subqueue_seqno[ADAPTER_MAX_SUBQUEUES];
+   uint64_t ring_wraps[ADAPTER_MAX_SUBQUEUES];
+   uint64_t total_syncobj_waits;
+   uint64_t fast_spin_syncobj_waits;
+   uint64_t poll_sleep_syncobj_waits;
+   uint32_t active_bos;
+   uint32_t cached_cpu_bos;
+   uint32_t imported_bos;
+   uint64_t active_bo_bytes;
+   uint32_t active_syncobjs;
+   double   window_fps;
+   double   avg_submit_us;
+   double   max_submit_us;
+   double   avg_cs_norm_us;
+   double   avg_cache_clean_us;
+   double   avg_kick_us;
+   double   avg_sync_wait_us;
+   double   max_sync_wait_us;
+};
+
+void panthor_kbase_get_telemetry_snapshot(struct adapter_telemetry_snapshot *out);
+
 #ifdef __cplusplus
 }
 #endif

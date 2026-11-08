@@ -55,7 +55,11 @@
 #include <tuple>
 #include <vector>
 
-// Minimal declarations for libLLVM-15.so.1 C API
+#include <dlfcn.h>
+#include <glob.h>
+
+// Dynamic runtime loader for ANY host libLLVM (LLVM 14..22+ on Arch, Ubuntu, Debian, Fedora)
+// Eliminates hardcoded DT_NEEDED on libLLVM-15.so.1 so prebuilt binaries work across distros.
 extern "C" {
 typedef struct LLVMOpaqueContext *LLVMContextRef;
 typedef struct LLVMOpaqueModule *LLVMModuleRef;
@@ -75,76 +79,157 @@ typedef enum {
     LLVMVerifierFailureActionPrintMessage = 1,
     LLVMVerifierFailureActionReturnStatus = 2
 } LLVMVerifierFailureAction;
+}
 
-void LLVMInitializeX86TargetInfo(void);
-void LLVMInitializeX86Target(void);
-void LLVMInitializeX86TargetMC(void);
-void LLVMInitializeX86AsmPrinter(void);
-void LLVMInitializeX86AsmParser(void);
+#define MALI_LLVM_API_LIST(X) \
+    X(void, LLVMInitializeX86TargetInfo, (void), ()) \
+    X(void, LLVMInitializeX86Target, (void), ()) \
+    X(void, LLVMInitializeX86TargetMC, (void), ()) \
+    X(void, LLVMInitializeX86AsmPrinter, (void), ()) \
+    X(void, LLVMInitializeX86AsmParser, (void), ()) \
+    X(LLVMContextRef, LLVMContextCreate, (void), ()) \
+    X(void, LLVMContextDispose, (LLVMContextRef C), (C)) \
+    X(LLVMBool, LLVMCreateMemoryBufferWithContentsOfFile, (const char *Path, LLVMMemoryBufferRef *OutMemBuf, char **OutMessage), (Path, OutMemBuf, OutMessage)) \
+    X(LLVMMemoryBufferRef, LLVMCreateMemoryBufferWithMemoryRangeCopy, (const char *InputData, size_t InputDataLength, const char *BufferName), (InputData, InputDataLength, BufferName)) \
+    X(LLVMBool, LLVMParseIRInContext, (LLVMContextRef ContextRef, LLVMMemoryBufferRef MemBuf, LLVMModuleRef *OutM, char **OutMessage), (ContextRef, MemBuf, OutM, OutMessage)) \
+    X(LLVMBool, LLVMVerifyModule, (LLVMModuleRef M, LLVMVerifierFailureAction Action, char **OutMessage), (M, Action, OutMessage)) \
+    X(LLVMBool, LLVMPrintModuleToFile, (LLVMModuleRef M, const char *Filename, char **ErrorMessage), (M, Filename, ErrorMessage)) \
+    X(void, LLVMDisposeMessage, (char *Message), (Message)) \
+    X(void, LLVMDisposeModule, (LLVMModuleRef M), (M)) \
+    X(LLVMContextRef, LLVMGetModuleContext, (LLVMModuleRef M), (M)) \
+    X(LLVMTypeRef, LLVMVoidTypeInContext, (LLVMContextRef C), (C)) \
+    X(LLVMTypeRef, LLVMInt1TypeInContext, (LLVMContextRef C), (C)) \
+    X(LLVMTypeRef, LLVMInt8TypeInContext, (LLVMContextRef C), (C)) \
+    X(LLVMTypeRef, LLVMInt32TypeInContext, (LLVMContextRef C), (C)) \
+    X(LLVMTypeRef, LLVMInt64TypeInContext, (LLVMContextRef C), (C)) \
+    X(LLVMTypeRef, LLVMPointerType, (LLVMTypeRef ElementType, unsigned AddressSpace), (ElementType, AddressSpace)) \
+    X(LLVMTypeRef, LLVMFunctionType, (LLVMTypeRef ReturnType, LLVMTypeRef *ParamTypes, unsigned ParamCount, LLVMBool IsVarArg), (ReturnType, ParamTypes, ParamCount, IsVarArg)) \
+    X(LLVMValueRef, LLVMConstInt, (LLVMTypeRef IntTy, unsigned long long N, LLVMBool SignExtend), (IntTy, N, SignExtend)) \
+    X(unsigned long long, LLVMConstIntGetZExtValue, (LLVMValueRef ConstantVal), (ConstantVal)) \
+    X(LLVMValueRef, LLVMGetNamedFunction, (LLVMModuleRef M, const char *Name), (M, Name)) \
+    X(LLVMValueRef, LLVMAddFunction, (LLVMModuleRef M, const char *Name, LLVMTypeRef FunctionTy), (M, Name, FunctionTy)) \
+    X(LLVMValueRef, LLVMGetFirstFunction, (LLVMModuleRef M), (M)) \
+    X(LLVMValueRef, LLVMGetNextFunction, (LLVMValueRef Fn), (Fn)) \
+    X(LLVMBasicBlockRef, LLVMGetFirstBasicBlock, (LLVMValueRef Fn), (Fn)) \
+    X(LLVMBasicBlockRef, LLVMGetNextBasicBlock, (LLVMBasicBlockRef BB), (BB)) \
+    X(LLVMValueRef, LLVMGetFirstInstruction, (LLVMBasicBlockRef BB), (BB)) \
+    X(LLVMValueRef, LLVMGetNextInstruction, (LLVMValueRef Inst), (Inst)) \
+    X(LLVMValueRef, LLVMIsACallInst, (LLVMValueRef Val), (Val)) \
+    X(unsigned, LLVMGetNumArgOperands, (LLVMValueRef Instr), (Instr)) \
+    X(LLVMValueRef, LLVMGetArgOperand, (LLVMValueRef Inst, unsigned i), (Inst, i)) \
+    X(LLVMValueRef, LLVMGetCalledValue, (LLVMValueRef Instr), (Instr)) \
+    X(const char *, LLVMGetValueName2, (LLVMValueRef Val, size_t *Length), (Val, Length)) \
+    X(void, LLVMReplaceAllUsesWith, (LLVMValueRef OldVal, LLVMValueRef NewVal), (OldVal, NewVal)) \
+    X(void, LLVMInstructionEraseFromParent, (LLVMValueRef Inst), (Inst)) \
+    X(LLVMBuilderRef, LLVMCreateBuilderInContext, (LLVMContextRef C), (C)) \
+    X(void, LLVMPositionBuilderBefore, (LLVMBuilderRef Builder, LLVMValueRef Instr), (Builder, Instr)) \
+    X(void, LLVMDisposeBuilder, (LLVMBuilderRef Builder), (Builder)) \
+    X(LLVMValueRef, LLVMBuildAdd, (LLVMBuilderRef B, LLVMValueRef LHS, LLVMValueRef RHS, const char *Name), (B, LHS, RHS, Name)) \
+    X(LLVMValueRef, LLVMBuildAnd, (LLVMBuilderRef B, LLVMValueRef LHS, LLVMValueRef RHS, const char *Name), (B, LHS, RHS, Name)) \
+    X(LLVMValueRef, LLVMBuildZExt, (LLVMBuilderRef B, LLVMValueRef Val, LLVMTypeRef DestTy, const char *Name), (B, Val, DestTy, Name)) \
+    X(LLVMValueRef, LLVMBuildTrunc, (LLVMBuilderRef B, LLVMValueRef Val, LLVMTypeRef DestTy, const char *Name), (B, Val, DestTy, Name)) \
+    X(LLVMValueRef, LLVMBuildIntToPtr, (LLVMBuilderRef B, LLVMValueRef Val, LLVMTypeRef DestTy, const char *Name), (B, Val, DestTy, Name)) \
+    X(LLVMValueRef, LLVMBuildPtrToInt, (LLVMBuilderRef B, LLVMValueRef Val, LLVMTypeRef DestTy, const char *Name), (B, Val, DestTy, Name)) \
+    X(LLVMValueRef, LLVMBuildGEP2, (LLVMBuilderRef B, LLVMTypeRef Ty, LLVMValueRef Pointer, LLVMValueRef *Indices, unsigned NumIndices, const char *Name), (B, Ty, Pointer, Indices, NumIndices, Name)) \
+    X(LLVMValueRef, LLVMBuildLoad2, (LLVMBuilderRef B, LLVMTypeRef Ty, LLVMValueRef PointerVal, const char *Name), (B, Ty, PointerVal, Name)) \
+    X(LLVMValueRef, LLVMBuildStore, (LLVMBuilderRef B, LLVMValueRef Val, LLVMValueRef Ptr), (B, Val, Ptr)) \
+    X(LLVMValueRef, LLVMBuildCall2, (LLVMBuilderRef B, LLVMTypeRef Ty, LLVMValueRef Fn, LLVMValueRef *Args, unsigned NumArgs, const char *Name), (B, Ty, Fn, Args, NumArgs, Name)) \
+    X(LLVMBool, LLVMGetTargetFromTriple, (const char *Triple, LLVMTargetRef *T, char **ErrorMessage), (Triple, T, ErrorMessage)) \
+    X(LLVMTargetMachineRef, LLVMCreateTargetMachine, (LLVMTargetRef T, const char *Triple, const char *CPU, const char *Features, int Level, int Reloc, int CodeModel), (T, Triple, CPU, Features, Level, Reloc, CodeModel)) \
+    X(void, LLVMDisposeTargetMachine, (LLVMTargetMachineRef T), (T)) \
+    X(LLVMPassBuilderOptionsRef, LLVMCreatePassBuilderOptions, (void), ()) \
+    X(void, LLVMDisposePassBuilderOptions, (LLVMPassBuilderOptionsRef Options), (Options)) \
+    X(LLVMErrorRef, LLVMRunPasses, (LLVMModuleRef M, const char *Passes, LLVMTargetMachineRef TM, LLVMPassBuilderOptionsRef Options), (M, Passes, TM, Options)) \
+    X(char *, LLVMGetErrorMessage, (LLVMErrorRef Err), (Err)) \
+    X(void, LLVMDisposeErrorMessage, (char *ErrMsg), (ErrMsg)) \
+    X(LLVMBool, LLVMTargetMachineEmitToFile, (LLVMTargetMachineRef T, LLVMModuleRef M, char *Filename, int codegen, char **ErrorMessage), (T, M, Filename, codegen, ErrorMessage))
 
-LLVMContextRef LLVMContextCreate(void);
-void LLVMContextDispose(LLVMContextRef C);
-LLVMBool LLVMCreateMemoryBufferWithContentsOfFile(const char *Path, LLVMMemoryBufferRef *OutMemBuf, char **OutMessage);
-LLVMMemoryBufferRef LLVMCreateMemoryBufferWithMemoryRangeCopy(const char *InputData, size_t InputDataLength, const char *BufferName);
-LLVMBool LLVMParseIRInContext(LLVMContextRef ContextRef, LLVMMemoryBufferRef MemBuf, LLVMModuleRef *OutM, char **OutMessage);
-LLVMBool LLVMVerifyModule(LLVMModuleRef M, LLVMVerifierFailureAction Action, char **OutMessage);
-LLVMBool LLVMPrintModuleToFile(LLVMModuleRef M, const char *Filename, char **ErrorMessage);
-void LLVMDisposeMessage(char *Message);
-void LLVMDisposeModule(LLVMModuleRef M);
+namespace {
+struct DynamicLlvmTable {
+    void *handle = nullptr;
+    std::string loaded_path;
+    LLVMTypeRef (*p_LLVMPointerTypeInContext)(LLVMContextRef, unsigned) = nullptr;
+#define DECL_PTR(ret, name, params, args) ret (*p_##name) params = nullptr;
+    MALI_LLVM_API_LIST(DECL_PTR)
+#undef DECL_PTR
 
-LLVMContextRef LLVMGetModuleContext(LLVMModuleRef M);
-LLVMTypeRef LLVMVoidTypeInContext(LLVMContextRef C);
-LLVMTypeRef LLVMInt1TypeInContext(LLVMContextRef C);
-LLVMTypeRef LLVMInt8TypeInContext(LLVMContextRef C);
-LLVMTypeRef LLVMInt32TypeInContext(LLVMContextRef C);
-LLVMTypeRef LLVMInt64TypeInContext(LLVMContextRef C);
-LLVMTypeRef LLVMPointerTypeInContext(LLVMContextRef C, unsigned AddressSpace);
-LLVMTypeRef LLVMFunctionType(LLVMTypeRef ReturnType, LLVMTypeRef *ParamTypes, unsigned ParamCount, LLVMBool IsVarArg);
+    bool tryOpen(const char *path) {
+        if (!path || !path[0]) return false;
+        void *h = dlopen(path, RTLD_LAZY | RTLD_GLOBAL);
+        if (!h) return false;
+        if (!dlsym(h, "LLVMContextCreate") || !dlsym(h, "LLVMRunPasses")) {
+            dlclose(h);
+            return false;
+        }
+        handle = h;
+        loaded_path = path;
+        p_LLVMPointerTypeInContext = reinterpret_cast<LLVMTypeRef (*)(LLVMContextRef, unsigned)>(
+            dlsym(h, "LLVMPointerTypeInContext"));
+#define LOAD_SYM(ret, name, params, args) \
+        p_##name = reinterpret_cast<ret (*) params>(dlsym(h, #name)); \
+        if (!p_##name) { std::fprintf(stderr, "[LLVM_LOADER] Missing symbol %s in %s\n", #name, path); return false; }
+        MALI_LLVM_API_LIST(LOAD_SYM)
+#undef LOAD_SYM
+        return true;
+    }
 
-LLVMValueRef LLVMConstInt(LLVMTypeRef IntTy, unsigned long long N, LLVMBool SignExtend);
-unsigned long long LLVMConstIntGetZExtValue(LLVMValueRef ConstantVal);
-LLVMValueRef LLVMGetNamedFunction(LLVMModuleRef M, const char *Name);
-LLVMValueRef LLVMAddFunction(LLVMModuleRef M, const char *Name, LLVMTypeRef FunctionTy);
+    void ensureLoaded() {
+        if (handle) return;
+        const char *env_lib = getenv("MALI_HOST_LIBLLVM");
+        if (env_lib && tryOpen(env_lib)) return;
 
-LLVMValueRef LLVMGetFirstFunction(LLVMModuleRef M);
-LLVMValueRef LLVMGetNextFunction(LLVMValueRef Fn);
-LLVMBasicBlockRef LLVMGetFirstBasicBlock(LLVMValueRef Fn);
-LLVMBasicBlockRef LLVMGetNextBasicBlock(LLVMBasicBlockRef BB);
-LLVMValueRef LLVMGetFirstInstruction(LLVMBasicBlockRef BB);
-LLVMValueRef LLVMGetNextInstruction(LLVMValueRef Inst);
+        // First check if already linked into process
+        if (dlsym(RTLD_DEFAULT, "LLVMContextCreate") && tryOpen(nullptr)) return;
 
-LLVMValueRef LLVMIsACallInst(LLVMValueRef Val);
-unsigned LLVMGetNumArgOperands(LLVMValueRef Instr);
-LLVMValueRef LLVMGetArgOperand(LLVMValueRef Inst, unsigned i);
-LLVMValueRef LLVMGetCalledValue(LLVMValueRef Instr);
-const char *LLVMGetValueName2(LLVMValueRef Val, size_t *Length);
-void LLVMReplaceAllUsesWith(LLVMValueRef OldVal, LLVMValueRef NewVal);
-void LLVMInstructionEraseFromParent(LLVMValueRef Inst);
+        static const char *const kDirectCandidates[] = {
+            "libLLVM.so",
+            "libLLVM-22.so", "libLLVM-21.so", "libLLVM-20.so", "libLLVM-19.so",
+            "libLLVM-18.so", "libLLVM-17.so", "libLLVM-16.so", "libLLVM-15.so",
+            "libLLVM-21.so.1", "libLLVM-20.so.1", "libLLVM-19.so.1", "libLLVM-18.so.1",
+            "libLLVM-17.so.1", "libLLVM-16.so.1", "libLLVM-15.so.1", "libLLVM-14.so.1",
+        };
+        for (const char *c : kDirectCandidates) {
+            if (tryOpen(c)) return;
+        }
 
-LLVMBuilderRef LLVMCreateBuilderInContext(LLVMContextRef C);
-void LLVMPositionBuilderBefore(LLVMBuilderRef Builder, LLVMValueRef Instr);
-void LLVMDisposeBuilder(LLVMBuilderRef Builder);
+        static const char *const kGlobPatterns[] = {
+            "/usr/lib/libLLVM*.so*",
+            "/usr/lib64/libLLVM*.so*",
+            "/usr/lib/x86_64-linux-gnu/libLLVM*.so*",
+            "/usr/lib/llvm-*/lib/libLLVM*.so*",
+            "/usr/local/lib/libLLVM*.so*",
+        };
+        for (const char *pat : kGlobPatterns) {
+            glob_t g{};
+            if (glob(pat, 0, nullptr, &g) == 0) {
+                // Prefer highest version (reverse order)
+                for (size_t i = g.gl_pathc; i > 0; --i) {
+                    if (tryOpen(g.gl_pathv[i - 1])) {
+                        globfree(&g);
+                        return;
+                    }
+                }
+                globfree(&g);
+            }
+        }
+        std::fprintf(stderr, "[ERROR] Could not dynamically load any host libLLVM shared library (checked LLVM 14..22 in /usr/lib, /usr/lib/x86_64-linux-gnu, /usr/lib/llvm-*/lib). Set MALI_HOST_LIBLLVM=/path/to/libLLVM.so\n");
+        std::exit(1);
+    }
+};
 
-LLVMValueRef LLVMBuildAdd(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS, const char *Name);
-LLVMValueRef LLVMBuildAnd(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS, const char *Name);
-LLVMValueRef LLVMBuildZExt(LLVMBuilderRef, LLVMValueRef Val, LLVMTypeRef DestTy, const char *Name);
-LLVMValueRef LLVMBuildTrunc(LLVMBuilderRef, LLVMValueRef Val, LLVMTypeRef DestTy, const char *Name);
-LLVMValueRef LLVMBuildIntToPtr(LLVMBuilderRef, LLVMValueRef Val, LLVMTypeRef DestTy, const char *Name);
-LLVMValueRef LLVMBuildPtrToInt(LLVMBuilderRef, LLVMValueRef Val, LLVMTypeRef DestTy, const char *Name);
-LLVMValueRef LLVMBuildGEP2(LLVMBuilderRef B, LLVMTypeRef Ty, LLVMValueRef Pointer, LLVMValueRef *Indices, unsigned NumIndices, const char *Name);
-LLVMValueRef LLVMBuildLoad2(LLVMBuilderRef, LLVMTypeRef Ty, LLVMValueRef PointerVal, const char *Name);
-LLVMValueRef LLVMBuildStore(LLVMBuilderRef, LLVMValueRef Val, LLVMValueRef Ptr);
-LLVMValueRef LLVMBuildCall2(LLVMBuilderRef, LLVMTypeRef, LLVMValueRef Fn, LLVMValueRef *Args, unsigned NumArgs, const char *Name);
+static DynamicLlvmTable g_llvm;
+} // namespace
 
-LLVMBool LLVMGetTargetFromTriple(const char *Triple, LLVMTargetRef *T, char **ErrorMessage);
-LLVMTargetMachineRef LLVMCreateTargetMachine(LLVMTargetRef T, const char *Triple, const char *CPU, const char *Features, int Level, int Reloc, int CodeModel);
-void LLVMDisposeTargetMachine(LLVMTargetMachineRef T);
-LLVMPassBuilderOptionsRef LLVMCreatePassBuilderOptions(void);
-void LLVMDisposePassBuilderOptions(LLVMPassBuilderOptionsRef Options);
-LLVMErrorRef LLVMRunPasses(LLVMModuleRef M, const char *Passes, LLVMTargetMachineRef TM, LLVMPassBuilderOptionsRef Options);
-char *LLVMGetErrorMessage(LLVMErrorRef Err);
-void LLVMDisposeErrorMessage(char *ErrMsg);
-LLVMBool LLVMTargetMachineEmitToFile(LLVMTargetMachineRef T, LLVMModuleRef M, char *Filename, int codegen, char **ErrorMessage);
+#define DEF_WRAPPER(ret, name, params, args) \
+    static inline ret name params { g_llvm.ensureLoaded(); return g_llvm.p_##name args; }
+MALI_LLVM_API_LIST(DEF_WRAPPER)
+#undef DEF_WRAPPER
+
+static inline LLVMTypeRef LLVMPointerTypeInContext(LLVMContextRef C, unsigned AddressSpace) {
+    g_llvm.ensureLoaded();
+    if (g_llvm.p_LLVMPointerTypeInContext)
+        return g_llvm.p_LLVMPointerTypeInContext(C, AddressSpace);
+    return g_llvm.p_LLVMPointerType(g_llvm.p_LLVMInt8TypeInContext(C), AddressSpace);
 }
 
 static constexpr uint64_t IMAGE_BASE = 0x400000000ULL;

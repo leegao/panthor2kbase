@@ -30,8 +30,46 @@
 #include <sys/mman.h>
 #include <dlfcn.h>
 
+#include <cstdarg>
+#include <unistd.h>
 #include "../include/mali0_emu.hpp"
 #include "../generated/mali_bionic_stubs_autogen.h"
+
+static bool mali_icd_log_enabled() {
+    static int s_enabled = -1;
+    if (s_enabled < 0) {
+        const char* env = getenv("MALI_AOT_ICD_LOG");
+        s_enabled = (env && env[0] && std::atoi(env) != 0) ? 1 : 0;
+    }
+    return s_enabled != 0;
+}
+
+static void mali_icd_log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+static void mali_icd_log(const char* fmt, ...) {
+    if (!mali_icd_log_enabled()) return;
+    std::fprintf(stderr, "[MALI_AOT_ICD] ");
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    std::fputc('\n', stderr);
+    std::fflush(stderr);
+}
+
+__attribute__((constructor))
+static void mali_aot_icd_onload() {
+    if (!mali_icd_log_enabled()) return;
+    char exe_buf[512]{};
+    ssize_t len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+    if (len > 0) exe_buf[len] = '\0';
+    mali_icd_log("Loaded libvulkan_mali_aot_icd.so into pid=%d exe='%s' DISPLAY='%s' WAYLAND_DISPLAY='%s' VK_ICD_FILENAMES='%s' VK_DRIVER_FILES='%s'",
+                 static_cast<int>(getpid()),
+                 exe_buf[0] ? exe_buf : "(unknown)",
+                 getenv("DISPLAY") ? getenv("DISPLAY") : "(unset)",
+                 getenv("WAYLAND_DISPLAY") ? getenv("WAYLAND_DISPLAY") : "(unset)",
+                 getenv("VK_ICD_FILENAMES") ? getenv("VK_ICD_FILENAMES") : "(unset)",
+                 getenv("VK_DRIVER_FILES") ? getenv("VK_DRIVER_FILES") : "(unset)");
+}
 
 // ============================================================================
 // Section 1: AOT ARM64 Runtime State & Imported Symbols from mali_mbs2_aot.o
@@ -502,11 +540,29 @@ struct MaliAotGlobalRuntime {
         if (initialized) return true;
 
         const char* env_so = getenv("MALI_AOT_DRIVER_SO");
+        std::string icd_dir_so, icd_root_so, icd_root_r44_so;
+        Dl_info dli{};
+        if (dladdr(reinterpret_cast<void*>(&mali_aot_icd_onload), &dli) && dli.dli_fname) {
+            std::string p(dli.dli_fname);
+            size_t sl = p.find_last_of('/');
+            if (sl != std::string::npos) {
+                std::string d = p.substr(0, sl);
+                icd_dir_so      = d + "/libGLES_mali.so";
+                icd_root_so     = d + "/../../libGLES_mali.so";
+                icd_root_r44_so = d + "/../../../libGLES_mali.r44p1.so";
+            }
+        }
         const char* candidates[] = {
             (env_so && env_so[0]) ? env_so : nullptr,
             "libGLES_mali.so",
+            "libGLES_mali.r44p1.so",
+            "libGLES_mali.r44.so",
             "../libGLES_mali.so",
             "src/aot/libGLES_mali.so",
+            icd_dir_so.empty() ? nullptr : icd_dir_so.c_str(),
+            icd_root_so.empty() ? nullptr : icd_root_so.c_str(),
+            icd_root_r44_so.empty() ? nullptr : icd_root_r44_so.c_str(),
+            "/working_dir/c_3106ac7496559798/user_uploaded_files/ttl=63d/user_uploaded/libGLES_mali.r44p1.so",
             "/working_dir/c_3106ac7496559798/work/archive/libGLES_mali/libGLES_mali.so",
             "/working_dir/c_24f54338d69d9705/user_uploaded_files/ttl=63d/user_uploaded/libGLES_mali.so",
             "/working_dir/c_a3c1acfa7b15211d/work/libGLES_mali.so"
@@ -1037,49 +1093,72 @@ __attribute__((visibility("default")))
 int32_t vkEnumerateInstanceExtensionProperties(const char* pLayerName, uint32_t* pPropertyCount, void* pProperties) {
     if (!pPropertyCount) return -3;
     g_aot_rt.ensureInitialized();
-    if (aot_vkEnumerateInstanceExtensionProperties && (!pLayerName || pLayerName[0] == '\0')) {
+    if (pLayerName && pLayerName[0] != '\0') {
+        *pPropertyCount = 0;
+        return 0;
+    }
+    std::vector<VkExtensionPropertiesIcd> exts;
+    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkEnumerateInstanceExtensionProperties) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         uint32_t aot_count = 0;
         g_aot_rt.cpu.x[0] = 0;
         g_aot_rt.cpu.x[1] = reinterpret_cast<uint64_t>(&aot_count);
         g_aot_rt.cpu.x[2] = 0;
         aot_vkEnumerateInstanceExtensionProperties(&g_aot_rt.cpu);
-        std::vector<VkExtensionPropertiesIcd> exts(aot_count);
-        if (aot_count > 0) {
+        if (aot_count > 0 && aot_count <= 128) {
+            exts.resize(aot_count);
             g_aot_rt.cpu.x[0] = 0;
             g_aot_rt.cpu.x[1] = reinterpret_cast<uint64_t>(&aot_count);
             g_aot_rt.cpu.x[2] = reinterpret_cast<uint64_t>(exts.data());
             aot_vkEnumerateInstanceExtensionProperties(&g_aot_rt.cpu);
         }
-        const char* extra_wsi[] = {"VK_KHR_surface", "VK_EXT_headless_surface", "VK_KHR_display", "VK_KHR_xcb_surface", "VK_KHR_xlib_surface", "VK_KHR_wayland_surface"};
-        for (const char* wext : extra_wsi) {
-            bool found = false;
-            for (const auto& e : exts) {
-                if (std::strcmp(e.extensionName, wext) == 0) { found = true; break; }
-            }
-            if (!found) {
-                VkExtensionPropertiesIcd ep{};
-                std::snprintf(ep.extensionName, sizeof(ep.extensionName), "%s", wext);
-                ep.specVersion = 1U;
-                exts.push_back(ep);
-            }
-        }
-        uint32_t total = static_cast<uint32_t>(exts.size());
-        if (!pProperties) {
-            *pPropertyCount = total;
-            return 0;
-        }
-        uint32_t n = std::min(*pPropertyCount, total);
-        std::memcpy(pProperties, exts.data(), n * sizeof(VkExtensionPropertiesIcd));
-        *pPropertyCount = n;
-        return (n < total) ? 5 : 0;
     }
-    *pPropertyCount = 0;
-    return 0;
+    static const struct { const char* name; uint32_t ver; } kStdInstExts[] = {
+        {"VK_KHR_surface", 25U},
+        {"VK_EXT_headless_surface", 1U},
+        {"VK_KHR_display", 23U},
+        {"VK_KHR_xcb_surface", 6U},
+        {"VK_KHR_xlib_surface", 6U},
+        {"VK_KHR_wayland_surface", 6U},
+        {"VK_KHR_get_physical_device_properties2", 2U},
+        {"VK_KHR_get_surface_capabilities2", 1U},
+        {"VK_KHR_external_memory_capabilities", 1U},
+        {"VK_KHR_external_semaphore_capabilities", 1U},
+        {"VK_KHR_external_fence_capabilities", 1U},
+        {"VK_KHR_device_group_creation", 1U},
+        {"VK_EXT_debug_utils", 2U},
+        {"VK_EXT_debug_report", 10U},
+        {"VK_EXT_swapchain_colorspace", 4U},
+    };
+    for (const auto& wext : kStdInstExts) {
+        bool found = false;
+        for (auto& e : exts) {
+            if (std::strcmp(e.extensionName, wext.name) == 0) {
+                if (e.specVersion < wext.ver) e.specVersion = wext.ver;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            VkExtensionPropertiesIcd ep{};
+            std::snprintf(ep.extensionName, sizeof(ep.extensionName), "%s", wext.name);
+            ep.specVersion = wext.ver;
+            exts.push_back(ep);
+        }
+    }
+    uint32_t total = static_cast<uint32_t>(exts.size());
+    if (!pProperties) {
+        *pPropertyCount = total;
+        return 0;
+    }
+    uint32_t n = std::min(*pPropertyCount, total);
+    std::memcpy(pProperties, exts.data(), n * sizeof(VkExtensionPropertiesIcd));
+    *pPropertyCount = n;
+    return (n < total) ? 5 : 0;
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateInstance(const void* /*pCreateInfo*/, const void* /*pAllocator*/, void** pInstance) {
+int32_t vkCreateInstance(const void* pCreateInfo, const void* /*pAllocator*/, void** pInstance) {
     if (!pInstance) return -3;
     if (!g_aot_rt.ensureInitialized()) return -3;
     auto* inst = new MaliIcdInstance();
@@ -1088,6 +1167,27 @@ int32_t vkCreateInstance(const void* /*pCreateInfo*/, const void* /*pAllocator*/
     inst->phys_dev.parent_instance = inst;
     inst->phys_dev.initAotInternalLayout();
     *pInstance = inst;
+    if (mali_icd_log_enabled() && pCreateInfo) {
+        struct InstCI {
+            uint32_t sType; const void* pNext; uint32_t flags; const void* pAppInfo;
+            uint32_t layerCount; const char* const* ppLayers;
+            uint32_t extCount; const char* const* ppExts;
+        };
+        const auto* ci = static_cast<const InstCI*>(pCreateInfo);
+        std::string exts_str;
+        if (ci->extCount <= 64 && ci->ppExts) {
+            for (uint32_t i = 0; i < ci->extCount; ++i) {
+                if (ci->ppExts[i]) {
+                    if (!exts_str.empty()) exts_str += ", ";
+                    exts_str += ci->ppExts[i];
+                }
+            }
+        }
+        mali_icd_log("vkCreateInstance -> instance=%p driver_so='%s' enabled_exts(%u)=[%s]",
+                     static_cast<void*>(inst),
+                     g_aot_rt.mapper.so_path_loaded.empty() ? "standalone-builtin" : g_aot_rt.mapper.so_path_loaded.c_str(),
+                     ci->extCount, exts_str.c_str());
+    }
     return 0;
 }
 
@@ -1120,7 +1220,7 @@ void vkGetPhysicalDeviceProperties(void* physicalDevice, void* pProperties) {
 
     // Execute AOT-lifted libGLES_mali.so vkGetPhysicalDeviceProperties (0x977730 -> 0x977738)
     // which populates all 504 bytes of genuine Valhall r54p3 VkPhysicalDeviceLimits & SparseProperties!
-    if (g_aot_rt.mapper.base && aot_vkGetPhysicalDeviceProperties && pdev) {
+    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkGetPhysicalDeviceProperties && pdev) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         pdev->initAotInternalLayout();
         g_aot_rt.cpu.x[0] = reinterpret_cast<uint64_t>(pdev->aot_internal + 1024);
@@ -1252,7 +1352,7 @@ void vkGetPhysicalDeviceFeatures(void* physicalDevice, void* pFeatures) {
     if (!pFeatures) return;
     g_aot_rt.ensureInitialized();
     auto* pdev = static_cast<MaliIcdPhysicalDevice*>(physicalDevice);
-    if (g_aot_rt.mapper.base && aot_vkGetPhysicalDeviceFeatures && pdev) {
+    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkGetPhysicalDeviceFeatures && pdev) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         pdev->initAotInternalLayout();
         g_aot_rt.cpu.x[0] = reinterpret_cast<uint64_t>(pdev->aot_internal);
@@ -1269,7 +1369,7 @@ void vkGetPhysicalDeviceFeatures2(void* physicalDevice, void* pFeatures2) {
     if (!pFeatures2) return;
     g_aot_rt.ensureInitialized();
     auto* pdev = static_cast<MaliIcdPhysicalDevice*>(physicalDevice);
-    if (g_aot_rt.mapper.base && aot_vkGetPhysicalDeviceFeatures2 && pdev) {
+    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkGetPhysicalDeviceFeatures2 && pdev) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         pdev->initAotInternalLayout();
         g_aot_rt.cpu.x[0] = reinterpret_cast<uint64_t>(pdev->aot_internal);
@@ -1285,7 +1385,7 @@ void vkGetPhysicalDeviceQueueFamilyProperties(void* physicalDevice, uint32_t* pQ
     if (!pQueueFamilyPropertyCount) return;
     g_aot_rt.ensureInitialized();
     auto* pdev = static_cast<MaliIcdPhysicalDevice*>(physicalDevice);
-    if (g_aot_rt.mapper.base && aot_vkGetPhysicalDeviceQueueFamilyProperties && pdev) {
+    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkGetPhysicalDeviceQueueFamilyProperties && pdev) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         pdev->initAotInternalLayout();
         g_aot_rt.cpu.x[0] = reinterpret_cast<uint64_t>(pdev->aot_internal);
@@ -1315,7 +1415,7 @@ void vkGetPhysicalDeviceQueueFamilyProperties2(void* physicalDevice, uint32_t* p
     if (!pQueueFamilyPropertyCount) return;
     g_aot_rt.ensureInitialized();
     auto* pdev = static_cast<MaliIcdPhysicalDevice*>(physicalDevice);
-    if (g_aot_rt.mapper.base && aot_vkGetPhysicalDeviceQueueFamilyProperties2 && pdev) {
+    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkGetPhysicalDeviceQueueFamilyProperties2 && pdev) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         pdev->initAotInternalLayout();
         g_aot_rt.cpu.x[0] = reinterpret_cast<uint64_t>(pdev->aot_internal);
@@ -1338,7 +1438,7 @@ void vkGetPhysicalDeviceMemoryProperties(void* physicalDevice, void* pMemoryProp
     if (!pMemoryProperties) return;
     g_aot_rt.ensureInitialized();
     auto* pdev = static_cast<MaliIcdPhysicalDevice*>(physicalDevice);
-    if (g_aot_rt.mapper.base && aot_vkGetPhysicalDeviceMemoryProperties && pdev) {
+    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkGetPhysicalDeviceMemoryProperties && pdev) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         pdev->initAotInternalLayout();
         g_aot_rt.cpu.x[0] = reinterpret_cast<uint64_t>(pdev->aot_internal);
@@ -1469,7 +1569,7 @@ int32_t vkEnumerateDeviceExtensionProperties(void* physicalDevice, const char* p
     auto* pdev = static_cast<MaliIcdPhysicalDevice*>(physicalDevice);
 
     std::vector<VkExtensionPropertiesIcd> exts;
-    if (g_aot_rt.mapper.base && aot_vkEnumerateDeviceExtensionProperties && pdev && (!pLayerName || pLayerName[0] == '\0')) {
+    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkEnumerateDeviceExtensionProperties && pdev && (!pLayerName || pLayerName[0] == '\0')) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         pdev->initAotInternalLayout();
         uint32_t aot_count = 0;
@@ -2336,7 +2436,7 @@ __attribute__((visibility("default")))
 void vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount,
                uint32_t /*firstVertex*/, uint32_t firstInstance) {
     static uint32_t s_auto_draw_frame = 0;
-    uint32_t inst = (firstInstance == 0 && vertexCount == 36) ? (s_auto_draw_frame++) : firstInstance;
+    uint32_t inst = (firstInstance == 0 && vertexCount >= 3) ? (s_auto_draw_frame++) : firstInstance;
     vkCmdDrawIndexed(commandBuffer, vertexCount, instanceCount, 0, 0, inst);
 }
 
@@ -2641,19 +2741,35 @@ struct MaliIcdSurface {
     void*    xcb_conn   = nullptr;
     uint32_t xcb_window = 0;
     uint8_t  xcb_depth  = 24;
+    bool     is_wayland = false;
 };
 
-// Unwrap either our own MaliIcdSurface* OR Khronos loader's VkIcdSurfaceXcb* / VkIcdSurfaceXlib*
-// (When the Khronos Vulkan Loader's WSI layer handles vkCreateXcbSurfaceKHR, it passes a pointer to
-//  VkIcdSurfaceXcb { VkIcdSurfaceBase base (platform=3); xcb_connection_t* connection (+8); xcb_window_t window (+16); }!)
+static void* xlibDisplayToXcbConnection(void* dpy) {
+    if (!dpy) return nullptr;
+    static void* s_x11_xcb = nullptr;
+    typedef void* (*pfn_XGetXCBConnection)(void*);
+    static pfn_XGetXCBConnection s_fn = nullptr;
+    if (!s_fn) {
+        s_x11_xcb = dlopen("libX11-xcb.so.1", RTLD_LAZY | RTLD_LOCAL);
+        if (!s_x11_xcb) s_x11_xcb = dlopen("libX11-xcb.so", RTLD_LAZY | RTLD_LOCAL);
+        if (s_x11_xcb)
+            s_fn = reinterpret_cast<pfn_XGetXCBConnection>(dlsym(s_x11_xcb, "XGetXCBConnection"));
+    }
+    return s_fn ? s_fn(dpy) : nullptr;
+}
+
+// Unwrap either our own MaliIcdSurface* OR Khronos loader's VkIcdSurfaceXcb* (platform=3),
+// VkIcdSurfaceXlib* (platform=4), or VkIcdSurfaceWayland* (platform=1).
 static void resolveSurfaceInfo(uint64_t surface, uint32_t* out_w, uint32_t* out_h,
-                               void** out_xcb_conn, uint32_t* out_xcb_win, uint8_t* out_xcb_depth) {
+                               void** out_xcb_conn, uint32_t* out_xcb_win, uint8_t* out_xcb_depth,
+                               bool* out_is_wayland = nullptr) {
     uint32_t default_dim = (getenv("MALI_VKCUBE_HIRES") != nullptr) ? 500U : 64U;
     if (out_w) *out_w = default_dim;
     if (out_h) *out_h = default_dim;
-    if (out_xcb_conn)  *out_xcb_conn = nullptr;
-    if (out_xcb_win)   *out_xcb_win = 0;
-    if (out_xcb_depth) *out_xcb_depth = 24;
+    if (out_xcb_conn)   *out_xcb_conn = nullptr;
+    if (out_xcb_win)    *out_xcb_win = 0;
+    if (out_xcb_depth)  *out_xcb_depth = 24;
+    if (out_is_wayland) *out_is_wayland = false;
     if (!surface) return;
 
     const uint64_t* ptr64 = reinterpret_cast<const uint64_t*>(surface);
@@ -2666,18 +2782,18 @@ static void resolveSurfaceInfo(uint64_t surface, uint32_t* out_w, uint32_t* out_
         }
         if (out_w) *out_w = w;
         if (out_h) *out_h = h;
-        if (out_xcb_conn)  *out_xcb_conn = ms->xcb_conn;
-        if (out_xcb_win)   *out_xcb_win = ms->xcb_window;
-        if (out_xcb_depth) *out_xcb_depth = depth;
+        if (out_xcb_conn)   *out_xcb_conn = ms->xcb_conn;
+        if (out_xcb_win)    *out_xcb_win = ms->xcb_window;
+        if (out_xcb_depth)  *out_xcb_depth = depth;
+        if (out_is_wayland) *out_is_wayland = ms->is_wayland;
         return;
     }
 
-    // Check VkIcdSurfaceBase::platform (3 = VK_ICD_WSI_PLATFORM_XCB)
     uint32_t platform = *reinterpret_cast<const uint32_t*>(surface);
-    if (platform == 3U) {
+    if (platform == 3U) { // VK_ICD_WSI_PLATFORM_XCB
         void* conn = reinterpret_cast<void*>(ptr64[1]);
         uint32_t win = *reinterpret_cast<const uint32_t*>(surface + 16);
-        uint32_t w = 500U, h = 500U;
+        uint32_t w = 300U, h = 300U;
         uint8_t depth = 24U;
         g_xcb_lib.queryWindowGeometry(conn, win, &w, &h, &depth);
         if (out_w) *out_w = w;
@@ -2685,6 +2801,23 @@ static void resolveSurfaceInfo(uint64_t surface, uint32_t* out_w, uint32_t* out_
         if (out_xcb_conn)  *out_xcb_conn = conn;
         if (out_xcb_win)   *out_xcb_win = win;
         if (out_xcb_depth) *out_xcb_depth = depth;
+    } else if (platform == 4U) { // VK_ICD_WSI_PLATFORM_XLIB
+        void* dpy = reinterpret_cast<void*>(ptr64[1]);
+        uint32_t win = static_cast<uint32_t>(ptr64[2]);
+        void* conn = xlibDisplayToXcbConnection(dpy);
+        uint32_t w = 300U, h = 300U;
+        uint8_t depth = 24U;
+        if (conn && win)
+            g_xcb_lib.queryWindowGeometry(conn, win, &w, &h, &depth);
+        if (out_w) *out_w = w;
+        if (out_h) *out_h = h;
+        if (out_xcb_conn)  *out_xcb_conn = conn;
+        if (out_xcb_win)   *out_xcb_win = win;
+        if (out_xcb_depth) *out_xcb_depth = depth;
+    } else if (platform == 1U) { // VK_ICD_WSI_PLATFORM_WAYLAND
+        if (out_w) *out_w = 300U;
+        if (out_h) *out_h = 300U;
+        if (out_is_wayland) *out_is_wayland = true;
     }
 }
 
@@ -2918,13 +3051,40 @@ int32_t vkCreateXcbSurfaceKHR(void* /*instance*/, const void* pCreateInfo, const
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateXlibSurfaceKHR(void* instance, const void* pCreateInfo, const void* pAllocator, uint64_t* pSurface) {
-    return vkCreateHeadlessSurfaceEXT(instance, pCreateInfo, pAllocator, pSurface);
+int32_t vkCreateXlibSurfaceKHR(void* /*instance*/, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pSurface) {
+    if (!pSurface) return -3;
+    auto* surf = new MaliIcdSurface();
+    if (pCreateInfo) {
+        struct VkXlibSurfaceCreateInfoKHR_Icd {
+            uint32_t sType; const void* pNext; uint32_t flags; void* dpy; unsigned long window;
+        };
+        const auto* xci = static_cast<const VkXlibSurfaceCreateInfoKHR_Icd*>(pCreateInfo);
+        surf->xcb_conn   = xlibDisplayToXcbConnection(xci->dpy);
+        surf->xcb_window = static_cast<uint32_t>(xci->window);
+        uint32_t w = 300U, h = 300U;
+        uint8_t depth = 24U;
+        if (g_xcb_lib.queryWindowGeometry(surf->xcb_conn, surf->xcb_window, &w, &h, &depth)) {
+            surf->width     = w;
+            surf->height    = h;
+            surf->xcb_depth = depth;
+        }
+    }
+    mali_icd_log("vkCreateXlibSurfaceKHR -> surface=%p xcb_conn=%p win=0x%x (%ux%u)",
+                 static_cast<void*>(surf), surf->xcb_conn, surf->xcb_window, surf->width, surf->height);
+    *pSurface = reinterpret_cast<uint64_t>(surf);
+    return 0;
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateWaylandSurfaceKHR(void* instance, const void* pCreateInfo, const void* pAllocator, uint64_t* pSurface) {
-    return vkCreateHeadlessSurfaceEXT(instance, pCreateInfo, pAllocator, pSurface);
+int32_t vkCreateWaylandSurfaceKHR(void* /*instance*/, const void* /*pCreateInfo*/, const void* /*pAllocator*/, uint64_t* pSurface) {
+    if (!pSurface) return -3;
+    auto* surf = new MaliIcdSurface();
+    surf->width      = 300U;
+    surf->height     = 300U;
+    surf->is_wayland = true;
+    mali_icd_log("vkCreateWaylandSurfaceKHR -> surface=%p (wayland mode)", static_cast<void*>(surf));
+    *pSurface = reinterpret_cast<uint64_t>(surf);
+    return 0;
 }
 
 __attribute__((visibility("default")))
@@ -2962,7 +3122,10 @@ __attribute__((visibility("default")))
 int32_t vkGetPhysicalDeviceSurfaceCapabilitiesKHR(void* /*physicalDevice*/, uint64_t surface, void* pSurfaceCapabilities) {
     if (!pSurfaceCapabilities) return -3;
     uint32_t w = 64U, h = 64U;
-    resolveSurfaceInfo(surface, &w, &h, nullptr, nullptr, nullptr);
+    bool is_wayland = false;
+    resolveSurfaceInfo(surface, &w, &h, nullptr, nullptr, nullptr, &is_wayland);
+    mali_icd_log("vkGetPhysicalDeviceSurfaceCapabilitiesKHR(surface=0x%lx) -> %ux%u (is_wayland=%d)",
+                 static_cast<unsigned long>(surface), w, h, is_wayland ? 1 : 0);
     struct SurfCaps {
         uint32_t minImageCount, maxImageCount;
         uint32_t currentExtent[2], minImageExtent[2], maxImageExtent[2];
@@ -3075,6 +3238,9 @@ int32_t vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const void* 
         img->bound_gpu_va = w_gpu_va;
         sc->images.push_back(img);
     }
+    mali_icd_log("vkCreateSwapchainKHR -> swapchain=%p extent=%ux%u format=%u images=%u xcb_conn=%p xcb_win=0x%x",
+                 static_cast<void*>(sc), sc->width, sc->height, sc->format,
+                 static_cast<unsigned>(sc->images.size()), sc->xcb_conn, sc->xcb_window);
     *pSwapchain = reinterpret_cast<uint64_t>(sc);
     return 0;
 }
@@ -3200,6 +3366,12 @@ int32_t vkQueuePresentKHR(void* /*queue*/, const void* pPresentInfo) {
         }
         if (pi->pResults) pi->pResults[i] = 0;
     }
+    static uint64_t s_total_presents = 0;
+    ++s_total_presents;
+    if (s_total_presents <= 5 || (s_total_presents % 100) == 0) {
+        mali_icd_log("vkQueuePresentKHR frame=%lu swapchains=%u",
+                     static_cast<unsigned long>(s_total_presents), pi->swapchainCount);
+    }
     return 0;
 }
 
@@ -3208,6 +3380,54 @@ int32_t vkQueueWaitIdle(void* /*queue*/) { return 0; }
 
 __attribute__((visibility("default")))
 int32_t vkDeviceWaitIdle(void* /*device*/) { return 0; }
+
+
+__attribute__((visibility("default")))
+void vkCmdClearAttachments(void* /*commandBuffer*/, uint32_t /*attachmentCount*/, const void* /*pAttachments*/, uint32_t /*rectCount*/, const void* /*pRects*/) {}
+__attribute__((visibility("default")))
+void vkCmdClearColorImage(void* /*commandBuffer*/, uint64_t /*image*/, uint32_t /*imageLayout*/, const void* /*pColor*/, uint32_t /*rangeCount*/, const void* /*pRanges*/) {}
+__attribute__((visibility("default")))
+void vkCmdClearDepthStencilImage(void* /*commandBuffer*/, uint64_t /*image*/, uint32_t /*imageLayout*/, const void* /*pDepthStencil*/, uint32_t /*rangeCount*/, const void* /*pRanges*/) {}
+__attribute__((visibility("default")))
+void vkCmdExecuteCommands(void* /*commandBuffer*/, uint32_t /*commandBufferCount*/, void* const* /*pCommandBuffers*/) {}
+__attribute__((visibility("default")))
+void vkCmdNextSubpass(void* /*commandBuffer*/, uint32_t /*contents*/) {}
+__attribute__((visibility("default")))
+int32_t vkCreateEvent(void* /*device*/, const void* /*pCreateInfo*/, const void* /*pAllocator*/, uint64_t* pEvent) { if (pEvent) *pEvent = 0xE7000001ULL; return 0; }
+__attribute__((visibility("default")))
+void vkDestroyEvent(void* /*device*/, uint64_t /*event*/, const void* /*pAllocator*/) {}
+__attribute__((visibility("default")))
+int32_t vkGetEventStatus(void* /*device*/, uint64_t /*event*/) { return 0; }
+__attribute__((visibility("default")))
+int32_t vkSetEvent(void* /*device*/, uint64_t /*event*/) { return 0; }
+__attribute__((visibility("default")))
+int32_t vkResetEvent(void* /*device*/, uint64_t /*event*/) { return 0; }
+__attribute__((visibility("default")))
+void vkCmdSetEvent(void* /*commandBuffer*/, uint64_t /*event*/, uint32_t /*stageMask*/) {}
+__attribute__((visibility("default")))
+void vkCmdResetEvent(void* /*commandBuffer*/, uint64_t /*event*/, uint32_t /*stageMask*/) {}
+__attribute__((visibility("default")))
+void vkCmdWaitEvents(void* /*commandBuffer*/, uint32_t /*eventCount*/, const uint64_t* /*pEvents*/, uint32_t /*srcStageMask*/, uint32_t /*dstStageMask*/, uint32_t /*memoryBarrierCount*/, const void* /*pMemoryBarriers*/, uint32_t /*bufferMemoryBarrierCount*/, const void* /*pBufferMemoryBarriers*/, uint32_t /*imageMemoryBarrierCount*/, const void* /*pImageMemoryBarriers*/) {}
+__attribute__((visibility("default")))
+int32_t vkGetPhysicalDeviceSurfaceCapabilities2KHR(void* physicalDevice, const void* pSurfaceInfo, void* pSurfaceCapabilities) {
+    if (!pSurfaceInfo || !pSurfaceCapabilities) return -3;
+    uint64_t surf = *reinterpret_cast<const uint64_t*>(static_cast<const uint8_t*>(pSurfaceInfo) + 16);
+    return vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, surf, static_cast<uint8_t*>(pSurfaceCapabilities) + 16);
+}
+__attribute__((visibility("default")))
+int32_t vkGetPhysicalDeviceSurfaceFormats2KHR(void* physicalDevice, const void* pSurfaceInfo, uint32_t* pSurfaceFormatCount, void* pSurfaceFormats) {
+    if (!pSurfaceInfo || !pSurfaceFormatCount) return -3;
+    uint64_t surf = *reinterpret_cast<const uint64_t*>(static_cast<const uint8_t*>(pSurfaceInfo) + 16);
+    if (!pSurfaceFormats)
+        return vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surf, pSurfaceFormatCount, nullptr);
+    struct Fmt2 { uint32_t sType; void* pNext; uint32_t format; uint32_t colorSpace; };
+    auto* out = static_cast<Fmt2*>(pSurfaceFormats);
+    uint32_t n = std::min<uint32_t>(*pSurfaceFormatCount, 2U);
+    if (n >= 1) { out[0].format = 37U; out[0].colorSpace = 0U; }
+    if (n >= 2) { out[1].format = 44U; out[1].colorSpace = 0U; }
+    *pSurfaceFormatCount = n;
+    return (n < 2U) ? 5 : 0;
+}
 
 typedef void (*PFN_vkVoidFunction)(void);
 
@@ -3309,8 +3529,33 @@ PFN_vkVoidFunction vkGetDeviceProcAddr(void* /*device*/, const char* pName) {
     if (std::strcmp(pName, "vkAcquireNextImageKHR") == 0)       return reinterpret_cast<PFN_vkVoidFunction>(&vkAcquireNextImageKHR);
     if (std::strcmp(pName, "vkAcquireNextImage2KHR") == 0)      return reinterpret_cast<PFN_vkVoidFunction>(&vkAcquireNextImage2KHR);
     if (std::strcmp(pName, "vkQueuePresentKHR") == 0)           return reinterpret_cast<PFN_vkVoidFunction>(&vkQueuePresentKHR);
+    if (std::strcmp(pName, "vkCmdClearAttachments") == 0)       return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdClearAttachments);
+    if (std::strcmp(pName, "vkCmdClearColorImage") == 0)        return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdClearColorImage);
+    if (std::strcmp(pName, "vkCmdClearDepthStencilImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdClearDepthStencilImage);
+    if (std::strcmp(pName, "vkCmdExecuteCommands") == 0)        return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdExecuteCommands);
+    if (std::strcmp(pName, "vkCmdNextSubpass") == 0)            return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdNextSubpass);
+    if (std::strcmp(pName, "vkCreateEvent") == 0)               return reinterpret_cast<PFN_vkVoidFunction>(&vkCreateEvent);
+    if (std::strcmp(pName, "vkDestroyEvent") == 0)              return reinterpret_cast<PFN_vkVoidFunction>(&vkDestroyEvent);
+    if (std::strcmp(pName, "vkGetEventStatus") == 0)            return reinterpret_cast<PFN_vkVoidFunction>(&vkGetEventStatus);
+    if (std::strcmp(pName, "vkSetEvent") == 0)                  return reinterpret_cast<PFN_vkVoidFunction>(&vkSetEvent);
+    if (std::strcmp(pName, "vkResetEvent") == 0)                return reinterpret_cast<PFN_vkVoidFunction>(&vkResetEvent);
+    if (std::strcmp(pName, "vkCmdSetEvent") == 0)               return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdSetEvent);
+    if (std::strcmp(pName, "vkCmdResetEvent") == 0)             return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdResetEvent);
+    if (std::strcmp(pName, "vkCmdWaitEvents") == 0)             return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdWaitEvents);
+    if (std::strcmp(pName, "vkCmdSetBlendConstants") == 0)      return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdSetViewport);
+    if (std::strcmp(pName, "vkCmdSetDepthBias") == 0)           return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdSetViewport);
+    if (std::strcmp(pName, "vkCmdSetDepthBounds") == 0)         return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdSetViewport);
+    if (std::strcmp(pName, "vkCmdSetLineWidth") == 0)           return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdSetViewport);
+    if (std::strcmp(pName, "vkCmdSetStencilCompareMask") == 0)  return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdSetViewport);
+    if (std::strcmp(pName, "vkCmdSetStencilReference") == 0)    return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdSetViewport);
+    if (std::strcmp(pName, "vkCmdSetStencilWriteMask") == 0)    return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdSetViewport);
+    mali_icd_log("vkGetDeviceProcAddr: unimplemented symbol '%s'", pName);
     return nullptr;
 }
+
+__attribute__((visibility("default"))) PFN_vkVoidFunction vk_icdGetInstanceProcAddr(void* instance, const char* pName);
+__attribute__((visibility("default"))) PFN_vkVoidFunction vk_icdGetPhysicalDeviceProcAddr(void* instance, const char* pName);
+__attribute__((visibility("default"))) int32_t vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t* pSupportedVersion);
 
 __attribute__((visibility("default")))
 PFN_vkVoidFunction vkGetInstanceProcAddr(void* instance, const char* pName) {
@@ -3378,6 +3623,11 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(void* instance, const char* pName) {
     if (std::strcmp(pName, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
     if (std::strcmp(pName, "vkGetPhysicalDeviceSurfaceFormatsKHR") == 0)   return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceSurfaceFormatsKHR);
     if (std::strcmp(pName, "vkGetPhysicalDeviceSurfacePresentModesKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceSurfacePresentModesKHR);
+    if (std::strcmp(pName, "vkGetPhysicalDeviceSurfaceCapabilities2KHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceSurfaceCapabilities2KHR);
+    if (std::strcmp(pName, "vkGetPhysicalDeviceSurfaceFormats2KHR") == 0)   return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceSurfaceFormats2KHR);
+    if (std::strcmp(pName, "vk_icdNegotiateLoaderICDInterfaceVersion") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vk_icdNegotiateLoaderICDInterfaceVersion);
+    if (std::strcmp(pName, "vk_icdGetInstanceProcAddr") == 0)               return reinterpret_cast<PFN_vkVoidFunction>(&vk_icdGetInstanceProcAddr);
+    if (std::strcmp(pName, "vk_icdGetPhysicalDeviceProcAddr") == 0)         return reinterpret_cast<PFN_vkVoidFunction>(&vk_icdGetPhysicalDeviceProcAddr);
     return vkGetDeviceProcAddr(instance, pName);
 }
 

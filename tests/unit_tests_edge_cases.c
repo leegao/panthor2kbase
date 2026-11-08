@@ -579,6 +579,19 @@ static void test_ringbuffer_multi_wrap_600_jobs(void)
       assert(drmSyncobjTimelineWait(drm_fd, &sync_handle, &pt, 1, 100000000ULL, 0, NULL) == 0);
    }
 
+   /* Verify telemetry snapshot counters (total submits, jobs, seqno, wraps, and fast-spin waits) */
+   struct adapter_telemetry_snapshot snap;
+   memset(&snap, 0, sizeof(snap));
+   panthor_kbase_get_telemetry_snapshot(&snap);
+   assert(snap.total_group_submits >= 600ULL);
+   assert(snap.total_subqueue_jobs[0] == 600ULL);
+   assert(snap.completed_subqueue_seqno[0] == 600ULL);
+   assert(snap.ring_wraps[0] >= 2ULL);
+   assert(snap.total_syncobj_waits >= 600ULL);
+   assert(snap.fast_spin_syncobj_waits > 0ULL);
+   assert(snap.active_bos >= 1U);
+   assert(snap.active_syncobjs >= 1U);
+
    /* Also verify panthor_kbase_dump_csf_diagnostics outputs the flight recorder cleanly */
    panthor_kbase_dump_csf_diagnostics("unit_test_600_jobs_wrap_verification");
 

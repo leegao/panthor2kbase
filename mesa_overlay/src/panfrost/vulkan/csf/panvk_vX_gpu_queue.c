@@ -1097,18 +1097,36 @@ panvk_queue_submit_init_cmdbufs(struct panvk_queue_submit *submit,
 
       uint32_t flush_id = panthor_kmod_get_flush_id(dev->kmod.dev);
 
+      bool flushed_late_cs = false;
       for (uint32_t j = 0; j < ARRAY_SIZE(cmdbuf->state.cs); j++) {
          struct cs_builder *b = panvk_get_cs_builder(cmdbuf, j);
-         if (cs_is_empty(b))
+         if (unlikely(b->cur_chunk.buffer.cpu != NULL ||
+                      b->cur_chunk.buffer.gpu != 0 ||
+                      b->cur_chunk.pos != 0 ||
+                      b->blocks.stack != NULL ||
+                      b->blocks.instrs.size != 0)) {
+            cs_end(b);
+            flushed_late_cs = true;
+         }
+         if (!cs_is_valid(b) || cs_is_empty(b))
+            continue;
+
+         uint32_t stream_sz = cs_root_chunk_size(b);
+         uint64_t stream_va = cs_root_chunk_gpu_addr(b);
+         if (stream_sz == 0 || stream_va == 0)
             continue;
 
          submit->qsubmits[submit->qsubmit_count++] =
             (struct drm_panthor_queue_submit){
                .queue_index = j,
-               .stream_size = cs_root_chunk_size(b),
-               .stream_addr = cs_root_chunk_gpu_addr(b),
+               .stream_size = stream_sz,
+               .stream_addr = stream_va,
                .latest_flush = flush_id,
             };
+      }
+      if (unlikely(flushed_late_cs)) {
+         panvk_pool_flush_maps(&cmdbuf->cs_pool);
+         panvk_pool_flush_maps(&cmdbuf->desc_pool);
       }
 
       if (util_bitcount(submit->utrace.queue_mask) > 0)

@@ -14,6 +14,43 @@ if [ ! -f "$SO_PATH" ]; then
     exit 1
 fi
 
+# Auto-detect installed host libLLVM shared library across Arch, Ubuntu, Debian, Fedora (LLVM 14..22+)
+detect_host_libllvm() {
+    if [ -n "${MALI_HOST_LIBLLVM:-}" ] && [ -f "${MALI_HOST_LIBLLVM}" ]; then
+        echo "${MALI_HOST_LIBLLVM}"
+        return 0
+    fi
+    for cfg in llvm-config llvm-config-22 llvm-config-21 llvm-config-20 llvm-config-19 llvm-config-18 llvm-config-17 llvm-config-16 llvm-config-15 llvm-config-14; do
+        if command -v "$cfg" >/dev/null 2>&1; then
+            local libdir
+            libdir="$("$cfg" --libdir 2>/dev/null || true)"
+            if [ -n "$libdir" ] && [ -d "$libdir" ]; then
+                local found
+                found="$(ls -1 "$libdir"/libLLVM*.so* 2>/dev/null | head -n 1 || true)"
+                if [ -n "$found" ]; then
+                    echo "$found"
+                    return 0
+                fi
+            fi
+        fi
+    done
+    local cand
+    cand="$(ls -1 /usr/lib/libLLVM*.so* /usr/lib64/libLLVM*.so* /usr/lib/x86_64-linux-gnu/libLLVM*.so* /usr/lib/llvm-*/lib/libLLVM*.so* 2>/dev/null | sort -V | tail -n 1 || true)"
+    if [ -n "$cand" ]; then
+        echo "$cand"
+        return 0
+    fi
+    return 1
+}
+
+HOST_LIBLLVM="$(detect_host_libllvm || true)"
+if [ -n "$HOST_LIBLLVM" ]; then
+    export MALI_HOST_LIBLLVM="$HOST_LIBLLVM"
+    echo "[LLVM] Auto-detected host LLVM library: $MALI_HOST_LIBLLVM"
+else
+    echo "[WARN] No host libLLVM*.so* detected in standard paths; mali_llvm_pass_driver will probe via dlopen()."
+fi
+
 # Verify ELF64 EM_AARCH64 and extract unique <driver_version>-<build_id_short> tag
 ELF_TAG="$(python3 -c '
 import struct, re, sys
@@ -47,19 +84,24 @@ OUT_DIR="${2:-$ROOT_DIR/build/$ELF_TAG}"
 mkdir -p "$OUT_DIR" "$ROOT_DIR/bin"
 
 PASS_DRIVER="$ROOT_DIR/bin/mali_llvm_pass_driver"
+NEEDS_REBUILD=0
 if [ ! -x "$PASS_DRIVER" ] || [ "$ROOT_DIR/src/mali_llvm_passes.cpp" -nt "$PASS_DRIVER" ]; then
-    LIB_LLVM="$(ls /usr/lib/x86_64-linux-gnu/libLLVM-*.so.1 -1 | head -1)"
+    NEEDS_REBUILD=1
+elif ldd "$PASS_DRIVER" 2>/dev/null | grep -q "not found"; then
+    echo "[Build] Existing $PASS_DRIVER has missing shared library dependencies on this host; rebuilding..."
+    NEEDS_REBUILD=1
+fi
+
+if [ "$NEEDS_REBUILD" -eq 1 ]; then
     echo "[Build] Compiling 6-Pass C++ LLVM Lifter & Lowerer (src/mali_llvm_passes.cpp -> bin/mali_llvm_pass_driver)..."
-    g++ -O3 "$ROOT_DIR/src/mali_llvm_passes.cpp" \
-        $LIB_LLVM \
-        -Wl,-rpath,/usr/lib/x86_64-linux-gnu \
-        -o "$PASS_DRIVER"
+    g++ -O3 "$ROOT_DIR/src/mali_llvm_passes.cpp" -ldl -o "$PASS_DRIVER"
 fi
 
 echo "================================================================================"
 echo " Mali 64-Bit AArch64 -> x86-64 Linux C++ LLVM 6-Pass AOT Translation Pipeline"
 echo " Input Binary   : $SO_PATH"
 echo " Driver Build   : $ELF_TAG (64-bit ELF64 EM_AARCH64)"
+echo " Host libLLVM   : ${MALI_HOST_LIBLLVM:-dynamic dlopen}"
 echo " Output Dir     : $OUT_DIR"
 echo "================================================================================"
 
@@ -83,4 +125,5 @@ echo "   Unoptimized IR : $OUT_DIR/mali_mbs2_unopt.ll"
 echo "   Optimized IR   : $OUT_DIR/mali_mbs2_opt.ll"
 echo "   x86-64 Object  : $OUT_DIR/mali_mbs2_aot.o"
 echo "   Runner Binary  : $OUT_DIR/mali_aot_runner"
+echo "   Vulkan ICD     : $OUT_DIR/libvulkan_mali_aot_icd.so"
 echo "================================================================================"

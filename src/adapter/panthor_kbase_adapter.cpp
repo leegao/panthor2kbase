@@ -239,6 +239,7 @@ struct adapter_subqueue {
    void *user_io_ptr; /* 3 * 4096 bytes: page 0 Doorbell, page 1 Input, page 2 Output */
    uint64_t insert_offset;
    uint64_t emitted_jobs;
+   uint64_t ring_wraps;
    uint64_t seqno_gpu_va;
    volatile uint64_t *seqno_cpu_ptr;
    uint64_t diag_gpu_va;
@@ -322,6 +323,35 @@ struct adapter_ctx {
    uint32_t next_group_handle;
    uint32_t next_heap_handle;
 
+   uint32_t max_bo_slot_used;
+   uint32_t bo_alloc_cursor;
+   uint32_t max_syncobj_slot_used;
+   uint32_t syncobj_alloc_cursor;
+
+   /* Cumulative & Windowed Telemetry Counters */
+   uint64_t total_group_submits;
+   uint64_t total_syncobj_waits;
+   uint64_t fast_spin_syncobj_waits;
+   uint64_t poll_sleep_syncobj_waits;
+   uint64_t window_start_ns;
+   uint64_t window_submits;
+   uint64_t window_submit_ns_sum;
+   uint64_t window_submit_ns_max;
+   uint64_t window_cs_norm_ns_sum;
+   uint64_t window_cache_clean_ns_sum;
+   uint64_t window_kick_ns_sum;
+   uint64_t window_sync_waits;
+   uint64_t window_sync_wait_ns_sum;
+   uint64_t window_sync_wait_ns_max;
+   double   last_window_fps;
+   double   last_avg_submit_us;
+   double   last_max_submit_us;
+   double   last_avg_cs_norm_us;
+   double   last_avg_cache_clean_us;
+   double   last_avg_kick_us;
+   double   last_avg_sync_wait_us;
+   double   last_max_sync_wait_us;
+
    struct adapter_bo bos[ADAPTER_MAX_BOS];
    struct adapter_syncobj syncobjs[ADAPTER_MAX_SYNCOBJS];
    struct adapter_group groups[ADAPTER_MAX_GROUPS];
@@ -392,7 +422,15 @@ static bool unregister_virtual_fd_locked(int fd)
 
 static struct adapter_bo *find_bo(uint32_t handle)
 {
-   for (size_t i = 0; i < ADAPTER_MAX_BOS; i++) {
+   if (handle == 0)
+      return nullptr;
+   size_t direct_idx = static_cast<size_t>((handle - 1U) % ADAPTER_MAX_BOS);
+   if (g_ctx.bos[direct_idx].in_use && g_ctx.bos[direct_idx].gem_handle == handle)
+      return &g_ctx.bos[direct_idx];
+   size_t limit = g_ctx.max_bo_slot_used ? g_ctx.max_bo_slot_used : ADAPTER_MAX_BOS;
+   if (limit > ADAPTER_MAX_BOS)
+      limit = ADAPTER_MAX_BOS;
+   for (size_t i = 0; i < limit; i++) {
       if (g_ctx.bos[i].in_use && g_ctx.bos[i].gem_handle == handle)
          return &g_ctx.bos[i];
    }
@@ -403,7 +441,10 @@ static struct adapter_bo *find_bo_by_va(uint64_t va)
 {
    if (va == 0)
       return nullptr;
-   for (size_t i = 0; i < ADAPTER_MAX_BOS; i++) {
+   size_t limit = g_ctx.max_bo_slot_used ? g_ctx.max_bo_slot_used : ADAPTER_MAX_BOS;
+   if (limit > ADAPTER_MAX_BOS)
+      limit = ADAPTER_MAX_BOS;
+   for (size_t i = 0; i < limit; i++) {
       if (g_ctx.bos[i].in_use) {
          if (g_ctx.bos[i].gpu_va != 0 &&
              va >= g_ctx.bos[i].gpu_va &&
@@ -442,7 +483,15 @@ static void *resolve_gpu_va_to_cpu(uint64_t va, size_t min_bytes)
 
 static struct adapter_syncobj *find_syncobj(uint32_t handle)
 {
-   for (size_t i = 0; i < ADAPTER_MAX_SYNCOBJS; i++) {
+   if (handle == 0)
+      return nullptr;
+   size_t direct_idx = static_cast<size_t>((handle - 1U) % ADAPTER_MAX_SYNCOBJS);
+   if (g_ctx.syncobjs[direct_idx].in_use && g_ctx.syncobjs[direct_idx].handle == handle)
+      return &g_ctx.syncobjs[direct_idx];
+   size_t limit = g_ctx.max_syncobj_slot_used ? g_ctx.max_syncobj_slot_used : ADAPTER_MAX_SYNCOBJS;
+   if (limit > ADAPTER_MAX_SYNCOBJS)
+      limit = ADAPTER_MAX_SYNCOBJS;
+   for (size_t i = 0; i < limit; i++) {
       if (g_ctx.syncobjs[i].in_use && g_ctx.syncobjs[i].handle == handle)
          return &g_ctx.syncobjs[i];
    }
@@ -1502,7 +1551,68 @@ void panthor_kbase_dump_csf_diagnostics(const char *reason)
          }
       }
    }
+   LOG_WARN("  Telemetry: submits=%llu waits=%llu(fast=%llu,poll=%llu) fps=%.1f submit_us(avg=%.1f,max=%.1f) wait_us(avg=%.1f,max=%.1f)",
+            static_cast<unsigned long long>(g_ctx.total_group_submits),
+            static_cast<unsigned long long>(g_ctx.total_syncobj_waits),
+            static_cast<unsigned long long>(g_ctx.fast_spin_syncobj_waits),
+            static_cast<unsigned long long>(g_ctx.poll_sleep_syncobj_waits),
+            g_ctx.last_window_fps,
+            g_ctx.last_avg_submit_us, g_ctx.last_max_submit_us,
+            g_ctx.last_avg_sync_wait_us, g_ctx.last_max_sync_wait_us);
    LOG_WARN("================================================================================");
+   pthread_mutex_unlock(&g_lock);
+}
+
+void panthor_kbase_get_telemetry_snapshot(struct adapter_telemetry_snapshot *out)
+{
+   if (!out)
+      return;
+   pthread_mutex_lock(&g_lock);
+   memset(out, 0, sizeof(*out));
+   out->total_group_submits      = g_ctx.total_group_submits;
+   out->total_syncobj_waits      = g_ctx.total_syncobj_waits;
+   out->fast_spin_syncobj_waits  = g_ctx.fast_spin_syncobj_waits;
+   out->poll_sleep_syncobj_waits = g_ctx.poll_sleep_syncobj_waits;
+   out->window_fps               = g_ctx.last_window_fps;
+   out->avg_submit_us            = g_ctx.last_avg_submit_us;
+   out->max_submit_us            = g_ctx.last_max_submit_us;
+   out->avg_cs_norm_us           = g_ctx.last_avg_cs_norm_us;
+   out->avg_cache_clean_us       = g_ctx.last_avg_cache_clean_us;
+   out->avg_kick_us              = g_ctx.last_avg_kick_us;
+   out->avg_sync_wait_us         = g_ctx.last_avg_sync_wait_us;
+   out->max_sync_wait_us         = g_ctx.last_max_sync_wait_us;
+
+   size_t bo_limit = g_ctx.max_bo_slot_used ? g_ctx.max_bo_slot_used : ADAPTER_MAX_BOS;
+   if (bo_limit > ADAPTER_MAX_BOS)
+      bo_limit = ADAPTER_MAX_BOS;
+   for (size_t i = 0; i < bo_limit; i++) {
+      if (g_ctx.bos[i].in_use) {
+         out->active_bos++;
+         out->active_bo_bytes += g_ctx.bos[i].size;
+         if (g_ctx.bos[i].kbase_flags & BASE_MEM_CACHED_CPU)
+            out->cached_cpu_bos++;
+         if (g_ctx.bos[i].is_imported)
+            out->imported_bos++;
+      }
+   }
+   size_t so_limit = g_ctx.max_syncobj_slot_used ? g_ctx.max_syncobj_slot_used : ADAPTER_MAX_SYNCOBJS;
+   if (so_limit > ADAPTER_MAX_SYNCOBJS)
+      so_limit = ADAPTER_MAX_SYNCOBJS;
+   for (size_t i = 0; i < so_limit; i++) {
+      if (g_ctx.syncobjs[i].in_use)
+         out->active_syncobjs++;
+   }
+   for (size_t g = 0; g < ADAPTER_MAX_GROUPS; g++) {
+      if (!g_ctx.groups[g].in_use)
+         continue;
+      for (uint32_t q = 0; q < g_ctx.groups[g].queue_count && q < ADAPTER_MAX_SUBQUEUES; q++) {
+         const struct adapter_subqueue *sq = &g_ctx.groups[g].subqueues[q];
+         out->total_subqueue_jobs[q] += sq->emitted_jobs;
+         out->ring_wraps[q]          += sq->ring_wraps;
+         if (sq->seqno_cpu_ptr)
+            out->completed_subqueue_seqno[q] = *sq->seqno_cpu_ptr;
+      }
+   }
    pthread_mutex_unlock(&g_lock);
 }
 
@@ -2178,9 +2288,22 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
    unsigned int type = _IOC_TYPE(request);
    int ret = 0;
 
-   LOG_INFO("ioctl intercepted: req=%s(0x%lx) fd=%d nr=%u type=%c",
-            panthor2kbase_ioctl_req_name(request), request, fd, nr,
-            type ? static_cast<char>(type) : '?');
+   bool is_hot_ioctl = (type == 'd') &&
+      (nr == 0xbf || nr == 0xc0 || nr == 0xc3 || nr == 0xc4 || nr == 0xc5 ||
+       nr == 0xca || nr == 0xcb || nr == 0xcc || nr == 0xcd ||
+       nr == (DRM_COMMAND_BASE + DRM_PANTHOR_GROUP_SUBMIT) ||
+       nr == (DRM_COMMAND_BASE + DRM_PANTHOR_GROUP_GET_STATE) ||
+       nr == (DRM_COMMAND_BASE + DRM_PANTHOR_VM_GET_STATE) ||
+       nr == (DRM_COMMAND_BASE + DRM_PANTHOR_BO_SYNC));
+   if (is_hot_ioctl && g_ctx.total_group_submits >= 5ULL) {
+      LOG_DEBUG("ioctl intercepted: req=%s(0x%lx) fd=%d nr=%u type=%c",
+                panthor2kbase_ioctl_req_name(request), request, fd, nr,
+                type ? static_cast<char>(type) : '?');
+   } else {
+      LOG_INFO("ioctl intercepted: req=%s(0x%lx) fd=%d nr=%u type=%c",
+               panthor2kbase_ioctl_req_name(request), request, fd, nr,
+               type ? static_cast<char>(type) : '?');
+   }
    panthor2kbase_log_ioctl_struct_in(request, arg);
 
    if (type != 'd') {
@@ -2246,6 +2369,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                g_ctx.syncobjs[i].in_use = true;
                g_ctx.syncobjs[i].handle = g_ctx.next_syncobj_handle++;
                g_ctx.syncobjs[i].value = 1ULL;
+               if (i + 1 > g_ctx.max_syncobj_slot_used)
+                  g_ctx.max_syncobj_slot_used = static_cast<uint32_t>(i + 1);
                sh->handle = g_ctx.syncobjs[i].handle;
                break;
             }
@@ -2390,6 +2515,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
 
       for (size_t i = 0; i < ADAPTER_MAX_BOS; i++) {
          if (!g_ctx.bos[i].in_use) {
+            if (i + 1 > g_ctx.max_bo_slot_used)
+               g_ctx.max_bo_slot_used = static_cast<uint32_t>(i + 1);
             struct adapter_bo *bo = &g_ctx.bos[i];
             memset(bo, 0, sizeof(*bo));
             bo->in_use = true;
@@ -2420,8 +2547,13 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
    }
    case 0xbf: { /* DRM_IOCTL_SYNCOBJ_CREATE */
       auto *sc = static_cast<struct drm_syncobj_create *>(arg);
-      for (size_t i = 0; i < ADAPTER_MAX_SYNCOBJS; i++) {
+      uint32_t next_h = g_ctx.next_syncobj_handle ? g_ctx.next_syncobj_handle : 1U;
+      size_t pref_idx = static_cast<size_t>((next_h - 1U) % ADAPTER_MAX_SYNCOBJS);
+      for (size_t step = 0; step < ADAPTER_MAX_SYNCOBJS; step++) {
+         size_t i = (pref_idx + step) % ADAPTER_MAX_SYNCOBJS;
          if (!g_ctx.syncobjs[i].in_use) {
+            if (i + 1 > g_ctx.max_syncobj_slot_used)
+               g_ctx.max_syncobj_slot_used = static_cast<uint32_t>(i + 1);
             struct adapter_syncobj *so = &g_ctx.syncobjs[i];
             memset(so, 0, sizeof(*so));
             so->in_use = true;
@@ -2434,8 +2566,12 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                *so->cqs_cpu_ptr = so->value;
             }
             sc->handle = so->handle;
-            LOG_INFO("DRM_IOCTL_SYNCOBJ_CREATE -> handle=%u signaled=%d",
-                     so->handle, (so->value != 0));
+            if (g_ctx.total_group_submits < 5ULL)
+               LOG_INFO("DRM_IOCTL_SYNCOBJ_CREATE -> handle=%u signaled=%d",
+                        so->handle, (so->value != 0));
+            else
+               LOG_DEBUG("DRM_IOCTL_SYNCOBJ_CREATE -> handle=%u signaled=%d",
+                         so->handle, (so->value != 0));
             pthread_mutex_unlock(&g_lock);
             return 0;
          }
@@ -2450,7 +2586,10 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       struct adapter_syncobj *so = find_syncobj(sd->handle);
       if (so)
          memset(so, 0, sizeof(*so));
-      LOG_INFO("DRM_IOCTL_SYNCOBJ_DESTROY handle=%u", sd ? sd->handle : 0);
+      if (g_ctx.total_group_submits < 5ULL)
+         LOG_INFO("DRM_IOCTL_SYNCOBJ_DESTROY handle=%u", sd ? sd->handle : 0);
+      else
+         LOG_DEBUG("DRM_IOCTL_SYNCOBJ_DESTROY handle=%u", sd ? sd->handle : 0);
       pthread_mutex_unlock(&g_lock);
       return 0;
    }
@@ -2528,11 +2667,56 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                   caller_budget_ns = max_wait_ns;
             }
 
+            /* Phase 1: Fast spin-yield window (default 300 us, configurable via
+             * PANTHOR_ADAPTER_FAST_SPIN_US) so sub-millisecond GPU jobs (~150-250 us)
+             * do not immediately sleep for 1-3 ms inside poll(mali_fd, timeout=1ms)! */
+            static uint64_t fast_spin_budget_ns = UINT64_MAX;
+            if (fast_spin_budget_ns == UINT64_MAX) {
+               const char *fs_env = getenv("PANTHOR_ADAPTER_FAST_SPIN_US");
+               uint64_t us = (fs_env && *fs_env) ? strtoull(fs_env, nullptr, 0) : 300ULL;
+               fast_spin_budget_ns = us * 1000ULL;
+            }
+            bool used_poll_sleep = false;
+            uint32_t spin_iters = 0;
+            while (!check_all_done()) {
+               uint64_t now_ns = get_monotonic_ns();
+               uint64_t elapsed_ns = (now_ns >= start_ns) ? (now_ns - start_ns) : 0ULL;
+               if (elapsed_ns >= fast_spin_budget_ns || elapsed_ns >= caller_budget_ns)
+                  break;
+               int mfd = g_ctx.mali_fd;
+               pthread_mutex_unlock(&g_lock);
+               if ((++spin_iters & 7U) == 0U && mfd >= 0) {
+                  struct pollfd pfd = { .fd = mfd, .events = POLLIN, .revents = 0 };
+                  if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+                     uint8_t notif[64];
+                     ssize_t rlen = read(mfd, notif, sizeof(notif));
+                     pthread_mutex_lock(&g_lock);
+                     if (rlen >= static_cast<ssize_t>(sizeof(struct base_csf_notification)) &&
+                         handle_mali_csf_notification_locked(notif, rlen)) {
+                        pthread_mutex_unlock(&g_lock);
+                        panthor_kbase_dump_csf_diagnostics("CSF_NOTIFICATION_GPU_QUEUE_GROUP_ERROR");
+                        pthread_mutex_lock(&g_lock);
+                        break;
+                     }
+                     grp = find_group(target_grp_id);
+                     if (!grp)
+                        break;
+                     continue;
+                  }
+               }
+               usleep(10);
+               pthread_mutex_lock(&g_lock);
+               grp = find_group(target_grp_id);
+               if (!grp)
+                  break;
+            }
+
             uint64_t last_kick_ns = start_ns;
             uint64_t last_diag_ns = start_ns;
             bool dumped_stall = false;
 
-            while (!check_all_done()) {
+            while (grp && !check_all_done()) {
+               used_poll_sleep = true;
                uint64_t now_ns = get_monotonic_ns();
                uint64_t elapsed_ns = (now_ns >= start_ns) ? (now_ns - start_ns) : 0ULL;
 
@@ -2607,14 +2791,34 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                if (!grp)
                   break;
             }
+
+            uint64_t wait_done_ns = get_monotonic_ns();
+            uint64_t wait_dur_ns = (wait_done_ns >= start_ns) ? (wait_done_ns - start_ns) : 0ULL;
+            g_ctx.total_syncobj_waits++;
+            if (used_poll_sleep)
+               g_ctx.poll_sleep_syncobj_waits++;
+            else
+               g_ctx.fast_spin_syncobj_waits++;
+            g_ctx.window_sync_waits++;
+            g_ctx.window_sync_wait_ns_sum += wait_dur_ns;
+            if (wait_dur_ns > g_ctx.window_sync_wait_ns_max)
+               g_ctx.window_sync_wait_ns_max = wait_dur_ns;
+         } else {
+            g_ctx.total_syncobj_waits++;
+            g_ctx.fast_spin_syncobj_waits++;
          }
       }
 
-      /* Invalidate CPU cache on imported swapchain dma-buf BOs so WSI readback sees fresh GPU pixels */
+      /* Invalidate CPU cache on imported swapchain dma-buf BOs ONLY when we waited on a GPU group */
 #if defined(__aarch64__)
-      for (size_t b = 0; b < ADAPTER_MAX_BOS; b++) {
-         if (g_ctx.bos[b].in_use && g_ctx.bos[b].is_imported && g_ctx.bos[b].cpu_ptr)
-            kbase_cpu_cache_invalidate_range(g_ctx.bos[b].cpu_ptr, g_ctx.bos[b].cpu_size);
+      if (target_grp_id != 0) {
+         size_t bo_lim = g_ctx.max_bo_slot_used ? g_ctx.max_bo_slot_used : ADAPTER_MAX_BOS;
+         if (bo_lim > ADAPTER_MAX_BOS)
+            bo_lim = ADAPTER_MAX_BOS;
+         for (size_t b = 0; b < bo_lim; b++) {
+            if (g_ctx.bos[b].in_use && g_ctx.bos[b].is_imported && g_ctx.bos[b].cpu_ptr)
+               kbase_cpu_cache_invalidate_range(g_ctx.bos[b].cpu_ptr, g_ctx.bos[b].cpu_size);
+         }
       }
 #endif
       LOG_DEBUG("DRM_IOCTL_SYNCOBJ_WAIT/TIMELINE_WAIT count=%u -> OK", count_handles);
@@ -2899,8 +3103,13 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       memset(cpu, 0, static_cast<size_t>(aligned_sz));
 
       struct adapter_bo *bo = nullptr;
-      for (size_t i = 0; i < ADAPTER_MAX_BOS; i++) {
+      uint32_t next_bh = g_ctx.next_gem_handle ? g_ctx.next_gem_handle : 1U;
+      size_t pref_b = static_cast<size_t>((next_bh - 1U) % ADAPTER_MAX_BOS);
+      for (size_t step = 0; step < ADAPTER_MAX_BOS; step++) {
+         size_t i = (pref_b + step) % ADAPTER_MAX_BOS;
          if (!g_ctx.bos[i].in_use) {
+            if (i + 1 > g_ctx.max_bo_slot_used)
+               g_ctx.max_bo_slot_used = static_cast<uint32_t>(i + 1);
             bo = &g_ctx.bos[i];
             break;
          }
@@ -3451,18 +3660,46 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       auto *qsubs = reinterpret_cast<struct drm_panthor_queue_submit *>(
          static_cast<uintptr_t>(gs->queue_submits.array));
 
-      LOG_INFO("DRM_PANTHOR_GROUP_SUBMIT handle=%u queue_submits=%u",
-               grp->group_handle, gs->queue_submits.count);
+      uint64_t submit_t0_ns = get_monotonic_ns();
+      if (g_ctx.window_start_ns == 0ULL)
+         g_ctx.window_start_ns = submit_t0_ns;
 
-      /* Flush CPU caches for all writable BOs (including shaders and imported dma-bufs) before kicking GPU */
+      if (g_ctx.total_group_submits < 5ULL)
+         LOG_INFO("DRM_PANTHOR_GROUP_SUBMIT handle=%u queue_submits=%u",
+                  grp->group_handle, gs->queue_submits.count);
+      else
+         LOG_DEBUG("DRM_PANTHOR_GROUP_SUBMIT handle=%u queue_submits=%u",
+                   grp->group_handle, gs->queue_submits.count);
+
+      /* Flush CPU caches ONLY for CPU-cached (BASE_MEM_CACHED_CPU) writable BOs (or all BOs if
+       * PANTHOR_ADAPTER_FULL_BO_CACHE_CLEAN=1). Write-Combined BOs (!BASE_MEM_CACHED_CPU) only
+       * require a single dsb sy barrier to drain the CPU write-combine buffer! */
+      uint64_t clean_t0_ns = get_monotonic_ns();
 #if defined(__aarch64__)
-      for (size_t b = 0; b < ADAPTER_MAX_BOS; b++) {
-         if (g_ctx.bos[b].in_use && g_ctx.bos[b].cpu_ptr &&
-             g_ctx.bos[b].size <= (4U * 1024U * 1024U)) {
-            kbase_cpu_cache_clean_range(g_ctx.bos[b].cpu_ptr, g_ctx.bos[b].size);
+      {
+         static int full_clean = -1;
+         if (full_clean < 0) {
+            const char *fc_env = getenv("PANTHOR_ADAPTER_FULL_BO_CACHE_CLEAN");
+            full_clean = (fc_env && fc_env[0] && atoi(fc_env) != 0) ? 1 : 0;
          }
+         size_t bo_lim = g_ctx.max_bo_slot_used ? g_ctx.max_bo_slot_used : ADAPTER_MAX_BOS;
+         if (bo_lim > ADAPTER_MAX_BOS)
+            bo_lim = ADAPTER_MAX_BOS;
+         for (size_t b = 0; b < bo_lim; b++) {
+            if (g_ctx.bos[b].in_use && g_ctx.bos[b].cpu_ptr &&
+                !g_ctx.bos[b].is_imported && !g_ctx.bos[b].is_executable &&
+                g_ctx.bos[b].size <= (4U * 1024U * 1024U) &&
+                (full_clean || (g_ctx.bos[b].kbase_flags & BASE_MEM_CACHED_CPU) != 0)) {
+               kbase_cpu_cache_clean_range(g_ctx.bos[b].cpu_ptr, g_ctx.bos[b].size);
+            }
+         }
+         __asm__ volatile("dsb sy" : : : "memory");
       }
+#else
+      __atomic_thread_fence(__ATOMIC_SEQ_CST);
 #endif
+      uint64_t clean_t1_ns = get_monotonic_ns();
+      uint64_t submit_norm_ns = 0ULL;
 
       bool breadcrumbs = is_csf_breadcrumbs_enabled();
       uint32_t touched_subqueues = 0;
@@ -3520,6 +3757,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          bool is_initial = (sq->emitted_jobs == 0);
 
          /* 1. Normalize the submitted CSF command stream in-place & clean CPU cache to DRAM */
+         uint64_t norm_t0_ns = get_monotonic_ns();
          struct adapter_cs_patch_stats stats;
          memset(&stats, 0, sizeof(stats));
          if (qs->stream_addr && qs->stream_size >= 8) {
@@ -3630,6 +3868,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             }
             kbase_cpu_cache_clean_range(stream_cpu, qs->stream_size);
          }
+         submit_norm_ns += (get_monotonic_ns() - norm_t0_ns);
 
          /* 2. Ensure the 64 KiB ring buffer has space (never overwrite unextracted CSF commands) */
          uint64_t extract_at_sub = 0;
@@ -3682,8 +3921,10 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             memset(wrap_ptr, 0, wrap_nop_bytes);
             kbase_cpu_cache_clean_range(wrap_ptr, wrap_nop_bytes);
             sq->insert_offset += wrap_nop_bytes;
-            LOG_DEBUG("DRM_PANTHOR_GROUP_SUBMIT q=%u job=%llu ring wrap at off=%u (+%zu > %u): NOP-padded %zuB -> ring_off=0",
+            sq->ring_wraps++;
+            LOG_DEBUG("DRM_PANTHOR_GROUP_SUBMIT q=%u job=%llu ring wrap #%llu at off=%u (+%zu > %u): NOP-padded %zuB -> ring_off=0",
                       qs->queue_index, static_cast<unsigned long long>(next_job_seqno),
+                      static_cast<unsigned long long>(sq->ring_wraps),
                       ring_off, slot_bytes, sq->ringbuf_size, wrap_nop_bytes);
             ring_off = 0;
          }
@@ -3736,12 +3977,21 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             }
          }
 
-         LOG_INFO("DRM_PANTHOR_GROUP_SUBMIT q=%u stream=0x%llx sz=%u sync_upgrades=%u heap_nops=%u fin_frag_clears=%u -> insert=%llu jobs=%llu",
-                  qs->queue_index, static_cast<unsigned long long>(qs->stream_addr),
-                  qs->stream_size, stats.sync_scope_upgrades,
-                  stats.heap_op_nops, stats.finish_frag_stat_clears,
-                  static_cast<unsigned long long>(sq->insert_offset),
-                  static_cast<unsigned long long>(sq->emitted_jobs));
+         if (g_ctx.total_group_submits < 5ULL) {
+            LOG_INFO("DRM_PANTHOR_GROUP_SUBMIT q=%u stream=0x%llx sz=%u sync_upgrades=%u heap_nops=%u fin_frag_clears=%u -> insert=%llu jobs=%llu",
+                     qs->queue_index, static_cast<unsigned long long>(qs->stream_addr),
+                     qs->stream_size, stats.sync_scope_upgrades,
+                     stats.heap_op_nops, stats.finish_frag_stat_clears,
+                     static_cast<unsigned long long>(sq->insert_offset),
+                     static_cast<unsigned long long>(sq->emitted_jobs));
+         } else {
+            LOG_DEBUG("DRM_PANTHOR_GROUP_SUBMIT q=%u stream=0x%llx sz=%u sync_upgrades=%u heap_nops=%u fin_frag_clears=%u -> insert=%llu jobs=%llu",
+                      qs->queue_index, static_cast<unsigned long long>(qs->stream_addr),
+                      qs->stream_size, stats.sync_scope_upgrades,
+                      stats.heap_op_nops, stats.finish_frag_stat_clears,
+                      static_cast<unsigned long long>(sq->insert_offset),
+                      static_cast<unsigned long long>(sq->emitted_jobs));
+         }
          trace_log("DRM_PANTHOR_GROUP_SUBMIT q=%u stream=0x%llx sz=%u sync_upgrades=%u heap_nops=%u -> KBASE_IOCTL_CS_QUEUE_KICK insert=%llu\n",
                    qs->queue_index, static_cast<unsigned long long>(qs->stream_addr),
                    qs->stream_size, stats.sync_scope_upgrades,
@@ -3753,6 +4003,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
        * cache-cleaned, publish CS_INSERT in USER_IO Input Page (+0x1000), ring Doorbell (+0x0000),
        * and call KBASE_IOCTL_CS_QUEUE_KICK for each touched subqueue.
        */
+      uint64_t kick_t0_ns = get_monotonic_ns();
       for (uint32_t q = 0; q < grp->queue_count; q++) {
          if (!(touched_subqueues & (1U << q)))
             continue;
@@ -3769,6 +4020,93 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
 
          struct kbase_ioctl_cs_queue_kick kick = { .buffer_gpu_addr = sq->ring_gpu_va };
          adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_KICK, &kick);
+      }
+      uint64_t submit_t1_ns = get_monotonic_ns();
+      uint64_t submit_dur_ns = (submit_t1_ns >= submit_t0_ns) ? (submit_t1_ns - submit_t0_ns) : 0ULL;
+      uint64_t clean_dur_ns  = (clean_t1_ns >= clean_t0_ns) ? (clean_t1_ns - clean_t0_ns) : 0ULL;
+      uint64_t kick_dur_ns   = (submit_t1_ns >= kick_t0_ns) ? (submit_t1_ns - kick_t0_ns) : 0ULL;
+
+      g_ctx.total_group_submits++;
+      g_ctx.window_submits++;
+      g_ctx.window_submit_ns_sum      += submit_dur_ns;
+      if (submit_dur_ns > g_ctx.window_submit_ns_max)
+         g_ctx.window_submit_ns_max = submit_dur_ns;
+      g_ctx.window_cs_norm_ns_sum     += submit_norm_ns;
+      g_ctx.window_cache_clean_ns_sum += clean_dur_ns;
+      g_ctx.window_kick_ns_sum        += kick_dur_ns;
+
+      static uint64_t telemetry_interval = UINT64_MAX;
+      if (telemetry_interval == UINT64_MAX) {
+         const char *ti_env = getenv("PANTHOR_ADAPTER_TELEMETRY_INTERVAL");
+         telemetry_interval = (ti_env && *ti_env) ? strtoull(ti_env, nullptr, 0) : 200ULL;
+      }
+      if (telemetry_interval > 0ULL && (g_ctx.total_group_submits % telemetry_interval) == 0ULL) {
+         double win_sec = (submit_t1_ns > g_ctx.window_start_ns)
+                             ? (static_cast<double>(submit_t1_ns - g_ctx.window_start_ns) / 1e9)
+                             : 1e-6;
+         double win_submits = static_cast<double>(g_ctx.window_submits ? g_ctx.window_submits : 1ULL);
+         double win_waits   = static_cast<double>(g_ctx.window_sync_waits ? g_ctx.window_sync_waits : 1ULL);
+         g_ctx.last_window_fps         = (win_submits * 0.5) / win_sec;
+         g_ctx.last_avg_submit_us      = (static_cast<double>(g_ctx.window_submit_ns_sum) / 1e3) / win_submits;
+         g_ctx.last_max_submit_us      = static_cast<double>(g_ctx.window_submit_ns_max) / 1e3;
+         g_ctx.last_avg_cs_norm_us     = (static_cast<double>(g_ctx.window_cs_norm_ns_sum) / 1e3) / win_submits;
+         g_ctx.last_avg_cache_clean_us = (static_cast<double>(g_ctx.window_cache_clean_ns_sum) / 1e3) / win_submits;
+         g_ctx.last_avg_kick_us        = (static_cast<double>(g_ctx.window_kick_ns_sum) / 1e3) / win_submits;
+         g_ctx.last_avg_sync_wait_us   = g_ctx.window_sync_waits
+                                            ? ((static_cast<double>(g_ctx.window_sync_wait_ns_sum) / 1e3) / win_waits)
+                                            : 0.0;
+         g_ctx.last_max_sync_wait_us   = static_cast<double>(g_ctx.window_sync_wait_ns_max) / 1e3;
+
+         uint32_t act_bos = 0, cached_bos = 0, imp_bos = 0, act_so = 0;
+         uint64_t act_bo_bytes = 0;
+         size_t bo_lim = g_ctx.max_bo_slot_used ? g_ctx.max_bo_slot_used : ADAPTER_MAX_BOS;
+         if (bo_lim > ADAPTER_MAX_BOS) bo_lim = ADAPTER_MAX_BOS;
+         for (size_t b = 0; b < bo_lim; b++) {
+            if (g_ctx.bos[b].in_use) {
+               act_bos++;
+               act_bo_bytes += g_ctx.bos[b].size;
+               if (g_ctx.bos[b].kbase_flags & BASE_MEM_CACHED_CPU) cached_bos++;
+               if (g_ctx.bos[b].is_imported) imp_bos++;
+            }
+         }
+         size_t so_lim = g_ctx.max_syncobj_slot_used ? g_ctx.max_syncobj_slot_used : ADAPTER_MAX_SYNCOBJS;
+         if (so_lim > ADAPTER_MAX_SYNCOBJS) so_lim = ADAPTER_MAX_SYNCOBJS;
+         for (size_t s_i = 0; s_i < so_lim; s_i++) {
+            if (g_ctx.syncobjs[s_i].in_use) act_so++;
+         }
+
+         uint64_t j0 = grp->subqueues[0].emitted_jobs;
+         uint64_t s0 = grp->subqueues[0].seqno_cpu_ptr ? *grp->subqueues[0].seqno_cpu_ptr : 0ULL;
+         uint64_t s1 = (grp->queue_count > 1 && grp->subqueues[1].seqno_cpu_ptr) ? *grp->subqueues[1].seqno_cpu_ptr : 0ULL;
+         uint64_t s2 = (grp->queue_count > 2 && grp->subqueues[2].seqno_cpu_ptr) ? *grp->subqueues[2].seqno_cpu_ptr : 0ULL;
+         LOG_INFO("[TELEMETRY] submits=%llu jobs(vt=%llu,seq=%llu/%llu/%llu) fps=%.1f submit_us(avg=%.1f,max=%.1f: norm=%.1f,clean=%.1f,kick=%.1f) wait_us(avg=%.1f,max=%.1f,fast=%llu,poll=%llu) bos=%u(%.1fMB,cached=%u,imp=%u) syncobjs=%u wraps=%llu/%llu/%llu",
+                  static_cast<unsigned long long>(g_ctx.total_group_submits),
+                  static_cast<unsigned long long>(j0),
+                  static_cast<unsigned long long>(s0),
+                  static_cast<unsigned long long>(s1),
+                  static_cast<unsigned long long>(s2),
+                  g_ctx.last_window_fps,
+                  g_ctx.last_avg_submit_us, g_ctx.last_max_submit_us,
+                  g_ctx.last_avg_cs_norm_us, g_ctx.last_avg_cache_clean_us, g_ctx.last_avg_kick_us,
+                  g_ctx.last_avg_sync_wait_us, g_ctx.last_max_sync_wait_us,
+                  static_cast<unsigned long long>(g_ctx.fast_spin_syncobj_waits),
+                  static_cast<unsigned long long>(g_ctx.poll_sleep_syncobj_waits),
+                  act_bos, static_cast<double>(act_bo_bytes) / (1024.0 * 1024.0), cached_bos, imp_bos,
+                  act_so,
+                  static_cast<unsigned long long>(grp->subqueues[0].ring_wraps),
+                  static_cast<unsigned long long>(grp->queue_count > 1 ? grp->subqueues[1].ring_wraps : 0ULL),
+                  static_cast<unsigned long long>(grp->queue_count > 2 ? grp->subqueues[2].ring_wraps : 0ULL));
+
+         g_ctx.window_start_ns           = submit_t1_ns;
+         g_ctx.window_submits            = 0;
+         g_ctx.window_submit_ns_sum      = 0;
+         g_ctx.window_submit_ns_max      = 0;
+         g_ctx.window_cs_norm_ns_sum     = 0;
+         g_ctx.window_cache_clean_ns_sum = 0;
+         g_ctx.window_kick_ns_sum        = 0;
+         g_ctx.window_sync_waits         = 0;
+         g_ctx.window_sync_wait_ns_sum   = 0;
+         g_ctx.window_sync_wait_ns_max   = 0;
       }
       break;
    }
