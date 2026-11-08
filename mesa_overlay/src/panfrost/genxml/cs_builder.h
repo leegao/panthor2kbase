@@ -200,6 +200,13 @@ struct cs_builder {
     * post-EndCommandBuffer instruction injection by layers (e.g. BCnLayer). */
    struct cs_chunk last_active_chunk;
 
+   /* Saved CS chunk position right before EndCommandBuffer epilogue
+    * (finish_queries / flush_sync_points / finish_cs), so post-EndCommandBuffer
+    * layer injections rewind over the premature epilogue instead of leaving a
+    * mid-stream finish_cs in the middle of the command buffer. */
+   struct cs_chunk pre_epilogue_chunk;
+   bool has_pre_epilogue_chunk;
+
    /* Current load/store tracker. */
    struct cs_load_store_tracker *cur_ls_tracker;
 
@@ -568,8 +575,15 @@ cs_reserve_instrs(struct cs_builder *b, uint32_t num_instrs)
       }
    } else if (unlikely(!b->cur_chunk.buffer.cpu)) {
       /* Reopen finalized builder if a layer or post-EndCommandBuffer hook
-       * appends instructions after cs_end() was already called. */
-      if (b->last_active_chunk.buffer.cpu != NULL) {
+       * appends instructions after cs_end() was already called. Prefer rewinding
+       * to pre_epilogue_chunk so the command buffer never retains a mid-stream
+       * finish_cs / flush_sync_points epilogue before the newly appended ops. */
+      if (b->has_pre_epilogue_chunk && b->pre_epilogue_chunk.buffer.cpu != NULL) {
+         b->cur_chunk = b->pre_epilogue_chunk;
+         b->has_pre_epilogue_chunk = false;
+         if (b->root_chunk.buffer.gpu == b->cur_chunk.buffer.gpu)
+            b->root_chunk.size = b->cur_chunk.pos;
+      } else if (b->last_active_chunk.buffer.cpu != NULL) {
          b->cur_chunk = b->last_active_chunk;
       } else {
          b->cur_chunk.buffer = b->root_chunk.buffer;

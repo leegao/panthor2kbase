@@ -107,34 +107,19 @@ finish_cs(struct panvk_cmd_buffer *cmdbuf, uint32_t subqueue)
 
    cs_wait_slots(b, dev->csf.sb.all_mask);
 
-   /* save CS error if non-zero */
-   if (cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
-      struct cs_index sync_addr = cs_scratch_reg64(b, 0);
-      struct cs_index error = cs_scratch_reg32(b, 2);
-
-      cs_load64_to(b, sync_addr, cs_subqueue_ctx_reg(b),
-                   offsetof(struct panvk_cs_subqueue_context, syncobjs));
-      cs_load32_to(b, error, sync_addr,
-                   sizeof(struct panvk_cs_sync64) * subqueue +
-                      offsetof(struct panvk_cs_sync64, error));
-      cs_flush_loads(b);
-
-      cs_if(b, MALI_CS_CONDITION_NEQUAL, error) {
-         cs_store32(b, error, cs_subqueue_ctx_reg(b),
-                    offsetof(struct panvk_cs_subqueue_context, last_error));
-         cs_flush_stores(b);
-      }
-   }
-
-   /* We need a clean because descriptor/CS memory can be returned to the
-    * command pool where they get recycled. If we don't clean dirty cache lines,
-    * those cache lines might get evicted asynchronously and their content
-    * pushed back to main memory after the CPU has written new stuff there. */
+   /* Do not emit non-atomic LOAD_MULTIPLE on queue->syncobjs (+8/+24/+40):
+    * 1. Non-atomic LS reads on the same 64B cache line as atomic SYNC_ADD64
+    *    trigger 0x88 GPU_SHAREABILITY_FAULT on non-coherent Mali-G615 (MT6878).
+    * 2. Loading sync_addr into r66:r67 followed by MOVE32 r66, 0x0 leaves stale
+    *    high bits r67 = 0x0000005f (0x0000005f00000000), causing MMU_TRANSLATION_FAULT
+    *    (0xc1) at 0x0000005f00000010 if instructions are appended after finish_cs.
+    * Always zero all 64 bits of r66:r67 via cs_move64_to(r66:r67, 0) (MOVE48). */
+   struct cs_index flush_id64 = cs_scratch_reg64(b, 0);
    struct cs_index flush_id = cs_scratch_reg32(b, 0);
 
    panvk_per_arch(panvk_instr_begin_work)(subqueue, cmdbuf,
                                           PANVK_INSTR_WORK_TYPE_FLUSH_CACHE);
-   cs_move32_to(b, flush_id, 0);
+   cs_move64_to(b, flush_id64, 0);
    cs_flush_caches(b, MALI_CS_FLUSH_MODE_CLEAN, MALI_CS_FLUSH_MODE_CLEAN,
                    MALI_CS_OTHER_FLUSH_MODE_NONE, flush_id,
                    cs_defer(SB_IMM_MASK, SB_ID(IMM_FLUSH)));
@@ -241,30 +226,39 @@ panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
 
-   /* Guard against duplicate EndCommandBuffer calls from layers (e.g. BCnLayer)
-    * or command buffers that have already been finalized. */
+   /* If EndCommandBuffer was already called and a layer (e.g. BCnLayer)
+    * reopened a subqueue builder to inject post-EndCommandBuffer work,
+    * re-emit flush_sync_points and finish_cs on the reopened subqueue(s). */
    if (cmdbuf->vk.state == MESA_VK_COMMAND_BUFFER_STATE_EXECUTABLE) {
+      bool any_reopened = false;
       for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++) {
          struct cs_builder *b = &cmdbuf->state.cs[i].builder;
          if (b->cur_chunk.buffer.cpu != NULL || b->cur_chunk.pos != 0)
-            cs_end(b);
+            any_reopened = true;
+      }
+      if (any_reopened) {
+         emit_tls(cmdbuf);
+         flush_sync_points(cmdbuf);
+         for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++) {
+            struct cs_builder *b = &cmdbuf->state.cs[i].builder;
+            if (b->cur_chunk.buffer.cpu != NULL || b->cur_chunk.pos != 0) {
+               b->pre_epilogue_chunk = b->cur_chunk;
+               b->has_pre_epilogue_chunk = (b->cur_chunk.buffer.cpu != NULL);
+               finish_cs(cmdbuf, i);
+            }
+         }
       }
       panvk_pool_flush_maps(&cmdbuf->cs_pool);
       panvk_pool_flush_maps(&cmdbuf->desc_pool);
       return VK_SUCCESS;
    }
 
-   /* Finishing queries requires a barrier. We don't want to do that more
-    * often than necessary. At the end of a primary is usually enough.
-    * Additionally, simultaneous use secondaries also need to flush if they
-    * contain timestamp query writes to avoid adding the same node more than
-    * once into panvk_cs_subqueue_context::render.ts_chain. */
-   const bool sim_use_sec_with_ts =
-      cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY &&
-      (cmdbuf->flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) &&
-      cmdbuf->state.contains_timestamp_queries;
-   if (cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY ||
-       unlikely(sim_use_sec_with_ts))
+   /* Only emit finish_queries() when timestamp queries were actually recorded in
+    * this command buffer (or inherited from a secondary). Emitting finish_queries()
+    * unconditionally on command buffers without timestamp queries forces VT(0),
+    * FRAG(1), and COMPUTE(2) to allocate 64 KiB CS BOs and execute a 3-subqueue
+    * cross-barrier even on pure-graphics or pure-compute command buffers! */
+   if (unlikely(cmdbuf->state.contains_timestamp_queries))
       finish_queries(cmdbuf);
 
    emit_tls(cmdbuf);
@@ -277,7 +271,13 @@ panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
          cs_end(b);
          vk_command_buffer_set_error(&cmdbuf->vk,
                                      VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      } else if (cs_is_empty(b)) {
+         /* Keep unused subqueues completely empty so they do not allocate a
+          * 64 KiB CS BO or submit a redundant job to DRM_PANTHOR_GROUP_SUBMIT. */
+         cs_end(b);
       } else {
+         b->pre_epilogue_chunk = b->cur_chunk;
+         b->has_pre_epilogue_chunk = (b->cur_chunk.buffer.cpu != NULL);
          finish_cs(cmdbuf, i);
          if (!cs_is_valid(b)) {
             cs_end(b);
@@ -626,11 +626,12 @@ emit_barrier_csf(struct panvk_cmd_buffer *cmdbuf, struct panvk_cs_deps deps)
 
       struct panvk_cache_flush_info cache_flush = deps.src[i].cache_flush;
       if (!panvk_cache_flush_is_nop(&cache_flush)) {
+         struct cs_index flush_id64 = cs_scratch_reg64(b, 0);
          struct cs_index flush_id = cs_scratch_reg32(b, 0);
 
          panvk_per_arch(panvk_instr_begin_work)(
             i, cmdbuf, PANVK_INSTR_WORK_TYPE_FLUSH_CACHE);
-         cs_move32_to(b, flush_id, 0);
+         cs_move64_to(b, flush_id64, 0);
          cs_flush_caches(b, cache_flush.l2, cache_flush.lsc, cache_flush.others,
                          flush_id, cs_defer(SB_IMM_MASK, SB_ID(IMM_FLUSH)));
          cs_wait_slot(b, SB_ID(IMM_FLUSH));
@@ -1138,6 +1139,8 @@ panvk_per_arch(CmdExecuteCommands)(VkCommandBuffer commandBuffer,
        * begin/end, but the renderpass ends in the primary, the primary can
        * correctly detect that an oq has ended in EndRendering. */
       primary->state.gfx.render.oq = secondary->state.gfx.render.oq;
+      primary->state.contains_timestamp_queries |=
+         secondary->state.contains_timestamp_queries;
 
       /* If the render context we passed to the secondary command buffer got
        * invalidated, reset the FB/tiler descs and treat things as if we

@@ -254,6 +254,15 @@ struct adapter_subqueue {
    uint64_t job_stream_va[64];
    uint32_t job_stream_size[64];
    struct adapter_flight_entry flight_log[ADAPTER_FLIGHT_LOG_ENTRIES];
+   /* 8-way per-subqueue CS normalization cache for static command buffers (vkcube.exe >400 FPS) */
+   struct {
+      uint64_t va;
+      uint32_t sz;
+      uint64_t head;
+      uint64_t mid;
+      uint64_t tail;
+   } norm_cache[8];
+   uint32_t norm_cache_hand;
 };
 
 /* Scheduling group state */
@@ -268,6 +277,7 @@ struct adapter_group {
    uint32_t queue_count;
    uint32_t fatal_state;
    uint32_t fatal_queues;
+   bool dumped_fatal_diag;
    struct adapter_subqueue subqueues[ADAPTER_MAX_SUBQUEUES];
    uint64_t active_tiler_heap_ctx_va;
    uint64_t redirected_syncobjs_va;
@@ -317,6 +327,12 @@ struct adapter_ctx {
    uint64_t diag_bo_gpu_va;
    uint8_t *diag_bo_cpu;
    size_t diag_bo_size;
+
+   /* 16 MiB Shadow CS Ring BO (BASE_MEM_COHERENT_LOCAL) for immutable in-flight CS snapshots */
+   uint64_t shadow_cs_bo_gpu_va;
+   uint8_t *shadow_cs_bo_cpu;
+   size_t shadow_cs_bo_size;
+   size_t shadow_cs_write_off;
 
    uint32_t next_vm_id;
    uint32_t next_gem_handle;
@@ -716,6 +732,7 @@ static void parse_kbase_gpuprops(struct adapter_ctx *ctx, const uint8_t *buf, si
 
    if (ctx->arch_major == 11) {
       setenv("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER", "1", 0);
+   setenv("MESA_VK_ENABLE_SUBMIT_THREAD", "0", 0);
       uint32_t prod_major = DRM_PANTHOR_PRODUCT_MAJOR(ctx->gpu_info.gpu_id);
       if (prod_major != 2 && prod_major != 3) {
          uint32_t mapped_prod = (prod_major == 0) ? 2U : 3U;
@@ -745,6 +762,7 @@ static int init_kbase_context(struct adapter_ctx *ctx, int mali_fd)
    ctx->stream_fd = -1;
 
    setenv("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER", "1", 0);
+   setenv("MESA_VK_ENABLE_SUBMIT_THREAD", "0", 0);
 
    /* Step 1: KBASE_IOCTL_VERSION_CHECK (nr 52) — MUST be first ioctl on fd */
    struct kbase_ioctl_version_check ver = { 0, 0 };
@@ -911,6 +929,29 @@ static int init_kbase_context(struct adapter_ctx *ctx, int mali_fd)
          kbase_cpu_cache_clean_range(ctx->diag_bo_cpu, ctx->diag_bo_size);
       } else {
          ctx->diag_bo_cpu = nullptr;
+      }
+   }
+
+   /* Step 10c: Allocate 8 MiB (2048 pages) SAME_VA Shadow CS Ring BO so dynamic command
+    * streams cannot be overwritten in-place while in flight on the GPU. */
+   const char *sh_env = getenv("PANTHOR_ADAPTER_SHADOW_CS");
+   bool enable_shadow_cs = (!sh_env || !sh_env[0] || atoi(sh_env) != 0);
+   if (enable_shadow_cs) {
+      uint64_t sh_pages = 2048ULL; /* 8 MiB */
+      uint64_t sh_out_flags = 0;
+      uint64_t sh_cookie = 0;
+      if (alloc_kbase_mem(mali_fd, sh_pages, sh_pages, 0, diag_flags, &sh_out_flags, &sh_cookie) == 0) {
+         ctx->shadow_cs_bo_size = static_cast<size_t>(sh_pages * 4096ULL);
+         ctx->shadow_cs_bo_cpu = static_cast<uint8_t *>(
+            real_mmap(nullptr, ctx->shadow_cs_bo_size, PROT_READ | PROT_WRITE,
+                      MAP_SHARED, mali_fd, static_cast<off_t>(sh_cookie)));
+         if (ctx->shadow_cs_bo_cpu != MAP_FAILED) {
+            ctx->shadow_cs_bo_gpu_va = reinterpret_cast<uintptr_t>(ctx->shadow_cs_bo_cpu);
+            ctx->shadow_cs_write_off = 0;
+         } else {
+            ctx->shadow_cs_bo_cpu = nullptr;
+            ctx->shadow_cs_bo_size = 0;
+         }
       }
    }
 
@@ -1812,6 +1853,17 @@ void panthor_kbase_normalize_cs_stream(uint64_t *stream_cpu,
        */
       if (opcode == MALI_CSF_OP_FLUSH_CACHE2 &&
           (((insn >> 32) & 0xffffULL) != 0ULL || (insn & 0xfffULL) != 0ULL)) {
+         /* Ensure the preceding flush_id zero-init uses 64-bit MOVE48 (0x01) instead of
+          * 32-bit MOVE32 (0x02) when targeting an even register (e.g. r66), so r67 never
+          * retains a stale 0x0000005f high address word (preventing 0x0000005f00000010 MMU fault)! */
+         if (i > 0U) {
+            uint64_t prev_insn = stream_cpu[i - 1U];
+            uint64_t prev_op = (prev_insn >> 56) & 0xffULL;
+            uint8_t prev_dst = static_cast<uint8_t>((prev_insn >> 48) & 0xffU);
+            if (prev_op == CSF_OP_MOVE32 && (prev_dst & 1U) == 0U && (prev_insn & 0xffffffffULL) == 0ULL) {
+               stream_cpu[i - 1U] = (CSF_OP_MOVE48 << 56) | (static_cast<uint64_t>(prev_dst) << 48);
+            }
+         }
          continue;
       }
 
@@ -2244,6 +2296,10 @@ int panthor_kbase_adapter_close(int fd)
          }
          if (g_ctx.stream_fd >= 0 && g_ctx.stream_fd != g_ctx.mali_fd)
             real_close(g_ctx.stream_fd);
+         if (g_ctx.shadow_cs_bo_cpu)
+            real_munmap(g_ctx.shadow_cs_bo_cpu, g_ctx.shadow_cs_bo_size);
+         if (g_ctx.diag_bo_cpu)
+            real_munmap(g_ctx.diag_bo_cpu, g_ctx.diag_bo_size);
          if (g_ctx.event_bo_cpu)
             real_munmap(g_ctx.event_bo_cpu, g_ctx.event_bo_size);
          if (g_ctx.user_reg_page)
@@ -2842,6 +2898,15 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             uint64_t elapsed_ns = (now_ns >= start_ns) ? (now_ns - start_ns) : 0ULL;
 
             struct adapter_group *grp = target_grp_id ? find_group(target_grp_id) : nullptr;
+            if (grp && grp->fatal_state != 0) {
+               if (!grp->dumped_fatal_diag) {
+                  grp->dumped_fatal_diag = true;
+                  pthread_mutex_unlock(&g_lock);
+                  panthor_kbase_dump_csf_diagnostics("SYNCOBJ_WAIT group fatal_state != 0");
+                  pthread_mutex_lock(&g_lock);
+               }
+               break;
+            }
             /* Re-kick unfinished subqueues after 2.5ms (and every 5ms thereafter) in case doorbell/event was missed */
             if (grp && (now_ns - last_kick_ns >= 5000000ULL || (last_kick_ns == start_ns && elapsed_ns >= 2500000ULL))) {
                last_kick_ns = now_ns;
@@ -3866,6 +3931,31 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
 
       bool breadcrumbs = is_csf_breadcrumbs_enabled();
       uint32_t touched_subqueues = 0;
+      uint64_t group_dep_seqno[ADAPTER_MAX_SUBQUEUES] = {0};
+      for (uint32_t q = 0; q < grp->queue_count && q < ADAPTER_MAX_SUBQUEUES; q++)
+         group_dep_seqno[q] = grp->subqueues[q].emitted_jobs;
+
+      /* Pre-scan all WAIT sync_ops across the entire DRM_PANTHOR_GROUP_SUBMIT batch */
+      for (uint32_t i = 0; i < gs->queue_submits.count; i++) {
+         struct drm_panthor_queue_submit *qs = &qsubs[i];
+         auto *sops = reinterpret_cast<struct drm_panthor_sync_op *>(
+            static_cast<uintptr_t>(qs->syncs.array));
+         if (!sops)
+            continue;
+         for (uint32_t s = 0; s < qs->syncs.count; s++) {
+            if ((sops[s].flags & DRM_PANTHOR_SYNC_OP_SIGNAL) == 0) {
+               struct adapter_syncobj *wso = find_syncobj(sops[s].handle);
+               if (wso) {
+                  for (uint32_t q = 0; q < ADAPTER_MAX_SUBQUEUES; q++) {
+                     uint64_t wseq = wso->target_subq_seqno[q] ? wso->target_subq_seqno[q] : wso->last_target_subq_seqno[q];
+                     if (wseq > group_dep_seqno[q])
+                        group_dep_seqno[q] = wseq;
+                  }
+               }
+            }
+         }
+      }
+
       for (uint32_t i = 0; i < gs->queue_submits.count; i++) {
          struct drm_panthor_queue_submit *qs = &qsubs[i];
          if (qs->queue_index >= grp->queue_count)
@@ -3873,90 +3963,49 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          struct adapter_subqueue *sq = &grp->subqueues[qs->queue_index];
 
          if (qs->stream_size == 0 || qs->stream_addr == 0) {
-            auto *sops = reinterpret_cast<struct drm_panthor_sync_op *>(
-               static_cast<uintptr_t>(qs->syncs.array));
-            uint64_t dep_seqno[ADAPTER_MAX_SUBQUEUES] = {0};
-            for (uint32_t q = 0; q < grp->queue_count && q < ADAPTER_MAX_SUBQUEUES; q++)
-               dep_seqno[q] = grp->subqueues[q].emitted_jobs;
-            for (uint32_t s = 0; s < qs->syncs.count; s++) {
-               if ((sops[s].flags & DRM_PANTHOR_SYNC_OP_SIGNAL) == 0) {
-                  struct adapter_syncobj *wso = find_syncobj(sops[s].handle);
-                  if (wso) {
-                     for (uint32_t q = 0; q < ADAPTER_MAX_SUBQUEUES; q++) {
-                        uint64_t wseq = wso->target_subq_seqno[q] ? wso->target_subq_seqno[q] : wso->last_target_subq_seqno[q];
-                        if (wseq > dep_seqno[q])
-                           dep_seqno[q] = wseq;
-                     }
-                  }
-               }
-            }
-            for (uint32_t s = 0; s < qs->syncs.count; s++) {
-               if (sops[s].flags & DRM_PANTHOR_SYNC_OP_SIGNAL) {
-                  struct adapter_syncobj *so = find_syncobj(sops[s].handle);
-                  if (so) {
-                     so->value = sops[s].timeline_value ? sops[s].timeline_value : 1ULL;
-                     so->target_group_handle = grp->group_handle;
-                     so->last_target_group_handle = grp->group_handle;
-                     for (uint32_t q = 0; q < ADAPTER_MAX_SUBQUEUES; q++) {
-                        if (dep_seqno[q] > so->target_subq_seqno[q])
-                           so->target_subq_seqno[q] = dep_seqno[q];
-                        if (dep_seqno[q] > so->last_target_subq_seqno[q])
-                           so->last_target_subq_seqno[q] = dep_seqno[q];
-                     }
-                     if (so->cqs_cpu_ptr)
-                        *so->cqs_cpu_ptr = so->value;
-                  }
-               }
-            }
-            LOG_DEBUG("DRM_PANTHOR_GROUP_SUBMIT q=%u sync-only (stream=0x0 sz=0) -> propagated subq seqnos=(%llu,%llu,%llu)",
-                      qs->queue_index,
-                      static_cast<unsigned long long>(dep_seqno[0]),
-                      static_cast<unsigned long long>(dep_seqno[1]),
-                      static_cast<unsigned long long>(dep_seqno[2]));
             continue;
          }
 
          bool is_initial = (sq->emitted_jobs == 0);
 
-         /* Fast-path for 8-byte (1-qword) pure-NOP streams emitted by PanVK between
-          * command buffers (e.g., q=0 sz=8 and q=1 sz=8 on every frame in vkcube_winlator.txt):
-          * Avoid emitting a redundant 320-byte primary CSF ringbuffer slot (which doubles
-          * ring slots and GPU CSF overhead per frame) and instead bind any signaled
-          * drm_syncobjs directly to the subqueue's current emitted_jobs seqno. */
+         /* Fast-path for 8-byte (1-qword) pure-NOP streams emitted by PanVK */
          if (!is_initial && qs->stream_size == 8U && qs->stream_addr != 0ULL) {
             const auto *nop_check = reinterpret_cast<const uint64_t *>(static_cast<uintptr_t>(qs->stream_addr));
             if (nop_check[0] == 0ULL) {
-               auto *sops = reinterpret_cast<struct drm_panthor_sync_op *>(
-                  static_cast<uintptr_t>(qs->syncs.array));
-               for (uint32_t s = 0; s < qs->syncs.count; s++) {
-                  if (sops[s].flags & DRM_PANTHOR_SYNC_OP_SIGNAL) {
-                     struct adapter_syncobj *so = find_syncobj(sops[s].handle);
-                     if (so) {
-                        so->value = sops[s].timeline_value ? sops[s].timeline_value : 1ULL;
-                        so->target_group_handle = grp->group_handle;
-                        so->last_target_group_handle = grp->group_handle;
-                        if (qs->queue_index < ADAPTER_MAX_SUBQUEUES) {
-                           so->target_subq_seqno[qs->queue_index] = sq->emitted_jobs;
-                           so->last_target_subq_seqno[qs->queue_index] = sq->emitted_jobs;
-                        }
-                        if (so->cqs_cpu_ptr)
-                           *so->cqs_cpu_ptr = so->value;
-                     }
-                  }
-               }
                LOG_DEBUG("DRM_PANTHOR_GROUP_SUBMIT q=%u pure-NOP stream (sz=8) elided -> bound syncs to jobs=%llu",
                          qs->queue_index, static_cast<unsigned long long>(sq->emitted_jobs));
                continue;
             }
          }
 
-         /* 1. Normalize the submitted CSF command stream in-place & clean CPU cache to DRAM */
+         /* 1. Normalize the submitted CSF command stream in-place (with 8-way static CB signature cache)
+          *    and optionally snapshot dynamic streams into shadow_cs_bo so in-flight CS memory can never
+          *    be overwritten by early pool resets. */
          uint64_t norm_t0_ns = get_monotonic_ns();
          struct adapter_cs_patch_stats stats;
          memset(&stats, 0, sizeof(stats));
+         uint64_t effective_stream_va = qs->stream_addr;
          if (qs->stream_addr && qs->stream_size >= 8) {
             auto *stream_cpu = reinterpret_cast<uint64_t *>(static_cast<uintptr_t>(qs->stream_addr));
-            panthor_kbase_normalize_cs_stream(stream_cpu, qs->stream_size, is_initial, &stats);
+            uint32_t n_qw = qs->stream_size / sizeof(uint64_t);
+            uint64_t sig_head = stream_cpu[0];
+            uint64_t sig_mid  = stream_cpu[n_qw >> 1];
+            uint64_t sig_tail = stream_cpu[n_qw - 1U];
+            bool cache_hit = false;
+            if (!is_initial) {
+               for (uint32_t c = 0; c < 8U; c++) {
+                  if (sq->norm_cache[c].va == qs->stream_addr &&
+                      sq->norm_cache[c].sz == qs->stream_size &&
+                      sq->norm_cache[c].head == sig_head &&
+                      sq->norm_cache[c].mid  == sig_mid &&
+                      sq->norm_cache[c].tail == sig_tail) {
+                     cache_hit = true;
+                     break;
+                  }
+               }
+            }
+            if (!cache_hit) {
+               panthor_kbase_normalize_cs_stream(stream_cpu, qs->stream_size, is_initial, &stats);
             if (is_initial && stats.extracted_subq_ctx_va) {
                sq->cached_subq_ctx_va = stats.extracted_subq_ctx_va;
                sq->cached_subq_ctx_reg = stats.extracted_subq_ctx_reg;
@@ -4060,7 +4109,39 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                   }
                }
             }
-            kbase_cpu_cache_clean_range(stream_cpu, qs->stream_size);
+               kbase_cpu_cache_clean_range(stream_cpu, qs->stream_size);
+               uint32_t slot_c = (sq->norm_cache_hand++) & 7U;
+               sq->norm_cache[slot_c].va   = qs->stream_addr;
+               sq->norm_cache[slot_c].sz   = qs->stream_size;
+               sq->norm_cache[slot_c].head = stream_cpu[0];
+               sq->norm_cache[slot_c].mid  = stream_cpu[n_qw >> 1];
+               sq->norm_cache[slot_c].tail = stream_cpu[n_qw - 1U];
+            }
+
+            /* Snapshot single-chunk primary CS streams (<= 32 KiB without relative JUMP) into
+             * g_ctx.shadow_cs_bo_cpu so that even if a layer or app resets a command pool
+             * while the GPU is still executing an earlier batch, the CSF stream is immutable. */
+            if (!is_initial && !cache_hit && g_ctx.shadow_cs_bo_cpu &&
+                qs->stream_size <= 32768U && g_ctx.shadow_cs_bo_size >= 65536U) {
+               bool has_jump = false;
+               for (uint32_t idx = 0; idx < n_qw; idx++) {
+                  uint64_t op = (stream_cpu[idx] >> 56) & 0xffULL;
+                  if (op == CSF_OP_JUMP) {
+                     has_jump = true;
+                     break;
+                  }
+               }
+               if (!has_jump) {
+                  size_t aligned_sz = (static_cast<size_t>(qs->stream_size) + 63U) & ~static_cast<size_t>(63U);
+                  if (g_ctx.shadow_cs_write_off + aligned_sz > g_ctx.shadow_cs_bo_size)
+                     g_ctx.shadow_cs_write_off = 0;
+                  uint8_t *dst_shadow = g_ctx.shadow_cs_bo_cpu + g_ctx.shadow_cs_write_off;
+                  memcpy(dst_shadow, stream_cpu, qs->stream_size);
+                  kbase_cpu_cache_clean_range(dst_shadow, qs->stream_size);
+                  effective_stream_va = g_ctx.shadow_cs_bo_gpu_va + g_ctx.shadow_cs_write_off;
+                  g_ctx.shadow_cs_write_off += aligned_sz;
+               }
+            }
          }
          submit_norm_ns += (get_monotonic_ns() - norm_t0_ns);
 
@@ -4096,7 +4177,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             qs->queue_index,
             sq->cached_subq_ctx_va,
             grp->active_tiler_heap_ctx_va,
-            qs->stream_addr,
+            effective_stream_va,
             qs->stream_size,
             qs->latest_flush,
             sq->seqno_gpu_va,
@@ -4129,14 +4210,16 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          /* Drain CPU cache / write-combine buffer so CSF MCU reads valid instructions from DRAM */
          kbase_cpu_cache_clean_range(slot_ptr, slot_bytes);
 
-         sq->last_stream_va = qs->stream_addr;
+         sq->last_stream_va = effective_stream_va;
          sq->last_stream_size = qs->stream_size;
-         sq->job_stream_va[next_job_seqno & 63U] = qs->stream_addr;
+         sq->job_stream_va[next_job_seqno & 63U] = effective_stream_va;
          sq->job_stream_size[next_job_seqno & 63U] = qs->stream_size;
          sq->last_ring_slot_offset = ring_off;
          sq->last_ring_slot_bytes = static_cast<uint32_t>(slot_bytes);
          sq->insert_offset += slot_bytes;
          sq->emitted_jobs = next_job_seqno;
+         if (qs->queue_index < ADAPTER_MAX_SUBQUEUES && next_job_seqno > group_dep_seqno[qs->queue_index])
+            group_dep_seqno[qs->queue_index] = next_job_seqno;
 
          struct adapter_flight_entry *fe = &sq->flight_log[next_job_seqno % ADAPTER_FLIGHT_LOG_ENTRIES];
          fe->job_seqno = next_job_seqno;
@@ -4190,6 +4273,40 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                    qs->queue_index, static_cast<unsigned long long>(qs->stream_addr),
                    qs->stream_size, stats.sync_scope_upgrades,
                    stats.heap_op_nops, static_cast<unsigned long long>(sq->insert_offset));
+      }
+
+      /* Pass 2: Propagate the full group_dep_seqno[0..queue_count-1] across ALL subqueues
+       * to every SIGNAL sync_op in this DRM_PANTHOR_GROUP_SUBMIT batch (including sync-only
+       * and pure-NOP qsubmits), so waiting on any fence/semaphore signaled by this batch
+       * always waits for all active subqueues (VT, FRAG, COMPUTE) to finish! */
+      for (uint32_t q = 0; q < grp->queue_count && q < ADAPTER_MAX_SUBQUEUES; q++) {
+         if (grp->subqueues[q].emitted_jobs > group_dep_seqno[q])
+            group_dep_seqno[q] = grp->subqueues[q].emitted_jobs;
+      }
+      for (uint32_t i = 0; i < gs->queue_submits.count; i++) {
+         struct drm_panthor_queue_submit *qs = &qsubs[i];
+         auto *sops = reinterpret_cast<struct drm_panthor_sync_op *>(
+            static_cast<uintptr_t>(qs->syncs.array));
+         if (!sops)
+            continue;
+         for (uint32_t s = 0; s < qs->syncs.count; s++) {
+            if (sops[s].flags & DRM_PANTHOR_SYNC_OP_SIGNAL) {
+               struct adapter_syncobj *so = find_syncobj(sops[s].handle);
+               if (so) {
+                  so->value = sops[s].timeline_value ? sops[s].timeline_value : 1ULL;
+                  so->target_group_handle = grp->group_handle;
+                  so->last_target_group_handle = grp->group_handle;
+                  for (uint32_t q = 0; q < grp->queue_count && q < ADAPTER_MAX_SUBQUEUES; q++) {
+                     if (group_dep_seqno[q] > so->target_subq_seqno[q])
+                        so->target_subq_seqno[q] = group_dep_seqno[q];
+                     if (group_dep_seqno[q] > so->last_target_subq_seqno[q])
+                        so->last_target_subq_seqno[q] = group_dep_seqno[q];
+                  }
+                  if (so->cqs_cpu_ptr)
+                     *so->cqs_cpu_ptr = so->value;
+               }
+            }
+         }
       }
 
       /*

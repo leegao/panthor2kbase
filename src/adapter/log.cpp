@@ -89,8 +89,6 @@ extern "C" void panthor2kbase_log_init(void)
 
     const char *level_s = getenv("PANTHOR2KBASE_LOG_LEVEL");
     panthor2kbase_log_level = panthor2kbase_parse_level(level_s);
-    fprintf(stderr, "[panthor2kbase_log_init]: panthor2kbase_parse_level returned %-5s\n",
-            g_level_names[panthor2kbase_log_level]);
 
     const char *path = getenv("PANTHOR2KBASE_LOG_PATH");
     if (path && path[0]) {

@@ -140,6 +140,10 @@ for p in props:
         ICD_JSON="$(resolve_active_icd_json)"
         ICD_DIR="$(dirname "$ICD_JSON")"
         export MALI_AOT_ICD_LOG="${MALI_AOT_ICD_LOG:-1}"
+        export NODEVICE_SELECT="${NODEVICE_SELECT:-1}"
+        if [ -z "${VK_INSTANCE_LAYERS:-}" ]; then
+            export VK_LOADER_LAYERS_DISABLE="${VK_LOADER_LAYERS_DISABLE:-~implicit~}"
+        fi
         export LD_LIBRARY_PATH="$ICD_DIR:$ROOT_DIR:${LD_LIBRARY_PATH:-}"
         export VK_DRIVER_FILES="$ICD_JSON"
         export VK_ICD_FILENAMES="$ICD_JSON"
@@ -198,6 +202,9 @@ for p in props:
         ;;
     --analyze-stall)
         python3 scripts/analyze_csf_stall_log.py "$@"
+        ;;
+    --run-dxvk)
+        exec "$ROOT_DIR/scripts/run_dxvk_aot.sh" "$@"
         ;;
     *)
         echo "Unknown command: $CMD" >&2

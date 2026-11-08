@@ -877,6 +877,16 @@ panvk_queue_submit_init_storage(
       struct panvk_cmd_buffer *cmdbuf = container_of(
          vk_submit->command_buffers[i], struct panvk_cmd_buffer, vk);
 
+      /* If a layer appended instructions after EndCommandBuffer, finalize the
+       * command buffer cleanly before counting non-empty subqueues. */
+      for (uint32_t j = 0; j < ARRAY_SIZE(cmdbuf->state.cs); j++) {
+         struct cs_builder *b = panvk_get_cs_builder(cmdbuf, j);
+         if (unlikely(b->cur_chunk.buffer.cpu != NULL || b->cur_chunk.pos != 0)) {
+            panvk_per_arch(EndCommandBuffer)(panvk_cmd_buffer_to_handle(cmdbuf));
+            break;
+         }
+      }
+
       for (uint32_t j = 0; j < ARRAY_SIZE(cmdbuf->state.cs); j++) {
          struct cs_builder *b = panvk_get_cs_builder(cmdbuf, j);
          assert(cs_is_valid(b));

@@ -3353,6 +3353,28 @@ void runBionicToGlibcLibcLoweringPass(LLVMModuleRef M, PassStats &stats) {
                     } else if (sym == "pthread_self") {
                         storeReg64(cpu, 0, LLVMConstInt(i64Ty, 1, 0));
                         stats.external_stubs_lowered++;
+                    } else if (sym == "vkCreateXcbSurfaceKHR" || sym == "vkCreateXlibSurfaceKHR" ||
+                               sym == "vkCreateWaylandSurfaceKHR") {
+                        std::string hookName = "__mali_hook_" + sym;
+                        LLVMValueRef hookFn = getOrCreateFunction(M, hookName.c_str(), i32Ty, {ptrTy, ptrTy, ptrTy, ptrTy});
+                        LLVMTypeRef hSig[4] = {ptrTy, ptrTy, ptrTy, ptrTy};
+                        LLVMTypeRef hTy = LLVMFunctionType(i32Ty, hSig, 4, 0);
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
+                        LLVMValueRef p2 = LLVMBuildIntToPtr(B, loadReg64(cpu, 2), ptrTy, "");
+                        LLVMValueRef p3 = LLVMBuildIntToPtr(B, loadReg64(cpu, 3), ptrTy, "");
+                        LLVMValueRef args[4] = {p0, p1, p2, p3};
+                        LLVMValueRef res32 = LLVMBuildCall2(B, hTy, hookFn, args, 4, "");
+                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
+                    } else if (sym == "vkQueuePresentKHR") {
+                        LLVMValueRef hookFn = getOrCreateFunction(M, "__mali_hook_vkQueuePresentKHR", i32Ty, {ptrTy, ptrTy});
+                        LLVMTypeRef hSig[2] = {ptrTy, ptrTy};
+                        LLVMTypeRef hTy = LLVMFunctionType(i32Ty, hSig, 2, 0);
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
+                        LLVMValueRef args[2] = {p0, p1};
+                        LLVMValueRef res32 = LLVMBuildCall2(B, hTy, hookFn, args, 2, "");
+                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
                     } else if (sym == "__stack_chk_fail" || sym == "abort") {
                         LLVMValueRef abortFn = getOrCreateFunction(M, "__mali_stack_chk_fail_diag", voidTy, {ptrTy});
                         LLVMTypeRef dTy = LLVMFunctionType(voidTy, &ptrTy, 1, 0);
