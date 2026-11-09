@@ -39,6 +39,8 @@ jobs:
               bison \
               flex \
               libdrm-dev \
+              libvulkan-dev \
+              libvulkan1 \
               libxcb1-dev \
               libx11-xcb-dev \
               libxcb-randr0-dev \

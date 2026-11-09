@@ -23,9 +23,19 @@ else()
    message(STATUS "Configuring Panthor-to-Kbase C++ Adapter Suite for Host (${CMAKE_SYSTEM_PROCESSOR})")
    find_package(Threads REQUIRED)
    set(PLATFORM_LIBS dl Threads::Threads m)
-   find_library(VULKAN_LIB NAMES vulkan HINTS /usr/lib/x86_64-linux-gnu /usr/lib)
+   find_library(VULKAN_LIB NAMES vulkan vulkan.1 libvulkan.so.1 HINTS /usr/lib/x86_64-linux-gnu /usr/lib /usr/lib64)
    if(NOT VULKAN_LIB)
-      set(VULKAN_LIB vulkan)
+      if(EXISTS "/usr/lib/x86_64-linux-gnu/libvulkan.so.1")
+         set(VULKAN_LIB "/usr/lib/x86_64-linux-gnu/libvulkan.so.1")
+      elseif(EXISTS "/usr/lib/x86_64-linux-gnu/libvulkan.so")
+         set(VULKAN_LIB "/usr/lib/x86_64-linux-gnu/libvulkan.so")
+      elseif(EXISTS "/usr/lib64/libvulkan.so.1")
+         set(VULKAN_LIB "/usr/lib64/libvulkan.so.1")
+      elseif(EXISTS "/usr/lib/libvulkan.so.1")
+         set(VULKAN_LIB "/usr/lib/libvulkan.so.1")
+      else()
+         set(VULKAN_LIB "")
+      endif()
    endif()
 endif()
 
@@ -381,12 +391,11 @@ if(PANTHOR_KBASE_BUILD_TESTS AND NOT ANDROID)
       "${CMAKE_CURRENT_SOURCE_DIR}/mesa/include"
       "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/include"
    )
-   target_link_libraries(test_wayland_and_vkgears_e2e PRIVATE
-      panthor_kbase_adapter
-      mali_kbase_emu
-      ${VULKAN_LIB}
-      ${PLATFORM_LIBS}
-   )
+   set(TEST_WAYLAND_LIBS panthor_kbase_adapter mali_kbase_emu ${PLATFORM_LIBS})
+   if(VULKAN_LIB)
+      list(APPEND TEST_WAYLAND_LIBS ${VULKAN_LIB})
+   endif()
+   target_link_libraries(test_wayland_and_vkgears_e2e PRIVATE ${TEST_WAYLAND_LIBS})
    set_target_properties(test_wayland_and_vkgears_e2e PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${TESTS_DIR}"
    )
