@@ -1155,14 +1155,46 @@ int panthor_vk_replay_trace_file(const char *filepath,
    if (opts && opts->icd_json_path && opts->icd_json_path[0]) {
       setenv("VK_ICD_FILENAMES", opts->icd_json_path, 1);
       setenv("VK_DRIVER_FILES", opts->icd_json_path, 1);
+   } else if (!getenv("VK_ICD_FILENAMES")) {
+      const char *json_cands[] = {
+         "build-x86-64/mali_aot_icd.x86_64.json",
+         "build-x86-64/aot/mali_aot_icd.x86_64.json",
+         "../build-x86-64/mali_aot_icd.x86_64.json",
+         "../mali_aot_icd.x86_64.json",
+         "mali_aot_icd.x86_64.json",
+         "src/aot/build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json",
+         "../src/aot/build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json",
+      };
+      for (const char *jc : json_cands) {
+         if (access(jc, R_OK) == 0) {
+            char rp[4096]{};
+            const char *real_p = realpath(jc, rp) ? rp : jc;
+            setenv("VK_ICD_FILENAMES", real_p, 1);
+            setenv("VK_DRIVER_FILES", real_p, 1);
+            break;
+         }
+      }
    }
    if (opts && opts->dump_ppm_path && opts->dump_ppm_path[0]) {
       setenv("MALI_VKCUBE_DUMP_PPM", opts->dump_ppm_path, 1);
    }
 
-   void *vk_so = dlopen("src/aot/build/r54p3-00eac0-6eda07/libvulkan_mali_aot_icd.so", RTLD_NOW | RTLD_LOCAL);
-   if (!vk_so)
-      vk_so = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+   const char *so_candidates[] = {
+      "build-x86-64/libvulkan_mali_aot_icd.so",
+      "build-x86-64/aot/libvulkan_mali_aot_icd.so",
+      "../build-x86-64/libvulkan_mali_aot_icd.so",
+      "../libvulkan_mali_aot_icd.so",
+      "libvulkan_mali_aot_icd.so",
+      "src/aot/build/r54p3-00eac0-6eda07/libvulkan_mali_aot_icd.so",
+      "../src/aot/build/r54p3-00eac0-6eda07/libvulkan_mali_aot_icd.so",
+      "libvulkan.so.1",
+      "libvulkan.so"
+   };
+   void *vk_so = nullptr;
+   for (const char *cand : so_candidates) {
+      vk_so = dlopen(cand, RTLD_NOW | RTLD_LOCAL);
+      if (vk_so) break;
+   }
    if (!vk_so) {
       fclose(fp);
       if (was_capturing)

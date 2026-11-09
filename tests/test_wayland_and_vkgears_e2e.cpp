@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <unistd.h>
 #include <vulkan/vulkan.h>
 
 extern "C" {
@@ -33,9 +34,26 @@ int main() {
     static_assert(sizeof(VkPhysicalDeviceProperties) == 824,
                   "Vulkan ABI requires sizeof(VkPhysicalDeviceProperties) == 824");
 
+    const char* icd_json_cands[] = {
+        "build-x86-64/mali_aot_icd.x86_64.json",
+        "build-x86-64/aot/mali_aot_icd.x86_64.json",
+        "../build-x86-64/mali_aot_icd.x86_64.json",
+        "../mali_aot_icd.x86_64.json",
+        "mali_aot_icd.x86_64.json",
+        "src/aot/build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json",
+        "../src/aot/build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json",
+    };
     char abs_icd[PATH_MAX]{};
-    const char* rel_icd = "src/aot/build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json";
-    const char* icd_path = realpath(rel_icd, abs_icd) ? abs_icd : rel_icd;
+    const char* icd_path = nullptr;
+    for (const char* c : icd_json_cands) {
+        if (access(c, R_OK) == 0) {
+            icd_path = realpath(c, abs_icd) ? abs_icd : c;
+            break;
+        }
+    }
+    if (!icd_path) {
+        icd_path = "build-x86-64/mali_aot_icd.x86_64.json";
+    }
 
     // Force overwrite=1 and disable implicit host layers (e.g. VK_LAYER_MESA_device_select)
     // and host drivers (radv/lvp/anv/nvidia) so system libvulkan.so.1 deterministically
@@ -54,8 +72,21 @@ int main() {
     std::printf("========================================================================\n");
 
     // 1. Verify 456 lifted Vulkan entrypoints in libvulkan_mali_aot_icd.so
-    void* icd_dl = dlopen("src/aot/build/r54p3-00eac0-6eda07/libvulkan_mali_aot_icd.so", RTLD_LAZY | RTLD_LOCAL);
-    assert(icd_dl != nullptr);
+    const char* so_cands[] = {
+        "build-x86-64/libvulkan_mali_aot_icd.so",
+        "build-x86-64/aot/libvulkan_mali_aot_icd.so",
+        "../build-x86-64/libvulkan_mali_aot_icd.so",
+        "../libvulkan_mali_aot_icd.so",
+        "libvulkan_mali_aot_icd.so",
+        "src/aot/build/r54p3-00eac0-6eda07/libvulkan_mali_aot_icd.so",
+        "../src/aot/build/r54p3-00eac0-6eda07/libvulkan_mali_aot_icd.so",
+    };
+    void* icd_dl = nullptr;
+    for (const char* s : so_cands) {
+        icd_dl = dlopen(s, RTLD_LAZY | RTLD_LOCAL);
+        if (icd_dl) break;
+    }
+    assert(icd_dl != nullptr && "Failed to dlopen libvulkan_mali_aot_icd.so");
     auto get_cnt = reinterpret_cast<pfn_aot_get_lifted_vk_entrypoint_count>(
         dlsym(icd_dl, "aot_get_lifted_vk_entrypoint_count"));
     assert(get_cnt != nullptr);

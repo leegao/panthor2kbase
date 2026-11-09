@@ -185,7 +185,14 @@ if [ -d "$BUILD_HOST_DIR" ]; then
     cp -f "$OUT_DIR/libvulkan_mali_aot_icd.so" "$BUILD_HOST_DIR/aot/libvulkan_mali_aot_icd.so" 2>/dev/null || true
     cp -f "$OUT_DIR/mali_aot_runner" "$BUILD_HOST_DIR/mali_aot_runner" 2>/dev/null || true
     cp -f "$OUT_DIR/mali_aot_runner" "$BUILD_HOST_DIR/aot/mali_aot_runner" 2>/dev/null || true
+    cp -f "$OUT_DIR/mali_aot_icd.x86_64.json" "$BUILD_HOST_DIR/mali_aot_icd.x86_64.json" 2>/dev/null || true
+    cp -f "$OUT_DIR/mali_aot_icd.x86_64.json" "$BUILD_HOST_DIR/aot/mali_aot_icd.x86_64.json" 2>/dev/null || true
 fi
+
+mkdir -p "$ROOT_DIR/build/$ELF_TAG"
+cp -f "$OUT_DIR/libvulkan_mali_aot_icd.so" "$ROOT_DIR/build/$ELF_TAG/" 2>/dev/null || true
+cp -f "$OUT_DIR/mali_aot_runner" "$ROOT_DIR/build/$ELF_TAG/" 2>/dev/null || true
+cp -f "$OUT_DIR/mali_aot_icd.x86_64.json" "$ROOT_DIR/build/$ELF_TAG/" 2>/dev/null || true
 
 echo "================================================================================"
 echo " [SUCCESS] 64-Bit C++ LLVM AOT Translation Complete!"

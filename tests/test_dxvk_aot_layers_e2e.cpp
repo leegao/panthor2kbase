@@ -62,8 +62,20 @@ int main() {
     // Test 2: Workstream 2 — vkGetDeviceProcAddr / vkGetInstanceProcAddr Completeness
     //         for vkgears & DXVK 1.10.3 on libvulkan_mali_aot_icd.so
     // ------------------------------------------------------------------------
-    const char* icd_so = "src/aot/build/r54p3-00eac0-6eda07/libvulkan_mali_aot_icd.so";
-    void* h_icd = dlopen(icd_so, RTLD_NOW | RTLD_LOCAL);
+    const char* so_cands[] = {
+        "build-x86-64/libvulkan_mali_aot_icd.so",
+        "build-x86-64/aot/libvulkan_mali_aot_icd.so",
+        "../build-x86-64/libvulkan_mali_aot_icd.so",
+        "../libvulkan_mali_aot_icd.so",
+        "libvulkan_mali_aot_icd.so",
+        "src/aot/build/r54p3-00eac0-6eda07/libvulkan_mali_aot_icd.so",
+        "../src/aot/build/r54p3-00eac0-6eda07/libvulkan_mali_aot_icd.so",
+    };
+    void* h_icd = nullptr;
+    for (const char* s : so_cands) {
+        h_icd = dlopen(s, RTLD_NOW | RTLD_LOCAL);
+        if (h_icd) break;
+    }
     assert(h_icd != nullptr && "Failed to dlopen libvulkan_mali_aot_icd.so");
 
     auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(h_icd, "vkGetInstanceProcAddr"));

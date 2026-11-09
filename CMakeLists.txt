@@ -399,6 +399,9 @@ if(PANTHOR_KBASE_BUILD_TESTS AND NOT ANDROID)
    set_target_properties(test_wayland_and_vkgears_e2e PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${TESTS_DIR}"
    )
+   if(TARGET aot_targets)
+      add_dependencies(test_wayland_and_vkgears_e2e aot_targets)
+   endif()
    add_test(NAME test_wayland_and_vkgears_e2e COMMAND test_wayland_and_vkgears_e2e WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
    add_executable(test_dxvk_aot_layers_e2e
@@ -416,6 +419,9 @@ if(PANTHOR_KBASE_BUILD_TESTS AND NOT ANDROID)
    set_target_properties(test_dxvk_aot_layers_e2e PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${TESTS_DIR}"
    )
+   if(TARGET aot_targets)
+      add_dependencies(test_dxvk_aot_layers_e2e aot_targets)
+   endif()
    add_test(NAME test_dxvk_aot_layers_e2e COMMAND test_dxvk_aot_layers_e2e WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
    find_package(Python3 COMPONENTS Interpreter)
