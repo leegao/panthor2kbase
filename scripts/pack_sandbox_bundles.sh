@@ -168,60 +168,61 @@ fi
 PRE_DIR="predownloaded"
 mkdir -p "$PRE_DIR"
 
-DOWNLOADS_DIR="/home/leegao/Downloads"
-DOWNLOADED_ZIPS=(
-   "vulkan-wsi-layer-main.zip"
-   "mesa-demos-main.zip"
-   "dxvk-1.10.3.zip"
-   "libhybris-arlinux.zip"
-   "android_kernel_modules_nothing_mt6878-mt6878-Tetris-u.zip"
-   "Mesa-PanVK-Android-v26.3.1-795ca7ff-ludashi.zip"
-   "libadrenotools-master.zip"
-   "cmake.zip"
-   "panthor-linux6.1-main.zip"
-   "gpu.zip"
-   "panvk-kbase-android-main.zip"
-   "Vulkan-Samples-main(1).zip"
-)
+# Already fetched, use predownloaded as source of truth
+# DOWNLOADS_DIR="/home/leegao/Downloads"
+# DOWNLOADED_ZIPS=(
+#    "vulkan-wsi-layer-main.zip"
+#    "mesa-demos-main.zip"
+#    "dxvk-1.10.3.zip"
+#    "libhybris-arlinux.zip"
+#    "android_kernel_modules_nothing_mt6878-mt6878-Tetris-u.zip"
+#    "Mesa-PanVK-Android-v26.3.1-795ca7ff-ludashi.zip"
+#    "libadrenotools-master.zip"
+#    "cmake.zip"
+#    "panthor-linux6.1-main.zip"
+#    "gpu.zip"
+#    "panvk-kbase-android-main.zip"
+#    "Vulkan-Samples-main(1).zip"
+# )
+#
+# for z in "${DOWNLOADED_ZIPS[@]}"; do
+#    if [[ ! -f "$PRE_DIR/$z" ]]; then
+#       if [[ -f "./$z" ]]; then
+#          mv -f "./$z" "$PRE_DIR/$z"
+#       elif [[ -f "$DOWNLOADS_DIR/$z" ]]; then
+#          echo "  [copy] Copying $z from $DOWNLOADS_DIR -> $PRE_DIR/..."
+#          cp -f "$DOWNLOADS_DIR/$z" "$PRE_DIR/$z"
+#       fi
+#    fi
+# done
 
-for z in "${DOWNLOADED_ZIPS[@]}"; do
-   if [[ ! -f "$PRE_DIR/$z" ]]; then
-      if [[ -f "./$z" ]]; then
-         mv -f "./$z" "$PRE_DIR/$z"
-      elif [[ -f "$DOWNLOADS_DIR/$z" ]]; then
-         echo "  [copy] Copying $z from $DOWNLOADS_DIR -> $PRE_DIR/..."
-         cp -f "$DOWNLOADS_DIR/$z" "$PRE_DIR/$z"
-      fi
-   fi
-done
+# if [[ ! -f "$PRE_DIR/bcn_layer-main.zip" ]]; then
+#    if [[ -f "./bcn_layer-main.zip" ]]; then
+#       mv -f "./bcn_layer-main.zip" "$PRE_DIR/bcn_layer-main.zip"
+#    else
+#       echo "  [fetch] Fetching bcn_layer source..."
+#       if ! curl -sL https://github.com/leegao/bcn_layer/archive/refs/heads/main.zip -o "$PRE_DIR/bcn_layer-main.zip"; then
+#          [[ -d "/home/leegao/meh/bcn_layer" ]] && git -C /home/leegao/meh/bcn_layer archive -o "$PWD/$PRE_DIR/bcn_layer-main.zip" HEAD
+#       fi
+#    fi
+# fi
+#
+# if [[ ! -f "$PRE_DIR/compat_layer-main.zip" ]]; then
+#    if [[ -f "./compat_layer-main.zip" ]]; then
+#       mv -f "./compat_layer-main.zip" "$PRE_DIR/compat_layer-main.zip"
+#    else
+#       echo "  [fetch] Fetching compat_layer source..."
+#       if ! curl -sL https://github.com/leegao/compat_layer/archive/refs/heads/main.zip -o "$PRE_DIR/compat_layer-main.zip"; then
+#          [[ -d "/home/leegao/meh/compat_layer" ]] && git -C /home/leegao/meh/compat_layer archive -o "$PWD/$PRE_DIR/compat_layer-main.zip" HEAD
+#       fi
+#    fi
+# fi
 
-if [[ ! -f "$PRE_DIR/bcn_layer-main.zip" ]]; then
-   if [[ -f "./bcn_layer-main.zip" ]]; then
-      mv -f "./bcn_layer-main.zip" "$PRE_DIR/bcn_layer-main.zip"
-   else
-      echo "  [fetch] Fetching bcn_layer source..."
-      if ! curl -sL https://github.com/leegao/bcn_layer/archive/refs/heads/main.zip -o "$PRE_DIR/bcn_layer-main.zip"; then
-         [[ -d "/home/leegao/meh/bcn_layer" ]] && git -C /home/leegao/meh/bcn_layer archive -o "$PWD/$PRE_DIR/bcn_layer-main.zip" HEAD
-      fi
-   fi
-fi
-
-if [[ ! -f "$PRE_DIR/compat_layer-main.zip" ]]; then
-   if [[ -f "./compat_layer-main.zip" ]]; then
-      mv -f "./compat_layer-main.zip" "$PRE_DIR/compat_layer-main.zip"
-   else
-      echo "  [fetch] Fetching compat_layer source..."
-      if ! curl -sL https://github.com/leegao/compat_layer/archive/refs/heads/main.zip -o "$PRE_DIR/compat_layer-main.zip"; then
-         [[ -d "/home/leegao/meh/compat_layer" ]] && git -C /home/leegao/meh/compat_layer archive -o "$PWD/$PRE_DIR/compat_layer-main.zip" HEAD
-      fi
-   fi
-fi
-
-for extra_zip in wrapper-src.zip llvm-include.zip; do
-   if [[ ! -f "$PRE_DIR/$extra_zip" && -f "./$extra_zip" ]]; then
-      mv -f "./$extra_zip" "$PRE_DIR/$extra_zip"
-   fi
-done
+# for extra_zip in wrapper-src.zip llvm-include.zip; do
+#    if [[ ! -f "$PRE_DIR/$extra_zip" && -f "./$extra_zip" ]]; then
+#       mv -f "./$extra_zip" "$PRE_DIR/$extra_zip"
+#    fi
+# done
 
 ensure_python_wheels "$PRE_DIR/wheels"
 
@@ -307,7 +308,7 @@ ls -lh "$UNIFIED_TARGET"
 rm -f "$OUT_DIR"/winlator* "$OUT_DIR"/device-reference* "$OUT_DIR"/*ndk-minimal*part* "$OUT_DIR"/*mesa-panvk*part* 2>/dev/null || true
 
 # ==============================================================================
-# 4. Split ONLY the Unified Bundle into 95 MiB Chunks
+# 4. Split ONLY the Unified Bundle into 100 MiB Chunks
 # ==============================================================================
 if [[ "$SPLIT_100M" -eq 1 ]]; then
    echo "[4/4] Checking split chunk limits for unified bundle (<= 95 MiB chunks)..."
@@ -320,7 +321,7 @@ if [[ "$SPLIT_100M" -eq 1 ]]; then
       else
          echo "  [split] Splitting $(basename "$UNIFIED_TARGET") ($sz bytes) into 95M parts..."
          rm -f "${PART_PREFIX}"*
-         split -b 95M "$UNIFIED_TARGET" "$PART_PREFIX"
+         split -b 100M "$UNIFIED_TARGET" "$PART_PREFIX"
       fi
    fi
 fi
