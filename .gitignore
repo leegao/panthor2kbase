@@ -88,3 +88,9 @@ screenshots
 sandbox_bundles/
 logcat.txt
 wrapper_log.txt
+panthor_drm_replayer
+panthor_vk_replayer
+!CMakeLists.txt
+!*/CMakeLists.txt
+*.txt
+patch.diff
