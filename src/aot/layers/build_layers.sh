@@ -7,8 +7,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$DIR/../../.." && pwd)"
 
 CMAKE_BIN="$("${ROOT_DIR}/scripts/find_cmake.sh")"
-BUILD_TARGET="$ROOT_DIR/build-x86-64"
-[ ! -d "$BUILD_TARGET" ] && [ -d "$ROOT_DIR/build-cmake-host" ] && BUILD_TARGET="$ROOT_DIR/build-cmake-host"
+BUILD_TARGET="${BUILD_DIR:-$ROOT_DIR/build-x86-64}"
 "$CMAKE_BIN" -S "$ROOT_DIR" -B "$BUILD_TARGET" -DCMAKE_BUILD_TYPE=Release
 "$CMAKE_BIN" --build "$BUILD_TARGET" --target VkLayer_BCN_bcn_layer VkLayer_COMPAT_dxvk_mali_compat VkLayer_PANTHOR_capture
 

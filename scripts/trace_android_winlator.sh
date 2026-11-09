@@ -9,9 +9,15 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+mkdir -p "$ROOT_DIR/build-android/scratch"
+
+FORCE_PUSH=0
+if [ "${1:-}" = "--force" ] || [ "${1:-}" = "-f" ]; then
+    FORCE_PUSH=1
+fi
+
 TRACER_SO="$ROOT_DIR/build-android/libmali_uapi_tracer.so"
 [ ! -f "$TRACER_SO" ] && [ -f "$ROOT_DIR/build-android/adapter/libmali_uapi_tracer.so" ] && TRACER_SO="$ROOT_DIR/build-android/adapter/libmali_uapi_tracer.so"
-[ ! -f "$TRACER_SO" ] && [ -f "$ROOT_DIR/build-android-tools/libmali_uapi_tracer_android_aarch64.so" ] && TRACER_SO="$ROOT_DIR/build-android-tools/libmali_uapi_tracer_android_aarch64.so"
 REMOTE_DIR="/data/local/tmp"
 REMOTE_TRACE="/sdcard/Download/mali_uapi_trace.jsonl"
 
@@ -20,11 +26,32 @@ if [ ! -f "$TRACER_SO" ]; then
     "$ROOT_DIR/build_all.sh"
 fi
 
+push() {
+    local file="$1"
+    if [ ! -f "$file" ]; then
+        return 0
+    fi
+    local tag
+    tag="$(basename "$file").pushed.cksum"
+    local cur_sum
+    cur_sum="$(cksum "$file" | awk '{print $1 "-" $2}')"
+    if [ "$FORCE_PUSH" -eq 0 ] && [ -f "$ROOT_DIR/build-android/scratch/$tag" ] && [ "$(cat "$ROOT_DIR/build-android/scratch/$tag")" = "$cur_sum" ]; then
+        echo "  [push] $file unchanged (cksum $cur_sum); skipping adb push (use --force to override)"
+        return 0
+    fi
+    adb push "$file" "$REMOTE_DIR/"
+    if adb shell run-as com.ludashi.benchmark id >/dev/null 2>&1; then
+        adb shell run-as com.ludashi.benchmark "cp $REMOTE_DIR/$(basename "$file") files/imagefs/usr/lib/$(basename "$file")"
+        adb shell run-as com.ludashi.benchmark "ls -lh files/imagefs/usr/lib/$(basename "$file")"
+    fi
+    echo "$cur_sum" > "$ROOT_DIR/build-android/scratch/$tag"
+}
+
 echo "================================================================================"
 echo " Android / Winlator /dev/mali0 UAPI + CSF Ring Tracer Utility"
 echo "================================================================================"
 echo " 1. Pushing tracer to device ($REMOTE_DIR/libmali_uapi_tracer.so):"
-echo "      adb push \"$TRACER_SO\" $REMOTE_DIR/libmali_uapi_tracer.so"
+push "$TRACER_SO"
 echo ""
 echo " 2. In Winlator Container Environment Variables, add:"
 echo "      MALI_UAPI_TRACE_OUT=$REMOTE_TRACE"

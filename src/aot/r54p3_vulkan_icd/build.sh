@@ -7,8 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 CMAKE_BIN="$("${REPO_ROOT}/scripts/find_cmake.sh")"
-BUILD_TARGET="$REPO_ROOT/build-x86-64"
-[ ! -d "$BUILD_TARGET" ] && [ -d "$REPO_ROOT/build-cmake-host" ] && BUILD_TARGET="$REPO_ROOT/build-cmake-host"
+BUILD_TARGET="${BUILD_DIR:-$REPO_ROOT/build-x86-64}"
 "$CMAKE_BIN" -S "$REPO_ROOT" -B "$BUILD_TARGET" -DCMAKE_BUILD_TYPE=Release
 "$CMAKE_BIN" --build "$BUILD_TARGET" --target r54p3_vulkan_icd
 

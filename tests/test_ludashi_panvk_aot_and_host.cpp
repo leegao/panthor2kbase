@@ -167,11 +167,8 @@ int main() {
     const char* patched_paths[] = {
         "./build-x86-64/libvulkan_panfrost_patched.so",
         "./build-x86-64/adapter/libvulkan_panfrost_patched.so",
-        "./build-cmake-host/libvulkan_panfrost_patched.so",
-        "./libvulkan_panfrost_patched.so",
         "../build-x86-64/libvulkan_panfrost_patched.so",
-        "../build-cmake-host/libvulkan_panfrost_patched.so",
-        "libvulkan_panfrost_patched.so"
+        "../build-x86-64/adapter/libvulkan_panfrost_patched.so",
     };
     void* patched_icd = nullptr;
     for (const char* p : patched_paths) {

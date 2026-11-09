@@ -299,16 +299,10 @@ static void *open_patched_panvk_library(void)
    const char *candidates[] = {
       "./build-x86-64/libvulkan_panfrost_patched.so",
       "./build-x86-64/adapter/libvulkan_panfrost_patched.so",
-      "./libvulkan_panfrost_patched.so",
-      "./coverage_output/libvulkan_panfrost_patched.so",
-      "./build-host/libvulkan_panfrost_patched.so",
-      "./build-cmake-host/libvulkan_panfrost_patched.so",
       "../build-x86-64/libvulkan_panfrost_patched.so",
       "../build-x86-64/adapter/libvulkan_panfrost_patched.so",
-      "../libvulkan_panfrost_patched.so",
+      "./coverage_output/libvulkan_panfrost_patched.so",
       "../coverage_output/libvulkan_panfrost_patched.so",
-      "../build-host/libvulkan_panfrost_patched.so",
-      "libvulkan_panfrost_patched.so",
    };
    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
       void *h = dlopen(candidates[i], RTLD_NOW | RTLD_LOCAL);

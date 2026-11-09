@@ -10,7 +10,7 @@
 # the 10-file Gemini Task Agent limit (1 source archive + up to 9 chunk parts <= 1 GB).
 # ==============================================================================
 set -euo pipefail
-
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_DIR="${1:-./sandbox_bundles}"
 SPLIT_100M=1
 if [[ "${2:-}" == "--no-split" ]]; then
