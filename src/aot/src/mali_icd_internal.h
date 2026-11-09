@@ -575,7 +575,7 @@ struct MaliAotGlobalRuntime {
         if (initialized) return true;
 
         const char* env_so = getenv("MALI_AOT_DRIVER_SO");
-        std::string icd_dir_so, icd_root_so, icd_root_r44_so;
+        std::string icd_dir_so, icd_aot_so, icd_repo_so, icd_repo_up_so, icd_root_r44_so;
         Dl_info dli{};
         if (dladdr(reinterpret_cast<void*>(&mali_aot_icd_onload), &dli) && dli.dli_fname) {
             std::string p(dli.dli_fname);
@@ -583,7 +583,9 @@ struct MaliAotGlobalRuntime {
             if (sl != std::string::npos) {
                 std::string d = p.substr(0, sl);
                 icd_dir_so      = d + "/libGLES_mali.so";
-                icd_root_so     = d + "/../../libGLES_mali.so";
+                icd_aot_so      = d + "/../../libGLES_mali.so";
+                icd_repo_so     = d + "/../../../libGLES_mali.so";
+                icd_repo_up_so  = d + "/../../../../libGLES_mali.so";
                 icd_root_r44_so = d + "/../../../libGLES_mali.r44p1.so";
             }
         }
@@ -595,12 +597,10 @@ struct MaliAotGlobalRuntime {
             "../libGLES_mali.so",
             "src/aot/libGLES_mali.so",
             icd_dir_so.empty() ? nullptr : icd_dir_so.c_str(),
-            icd_root_so.empty() ? nullptr : icd_root_so.c_str(),
-            icd_root_r44_so.empty() ? nullptr : icd_root_r44_so.c_str(),
-            "/working_dir/c_3106ac7496559798/user_uploaded_files/ttl=63d/user_uploaded/libGLES_mali.r44p1.so",
-            "/working_dir/c_3106ac7496559798/work/archive/libGLES_mali/libGLES_mali.so",
-            "/working_dir/c_24f54338d69d9705/user_uploaded_files/ttl=63d/user_uploaded/libGLES_mali.so",
-            "/working_dir/c_a3c1acfa7b15211d/work/libGLES_mali.so"
+            icd_aot_so.empty() ? nullptr : icd_aot_so.c_str(),
+            icd_repo_so.empty() ? nullptr : icd_repo_so.c_str(),
+            icd_repo_up_so.empty() ? nullptr : icd_repo_up_so.c_str(),
+            icd_root_r44_so.empty() ? nullptr : icd_root_r44_so.c_str()
         };
         bool mapped_ok = false;
         for (const char* cand : candidates) {
@@ -700,8 +700,17 @@ struct MaliAotGlobalRuntime {
         // (read by vkEnumerateDeviceExtensionProperties @ 0x977140 and vkGetPhysicalDeviceFeatures2 @ 0x97ad30)
         if (mapper.base) {
             uint8_t* cfg_blob = mapper.base + 0x03ffe000ULL;
-            cfg_blob[704]  = 8U; // bit 3: enable full hardware extension & feature table
-            cfg_blob[7368] = 8U;
+            // In libGLES_mali.so (r54p3):
+            //   - cfg_blob[704] (0x2c0) is read by vkGetPhysicalDeviceProperties @ 0x9778d4 for
+            //     framebufferNoAttachmentsSampleCounts AND bit 3 (0x08) is tested by tbz/tbnz
+            //     in vkEnumerateDeviceExtensionProperties @ 0x977140.
+            //   - cfg_blob[7368] (0x1cc8) is read by vkGetPhysicalDeviceProperties @ 0x9778cc for
+            //     framebufferColorSampleCounts, framebufferDepthSampleCounts, framebufferStencilSampleCounts,
+            //     and duplicated across v0.4s into sampledImage{Color,Integer,Depth,Stencil}SampleCounts!
+            // Setting 0x0FU (VK_SAMPLE_COUNT_1_BIT | 2_BIT | 4_BIT | 8_BIT) keeps bit 3 (0x08) set while
+            // advertising 1x, 2x, 4x, and 8x sample counts directly from lifted aot_vkGetPhysicalDeviceProperties!
+            cfg_blob[704]  = 0x0FU;
+            cfg_blob[7368] = 0x0FU;
             *reinterpret_cast<uint64_t*>(mapper.base + 0x031462a0ULL) = reinterpret_cast<uint64_t>(cfg_blob);
         }
 
@@ -730,7 +739,7 @@ struct VkLayerPropertiesIcd {
     char     description[256];
 };
 
-struct VkPhysicalDeviceLimitsIcd {
+struct alignas(8) VkPhysicalDeviceLimitsIcd {
     uint8_t raw[504]; // Exact size of VkPhysicalDeviceLimits in Vulkan 1.3 (504 bytes, aligned to 8)
 };
 
@@ -753,6 +762,10 @@ struct VkPhysicalDevicePropertiesIcd {
     VkPhysicalDeviceLimitsIcd           limits;
     VkPhysicalDeviceSparsePropertiesIcd sparseProperties;
 };
+static_assert(offsetof(VkPhysicalDevicePropertiesIcd, limits) == 296,
+              "VkPhysicalDevicePropertiesIcd::limits must be at byte offset 296 (matching Vulkan C ABI)");
+static_assert(sizeof(VkPhysicalDevicePropertiesIcd) == 824,
+              "VkPhysicalDevicePropertiesIcd must be 824 bytes (matching Vulkan C ABI)");
 
 struct VkQueueFamilyPropertiesIcd {
     uint32_t queueFlags;

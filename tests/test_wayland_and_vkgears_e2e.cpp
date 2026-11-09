@@ -5,13 +5,17 @@
 //      verifying -Wl,-Bsymbolic prevents ELF GOT interposition of
 //      vkEnumerateInstanceExtensionProperties ("points to the loader, this would
 //      lead to infinite recursion"), VK_FORMAT_B8G8R8A8_SRGB (50) surface format
-//      enumeration, and 3-gear multi-draw vkCmdDraw rendering.
+//      enumeration, VkPhysicalDeviceLimits offset 296 alignment & MSAA sample count
+//      bitmasks (1x & 4x via lifted aot_vkGetPhysicalDeviceProperties), and
+//      3-gear multi-draw vkCmdDraw rendering.
 //   2. Workstream 1 (Wayland & X11 WSI): MALI_AOT_DISABLE_WAYLAND_EXT=1 X11 routing
-//      and native WaylandVK_KHR_wayland_surface + wl_shm presentation path.
+//      and native Wayland VK_KHR_wayland_surface + wl_shm presentation path.
 //   3. Workstream 5 (Full-ELF AOT Lifting): Verifies all 456 Vulkan 1.3 dispatch
 //      table entrypoints in libGLES_mali.so are lifted and exported as aot_vk*.
 // ============================================================================
 #include <cassert>
+#include <climits>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -24,10 +28,29 @@ typedef uint64_t (*pfn_aot_get_lifted_vk_entrypoint_count)();
 }
 
 int main() {
-    setenv("VK_ICD_FILENAMES", "src/aot/build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json", 0);
-    setenv("VK_DRIVER_FILES", "src/aot/build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json", 0);
+    static_assert(offsetof(VkPhysicalDeviceProperties, limits) == 296,
+                  "Vulkan ABI requires offsetof(VkPhysicalDeviceProperties, limits) == 296");
+    static_assert(sizeof(VkPhysicalDeviceProperties) == 824,
+                  "Vulkan ABI requires sizeof(VkPhysicalDeviceProperties) == 824");
+
+    char abs_icd[PATH_MAX]{};
+    const char* rel_icd = "src/aot/build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json";
+    const char* icd_path = realpath(rel_icd, abs_icd) ? abs_icd : rel_icd;
+
+    // Force overwrite=1 and disable implicit host layers (e.g. VK_LAYER_MESA_device_select)
+    // and host drivers (radv/lvp/anv/nvidia) so system libvulkan.so.1 deterministically
+    // loads ONLY libvulkan_mali_aot_icd.so on every Linux distribution.
+    setenv("VK_ICD_FILENAMES", icd_path, 1);
+    setenv("VK_DRIVER_FILES", icd_path, 1);
+    setenv("VK_ADD_DRIVER_FILES", "", 1);
+    setenv("NODEVICE_SELECT", "1", 1);
+    setenv("VK_LOADER_LAYERS_DISABLE", "~implicit~", 1);
+    setenv("VK_LOADER_DRIVERS_SELECT", "*mali_aot*", 1);
+    setenv("VK_LOADER_DRIVERS_DISABLE", "*radeon*,*radv*,*lvp*,*intel*,*anv*,*nouveau*,*nvk*,*nvidia*", 1);
+    unsetenv("MALI_AOT_DISABLE_WAYLAND_EXT");
+
     std::printf("========================================================================\n");
-    std::printf(" [Test] Wayland WSI, vkgears (-lvulkan + SRGB + 3D Gears) & 456-Entry AOT\n");
+    std::printf(" [Test] Wayland WSI, vkgears (-lvulkan + SRGB + SampleCounts + 3D Gears)\n");
     std::printf("========================================================================\n");
 
     // 1. Verify 456 lifted Vulkan entrypoints in libvulkan_mali_aot_icd.so
@@ -93,6 +116,22 @@ int main() {
     uint32_t pdev_cnt = 1;
     VkPhysicalDevice pdev = VK_NULL_HANDLE;
     assert(vkEnumeratePhysicalDevices(inst, &pdev_cnt, &pdev) == VK_SUCCESS && pdev != VK_NULL_HANDLE);
+
+    // 3b. Verify vkgears check_sample_count_support() against standard Vulkan VkPhysicalDeviceProperties
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(pdev, &props);
+    std::printf("  [INFO] Active PhysicalDevice: %s (vendorID=0x%04x, colorSamples=0x%x, depthSamples=0x%x)\n",
+                props.deviceName, props.vendorID,
+                props.limits.framebufferColorSampleCounts,
+                props.limits.framebufferDepthSampleCounts);
+    assert(props.vendorID == 0x13B5U);
+    assert((props.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_1_BIT) != 0);
+    assert((props.limits.framebufferDepthSampleCounts & VK_SAMPLE_COUNT_1_BIT) != 0);
+    assert((props.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) != 0);
+    assert((props.limits.framebufferDepthSampleCounts & VK_SAMPLE_COUNT_4_BIT) != 0);
+    assert((props.limits.sampledImageColorSampleCounts & (VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT)) ==
+           (VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT));
+    std::printf("  [PASS] vkgears check_sample_count_support(1x & 4x) verified at offsetof(limits)==296!\n");
 
     // 4. Verify VK_FORMAT_B8G8R8A8_SRGB (50) is advertised for vkgears
     auto pfn_create_headless = reinterpret_cast<PFN_vkCreateHeadlessSurfaceEXT>(
@@ -196,16 +235,17 @@ int main() {
     pi.swapchainCount = 1;
     pi.pSwapchains = &swapchain;
     pi.pImageIndices = &img_idx;
-    setenv("MALI_VKCUBE_DUMP_PPM", "/working_dir/c_3106ac7496559798/v7_work/vkgears_test_frame.ppm", 1);
+    const char* ppm_path = "./vkgears_test_frame.ppm";
+    setenv("MALI_VKCUBE_DUMP_PPM", ppm_path, 1);
     assert(vkQueuePresentKHR(queue, &pi) == VK_SUCCESS);
     unsetenv("MALI_VKCUBE_DUMP_PPM");
 
-    FILE* fp = std::fopen("/working_dir/c_3106ac7496559798/v7_work/vkgears_test_frame.ppm", "rb");
+    FILE* fp = std::fopen(ppm_path, "rb");
     assert(fp != nullptr);
     std::fseek(fp, 0, SEEK_END);
     long fsz = std::ftell(fp);
     std::fclose(fp);
-    std::remove("/working_dir/c_3106ac7496559798/v7_work/vkgears_test_frame.ppm");
+    std::remove(ppm_path);
     assert(fsz > 128 * 128 * 3);
     std::printf("  [PASS] 3-gear multi-draw vkCmdDraw rendered non-empty frame (%ld bytes)\n", fsz);
 

@@ -7,13 +7,19 @@ export PATH="$MESON_WORKING_DIR/build-host/src/compiler/clc:$MESON_WORKING_DIR/b
 
 CS_BUILDER_CHANGED=0
 
-file_sha256() {
-   sha256sum "$1" | awk '{print $1}'
+# Fast checksum helper (uses POSIX `cksum` CRC-32 with `sha256sum` fallback).
+file_fast_cksum() {
+   if command -v cksum >/dev/null 2>&1; then
+      cksum "$1" | awk '{print $1 "-" $2}'
+   else
+      sha256sum "$1" | awk '{print $1}'
+   fi
 }
 
-# Helper: compare exact SHA-256 checksums of source and destination files.
+# Helper: compare exact byte contents of source and destination files via `cmp -s`
+# (zero subshell/pipe hash overhead per file, while remaining 100% immune to timestamp skew).
 # - If a src pull / unzip touched all timestamps in mesa_overlay/ without
-#   changing file contents, SHA-256 matches and destination mtime is untouched
+#   changing file contents, `cmp -s` matches and destination mtime is untouched
 #   (zero unnecessary Mesa rebuilds).
 # - If file contents actually changed (even if extracted from an archive with an
 #   older timestamp), copy and `touch` the destination file so Ninja is
@@ -26,22 +32,17 @@ sync_tree_if_changed() {
    while IFS= read -r -d '' src_file; do
       local rel="${src_file#$src_dir/}"
       local dst_file="$dst_dir/$rel"
-      mkdir -p "$(dirname "$dst_file")"
       local need_copy=0
       if [ ! -f "$dst_file" ]; then
+         mkdir -p "$(dirname "$dst_file")"
          need_copy=1
-      else
-         local src_sum dst_sum
-         src_sum="$(file_sha256 "$src_file")"
-         dst_sum="$(file_sha256 "$dst_file")"
-         if [ "$src_sum" != "$dst_sum" ]; then
-            need_copy=1
-         fi
+      elif ! cmp -s "$src_file" "$dst_file"; then
+         need_copy=1
       fi
       if [ "$need_copy" -eq 1 ]; then
          cp -f "$src_file" "$dst_file"
          touch "$dst_file"
-         echo "  [sync] Updated $dst_file (sha256 changed)"
+         echo "  [sync] Updated $dst_file (content changed)"
          if [[ "$rel" == *"cs_builder.h" ]]; then
             CS_BUILDER_CHANGED=1
          fi
@@ -65,13 +66,13 @@ elif [ -x "$NDK_BIN/aarch64-linux-android35-clang++" ]; then
 fi
 
 if [ -n "$NDK_CXX" ]; then
-   ADAPTER_SHA="$(sha256sum src/adapter/panthor_kbase_adapter.cpp src/adapter/log.cpp src/adapter/drm_mode_stubs.c include/panthor_kbase_adapter.h include/mali_kbase_uapi.h include/panthor_drm.h 2>/dev/null | sha256sum | awk '{print $1}')"
-   PREV_ADAPTER_SHA=""
+   ADAPTER_SUM="$(cksum src/adapter/panthor_kbase_adapter.cpp src/adapter/log.cpp src/adapter/drm_mode_stubs.c include/panthor_kbase_adapter.h include/mali_kbase_uapi.h include/panthor_drm.h 2>/dev/null | cksum | awk '{print $1 "-" $2}')"
+   PREV_ADAPTER_SUM=""
    if [ -f build-android-ndk/.libdrm_sources.sha256 ]; then
-      PREV_ADAPTER_SHA="$(cat build-android-ndk/.libdrm_sources.sha256)"
+      PREV_ADAPTER_SUM="$(cat build-android-ndk/.libdrm_sources.sha256)"
    fi
-   if [ ! -f shims/lib/libdrm.a ] || [ "$ADAPTER_SHA" != "$PREV_ADAPTER_SHA" ]; then
-      echo "  [ndk] Rebuilding shims/lib/libdrm.a (SHA-256 digest changed: ${ADAPTER_SHA:0:12})..."
+   if [ ! -f shims/lib/libdrm.a ] || [ "$ADAPTER_SUM" != "$PREV_ADAPTER_SUM" ]; then
+      echo "  [ndk] Rebuilding shims/lib/libdrm.a (digest changed: $ADAPTER_SUM)..."
       "$NDK_CXX" -std=c++17 -O2 -fPIC -Wall -Wextra -Iinclude -Isrc/adapter \
          -c src/adapter/panthor_kbase_adapter.cpp -o build-android-ndk/panthor_kbase_adapter.o
       "$NDK_CXX" -std=c++17 -O2 -fPIC -Wall -Wextra -Iinclude -Isrc/adapter \
@@ -85,7 +86,7 @@ if [ -n "$NDK_CXX" ]; then
       cp -f shims/lib/libdrm.a shims/libdrm.a
       cp -f shims/lib/libdrm.a shims/libpanthor_kbase_adapter.a
       cp -f shims/lib/libdrm.a shims/lib/libpanthor_kbase_adapter.a
-      echo "$ADAPTER_SHA" > build-android-ndk/.libdrm_sources.sha256
+      echo "$ADAPTER_SUM" > build-android-ndk/.libdrm_sources.sha256
    fi
 fi
 
@@ -99,30 +100,30 @@ if [ -d mesa ]; then
    sync_tree_if_changed "include" "mesa/subprojects/panthor_kbase_adapter/include"
    sync_tree_if_changed "src/adapter" "mesa/subprojects/panthor_kbase_adapter/src/adapter"
    if [ -f mesa_subproject/meson.build ]; then
-      if [ ! -f mesa/subprojects/panthor_kbase_adapter/meson.build ] || [ "$(file_sha256 mesa_subproject/meson.build)" != "$(file_sha256 mesa/subprojects/panthor_kbase_adapter/meson.build)" ]; then
+      if [ ! -f mesa/subprojects/panthor_kbase_adapter/meson.build ] || ! cmp -s mesa_subproject/meson.build mesa/subprojects/panthor_kbase_adapter/meson.build; then
          cp -f mesa_subproject/meson.build mesa/subprojects/panthor_kbase_adapter/meson.build
          touch mesa/subprojects/panthor_kbase_adapter/meson.build
       fi
    fi
 fi
 
-CS_BUILDER_SHA=""
+CS_BUILDER_SUM=""
 if [ -f mesa_overlay/src/panfrost/genxml/cs_builder.h ]; then
-   CS_BUILDER_SHA="$(file_sha256 mesa_overlay/src/panfrost/genxml/cs_builder.h)"
+   CS_BUILDER_SUM="$(file_fast_cksum mesa_overlay/src/panfrost/genxml/cs_builder.h)"
 fi
 
 for build_dir in build-android mesa/build; do
    if [ -d "$build_dir" ]; then
-      PREV_CS_SHA=""
+      PREV_CS_SUM=""
       if [ -f "$build_dir/.cs_builder_abi.sha256" ]; then
-         PREV_CS_SHA="$(cat "$build_dir/.cs_builder_abi.sha256")"
+         PREV_CS_SUM="$(cat "$build_dir/.cs_builder_abi.sha256")"
       fi
-      if [ "$CS_BUILDER_CHANGED" -eq 1 ] || [ "$CS_BUILDER_SHA" != "$PREV_CS_SHA" ]; then
-         echo "  [abi] cs_builder.h SHA-256 changed (${CS_BUILDER_SHA:0:12}); cleaning panvk CSF .o files in $build_dir..."
+      if [ "$CS_BUILDER_CHANGED" -eq 1 ] || [ "$CS_BUILDER_SUM" != "$PREV_CS_SUM" ]; then
+         echo "  [abi] cs_builder.h digest changed ($CS_BUILDER_SUM); cleaning panvk CSF .o files in $build_dir..."
          rm -f "$build_dir"/src/panfrost/vulkan/libpanfrost_vk_*.a.p/*.o 2>/dev/null || true
          rm -f "$build_dir"/src/panfrost/vulkan/libvulkan_panfrost.so.p/*.o 2>/dev/null || true
          [ -d mesa/src/panfrost/vulkan/csf ] && touch mesa/src/panfrost/vulkan/csf/*.c 2>/dev/null || true
-         echo "$CS_BUILDER_SHA" > "$build_dir/.cs_builder_abi.sha256"
+         echo "$CS_BUILDER_SUM" > "$build_dir/.cs_builder_abi.sha256"
       fi
    fi
 done

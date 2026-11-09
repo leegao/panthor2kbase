@@ -4,8 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$ROOT_DIR/../.." && pwd)"
 
-DEFAULT_SO="$ROOT_DIR/libGLES_mali.so"
-if [ ! -f "$DEFAULT_SO" ] && [ -f "$ROOT_DIR/driver/r54p3-00eac0-6eda07/lib64/egl/libGLES_mali.so" ]; then
+DEFAULT_SO="$REPO_ROOT/libGLES_mali.so"
+if [ ! -f "$DEFAULT_SO" ] && [ -f "$ROOT_DIR/libGLES_mali.so" ]; then
+    DEFAULT_SO="$ROOT_DIR/libGLES_mali.so"
+elif [ ! -f "$DEFAULT_SO" ] && [ -f "$ROOT_DIR/driver/r54p3-00eac0-6eda07/lib64/egl/libGLES_mali.so" ]; then
     DEFAULT_SO="$ROOT_DIR/driver/r54p3-00eac0-6eda07/lib64/egl/libGLES_mali.so"
 fi
 
@@ -13,6 +15,8 @@ SO_ARG="${1:-$DEFAULT_SO}"
 SO_PATH=""
 if [ -f "$SO_ARG" ]; then
     SO_PATH="$(realpath "$SO_ARG")"
+elif [ -f "$REPO_ROOT/$SO_ARG" ]; then
+    SO_PATH="$(realpath "$REPO_ROOT/$SO_ARG")"
 fi
 
 # Auto-detect installed host libLLVM shared library across Arch, Ubuntu, Debian, Fedora (LLVM 14..22+)
@@ -85,6 +89,7 @@ fi
 
 OUT_DIR="${2:-$ROOT_DIR/build/$ELF_TAG}"
 mkdir -p "$OUT_DIR" "$ROOT_DIR/bin"
+OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
 PASS_DRIVER="$ROOT_DIR/bin/mali_llvm_pass_driver"
 NEEDS_REBUILD=0

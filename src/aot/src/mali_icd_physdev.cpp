@@ -238,16 +238,16 @@ void vkGetPhysicalDeviceProperties(void* physicalDevice, void* pProperties) {
     if (*reinterpret_cast<uint32_t*>(lim + 368) == 0) *reinterpret_cast<uint32_t*>(lim + 368) = 16384U; // maxFramebufferHeight
     if (*reinterpret_cast<uint32_t*>(lim + 372) == 0) *reinterpret_cast<uint32_t*>(lim + 372) = 2048U;  // maxFramebufferLayers
     // Sample counts (VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT = 0x05) required by vkgears & DXVK:
-    if (*reinterpret_cast<uint32_t*>(lim + 376) == 0) *reinterpret_cast<uint32_t*>(lim + 376) = 0x05U;  // framebufferColorSampleCounts
-    if (*reinterpret_cast<uint32_t*>(lim + 380) == 0) *reinterpret_cast<uint32_t*>(lim + 380) = 0x05U;  // framebufferDepthSampleCounts
-    if (*reinterpret_cast<uint32_t*>(lim + 384) == 0) *reinterpret_cast<uint32_t*>(lim + 384) = 0x05U;  // framebufferStencilSampleCounts
-    if (*reinterpret_cast<uint32_t*>(lim + 388) == 0) *reinterpret_cast<uint32_t*>(lim + 388) = 0x05U;  // framebufferNoAttachmentsSampleCounts
+    *reinterpret_cast<uint32_t*>(lim + 376) |= 0x05U;  // framebufferColorSampleCounts
+    *reinterpret_cast<uint32_t*>(lim + 380) |= 0x05U;  // framebufferDepthSampleCounts
+    *reinterpret_cast<uint32_t*>(lim + 384) |= 0x05U;  // framebufferStencilSampleCounts
+    *reinterpret_cast<uint32_t*>(lim + 388) |= 0x05U;  // framebufferNoAttachmentsSampleCounts
     if (*reinterpret_cast<uint32_t*>(lim + 392) == 0) *reinterpret_cast<uint32_t*>(lim + 392) = 8U;     // maxColorAttachments
-    if (*reinterpret_cast<uint32_t*>(lim + 396) == 0) *reinterpret_cast<uint32_t*>(lim + 396) = 0x05U;  // sampledImageColorSampleCounts
-    if (*reinterpret_cast<uint32_t*>(lim + 400) == 0) *reinterpret_cast<uint32_t*>(lim + 400) = 0x05U;  // sampledImageIntegerSampleCounts
-    if (*reinterpret_cast<uint32_t*>(lim + 404) == 0) *reinterpret_cast<uint32_t*>(lim + 404) = 0x05U;  // sampledImageDepthSampleCounts
-    if (*reinterpret_cast<uint32_t*>(lim + 408) == 0) *reinterpret_cast<uint32_t*>(lim + 408) = 0x05U;  // sampledImageStencilSampleCounts
-    if (*reinterpret_cast<uint32_t*>(lim + 412) == 0) *reinterpret_cast<uint32_t*>(lim + 412) = 0x01U;  // storageImageSampleCounts
+    *reinterpret_cast<uint32_t*>(lim + 396) |= 0x05U;  // sampledImageColorSampleCounts
+    *reinterpret_cast<uint32_t*>(lim + 400) |= 0x05U;  // sampledImageIntegerSampleCounts
+    *reinterpret_cast<uint32_t*>(lim + 404) |= 0x05U;  // sampledImageDepthSampleCounts
+    *reinterpret_cast<uint32_t*>(lim + 408) |= 0x05U;  // sampledImageStencilSampleCounts
+    *reinterpret_cast<uint32_t*>(lim + 412) |= 0x01U;  // storageImageSampleCounts
     if (*reinterpret_cast<uint32_t*>(lim + 420) == 0) *reinterpret_cast<uint32_t*>(lim + 420) = 1U;     // timestampComputeAndGraphics
     if (*reinterpret_cast<float*>(lim + 424) == 0.0f) *reinterpret_cast<float*>(lim + 424)    = 1.0f;   // timestampPeriod
     if (*reinterpret_cast<uint64_t*>(lim + 496) == 0) *reinterpret_cast<uint64_t*>(lim + 496) = 64ULL;  // nonCoherentAtomSize

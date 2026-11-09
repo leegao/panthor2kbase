@@ -2,7 +2,9 @@
 *.d
 
 # Archives
-mesa-*.zip
+*.zip
+!shims.zip
+predownloaded/
 
 # Compiled Object files
 *.slo

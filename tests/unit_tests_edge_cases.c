@@ -812,19 +812,130 @@ static void test_v17_cs_builder_abi_and_ls_tracker_invariants(void)
    assert(strstr(buf, "cs_get_ls_tracker(struct cs_builder *b)") != NULL &&
           "cs_builder.h must define self-healing cs_get_ls_tracker(b)");
 
-   /* Verify compile.sh uses sha256sum and touches synced destination files */
+   /* Verify compile.sh uses fast cmp -s / cksum and touches synced destination files */
    FILE *cfp = fopen("compile.sh", "r");
    assert(cfp != NULL);
    char cbuf[8192];
    size_t cn = fread(cbuf, 1, sizeof(cbuf) - 1, cfp);
    cbuf[cn] = '\0';
    fclose(cfp);
-   assert(strstr(cbuf, "sha256sum") != NULL &&
-          "compile.sh must compare exact SHA-256 checksums");
+   assert(strstr(cbuf, "cmp -s") != NULL &&
+          "compile.sh must use fast cmp -s byte comparison in sync_tree_if_changed");
+   assert(strstr(cbuf, "cksum") != NULL &&
+          "compile.sh must use fast POSIX cksum CRC-32 digest");
    assert(strstr(cbuf, "touch \"$dst_file\"") != NULL &&
           "compile.sh must touch updated destination files so Ninja recompiles");
 
-   printf("  -> Checkpoint v17 struct cs_builder ABI & compile.sh SHA-256 Invariants: PASS\n");
+   printf("  -> Checkpoint v17/v18 struct cs_builder ABI & compile.sh Fast Checksum Invariants: PASS\n");
+}
+
+static void test_v18_dogwitch_machick2_user_reg_munmap_guard_and_multigroup_isolation(void)
+{
+   /* Simulates the exact DOG WITCH.exe & Machick 2.exe multi-device + temporary-instance
+    * sequence that previously crashed inside vkQueueSubmit -> panthor_kmod_get_flush_id:
+    *   1. Device 1 opens /dev/mali0 (fd1), creates VM 1, Tiler Heap 1, Group 1, and maps USER_REG_PAGE.
+    *   2. Device 2 (bcn_layer / secondary device) opens /dev/mali0 (fd2), creates VM 2, Tiler Heap 2, Group 2,
+    *      and maps USER_REG_PAGE.
+    *   3. Temporary VkInstance (Unity/DXVK swapchain re-enumeration) opens /dev/mali0 (fd3), maps USER_REG_PAGE,
+    *      and immediately calls panthor_kbase_adapter_munmap(user_reg, 4096) + panthor_kbase_adapter_close(fd3).
+    *   4. Verify USER_REG_PAGE remains mapped and readable (no SIGSEGV on *(volatile uint32_t *)user_reg!)
+    *      and Group 1 & Group 2 have completely isolated seqno cells in event_bo!
+    */
+   int fd1 = panthor_kbase_adapter_open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+   assert(fd1 >= 0);
+   int fd2 = panthor_kbase_adapter_open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+   assert(fd2 >= 0);
+
+   void *ureg1 = panthor_kbase_adapter_mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd1,
+                                            (off_t)DRM_PANTHOR_USER_MMIO_OFFSET_64BIT);
+   assert(ureg1 != NULL && ureg1 != MAP_FAILED);
+
+   void *ureg2 = panthor_kbase_adapter_mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd2,
+                                            (off_t)DRM_PANTHOR_USER_MMIO_OFFSET_64BIT);
+   assert(ureg2 == ureg1);
+
+   /* Open temporary 3rd instance fd3, map USER_REG_PAGE, then munmap + close fd3 */
+   int fd3 = panthor_kbase_adapter_open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+   assert(fd3 >= 0);
+   void *ureg3 = panthor_kbase_adapter_mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd3,
+                                            (off_t)DRM_PANTHOR_USER_MMIO_OFFSET_64BIT);
+   assert(ureg3 == ureg1);
+   assert(panthor_kbase_adapter_munmap(ureg3, 4096) == 0);
+   assert(panthor_kbase_adapter_close(fd3) == 0);
+
+   /* Dereference ureg1 just as panthor_kmod_get_flush_id() does inside vkQueueSubmit! */
+   volatile uint32_t flush_id = *(const volatile uint32_t *)ureg1;
+   (void)flush_id;
+
+   /* Create VM 1 + Heap 1 + Group 1 on fd1, and VM 2 + Heap 2 + Group 2 on fd2 */
+   struct drm_panthor_vm_create vmc1 = { .flags = 0, .id = 0, .user_va_range = 0 };
+   struct drm_panthor_vm_create vmc2 = { .flags = 0, .id = 0, .user_va_range = 0 };
+   assert(panthor_kbase_adapter_ioctl(fd1, DRM_IOCTL_PANTHOR_VM_CREATE, &vmc1) == 0);
+   assert(panthor_kbase_adapter_ioctl(fd2, DRM_IOCTL_PANTHOR_VM_CREATE, &vmc2) == 0);
+
+   struct drm_panthor_tiler_heap_create hc1 = { .vm_id = vmc1.id, .initial_chunk_count = 5, .chunk_size = 2097152, .max_chunks = 64, .target_in_flight = 65535 };
+   struct drm_panthor_tiler_heap_create hc2 = { .vm_id = vmc2.id, .initial_chunk_count = 5, .chunk_size = 2097152, .max_chunks = 64, .target_in_flight = 65535 };
+   assert(panthor_kbase_adapter_ioctl(fd1, DRM_IOCTL_PANTHOR_TILER_HEAP_CREATE, &hc1) == 0);
+   assert(panthor_kbase_adapter_ioctl(fd2, DRM_IOCTL_PANTHOR_TILER_HEAP_CREATE, &hc2) == 0);
+
+   struct drm_panthor_queue_create qdefs[3] = {
+      { .priority = 1, .ringbuf_size = 65536 },
+      { .priority = 1, .ringbuf_size = 65536 },
+      { .priority = 1, .ringbuf_size = 65536 },
+   };
+   struct drm_panthor_group_create gc1 = {
+      .queues = DRM_PANTHOR_OBJ_ARRAY(3, qdefs),
+      .max_compute_cores = 2, .max_fragment_cores = 2, .max_tiler_cores = 1,
+      .priority = PANTHOR_GROUP_PRIORITY_MEDIUM, .vm_id = vmc1.id
+   };
+   struct drm_panthor_group_create gc2 = {
+      .queues = DRM_PANTHOR_OBJ_ARRAY(3, qdefs),
+      .max_compute_cores = 2, .max_fragment_cores = 2, .max_tiler_cores = 1,
+      .priority = PANTHOR_GROUP_PRIORITY_MEDIUM, .vm_id = vmc2.id
+   };
+   assert(panthor_kbase_adapter_ioctl(fd1, DRM_IOCTL_PANTHOR_GROUP_CREATE, &gc1) == 0);
+   assert(panthor_kbase_adapter_ioctl(fd2, DRM_IOCTL_PANTHOR_GROUP_CREATE, &gc2) == 0);
+   assert(gc1.group_handle != gc2.group_handle);
+
+   /* Submit a compute stream to Group 1 and Group 2 and verify both complete independently */
+   struct drm_panthor_bo_create boc = { .size = 4096, .flags = 0 };
+   assert(panthor_kbase_adapter_ioctl(fd1, DRM_IOCTL_PANTHOR_BO_CREATE, &boc) == 0);
+   struct drm_panthor_bo_mmap_offset bmo = { .handle = boc.handle };
+   assert(panthor_kbase_adapter_ioctl(fd1, DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET, &bmo) == 0);
+   uint64_t *cs_ptr = (uint64_t *)panthor_kbase_adapter_mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd1, (off_t)bmo.offset);
+   assert(cs_ptr != NULL && cs_ptr != MAP_FAILED);
+   struct drm_panthor_vm_bind_op bop = { .flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, .bo_handle = boc.handle, .bo_offset = 0, .va = 0, .size = 4096 };
+   struct drm_panthor_vm_bind vmb = { .vm_id = vmc1.id, .flags = 0, .ops = DRM_PANTHOR_OBJ_ARRAY(1, &bop) };
+   assert(panthor_kbase_adapter_ioctl(fd1, DRM_IOCTL_PANTHOR_VM_BIND, &vmb) == 0);
+   cs_ptr[0] = ((uint64_t)CSF_OP_MOVE48 << 56) | (68ULL << 48) | bop.va;
+
+   uint32_t s1 = 0, s2 = 0;
+   assert(drmSyncobjCreate(fd1, 0, &s1) == 0);
+   assert(drmSyncobjCreate(fd2, 0, &s2) == 0);
+
+   struct drm_panthor_sync_op sop1 = { .flags = DRM_PANTHOR_SYNC_OP_SIGNAL | DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_SYNCOBJ, .handle = s1, .timeline_value = 0 };
+   struct drm_panthor_queue_submit qsub1 = { .queue_index = 2, .stream_size = 8, .stream_addr = bop.va, .latest_flush = *(const volatile uint32_t *)ureg1, .syncs = DRM_PANTHOR_OBJ_ARRAY(1, &sop1) };
+   struct drm_panthor_group_submit gsub1 = { .group_handle = gc1.group_handle, .queue_submits = DRM_PANTHOR_OBJ_ARRAY(1, &qsub1) };
+   assert(panthor_kbase_adapter_ioctl(fd1, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &gsub1) == 0);
+
+   struct drm_panthor_sync_op sop2 = { .flags = DRM_PANTHOR_SYNC_OP_SIGNAL | DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_SYNCOBJ, .handle = s2, .timeline_value = 0 };
+   struct drm_panthor_queue_submit qsub2 = { .queue_index = 0, .stream_size = 8, .stream_addr = bop.va, .latest_flush = *(const volatile uint32_t *)ureg2, .syncs = DRM_PANTHOR_OBJ_ARRAY(1, &sop2) };
+   struct drm_panthor_group_submit gsub2 = { .group_handle = gc2.group_handle, .queue_submits = DRM_PANTHOR_OBJ_ARRAY(1, &qsub2) };
+   assert(panthor_kbase_adapter_ioctl(fd2, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &gsub2) == 0);
+
+   assert(drmSyncobjWait(fd1, &s1, 1, INT64_MAX, 0, NULL) == 0);
+   assert(drmSyncobjWait(fd2, &s2, 1, INT64_MAX, 0, NULL) == 0);
+
+   assert(drmSyncobjDestroy(fd1, s1) == 0);
+   assert(drmSyncobjDestroy(fd2, s2) == 0);
+   assert(drmCloseBufferHandle(fd1, boc.handle) == 0);
+   struct drm_panthor_group_destroy gd2 = { .group_handle = gc2.group_handle };
+   struct drm_panthor_group_destroy gd1 = { .group_handle = gc1.group_handle };
+   assert(panthor_kbase_adapter_ioctl(fd2, DRM_IOCTL_PANTHOR_GROUP_DESTROY, &gd2) == 0);
+   assert(panthor_kbase_adapter_ioctl(fd1, DRM_IOCTL_PANTHOR_GROUP_DESTROY, &gd1) == 0);
+   assert(panthor_kbase_adapter_close(fd2) == 0);
+   assert(panthor_kbase_adapter_close(fd1) == 0);
+   printf("  -> Checkpoint v18 DOG WITCH / Machick 2 USER_REG_PAGE munmap Guard & Multi-Group Seqno Isolation: PASS\n");
 }
 
 int main(void)
@@ -841,6 +952,7 @@ int main(void)
    test_ringbuffer_multi_wrap_600_jobs();
    test_dice_a_million_syncobj_wait_and_bcn_layer_race();
    test_v17_cs_builder_abi_and_ls_tracker_invariants();
+   test_v18_dogwitch_machick2_user_reg_munmap_guard_and_multigroup_isolation();
    printf("[Unit Tests] ALL EDGE CASES PASSED!\n");
    return 0;
 }

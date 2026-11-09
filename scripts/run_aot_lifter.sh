@@ -210,6 +210,9 @@ for p in props:
         export LD_LIBRARY_PATH="$ICD_DIR:$ROOT_DIR:${LD_LIBRARY_PATH:-}"
         export VK_DRIVER_FILES="$ICD_JSON"
         export VK_ICD_FILENAMES="$ICD_JSON"
+        export VK_ADD_DRIVER_FILES=""
+        export VK_LOADER_DRIVERS_SELECT="*mali_aot*"
+        export VK_LOADER_DRIVERS_DISABLE="*radeon*,*radv*,*lvp*,*intel*,*anv*,*nouveau*,*nvk*,*nvidia*"
 
         APP_BIN="$(command -v "$1" 2>/dev/null || echo "$1")"
         echo "================================================================================" >&2
