@@ -66,7 +66,7 @@ elif [ -x "$NDK_BIN/aarch64-linux-android35-clang++" ]; then
 fi
 
 if [ -n "$NDK_CXX" ]; then
-   ADAPTER_SUM="$(cksum src/adapter/panthor_kbase_adapter.cpp src/adapter/log.cpp src/adapter/drm_mode_stubs.c include/panthor_kbase_adapter.h include/mali_kbase_uapi.h include/panthor_drm.h 2>/dev/null | cksum | awk '{print $1 "-" $2}')"
+   ADAPTER_SUM="$(cksum src/adapter/panthor_kbase_adapter.cpp src/adapter/panthor_drm_capture_replay.cpp src/adapter/log.cpp src/adapter/drm_mode_stubs.c include/panthor_kbase_adapter.h include/mali_kbase_uapi.h include/panthor_drm.h 2>/dev/null | cksum | awk '{print $1 "-" $2}')"
    PREV_ADAPTER_SUM=""
    if [ -f build-android-ndk/.libdrm_sources.sha256 ]; then
       PREV_ADAPTER_SUM="$(cat build-android-ndk/.libdrm_sources.sha256)"
@@ -75,6 +75,8 @@ if [ -n "$NDK_CXX" ]; then
       echo "  [ndk] Rebuilding shims/lib/libdrm.a (digest changed: $ADAPTER_SUM)..."
       "$NDK_CXX" -std=c++17 -O2 -fPIC -Wall -Wextra -Iinclude -Isrc/adapter \
          -c src/adapter/panthor_kbase_adapter.cpp -o build-android-ndk/panthor_kbase_adapter.o
+      "$NDK_CXX" -std=c++17 -O2 -fPIC -Wall -Iinclude -Isrc/adapter -Isrc/emulator \
+         -c src/adapter/panthor_drm_capture_replay.cpp -o build-android-ndk/panthor_drm_capture_replay.o
       "$NDK_CXX" -std=c++17 -O2 -fPIC -Wall -Wextra -Iinclude -Isrc/adapter \
          -c src/adapter/log.cpp -o build-android-ndk/log.o
       "$NDK_CC" -std=c11 -O2 -fPIC -Wall -Wextra -Iinclude -Isrc/adapter \

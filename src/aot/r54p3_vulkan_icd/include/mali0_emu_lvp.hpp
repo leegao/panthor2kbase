@@ -618,10 +618,25 @@ public:
         std::vector<uint32_t> color_staging(total_pixels, mfbd.clear_color_rgba8);
         std::vector<float>    depth_staging(total_pixels, mfbd.clear_depth > 0.0f ? mfbd.clear_depth : 1.0f);
 
+        // Optional 2D texture descriptor passed in fs_spd[2] (tex_va) and fs_spd[3] ((1ULL<<63) | (tex_h<<32) | tex_w)
+        const uint32_t* tex_rgba8 = nullptr;
+        uint32_t tex_w = 0, tex_h = 0;
+        bool y_flipped_winding = false;
+        if (draw.fs_spd_gpu_va) {
+            const uint64_t* fspd = reinterpret_cast<const uint64_t*>(draw.fs_spd_gpu_va);
+            if ((fspd[3] >> 63) != 0ULL && fspd[2] != 0ULL) {
+                tex_rgba8         = reinterpret_cast<const uint32_t*>(fspd[2]);
+                tex_w             = static_cast<uint32_t>(fspd[3] & 0xFFFFFFFFULL);
+                tex_h             = static_cast<uint32_t>((fspd[3] >> 32) & 0x3FFFFFFFULL);
+                y_flipped_winding = ((fspd[3] >> 62) & 1ULL) != 0ULL;
+            }
+        }
+
         // 1. Lifted Vertex Shader Stage: transform vertices by 4x4 column-major MVP matrix
         struct ScreenVertex {
             float sx, sy, ndc_z, inv_w;
-            float cr, cg, cb, ca;
+            float cx, cy, cz, cw;
+            float cr, cg, cb, u, v;
             float nx, ny, nz;
         };
         std::vector<ScreenVertex> sverts(draw.vertex_count);
@@ -639,13 +654,15 @@ public:
             sverts[i].sy    = (ndc_y * 0.5f + 0.5f) * static_cast<float>(mfbd.height);
             sverts[i].ndc_z = ndc_z;
             sverts[i].inv_w = inv_w;
-            sverts[i].cr    = v.cr; sverts[i].cg = v.cg; sverts[i].cb = v.cb; sverts[i].ca = v.ca;
+            sverts[i].cx    = cx; sverts[i].cy = cy; sverts[i].cz = cz; sverts[i].cw = cw;
+            sverts[i].cr    = v.cr; sverts[i].cg = v.cg; sverts[i].cb = v.cb;
+            sverts[i].u     = v.ca; sverts[i].v  = v.nw;
             sverts[i].nx    = v.nx; sverts[i].ny = v.ny; sverts[i].nz = v.nz;
         }
 
-        // Light direction from UBO[16..18] (or default normalized (0.4, 0.6, 0.7))
+        // Light direction from UBO[16..18] (or default Khronos cube.frag (0.424, 0.566, 0.707))
         float lx = ubo[16], ly = ubo[17], lz = ubo[18];
-        if (lx == 0.0f && ly == 0.0f && lz == 0.0f) { lx = 0.408f; ly = 0.577f; lz = 0.707f; }
+        if (lx == 0.0f && ly == 0.0f && lz == 0.0f) { lx = 0.424f; ly = 0.566f; lz = 0.707f; }
 
         // 1b. Execute real Host Vulkan VkRenderPass + VkGraphicsPipeline + vkCmdDrawIndexed on llvmpipe/radv
         struct HostClipVertex { float cx, cy, cz, cw; float cr, cg, cb, ca; };
@@ -670,6 +687,10 @@ public:
         auto edgeFn = [](float ax, float ay, float bx, float by, float px, float py) -> float {
             return (bx - ax) * (py - ay) - (by - ay) * (px - ax);
         };
+        auto linearToSrgb = [](float c) -> float {
+            c = std::max(0.0f, std::min(1.0f, c));
+            return (c <= 0.0031308f) ? (12.92f * c) : (1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f);
+        };
 
         for (uint32_t t = 0; t + 2 < draw.index_count; t += 3) {
             uint32_t i0 = indices[t + 0];
@@ -677,13 +698,32 @@ public:
             uint32_t i2 = indices[t + 2];
             if (i0 >= draw.vertex_count || i1 >= draw.vertex_count || i2 >= draw.vertex_count) continue;
 
-            const auto& v0 = sverts[i0];
-            const auto& v1 = sverts[i1];
-            const auto& v2 = sverts[i2];
+            const auto* pv0 = &sverts[i0];
+            const auto* pv1 = &sverts[i1];
+            const auto* pv2 = &sverts[i2];
 
-            float area = edgeFn(v0.sx, v0.sy, v1.sx, v1.sy, v2.sx, v2.sy);
-            if (area <= 0.0f) continue; // Back-face culled
+            float area = edgeFn(pv0->sx, pv0->sy, pv1->sx, pv1->sy, pv2->sx, pv2->sy);
+            if (y_flipped_winding) {
+                if (area >= -1e-3f) continue; // Back-face culled under Khronos clip[1][1] = -1.0 Y-flip
+                std::swap(pv1, pv2);
+                area = -area;
+            } else {
+                if (area <= 0.0f) continue;   // Back-face culled under standard CCW
+            }
+            const auto& v0 = *pv0;
+            const auto& v1 = *pv1;
+            const auto& v2 = *pv2;
             stats.triangles_front_facing++;
+
+            // Compute clip-space face normal matching cube.frag dFdx(frag_pos) x dFdy(frag_pos)
+            float d1x = v1.cx - v0.cx, d1y = v1.cy - v0.cy, d1z = v1.cz - v0.cz;
+            float d2x = v2.cx - v0.cx, d2y = v2.cy - v0.cy, d2z = v2.cz - v0.cz;
+            float fnx = d1y * d2z - d1z * d2y;
+            float fny = d1z * d2x - d1x * d2z;
+            float fnz = d1x * d2y - d1y * d2x;
+            float fn_len = std::sqrt(fnx * fnx + fny * fny + fnz * fnz);
+            if (fn_len > 1e-6f) { fnx /= fn_len; fny /= fn_len; fnz /= fn_len; }
+            if (fnz < 0.0f) { fnx = -fnx; fny = -fny; fnz = -fnz; }
 
             int min_x = std::max(0, static_cast<int>(std::floor(std::min({v0.sx, v1.sx, v2.sx}))));
             int max_x = std::min(static_cast<int>(mfbd.width) - 1,  static_cast<int>(std::ceil(std::max({v0.sx, v1.sx, v2.sx}))));
@@ -714,19 +754,58 @@ public:
                             stats.bbox_max_x = std::max<uint32_t>(stats.bbox_max_x, px);
                             stats.bbox_max_y = std::max<uint32_t>(stats.bbox_max_y, py);
 
-                            // Lifted Fragment Shader: perspective-correct color + Lambertian diffuse FMA
                             float cr = w0 * v0.cr + w1 * v1.cr + w2 * v2.cr;
                             float cg = w0 * v0.cg + w1 * v1.cg + w2 * v2.cg;
                             float cb = w0 * v0.cb + w1 * v1.cb + w2 * v2.cb;
-                            float nx = w0 * v0.nx + w1 * v1.nx + w2 * v2.nx;
-                            float ny = w0 * v0.ny + w1 * v1.ny + w2 * v2.ny;
-                            float nz = w0 * v0.nz + w1 * v1.nz + w2 * v2.nz;
-                            float ndotl = std::max(0.0f, nx * lx + ny * ly + nz * lz);
-                            float shade = std::min(1.0f, 0.30f + 0.70f * ndotl);
 
-                            uint32_t r8 = static_cast<uint32_t>(std::min(255.0f, std::max(0.0f, cr * shade * 255.0f + 0.5f)));
-                            uint32_t g8 = static_cast<uint32_t>(std::min(255.0f, std::max(0.0f, cg * shade * 255.0f + 0.5f)));
-                            uint32_t b8 = static_cast<uint32_t>(std::min(255.0f, std::max(0.0f, cb * shade * 255.0f + 0.5f)));
+                            if (tex_rgba8 && tex_w > 0 && tex_h > 0) {
+                                float p_w0 = w0 * v0.inv_w;
+                                float p_w1 = w1 * v1.inv_w;
+                                float p_w2 = w2 * v2.inv_w;
+                                float inv_w_sum = p_w0 + p_w1 + p_w2;
+                                if (std::fabs(inv_w_sum) > 1e-7f) {
+                                    p_w0 /= inv_w_sum; p_w1 /= inv_w_sum; p_w2 /= inv_w_sum;
+                                }
+                                float u = std::max(0.0f, std::min(1.0f, p_w0 * v0.u + p_w1 * v1.u + p_w2 * v2.u));
+                                float v = std::max(0.0f, std::min(1.0f, p_w0 * v0.v + p_w1 * v1.v + p_w2 * v2.v));
+                                float tx = u * static_cast<float>(tex_w - 1U);
+                                float ty = v * static_cast<float>(tex_h - 1U);
+                                uint32_t tx0 = std::min<uint32_t>(tex_w - 1U, static_cast<uint32_t>(tx));
+                                uint32_t ty0 = std::min<uint32_t>(tex_h - 1U, static_cast<uint32_t>(ty));
+                                uint32_t tx1 = std::min<uint32_t>(tex_w - 1U, tx0 + 1U);
+                                uint32_t ty1 = std::min<uint32_t>(tex_h - 1U, ty0 + 1U);
+                                float fx = tx - static_cast<float>(tx0);
+                                float fy = ty - static_cast<float>(ty0);
+                                auto unpack_rgb = [&](uint32_t p, float& or_c, float& og_c, float& ob_c) {
+                                    or_c = static_cast<float>(p & 0xFFU) / 255.0f;
+                                    og_c = static_cast<float>((p >> 8) & 0xFFU) / 255.0f;
+                                    ob_c = static_cast<float>((p >> 16) & 0xFFU) / 255.0f;
+                                };
+                                float r00, g00, b00, r10, g10, b10, r01, g01, b01, r11, g11, b11;
+                                unpack_rgb(tex_rgba8[ty0 * tex_w + tx0], r00, g00, b00);
+                                unpack_rgb(tex_rgba8[ty0 * tex_w + tx1], r10, g10, b10);
+                                unpack_rgb(tex_rgba8[ty1 * tex_w + tx0], r01, g01, b01);
+                                unpack_rgb(tex_rgba8[ty1 * tex_w + tx1], r11, g11, b11);
+                                float tr = (r00 * (1.0f - fx) + r10 * fx) * (1.0f - fy) + (r01 * (1.0f - fx) + r11 * fx) * fy;
+                                float tg = (g00 * (1.0f - fx) + g10 * fx) * (1.0f - fy) + (g01 * (1.0f - fx) + g11 * fx) * fy;
+                                float tb = (b00 * (1.0f - fx) + b10 * fx) * (1.0f - fy) + (b01 * (1.0f - fx) + b11 * fx) * fy;
+                                float ndotl = std::max(0.0f, fnx * lx + fny * ly + fnz * lz);
+                                float light_val = std::max(0.22f, std::min(1.0f, ndotl));
+                                cr = linearToSrgb(tr * cr * light_val);
+                                cg = linearToSrgb(tg * cg * light_val);
+                                cb = linearToSrgb(tb * cb * light_val);
+                            } else {
+                                float nx = w0 * v0.nx + w1 * v1.nx + w2 * v2.nx;
+                                float ny = w0 * v0.ny + w1 * v1.ny + w2 * v2.ny;
+                                float nz = w0 * v0.nz + w1 * v1.nz + w2 * v2.nz;
+                                float ndotl = std::max(0.0f, nx * lx + ny * ly + nz * lz);
+                                float shade = std::min(1.0f, 0.30f + 0.70f * ndotl);
+                                cr *= shade; cg *= shade; cb *= shade;
+                            }
+
+                            uint32_t r8 = static_cast<uint32_t>(std::min(255.0f, std::max(0.0f, cr * 255.0f + 0.5f)));
+                            uint32_t g8 = static_cast<uint32_t>(std::min(255.0f, std::max(0.0f, cg * 255.0f + 0.5f)));
+                            uint32_t b8 = static_cast<uint32_t>(std::min(255.0f, std::max(0.0f, cb * 255.0f + 0.5f)));
                             color_staging[pidx] = (0xFFU << 24) | (b8 << 16) | (g8 << 8) | r8;
                         } else {
                             stats.depth_overdraw_rejects++;

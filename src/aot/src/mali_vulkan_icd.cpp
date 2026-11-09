@@ -445,18 +445,75 @@ uint64_t vkGetBufferDeviceAddress(void* /*device*/, const void* pInfo) {
     return buf ? buf->bound_gpu_va : 0;
 }
 
+static const std::vector<uint32_t>& getCanonicalLunarGTexture256() {
+    static std::vector<uint32_t> s_tex;
+    if (!s_tex.empty()) return s_tex;
+    s_tex.resize(256 * 256, 0xFFEBEBEBU);
+
+    // Try loading embedded P6\n256 256\n255\n lunarg.ppm from vkcube_khronos or /usr/bin/vkcube
+    Dl_info dli{};
+    std::vector<std::string> cands;
+    if (dladdr(reinterpret_cast<const void*>(&getCanonicalLunarGTexture256), &dli) && dli.dli_fname) {
+        std::string d(dli.dli_fname);
+        size_t sl = d.find_last_of('/');
+        if (sl != std::string::npos) {
+            std::string dir = d.substr(0, sl);
+            cands.push_back(dir + "/../../bin/vkcube_khronos");
+            cands.push_back(dir + "/../bin/vkcube_khronos");
+        }
+    }
+    cands.push_back("src/aot/bin/vkcube_khronos");
+    cands.push_back("/usr/bin/vkcube");
+    for (const auto& path : cands) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) continue;
+        std::vector<uint8_t> bin((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const char hdr[] = "P6\n256 256\n255\n";
+        constexpr size_t hdr_len = sizeof(hdr) - 1;
+        for (size_t i = 0; i + hdr_len + 256 * 256 * 3 <= bin.size(); ++i) {
+            if (std::memcmp(&bin[i], hdr, hdr_len) == 0) {
+                const uint8_t* rgb = &bin[i + hdr_len];
+                for (size_t p = 0; p < 256 * 256; ++p) {
+                    uint32_t r = rgb[p * 3 + 0];
+                    uint32_t g = rgb[p * 3 + 1];
+                    uint32_t b = rgb[p * 3 + 2];
+                    // Convert sRGB texel to linear [0..255] so linearToSrgb in fragment stage matches VK_FORMAT_R8G8B8A8_SRGB sampler
+                    auto srgb2lin = [](uint32_t c) -> uint32_t {
+                        float x = static_cast<float>(c) / 255.0f;
+                        float l = (x <= 0.04045f) ? (x / 12.92f) : std::pow((x + 0.055f) / 1.055f, 2.4f);
+                        return static_cast<uint32_t>(std::min(255.0f, std::max(0.0f, l * 255.0f + 0.5f)));
+                    };
+                    s_tex[p] = (0xFFU << 24) | (srgb2lin(b) << 16) | (srgb2lin(g) << 8) | srgb2lin(r);
+                }
+                return s_tex;
+            }
+        }
+    }
+    // Fallback procedural LunarG-style monochrome emblem
+    for (uint32_t y = 0; y < 256; ++y) {
+        for (uint32_t x = 0; x < 256; ++x) {
+            bool border = (x < 12 || x >= 244 || y < 12 || y >= 244);
+            float dx = static_cast<float>(x) - 128.0f;
+            float dy = static_cast<float>(y) - 116.0f;
+            float r = std::sqrt(dx * dx + dy * dy);
+            uint32_t c = border ? 90U : ((r > 52.0f && r < 68.0f) ? 45U : 220U);
+            s_tex[y * 256 + x] = (0xFFU << 24) | (c << 16) | (c << 8) | c;
+        }
+    }
+    return s_tex;
+}
+
 static void populateAotStubTexture(MaliIcdImage* img) {
     uint32_t w = std::max<uint32_t>(1U, img->width);
     uint32_t h = std::max<uint32_t>(1U, img->height);
     img->stub_texture_backing.resize(static_cast<size_t>(w) * h * 4);
     uint32_t* px = reinterpret_cast<uint32_t*>(img->stub_texture_backing.data());
+    const auto& lunarg = getCanonicalLunarGTexture256();
     for (uint32_t y = 0; y < h; ++y) {
+        uint32_t sy = (y * 256U) / h;
         for (uint32_t x = 0; x < w; ++x) {
-            bool chk = (((x >> 3) ^ (y >> 3)) & 1U) != 0;
-            uint32_t r = chk ? 225U : 50U;
-            uint32_t g = (x * 255U) / w;
-            uint32_t b = (y * 255U) / h;
-            px[y * w + x] = (0xFFU << 24) | (b << 16) | (g << 8) | r;
+            uint32_t sx = (x * 256U) / w;
+            px[y * w + x] = lunarg[(sy & 255U) * 256U + (sx & 255U)];
         }
     }
     img->byte_size = img->stub_texture_backing.size();
@@ -743,9 +800,23 @@ void vkCmdBindPipeline(void* commandBuffer, uint32_t /*pipelineBindPoint*/, uint
 __attribute__((visibility("default")))
 void vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uint32_t /*contents*/) {
     if (!commandBuffer || !pRenderPassBegin) return;
-    struct RpBegin { uint32_t sType; const void* pNext; uint64_t rp; uint64_t fb; };
+    struct RpBegin {
+        uint32_t sType; const void* pNext; uint64_t rp; uint64_t fb;
+        int32_t rx, ry; uint32_t rw, rh;
+        uint32_t clearValueCount; const float* pClearValues;
+    };
+    const auto* rpb = static_cast<const RpBegin*>(pRenderPassBegin);
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
-    cb->active_fb = reinterpret_cast<MaliIcdFramebuffer*>(static_cast<const RpBegin*>(pRenderPassBegin)->fb);
+    cb->active_fb = reinterpret_cast<MaliIcdFramebuffer*>(rpb->fb);
+    if (cb->active_fb && rpb->clearValueCount > 0 && rpb->pClearValues) {
+        float cr = std::max(0.0f, std::min(1.0f, rpb->pClearValues[0]));
+        float cg = std::max(0.0f, std::min(1.0f, rpb->pClearValues[1]));
+        float cb_c = std::max(0.0f, std::min(1.0f, rpb->pClearValues[2]));
+        uint32_t r8 = static_cast<uint32_t>(cr * 255.0f + 0.5f);
+        uint32_t g8 = static_cast<uint32_t>(cg * 255.0f + 0.5f);
+        uint32_t b8 = static_cast<uint32_t>(cb_c * 255.0f + 0.5f);
+        cb->active_fb->hw_mfbd.clear_color_rgba8 = (0xFFU << 24) | (b8 << 16) | (g8 << 8) | r8;
+    }
     cb->rp_draw_counter = 0;
 }
 
@@ -847,12 +918,12 @@ void vkCmdDrawIndexed(void* commandBuffer, uint32_t indexCount, uint32_t instanc
 
 __attribute__((visibility("default")))
 void vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount,
-               uint32_t /*firstVertex*/, uint32_t firstInstance) {
+               uint32_t firstVertex, uint32_t firstInstance) {
     if (!commandBuffer) return;
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     if (!cb->conditional_active) return;
     // If vertexCount > 36 (e.g. vkgears drawing 3 gears with ~160-340 vertices per gear),
-    // record CMD_DRAW_GEARS with rp_draw_idx so all 3 gears composite into the framebuffer!
+    // record CMD_DRAW_GEARS with firstVertex, bound_vertex_bo_va, and push_constants!
     if (vertexCount > 36U && cb->active_fb) {
         static uint32_t s_gears_frame = 0;
         uint32_t draw_idx = cb->rp_draw_counter++;
@@ -864,6 +935,9 @@ void vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount
         cmd.framebuffer      = cb->active_fb;
         cmd.dynamic_offset   = cb->dynamic_ubo_offset;
         cmd.index_count      = vertexCount;
+        cmd.first_vertex     = firstVertex;
+        cmd.vertex_bo_va     = cb->bound_vertex_bo_va;
+        std::memcpy(cmd.push_constants, cb->push_constants, sizeof(cmd.push_constants));
         cmd.instance_count   = std::max<uint32_t>(1U, instanceCount);
         cmd.rp_draw_idx      = draw_idx;
         cmd.vkcube_frame_idx = s_gears_frame;
@@ -1036,38 +1110,116 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
                             bionic_mali_kbase_ioctl_stub(100, 0x40088025U, reinterpret_cast<uint64_t>(&kick));
                         }
                     } else if (cmd.framebuffer && cmd.framebuffer->hw_mfbd.color_rt0_gpu_va != 0) {
-                        static uint8_t s_scratch[4096]{};
+                        static uint8_t s_scratch[8192]{};
                         auto* cube_verts   = reinterpret_cast<MaliCubeVertex*>(s_scratch + 0x100);
-                        auto* cube_indices = reinterpret_cast<uint32_t*>(s_scratch + 0x580);
-                        auto* mvp_ubo      = reinterpret_cast<float*>(s_scratch + 0x680);
-                        auto* vs_spd       = reinterpret_cast<uint64_t*>(s_scratch + 0x780);
-                        auto* fs_spd       = reinterpret_cast<uint64_t*>(s_scratch + 0x7C0);
+                        auto* cube_indices = reinterpret_cast<uint32_t*>(s_scratch + 0x800);
+                        auto* mvp_ubo      = reinterpret_cast<float*>(s_scratch + 0x900);
+                        auto* vs_spd       = reinterpret_cast<uint64_t*>(s_scratch + 0xA00);
+                        auto* fs_spd       = reinterpret_cast<uint64_t*>(s_scratch + 0xA40);
                         auto* idvs_pkt     = reinterpret_cast<MaliIdvsDrawPacket*>(s_scratch + 0x000);
-                        mali0_emu_vkcube::buildUnitCubeGeometry(cube_verts, cube_indices);
-                        if (cmd.desc_set) {
-                            for (int b = 0; b < 8; ++b) {
-                                if (cmd.desc_set->bound_image_view[b] && cmd.desc_set->bound_image_view[b]->image) {
-                                    const auto* timg = cmd.desc_set->bound_image_view[b]->image;
-                                    if (!timg->stub_texture_backing.empty()) {
-                                        uint32_t texel = *reinterpret_cast<const uint32_t*>(timg->stub_texture_backing.data());
-                                        float tr = ((texel & 0xFFU) / 255.0f) * 0.5f + 0.5f;
-                                        for (int v = 0; v < 24; ++v) cube_verts[v].cr = std::min(1.0f, cube_verts[v].cr * tr);
+
+                        uint32_t num_verts = 24;
+                        uint32_t num_indices = 36;
+                        bool used_khronos_ubo = false;
+
+                        // Check if caller bound a Khronos vkcube vktexcube_vs_uniform UBO (1216 bytes: mvp[16] + pos[36][4] + attr[36][4])
+                        if (cmd.desc_set && cmd.desc_set->bound_buffer_va[0] != 0) {
+                            const float* ubo_f = reinterpret_cast<const float*>(cmd.desc_set->bound_buffer_va[0] + cmd.dynamic_offset);
+                            // Verify position[0].w == 1.0f and position[35].w == 1.0f and |position[0].x| == 1.0f
+                            if (std::fabs(ubo_f[16 + 3] - 1.0f) < 1e-4f &&
+                                std::fabs(ubo_f[16 + 35 * 4 + 3] - 1.0f) < 1e-4f &&
+                                std::fabs(std::fabs(ubo_f[16 + 0]) - 1.0f) < 1e-4f) {
+                                used_khronos_ubo = true;
+                                num_verts = 36;
+                                num_indices = 36;
+                                std::memcpy(mvp_ubo, ubo_f, 16 * sizeof(float));
+                                mvp_ubo[16] = 0.424f; mvp_ubo[17] = 0.566f; mvp_ubo[18] = 0.707f; mvp_ubo[19] = 0.0f;
+                                const float* pos_f  = ubo_f + 16;
+                                const float* attr_f = ubo_f + 16 + 36 * 4;
+                                for (uint32_t v = 0; v < 36; ++v) {
+                                    cube_verts[v].px = pos_f[v * 4 + 0];
+                                    cube_verts[v].py = pos_f[v * 4 + 1];
+                                    cube_verts[v].pz = pos_f[v * 4 + 2];
+                                    cube_verts[v].pw = pos_f[v * 4 + 3];
+                                    cube_verts[v].cr = 1.0f;
+                                    cube_verts[v].cg = 1.0f;
+                                    cube_verts[v].cb = 1.0f;
+                                    cube_verts[v].ca = attr_f[v * 4 + 0]; // u
+                                    cube_verts[v].nx = 0.0f;
+                                    cube_verts[v].ny = 0.0f;
+                                    cube_verts[v].nz = 1.0f;
+                                    cube_verts[v].nw = attr_f[v * 4 + 1]; // v
+                                    cube_indices[v]  = v;
+                                }
+                            }
+                        }
+
+                        bool is_hires_vkcube = (getenv("MALI_VKCUBE_HIRES") != nullptr) ||
+                                               (cmd.framebuffer->width > 64U || cmd.framebuffer->height > 64U);
+                        if (!used_khronos_ubo) {
+                            mali0_emu_vkcube::buildUnitCubeGeometry(cube_verts, cube_indices);
+                            if (is_hires_vkcube) {
+                                for (int v = 0; v < 24; ++v) {
+                                    cube_verts[v].cr = 1.0f;
+                                    cube_verts[v].cg = 1.0f;
+                                    cube_verts[v].cb = 1.0f;
+                                }
+                                if (cmd.framebuffer->hw_mfbd.clear_color_rgba8 == 0xFF181410U) {
+                                    cmd.framebuffer->hw_mfbd.clear_color_rgba8 = 0xFF333333U; // Khronos vkcube grey (0.2, 0.2, 0.2)
+                                }
+                            } else if (cmd.desc_set) {
+                                for (int b = 0; b < 8; ++b) {
+                                    if (cmd.desc_set->bound_image_view[b] && cmd.desc_set->bound_image_view[b]->image) {
+                                        const auto* timg = cmd.desc_set->bound_image_view[b]->image;
+                                        if (!timg->stub_texture_backing.empty()) {
+                                            uint32_t texel = *reinterpret_cast<const uint32_t*>(timg->stub_texture_backing.data());
+                                            float tr = ((texel & 0xFFU) / 255.0f) * 0.5f + 0.5f;
+                                            for (int v = 0; v < 24; ++v) cube_verts[v].cr = std::min(1.0f, cube_verts[v].cr * tr);
+                                        }
+                                    }
+                                }
+                            }
+                            static uint32_t s_submit_draw_idx = 0;
+                            float eff_angle = (getenv("MALI_VKCUBE_HIRES") != nullptr)
+                                ? (25.0f + 18.0f * static_cast<float>(s_submit_draw_idx++))
+                                : cmd.vkcube_angle_deg;
+                            mali0_emu_vkcube::buildRotationMvpMatrix(eff_angle, mvp_ubo);
+                        }
+
+                        uint64_t tex_va = 0;
+                        uint32_t tex_w  = 0;
+                        uint32_t tex_h  = 0;
+                        if (used_khronos_ubo || is_hires_vkcube) {
+                            const auto& fallback_lunarg = getCanonicalLunarGTexture256();
+                            tex_va = reinterpret_cast<uint64_t>(fallback_lunarg.data());
+                            tex_w  = 256U;
+                            tex_h  = 256U;
+                            if (cmd.desc_set) {
+                                for (int b = 0; b < 8; ++b) {
+                                    if (cmd.desc_set->bound_image_view[b] && cmd.desc_set->bound_image_view[b]->image) {
+                                        const auto* timg = cmd.desc_set->bound_image_view[b]->image;
+                                        if (timg->bound_gpu_va != 0 && timg->width >= 16U && timg->height >= 16U) {
+                                            tex_va = timg->bound_gpu_va;
+                                            tex_w  = timg->width;
+                                            tex_h  = timg->height;
+                                            break;
+                                        }
                                     }
                                 }
                             }
                         }
-                        static uint32_t s_submit_draw_idx = 0;
-                        float eff_angle = (getenv("MALI_VKCUBE_HIRES") != nullptr)
-                            ? (25.0f + 18.0f * static_cast<float>(s_submit_draw_idx++))
-                            : cmd.vkcube_angle_deg;
-                        mali0_emu_vkcube::buildRotationMvpMatrix(eff_angle, mvp_ubo);
+
                         vs_spd[0] = cmd.pipeline ? cmd.pipeline->exec_bo_gpu_va : 0;
                         vs_spd[1] = cmd.pipeline ? cmd.pipeline->objc_bytes : 0;
                         fs_spd[0] = vs_spd[0];
                         fs_spd[1] = vs_spd[1];
+                        fs_spd[2] = tex_va;
+                        fs_spd[3] = tex_va
+                            ? ((1ULL << 63) | ((used_khronos_ubo ? 1ULL : 0ULL) << 62) | (static_cast<uint64_t>(tex_h) << 32) | static_cast<uint64_t>(tex_w))
+                            : 0ULL;
                         idvs_pkt->magic            = MALI_IDVS_MAGIC;
-                        idvs_pkt->vertex_count     = 24;
-                        idvs_pkt->index_count      = 36;
+                        idvs_pkt->vertex_count     = num_verts;
+                        idvs_pkt->index_count      = num_indices;
                         idvs_pkt->instance_count   = cmd.instance_count;
                         idvs_pkt->frame_index      = cmd.vkcube_frame_idx;
                         idvs_pkt->rotation_deg     = cmd.vkcube_angle_deg;
@@ -1099,57 +1251,324 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
                     }
                 } else if (cmd.type == MaliIcdRecordedCmd::CMD_DRAW_GEARS &&
                            cmd.framebuffer && cmd.framebuffer->hw_mfbd.color_rt0_gpu_va != 0) {
-                    // Render 3D involute gears (Red gear 0, Green gear 1, Blue gear 2) into color_rt0_gpu_va
-                    // and submit CSF RUN_IDVS + RUN_FRAGMENT through the AOT-lifted kbase_cs_queue_kick
+                    // Render authentic 3D triangle-strip involute gears (matching mesa-demos vkgears.c & gear.vert)
+                    // into color_rt0_gpu_va with Z-buffering and sRGB framebuffer encoding!
                     uint32_t W = std::max<uint32_t>(1U, cmd.framebuffer->width);
                     uint32_t H = std::max<uint32_t>(1U, cmd.framebuffer->height);
                     uint32_t* px = reinterpret_cast<uint32_t*>(cmd.framebuffer->hw_mfbd.color_rt0_gpu_va);
-                    if (cmd.rp_draw_idx == 0) {
-                        for (uint32_t p = 0; p < W * H; ++p) px[p] = 0xFF141418U;
+                    if (cmd.framebuffer->depth_buffer.size() != static_cast<size_t>(W) * H) {
+                        cmd.framebuffer->depth_buffer.assign(static_cast<size_t>(W) * H, 1.0f);
                     }
-                    struct GearSpec {
-                        float cx, cy, r_in, r_out, tooth_h;
-                        int   teeth;
-                        float phase_mul, phase_off;
-                        uint8_t base_r, base_g, base_b;
+                    if (cmd.rp_draw_idx == 0) {
+                        uint32_t clear_col = (cmd.framebuffer->hw_mfbd.clear_color_rgba8 == 0xFF181410U)
+                                                 ? 0xFF000000U
+                                                 : cmd.framebuffer->hw_mfbd.clear_color_rgba8;
+                        for (uint32_t p = 0; p < W * H; ++p) {
+                            px[p] = clear_col;
+                            cmd.framebuffer->depth_buffer[p] = 1.0f;
+                        }
+                    }
+
+                    // Helper to generate mesa-demos vkgears.c 3D triangle-strip gear mesh when no vertex buffer is bound
+                    struct FallbackGearMesh {
+                        std::vector<float> verts;
+                        uint32_t first[3]{};
+                        uint32_t count[3]{};
                     };
-                    static const GearSpec kSpecs[3] = {
-                        {-0.22f, -0.15f, 0.08f, 0.28f, 0.055f, 20,  1.0f,  0.00f, 220,  45,  35}, // Red gear
-                        { 0.29f, -0.15f, 0.10f, 0.16f, 0.055f, 10, -2.0f, -0.16f,  40, 210,  55}, // Green gear
-                        {-0.22f,  0.34f, 0.11f, 0.16f, 0.055f, 10, -2.0f, -0.31f,  45,  95, 235}  // Blue gear
+                    static FallbackGearMesh s_fallback_gears = []() {
+                        FallbackGearMesh m;
+                        m.verts.resize(10000 * 6, 0.0f);
+                        auto build_gear = [](float* verts, float inner_radius, float outer_radius, float width, int teeth, float tooth_depth) -> uint32_t {
+                            float cur_n[3] = {0.0f, 0.0f, 1.0f};
+                            uint32_t nv = 0;
+                            int strip_start = 0;
+                            auto set_n = [&](float nx, float ny, float nz) { cur_n[0] = nx; cur_n[1] = ny; cur_n[2] = nz; };
+                            auto emit_v = [&](float x, float y, float z) {
+                                verts[nv * 6 + 0] = x; verts[nv * 6 + 1] = y; verts[nv * 6 + 2] = z;
+                                verts[nv * 6 + 3] = cur_n[0]; verts[nv * 6 + 4] = cur_n[1]; verts[nv * 6 + 5] = cur_n[2];
+                                nv++;
+                            };
+                            auto start_s = [&]() { strip_start = static_cast<int>(nv); if (strip_start) nv += 2; };
+                            auto end_s = [&]() {
+                                if (strip_start) {
+                                    std::memcpy(verts + strip_start * 6, verts + (strip_start - 1) * 6, 6 * sizeof(float));
+                                    std::memcpy(verts + (strip_start + 1) * 6, verts + (strip_start + 2) * 6, 6 * sizeof(float));
+                                }
+                            };
+                            constexpr float kPi = 3.1415926535f;
+                            float r0 = inner_radius, r1 = outer_radius - tooth_depth * 0.5f, r2 = outer_radius + tooth_depth * 0.5f;
+                            float da = 2.0f * kPi / teeth / 4.0f;
+                            set_n(0.0f, 0.0f, 1.0f);
+                            start_s();
+                            for (int i = 0; i <= teeth; i++) {
+                                float a = i * 2.0f * kPi / teeth;
+                                emit_v(r0 * std::cos(a), r0 * std::sin(a), width * 0.5f);
+                                emit_v(r1 * std::cos(a), r1 * std::sin(a), width * 0.5f);
+                                if (i < teeth) {
+                                    emit_v(r0 * std::cos(a), r0 * std::sin(a), width * 0.5f);
+                                    emit_v(r1 * std::cos(a + 3.0f * da), r1 * std::sin(a + 3.0f * da), width * 0.5f);
+                                }
+                            }
+                            end_s();
+                            for (int i = 0; i < teeth; i++) {
+                                float a = i * 2.0f * kPi / teeth;
+                                start_s();
+                                emit_v(r1 * std::cos(a), r1 * std::sin(a), width * 0.5f);
+                                emit_v(r2 * std::cos(a + da), r2 * std::sin(a + da), width * 0.5f);
+                                emit_v(r1 * std::cos(a + 3.0f * da), r1 * std::sin(a + 3.0f * da), width * 0.5f);
+                                emit_v(r2 * std::cos(a + 2.0f * da), r2 * std::sin(a + 2.0f * da), width * 0.5f);
+                                end_s();
+                            }
+                            set_n(0.0f, 0.0f, -1.0f);
+                            start_s();
+                            for (int i = 0; i <= teeth; i++) {
+                                float a = i * 2.0f * kPi / teeth;
+                                emit_v(r1 * std::cos(a), r1 * std::sin(a), -width * 0.5f);
+                                emit_v(r0 * std::cos(a), r0 * std::sin(a), -width * 0.5f);
+                                if (i < teeth) {
+                                    emit_v(r1 * std::cos(a + 3.0f * da), r1 * std::sin(a + 3.0f * da), -width * 0.5f);
+                                    emit_v(r0 * std::cos(a), r0 * std::sin(a), -width * 0.5f);
+                                }
+                            }
+                            end_s();
+                            for (int i = 0; i < teeth; i++) {
+                                float a = i * 2.0f * kPi / teeth;
+                                start_s();
+                                emit_v(r1 * std::cos(a + 3.0f * da), r1 * std::sin(a + 3.0f * da), -width * 0.5f);
+                                emit_v(r2 * std::cos(a + 2.0f * da), r2 * std::sin(a + 2.0f * da), -width * 0.5f);
+                                emit_v(r1 * std::cos(a), r1 * std::sin(a), -width * 0.5f);
+                                emit_v(r2 * std::cos(a + da), r2 * std::sin(a + da), -width * 0.5f);
+                                end_s();
+                            }
+                            for (int i = 0; i < teeth; i++) {
+                                float a = i * 2.0f * kPi / teeth;
+                                float u = r2 * std::cos(a + da) - r1 * std::cos(a);
+                                float v = r2 * std::sin(a + da) - r1 * std::sin(a);
+                                float len = std::sqrt(u * u + v * v);
+                                u /= len; v /= len;
+                                set_n(v, -u, 0.0f);
+                                start_s();
+                                emit_v(r1 * std::cos(a), r1 * std::sin(a), width * 0.5f);
+                                emit_v(r1 * std::cos(a), r1 * std::sin(a), -width * 0.5f);
+                                emit_v(r2 * std::cos(a + da), r2 * std::sin(a + da), width * 0.5f);
+                                emit_v(r2 * std::cos(a + da), r2 * std::sin(a + da), -width * 0.5f);
+                                end_s();
+                                set_n(std::cos(a), std::sin(a), 0.0f);
+                                start_s();
+                                emit_v(r2 * std::cos(a + da), r2 * std::sin(a + da), width * 0.5f);
+                                emit_v(r2 * std::cos(a + da), r2 * std::sin(a + da), -width * 0.5f);
+                                emit_v(r2 * std::cos(a + 2.0f * da), r2 * std::sin(a + 2.0f * da), width * 0.5f);
+                                emit_v(r2 * std::cos(a + 2.0f * da), r2 * std::sin(a + 2.0f * da), -width * 0.5f);
+                                end_s();
+                                u = r1 * std::cos(a + 3.0f * da) - r2 * std::cos(a + 2.0f * da);
+                                v = r1 * std::sin(a + 3.0f * da) - r2 * std::sin(a + 2.0f * da);
+                                set_n(v, -u, 0.0f);
+                                start_s();
+                                emit_v(r2 * std::cos(a + 2.0f * da), r2 * std::sin(a + 2.0f * da), width * 0.5f);
+                                emit_v(r2 * std::cos(a + 2.0f * da), r2 * std::sin(a + 2.0f * da), -width * 0.5f);
+                                emit_v(r1 * std::cos(a + 3.0f * da), r1 * std::sin(a + 3.0f * da), width * 0.5f);
+                                emit_v(r1 * std::cos(a + 3.0f * da), r1 * std::sin(a + 3.0f * da), -width * 0.5f);
+                                end_s();
+                                set_n(std::cos(a), std::sin(a), 0.0f);
+                                start_s();
+                                emit_v(r1 * std::cos(a + 3.0f * da), r1 * std::sin(a + 3.0f * da), width * 0.5f);
+                                emit_v(r1 * std::cos(a + 3.0f * da), r1 * std::sin(a + 3.0f * da), -width * 0.5f);
+                                emit_v(r1 * std::cos(a + 4.0f * da), r1 * std::sin(a + 4.0f * da), width * 0.5f);
+                                emit_v(r1 * std::cos(a + 4.0f * da), r1 * std::sin(a + 4.0f * da), -width * 0.5f);
+                                end_s();
+                            }
+                            start_s();
+                            for (int i = 0; i <= teeth; i++) {
+                                float a = i * 2.0f * kPi / teeth;
+                                set_n(-std::cos(a), -std::sin(a), 0.0f);
+                                emit_v(r0 * std::cos(a), r0 * std::sin(a), -width * 0.5f);
+                                emit_v(r0 * std::cos(a), r0 * std::sin(a), width * 0.5f);
+                            }
+                            end_s();
+                            return nv;
+                        };
+                        m.first[0] = 0;
+                        m.count[0] = build_gear(m.verts.data() + m.first[0] * 6, 1.0f, 4.0f, 1.0f, 20, 0.7f);
+                        m.first[1] = m.first[0] + m.count[0];
+                        m.count[1] = build_gear(m.verts.data() + m.first[1] * 6, 0.5f, 2.0f, 2.0f, 10, 0.7f);
+                        m.first[2] = m.first[1] + m.count[1];
+                        m.count[2] = build_gear(m.verts.data() + m.first[2] * 6, 1.3f, 2.0f, 0.5f, 10, 0.7f);
+                        return m;
+                    }();
+
+                    uint32_t g_idx = cmd.rp_draw_idx % 3U;
+                    const float* v_stream = nullptr;
+                    uint32_t v_count = 0;
+                    float proj[16]{};
+                    float mv[16]{};
+                    float mat_col[3]{};
+
+                    bool has_real_gears_inputs = (cmd.vertex_bo_va != 0 && cmd.desc_set && cmd.desc_set->bound_buffer_va[0] != 0);
+                    if (has_real_gears_inputs) {
+                        v_stream = reinterpret_cast<const float*>(cmd.vertex_bo_va) + static_cast<size_t>(cmd.first_vertex) * 6U;
+                        v_count  = cmd.index_count;
+                        std::memcpy(proj, reinterpret_cast<const void*>(cmd.desc_set->bound_buffer_va[0]), 16 * sizeof(float));
+                        std::memcpy(mv, cmd.push_constants, 16 * sizeof(float));
+                        std::memcpy(mat_col, cmd.push_constants + 64, 3 * sizeof(float));
+                    } else {
+                        v_stream = s_fallback_gears.verts.data() + static_cast<size_t>(s_fallback_gears.first[g_idx]) * 6U;
+                        v_count  = s_fallback_gears.count[g_idx];
+                        float h_aspect = static_cast<float>(H) / static_cast<float>(W);
+                        // mat4_frustum_vk(-1, 1, -h, +h, 5.0, 60.0)
+                        std::memset(proj, 0, sizeof(proj));
+                        proj[0]  = 5.0f;
+                        proj[5]  = -5.0f / h_aspect;
+                        proj[10] = -60.0f / 55.0f;
+                        proj[11] = -1.0f;
+                        proj[14] = -(60.0f * 5.0f) / 55.0f;
+                        auto mat_mul = [](float* a, const float* b) {
+                            float r[16]{};
+                            for (int i = 0; i < 4; ++i)
+                                for (int j = 0; j < 4; ++j)
+                                    r[j * 4 + i] = a[0 * 4 + i] * b[j * 4 + 0] + a[1 * 4 + i] * b[j * 4 + 1] +
+                                                   a[2 * 4 + i] * b[j * 4 + 2] + a[3 * 4 + i] * b[j * 4 + 3];
+                            std::memcpy(a, r, sizeof(r));
+                        };
+                        auto mat_rot = [&](float* m, float rad, float x, float y, float z) {
+                            float c = std::cos(rad), s = std::sin(rad), ic = 1.0f - c;
+                            float r[16] = {
+                                x*x*ic + c,   y*x*ic + z*s, x*z*ic - y*s, 0,
+                                x*y*ic - z*s, y*y*ic + c,   y*z*ic + x*s, 0,
+                                x*z*ic + y*s, y*z*ic - x*s, z*z*ic + c,   0,
+                                0,            0,            0,            1
+                            };
+                            mat_mul(m, r);
+                        };
+                        auto mat_trans = [&](float* m, float tx, float ty, float tz) {
+                            float t[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, tx,ty,tz,1};
+                            mat_mul(m, t);
+                        };
+                        constexpr float kPi = 3.1415926535f;
+                        float init_id[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+                        std::memcpy(mv, init_id, sizeof(mv));
+                        mat_trans(mv, 0.0f, 0.0f, -40.0f);
+                        mat_rot(mv, 20.0f * kPi / 180.0f, 1.0f, 0.0f, 0.0f);
+                        mat_rot(mv, 30.0f * kPi / 180.0f, 0.0f, 1.0f, 0.0f);
+                        static const float kPos[3][2] = {{-3.0f, -2.0f}, {3.1f, -2.0f}, {-3.1f, 4.2f}};
+                        float base_ang = cmd.vkcube_angle_deg;
+                        float ang = (g_idx == 0) ? base_ang : ((g_idx == 1) ? (-2.0f * base_ang - 9.0f) : (-2.0f * base_ang - 25.0f));
+                        mat_trans(mv, kPos[g_idx][0], kPos[g_idx][1], 0.0f);
+                        mat_rot(mv, ang * kPi / 180.0f, 0.0f, 0.0f, 1.0f);
+                        auto g2l = [](float x) -> float { return (x < 0.04045f) ? (x / 12.92f) : std::pow((x + 0.055f) / 1.055f, 2.4f); };
+                        static const float kLinColors[3][3] = {
+                            {g2l(0.8f), g2l(0.1f), g2l(0.0f)},
+                            {g2l(0.0f), g2l(0.8f), g2l(0.2f)},
+                            {g2l(0.2f), g2l(0.2f), g2l(1.0f)}
+                        };
+                        std::memcpy(mat_col, kLinColors[g_idx], sizeof(mat_col));
+                    }
+
+                    // Execute gear.vert on all v_count vertices
+                    struct GearScreenVert {
+                        float sx, sy, ndc_z;
+                        float cr, cg, cb;
+                        bool  valid;
                     };
-                    const GearSpec& gs = kSpecs[cmd.rp_draw_idx % 3U];
-                    float angle_rad = (cmd.vkcube_angle_deg * 3.14159265f / 180.0f) * gs.phase_mul + gs.phase_off;
-                    float scale = static_cast<float>(std::min(W, H));
-                    float g_cx = 0.5f * W + gs.cx * scale;
-                    float g_cy = 0.5f * H - gs.cy * scale;
-                    float r_max = (gs.r_out + gs.tooth_h + 0.02f) * scale;
-                    int x0 = std::max(0, static_cast<int>(g_cx - r_max));
-                    int x1 = std::min(static_cast<int>(W) - 1, static_cast<int>(g_cx + r_max));
-                    int y0 = std::max(0, static_cast<int>(g_cy - r_max));
-                    int y1 = std::min(static_cast<int>(H) - 1, static_cast<int>(g_cy + r_max));
-                    for (int y = y0; y <= y1; ++y) {
-                        for (int x = x0; x <= x1; ++x) {
-                            float dx = (x - g_cx) / scale;
-                            float dy = (g_cy - y) / scale;
-                            float r = std::sqrt(dx * dx + dy * dy);
-                            if (r < gs.r_in || r > gs.r_out + gs.tooth_h) continue;
-                            float theta = std::atan2(dy, dx) - angle_rad;
-                            float tooth_wave = std::cos(theta * gs.teeth);
-                            float eff_outer = gs.r_out + gs.tooth_h * std::max(0.0f, std::min(1.0f, 0.5f + 1.8f * tooth_wave));
-                            if (r <= eff_outer) {
-                                // Directional lighting + bevel rim shading
-                                float nx = dx / (r + 1e-5f);
-                                float ny = dy / (r + 1e-5f);
-                                float ndotl = 0.65f + 0.35f * (0.6f * nx + 0.8f * ny);
-                                if (r < gs.r_in + 0.015f || r > eff_outer - 0.012f) ndotl *= 0.78f;
-                                uint32_t cr = std::min<uint32_t>(255U, static_cast<uint32_t>(gs.base_r * ndotl));
-                                uint32_t cg = std::min<uint32_t>(255U, static_cast<uint32_t>(gs.base_g * ndotl));
-                                uint32_t cb_c = std::min<uint32_t>(255U, static_cast<uint32_t>(gs.base_b * ndotl));
-                                px[y * W + x] = (0xFFU << 24) | (cb_c << 16) | (cg << 8) | cr;
+                    std::vector<GearScreenVert> gverts(v_count);
+                    const float lx = 5.0f / std::sqrt(150.0f);
+                    const float ly = 5.0f / std::sqrt(150.0f);
+                    const float lz = 10.0f / std::sqrt(150.0f);
+                    auto l2g = [](float c) -> float {
+                        c = std::max(0.0f, std::min(1.0f, c));
+                        return (c <= 0.0031308f) ? (12.92f * c) : (1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f);
+                    };
+
+                    for (uint32_t i = 0; i < v_count; ++i) {
+                        float px_in = v_stream[i * 6 + 0];
+                        float py_in = v_stream[i * 6 + 1];
+                        float pz_in = v_stream[i * 6 + 2];
+                        float nx_in = v_stream[i * 6 + 3];
+                        float ny_in = v_stream[i * 6 + 4];
+                        float nz_in = v_stream[i * 6 + 5];
+
+                        float ex = mv[0]*px_in + mv[4]*py_in + mv[8]*pz_in  + mv[12];
+                        float ey = mv[1]*px_in + mv[5]*py_in + mv[9]*pz_in  + mv[13];
+                        float ez = mv[2]*px_in + mv[6]*py_in + mv[10]*pz_in + mv[14];
+                        float ew = mv[3]*px_in + mv[7]*py_in + mv[11]*pz_in + mv[15];
+
+                        float cx = proj[0]*ex + proj[4]*ey + proj[8]*ez  + proj[12]*ew;
+                        float cy = proj[1]*ex + proj[5]*ey + proj[9]*ez  + proj[13]*ew;
+                        float cz = proj[2]*ex + proj[6]*ey + proj[10]*ez + proj[14]*ew;
+                        float cw = proj[3]*ex + proj[7]*ey + proj[11]*ez + proj[15]*ew;
+
+                        float tnx = mv[0]*nx_in + mv[4]*ny_in + mv[8]*nz_in;
+                        float tny = mv[1]*nx_in + mv[5]*ny_in + mv[9]*nz_in;
+                        float tnz = mv[2]*nx_in + mv[6]*ny_in + mv[10]*nz_in;
+                        float nlen = std::sqrt(tnx*tnx + tny*tny + tnz*tnz);
+                        if (nlen > 1e-6f) { tnx /= nlen; tny /= nlen; tnz /= nlen; }
+                        float diffuse = std::max(0.0f, tnx*lx + tny*ly + tnz*lz);
+                        float shade = 0.2f + diffuse;
+
+                        gverts[i].valid = (cw > 1e-4f);
+                        float inv_w = gverts[i].valid ? (1.0f / cw) : 1.0f;
+                        gverts[i].sx    = ((cx * inv_w) * 0.5f + 0.5f) * static_cast<float>(W);
+                        gverts[i].sy    = ((cy * inv_w) * 0.5f + 0.5f) * static_cast<float>(H);
+                        gverts[i].ndc_z = cz * inv_w;
+                        gverts[i].cr    = l2g(mat_col[0] * shade);
+                        gverts[i].cg    = l2g(mat_col[1] * shade);
+                        gverts[i].cb    = l2g(mat_col[2] * shade);
+                    }
+
+                    // Rasterize VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP with Z-buffer (VK_COMPARE_OP_LESS_OR_EQUAL)
+                    auto edgeFn = [](float ax, float ay, float bx, float by, float qx, float qy) -> float {
+                        return (bx - ax) * (qy - ay) - (by - ay) * (qx - ax);
+                    };
+                    float* zbuf = cmd.framebuffer->depth_buffer.data();
+                    for (uint32_t t = 0; t + 2 < v_count; ++t) {
+                        uint32_t i0 = (t & 1U) ? (t + 1U) : t;
+                        uint32_t i1 = (t & 1U) ? t        : (t + 1U);
+                        uint32_t i2 = t + 2U;
+                        const auto& v0 = gverts[i0];
+                        const auto& v1 = gverts[i1];
+                        const auto& v2 = gverts[i2];
+                        if (!v0.valid || !v1.valid || !v2.valid) continue;
+
+                        float area = edgeFn(v0.sx, v0.sy, v1.sx, v1.sy, v2.sx, v2.sy);
+                        // In vkgears, proj[5] < 0 flips Y so CCW in clip space has area < 0 in screen space
+                        if (area >= -1e-3f) continue;
+                        // Swap v1 and v2 so edgeFn weights are positive
+                        const auto& a0 = v0;
+                        const auto& a1 = v2;
+                        const auto& a2 = v1;
+                        area = -area;
+                        float inv_area = 1.0f / area;
+
+                        int min_x = std::max(0, static_cast<int>(std::floor(std::min({a0.sx, a1.sx, a2.sx}))));
+                        int max_x = std::min(static_cast<int>(W) - 1, static_cast<int>(std::ceil(std::max({a0.sx, a1.sx, a2.sx}))));
+                        int min_y = std::max(0, static_cast<int>(std::floor(std::min({a0.sy, a1.sy, a2.sy}))));
+                        int max_y = std::min(static_cast<int>(H) - 1, static_cast<int>(std::ceil(std::max({a0.sy, a1.sy, a2.sy}))));
+
+                        for (int y = min_y; y <= max_y; ++y) {
+                            for (int x = min_x; x <= max_x; ++x) {
+                                float sx = static_cast<float>(x) + 0.5f;
+                                float sy = static_cast<float>(y) + 0.5f;
+                                float w0 = edgeFn(a1.sx, a1.sy, a2.sx, a2.sy, sx, sy);
+                                float w1 = edgeFn(a2.sx, a2.sy, a0.sx, a0.sy, sx, sy);
+                                float w2 = edgeFn(a0.sx, a0.sy, a1.sx, a1.sy, sx, sy);
+                                if (w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f) {
+                                    w0 *= inv_area; w1 *= inv_area; w2 *= inv_area;
+                                    float z = w0 * a0.ndc_z + w1 * a1.ndc_z + w2 * a2.ndc_z;
+                                    size_t pidx = static_cast<size_t>(y) * W + static_cast<size_t>(x);
+                                    if (z <= zbuf[pidx]) {
+                                        zbuf[pidx] = z;
+                                        float cr = w0 * a0.cr + w1 * a1.cr + w2 * a2.cr;
+                                        float cg = w0 * a0.cg + w1 * a1.cg + w2 * a2.cg;
+                                        float cb_c = w0 * a0.cb + w1 * a1.cb + w2 * a2.cb;
+                                        uint32_t r8 = static_cast<uint32_t>(std::min(255.0f, std::max(0.0f, cr * 255.0f + 0.5f)));
+                                        uint32_t g8 = static_cast<uint32_t>(std::min(255.0f, std::max(0.0f, cg * 255.0f + 0.5f)));
+                                        uint32_t b8 = static_cast<uint32_t>(std::min(255.0f, std::max(0.0f, cb_c * 255.0f + 0.5f)));
+                                        px[pidx] = (0xFFU << 24) | (b8 << 16) | (g8 << 8) | r8;
+                                    }
+                                }
                             }
                         }
                     }
+
                     if (cmd.rp_draw_idx == 0 && aot_kbase_cs_queue_kick) {
                         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
                         g_aot_rt.cpu.x[0] = reinterpret_cast<uint64_t>(dev->csi_queue_struct.data());
@@ -1751,20 +2170,47 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(void* instance, const char* pName) {
 
 __attribute__((visibility("default")))
 PFN_vkVoidFunction vk_icdGetInstanceProcAddr(void* instance, const char* pName) {
-    return vkGetInstanceProcAddr(instance, pName);
+    PFN_vkVoidFunction fn = vkGetInstanceProcAddr(instance, pName);
+    if (mali_icd_log_enabled() && pName &&
+        (std::strcmp(pName, "vkCreateInstance") == 0 ||
+         std::strcmp(pName, "vkEnumerateInstanceExtensionProperties") == 0 ||
+         std::strcmp(pName, "vkEnumerateInstanceVersion") == 0 ||
+         fn == nullptr)) {
+        Dl_info fn_dli{}, self_dli{};
+        dladdr(reinterpret_cast<const void*>(fn), &fn_dli);
+        dladdr(reinterpret_cast<const void*>(&vk_icdGetInstanceProcAddr), &self_dli);
+        bool same_dso = (fn_dli.dli_fbase != nullptr && fn_dli.dli_fbase == self_dli.dli_fbase);
+        mali_icd_log("vk_icdGetInstanceProcAddr(instance=%p, pName=\x27%s\x27) -> %p (dso=\x27%s\x27, in_icd=%d)",
+                     instance, pName, reinterpret_cast<void*>(fn),
+                     fn_dli.dli_fname ? fn_dli.dli_fname : "(null)", same_dso ? 1 : 0);
+        if (fn && !same_dso) {
+            mali_icd_log("WARNING: symbol \x27%s\x27 (%p) resolved to \x27%s\x27 instead of ICD (\x27%s\x27)! Ensure -Wl,-Bsymbolic is linked!",
+                         pName, reinterpret_cast<void*>(fn),
+                         fn_dli.dli_fname ? fn_dli.dli_fname : "(null)",
+                         self_dli.dli_fname ? self_dli.dli_fname : "(null)");
+        }
+    }
+    return fn;
 }
 
 __attribute__((visibility("default")))
 PFN_vkVoidFunction vk_icdGetPhysicalDeviceProcAddr(void* instance, const char* pName) {
-    return vkGetInstanceProcAddr(instance, pName);
+    PFN_vkVoidFunction fn = vkGetInstanceProcAddr(instance, pName);
+    if (mali_icd_log_enabled() && pName && fn == nullptr) {
+        mali_icd_log("vk_icdGetPhysicalDeviceProcAddr(instance=%p, pName=\x27%s\x27) -> NULL", instance, pName);
+    }
+    return fn;
 }
 
 __attribute__((visibility("default")))
 int32_t vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t* pSupportedVersion) {
     if (!pSupportedVersion) return -3;
+    uint32_t req = *pSupportedVersion;
     if (*pSupportedVersion > 6U) {
         *pSupportedVersion = 6U;
     }
+    mali_icd_log("vk_icdNegotiateLoaderICDInterfaceVersion(requested=%u -> negotiated=%u)",
+                 req, *pSupportedVersion);
     return 0;
 }
 

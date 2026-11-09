@@ -70,6 +70,8 @@ struct kbase_emu_stats {
    uint32_t csg_scope_warnings;
    uint32_t oom_heap_stat_errors;
    uint32_t same_va_munmap_destroys;
+   uint32_t unwaited_deferred_sync_errors;
+   uint32_t csf_jumps_followed;
 };
 
 void mali_kbase_emu_get_stats(struct kbase_emu_stats *out);

@@ -40,14 +40,17 @@ inline void buildUnitCubeGeometry(MaliCubeVertex out_verts[24], uint32_t out_ind
             dst.py = faces[f].v[k][1];
             dst.pz = faces[f].v[k][2];
             dst.pw = 1.0f;
+            static const float kFaceUV[4][2] = {
+                {0.0f, 1.0f}, {1.0f, 1.0f}, {1.0f, 0.0f}, {0.0f, 0.0f}
+            };
             dst.cr = faces[f].cr;
             dst.cg = faces[f].cg;
             dst.cb = faces[f].cb;
-            dst.ca = 1.0f;
+            dst.ca = kFaceUV[k][0];
             dst.nx = faces[f].nx;
             dst.ny = faces[f].ny;
             dst.nz = faces[f].nz;
-            dst.nw = 0.0f;
+            dst.nw = kFaceUV[k][1];
         }
         uint32_t base = f * 4;
         out_indices[f * 6 + 0] = base + 0;

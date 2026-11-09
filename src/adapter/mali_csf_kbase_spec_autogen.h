@@ -110,6 +110,11 @@
 #define MALI_CSF_INS_CALL_LENGTH_MASK  UINT64_C(0x000000ff00000000)
 #define MALI_CSF_INS_CALL_ADDRESS_SHIFT 40U
 #define MALI_CSF_INS_CALL_ADDRESS_MASK  UINT64_C(0x0000ff0000000000)
+/* JUMP (opcode = 0x21 = 33, v11.xml:struct[CS JUMP]) */
+#define MALI_CSF_INS_JUMP_LENGTH_SHIFT 32U
+#define MALI_CSF_INS_JUMP_LENGTH_MASK  UINT64_C(0x000000ff00000000)
+#define MALI_CSF_INS_JUMP_ADDRESS_SHIFT 40U
+#define MALI_CSF_INS_JUMP_ADDRESS_MASK  UINT64_C(0x0000ff0000000000)
 /* LOAD_MULTIPLE (opcode = 0x14 = 20, v11.xml:struct[CS LOAD_MULTIPLE]) */
 #define MALI_CSF_INS_LOAD_MULTIPLE_OFFSET_SHIFT 0U
 #define MALI_CSF_INS_LOAD_MULTIPLE_OFFSET_MASK  UINT64_C(0x000000000000ffff)
@@ -257,6 +262,59 @@
 #define MALI_CSF_INS_SET_STATE_IMM32_STATE_SHIFT 32U
 #define MALI_CSF_INS_SET_STATE_IMM32_STATE_MASK  UINT64_C(0x000000ff00000000)
 /* ERROR_BARRIER (opcode = 0x2f = 47, v11.xml:struct[CS ERROR_BARRIER]) */
+
+/* --------------------------------------------------------------------------
+ * 3b. Hardware CSF Call Stack Bound & Typed Instruction Unpackers
+ *     (Auto-generated from v10.xml/v11.xml to prevent manual shift bugs)
+ * -------------------------------------------------------------------------- */
+#define MALI_CSF_MAX_CALL_STACK_DEPTH              8U
+
+struct mali_csf_sync_op_fields {
+   uint8_t  opcode;
+   bool     error_propagate;
+   uint8_t  scope;
+   uint16_t wait_mask;
+   uint8_t  data_reg;
+   uint8_t  addr_reg;
+   uint8_t  signal_slot;
+   uint8_t  defer_mode;
+   bool     is_deferred;
+};
+
+static inline bool mali_csf_unpack_sync_op(uint64_t insn, struct mali_csf_sync_op_fields *out) {
+   uint8_t op = (uint8_t)((insn >> 56) & 0xffULL);
+   if (op != MALI_CSF_OP_SYNC_ADD32 && op != MALI_CSF_OP_SYNC_SET32 &&
+       op != MALI_CSF_OP_SYNC_ADD64 && op != MALI_CSF_OP_SYNC_SET64)
+      return false;
+   if (out) {
+      out->opcode          = op;
+      out->error_propagate = (insn & MALI_CSF_INS_SYNC_ADD32_ERROR_PROPAGATE_MASK) != 0ULL;
+      out->scope           = (uint8_t)((insn & MALI_CSF_INS_SYNC_ADD32_SCOPE_MASK) >> MALI_CSF_INS_SYNC_ADD32_SCOPE_SHIFT);
+      out->wait_mask       = (uint16_t)((insn & MALI_CSF_INS_SYNC_ADD32_WAIT_MASK_MASK) >> MALI_CSF_INS_SYNC_ADD32_WAIT_MASK_SHIFT);
+      out->data_reg        = (uint8_t)((insn & MALI_CSF_INS_SYNC_ADD32_DATA_MASK) >> MALI_CSF_INS_SYNC_ADD32_DATA_SHIFT);
+      out->addr_reg        = (uint8_t)((insn & MALI_CSF_INS_SYNC_ADD32_ADDRESS_MASK) >> MALI_CSF_INS_SYNC_ADD32_ADDRESS_SHIFT);
+      out->signal_slot     = (uint8_t)((insn & MALI_CSF_INS_SYNC_ADD32_SIGNAL_SLOT_MASK) >> MALI_CSF_INS_SYNC_ADD32_SIGNAL_SLOT_SHIFT);
+      out->defer_mode      = (uint8_t)((insn & MALI_CSF_INS_SYNC_ADD32_DEFER_MODE_MASK) >> MALI_CSF_INS_SYNC_ADD32_DEFER_MODE_SHIFT);
+      out->is_deferred     = (out->signal_slot == 1U /* MALI_PANVK_SB_ID_DEFERRED_SYNC */) ||
+                             (out->defer_mode == MALI_CS_DEFER_MODE_DEFER_INDIRECT);
+   }
+   return true;
+}
+
+static inline bool mali_csf_sync_op_is_deferred(uint64_t insn) {
+   struct mali_csf_sync_op_fields f;
+   return mali_csf_unpack_sync_op(insn, &f) && f.is_deferred;
+}
+
+static inline bool mali_csf_unpack_call_or_jump(uint64_t insn, uint8_t *out_op, uint8_t *out_addr_reg, uint8_t *out_len_reg) {
+   uint8_t op = (uint8_t)((insn >> 56) & 0xffULL);
+   if (op != MALI_CSF_OP_CALL && op != MALI_CSF_OP_JUMP)
+      return false;
+   if (out_op) *out_op = op;
+   if (out_addr_reg) *out_addr_reg = (uint8_t)((insn & MALI_CSF_INS_CALL_ADDRESS_MASK) >> MALI_CSF_INS_CALL_ADDRESS_SHIFT);
+   if (out_len_reg)  *out_len_reg  = (uint8_t)((insn & MALI_CSF_INS_CALL_LENGTH_MASK) >> MALI_CSF_INS_CALL_LENGTH_SHIFT);
+   return true;
+}
 
 /* --------------------------------------------------------------------------
  * 4. CSF Scoreboard Slot Conventions in PanVK (src/panfrost/vulkan/csf/)

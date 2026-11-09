@@ -409,16 +409,55 @@ int32_t vkMergePipelineCaches(void* /*device*/, uint64_t /*dstCache*/, uint32_t 
     return 0;
 }
 
+static inline void computeGenericVkFormatPitchAndSize(uint32_t format, uint32_t w, uint32_t h,
+                                                      uint64_t* out_row_pitch, uint64_t* out_size) {
+    uint32_t bw = 1U, bh = 1U, bpp = 4U;
+    if (format >= 131U && format <= 146U) {
+        // VK_FORMAT_BC1..BC7 (4x4 compressed blocks: 8B for BC1/BC4, 16B for BC2/BC3/BC5/BC6H/BC7)
+        bw = 4U; bh = 4U;
+        bpp = (format <= 134U || format == 139U || format == 140U) ? 8U : 16U;
+    } else if (format == 9U || format == 13U) {
+        bpp = 1U; // R8
+    } else if (format == 16U || format == 20U || format == 70U || format == 76U) {
+        bpp = 2U; // R8G8 / R16
+    } else if (format >= 97U && format <= 99U) {
+        bpp = 8U; // RGBA16F / RG32F
+    } else if (format >= 106U && format <= 109U) {
+        bpp = 16U; // RGBA32F / RGBA32U / RGBA32I
+    }
+    uint64_t blocks_x = (static_cast<uint64_t>(w) + bw - 1ULL) / bw;
+    uint64_t blocks_y = (static_cast<uint64_t>(h) + bh - 1ULL) / bh;
+    *out_row_pitch = blocks_x * bpp;
+    *out_size      = (*out_row_pitch) * blocks_y;
+}
+
 __attribute__((visibility("default")))
-void vkGetImageSubresourceLayout(void* /*device*/, uint64_t /*image*/, const void* /*pSubresource*/, void* pLayout) {
+void vkGetImageSubresourceLayout(void* device, uint64_t image, const void* pSubresource, void* pLayout) {
     if (!pLayout) return;
+    const auto* img = reinterpret_cast<const MaliIcdImage*>(image);
+    // 1. Defer directly to lifted libGLES_mali.so (aot_vkGetImageSubresourceLayout @ 0x988788) when backed by a native DDK handle
+    if (img && img->aot_image_handle != 0) {
+        typedef void (*PFN_aot_vkGetImageSubresourceLayout)(void*, uint64_t, const void*, void*);
+        auto fn = reinterpret_cast<PFN_aot_vkGetImageSubresourceLayout>(
+            dlsym(RTLD_DEFAULT, "aot_vkGetImageSubresourceLayout"));
+        if (fn) {
+            fn(device, img->aot_image_handle, pSubresource, pLayout);
+            return;
+        }
+    }
+    // 2. Generic Vulkan format-driven subresource layout calculation (uncompressed + BC1..BC7 block formats)
     struct SubLayout { uint64_t offset, size, rowPitch, arrayPitch, depthPitch; };
     auto* l = static_cast<SubLayout*>(pLayout);
-    l->offset = 0;
-    l->size = 64 * 64 * 4;
-    l->rowPitch = 64 * 4;
-    l->arrayPitch = 64 * 64 * 4;
-    l->depthPitch = 64 * 64 * 4;
+    uint32_t w = (img && img->width > 0) ? img->width : 256U;
+    uint32_t h = (img && img->height > 0) ? img->height : 256U;
+    uint32_t fmt = img ? img->format : 37U;
+    uint64_t pitch = 0, total_sz = 0;
+    computeGenericVkFormatPitchAndSize(fmt, w, h, &pitch, &total_sz);
+    l->offset     = 0;
+    l->rowPitch   = pitch;
+    l->size       = total_sz;
+    l->arrayPitch = total_sz;
+    l->depthPitch = total_sz;
 }
 
 __attribute__((visibility("default")))
@@ -799,16 +838,14 @@ int32_t vkQueuePresentKHR(void* /*queue*/, const void* pPresentInfo) {
                     if (sc->wl_buffer && sc->wl_shm_map) {
                         const uint32_t* src_px = reinterpret_cast<const uint32_t*>(img->bound_gpu_va);
                         uint32_t total_px = img->width * img->height;
-                        if (sc->format == 37U || sc->format == 43U) { // RGBA -> XRGB8888
-                            for (uint32_t p = 0; p < total_px; ++p) {
-                                uint32_t v = src_px[p];
-                                uint32_t r = v & 0xFFU;
-                                uint32_t g = (v >> 8) & 0xFFU;
-                                uint32_t b = (v >> 16) & 0xFFU;
-                                sc->wl_shm_map[p] = (0xFFU << 24) | (r << 16) | (g << 8) | b;
-                            }
-                        } else {
-                            std::memcpy(sc->wl_shm_map, src_px, total_px * sizeof(uint32_t));
+                        // Internal /dev/mali0 MFBD tile writeback is canonical RGBA8 (byte0=R, byte1=G, byte2=B, byte3=A);
+                        // convert to WL_SHM_FORMAT_XRGB8888 ((0xFF << 24) | (R << 16) | (G << 8) | B).
+                        for (uint32_t p = 0; p < total_px; ++p) {
+                            uint32_t v = src_px[p];
+                            uint32_t r = v & 0xFFU;
+                            uint32_t g = (v >> 8) & 0xFFU;
+                            uint32_t b = (v >> 16) & 0xFFU;
+                            sc->wl_shm_map[p] = (0xFFU << 24) | (r << 16) | (g << 8) | b;
                         }
                         g_wayland_lib.proxy_marshal(sc->wl_surface, 1U /* WL_SURFACE_ATTACH */, sc->wl_buffer, 0, 0);
                         g_wayland_lib.proxy_marshal(sc->wl_surface, 2U /* WL_SURFACE_DAMAGE */, 0, 0,
@@ -825,21 +862,16 @@ int32_t vkQueuePresentKHR(void* /*queue*/, const void* pPresentInfo) {
                         g_xcb_lib.create_gc(sc->xcb_conn, sc->xcb_gc, sc->xcb_window, 0, nullptr);
                     }
                     const uint32_t* src_px = reinterpret_cast<const uint32_t*>(img->bound_gpu_va);
-                    const uint32_t* x11_px = src_px;
-                    std::vector<uint32_t> bgra_px;
-                    if (sc->format == 37U || sc->format == 43U) { // VK_FORMAT_R8G8B8A8_UNORM/SRGB -> X11 ZPixmap BGRX
-                        bgra_px.resize(img->width * img->height);
-                        for (uint32_t p = 0; p < img->width * img->height; ++p) {
-                            uint32_t v = src_px[p];
-                            uint32_t r = v & 0xFFU;
-                            uint32_t g = (v >> 8) & 0xFFU;
-                            uint32_t b = (v >> 16) & 0xFFU;
-                            uint32_t a = (v >> 24) & 0xFFU;
-                            bgra_px[p] = (a << 24) | (r << 16) | (g << 8) | b;
-                        }
-                        x11_px = bgra_px.data();
+                    std::vector<uint32_t> bgra_px(img->width * img->height);
+                    for (uint32_t p = 0; p < img->width * img->height; ++p) {
+                        uint32_t v = src_px[p];
+                        uint32_t r = v & 0xFFU;
+                        uint32_t g = (v >> 8) & 0xFFU;
+                        uint32_t b = (v >> 16) & 0xFFU;
+                        uint32_t a = (v >> 24) & 0xFFU;
+                        bgra_px[p] = (a << 24) | (r << 16) | (g << 8) | b;
                     }
-                    // For VK_FORMAT_B8G8R8A8_UNORM (44) and VK_FORMAT_B8G8R8A8_SRGB (50), src_px is already native X11 BGRX!
+                    const uint32_t* x11_px = bgra_px.data();
                     // Send in horizontal bands so large windows (e.g. 500x500 = 1 MB) never exceed X11 max request size (256 KiB)
                     uint32_t rows_per_band = std::max<uint32_t>(1U, (65536U) / (img->width * 4U));
                     for (uint32_t y = 0; y < img->height; y += rows_per_band) {
@@ -860,12 +892,11 @@ int32_t vkQueuePresentKHR(void* /*queue*/, const void* pPresentInfo) {
                     if (out) {
                         out << "P6\n" << img->width << " " << img->height << "\n255\n";
                         const uint32_t* px = reinterpret_cast<const uint32_t*>(img->bound_gpu_va);
-                        bool is_bgra = (sc->format == 44U || sc->format == 50U);
                         for (uint32_t p = 0; p < img->width * img->height; ++p) {
                             uint8_t rgb[3] = {
-                                static_cast<uint8_t>(is_bgra ? ((px[p] >> 16) & 0xFFU) : (px[p] & 0xFFU)),
+                                static_cast<uint8_t>(px[p] & 0xFFU),
                                 static_cast<uint8_t>((px[p] >> 8) & 0xFFU),
-                                static_cast<uint8_t>(is_bgra ? (px[p] & 0xFFU) : ((px[p] >> 16) & 0xFFU))
+                                static_cast<uint8_t>((px[p] >> 16) & 0xFFU)
                             };
                             out.write(reinterpret_cast<const char*>(rgb), 3);
                         }

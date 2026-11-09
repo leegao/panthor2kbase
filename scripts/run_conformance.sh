@@ -21,7 +21,7 @@ make clean
 make all
 gcc -Wall -Wextra -Werror -O2 -Iinclude -Isrc/adapter -Isrc/emulator \
     -o tests/unit_tests_edge_cases tests/unit_tests_edge_cases.c \
-    ./libpanthor_kbase_adapter.so ./libmali_kbase_emu.so -Wl,-rpath,'$ORIGIN/..' -ldl -lpthread
+    ./libpanthor_kbase_adapter.so ./libmali_kbase_emu.so ./src/aot/layers/libVkLayer_PANTHOR_capture.so -Wl,-rpath,'$ORIGIN/..:$ORIGIN/../src/aot/layers' -ldl -lpthread
 
 echo "================================================================================"
 echo " 2. Running State Machine & Precondition Boundary Validation"

@@ -996,15 +996,20 @@ struct MaliIcdShaderModule {
 
 struct MaliIcdPipeline {
     MaliIcdShaderModule* shader_mod     = nullptr;
+    MaliIcdShaderModule* vs_mod         = nullptr;
+    MaliIcdShaderModule* fs_mod         = nullptr;
     uint64_t             exec_bo_gpu_va = 0;
     size_t               objc_bytes     = 0;
     bool                 is_compute     = true;
+    uint32_t             vertex_stride  = 0;
+    uint32_t             topology       = 3;
 };
 
 struct MaliIcdImage {
     uint32_t             width = 64, height = 64, depth = 1, mip_levels = 1, array_layers = 1, format = 37;
     uint64_t             bound_gpu_va = 0;
     uint64_t             byte_size = 16384;
+    uint64_t             aot_image_handle = 0;
     std::vector<uint8_t> stub_texture_backing;
 };
 
@@ -1025,6 +1030,7 @@ struct MaliIcdRenderPass {
 struct MaliIcdFramebuffer {
     uint32_t           width = 64, height = 64;
     MaliMfbdDescriptor hw_mfbd{};
+    std::vector<float> depth_buffer;
 };
 
 struct MaliIcdQueryPool {
@@ -1057,6 +1063,9 @@ struct MaliIcdRecordedCmd {
     uint32_t              dynamic_offset = 0;
     uint32_t              wg_x = 1, wg_y = 1, wg_z = 1;
     uint32_t              index_count = 0, instance_count = 1;
+    uint32_t              first_vertex = 0;
+    uint64_t              vertex_bo_va = 0;
+    uint8_t               push_constants[128]{};
     float                 vkcube_angle_deg = 25.0f;
     uint32_t              vkcube_frame_idx = 0;
     uint64_t              src_va = 0, dst_va = 0, copy_bytes = 0;

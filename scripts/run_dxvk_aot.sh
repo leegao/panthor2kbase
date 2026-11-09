@@ -46,7 +46,7 @@ else
 {
     "file_format_version": "1.2.0",
     "layer": {
-        "name": "VK_LAYER_BCN_BCnLayer",
+        "name": "VK_LAYER_BCN_BCnLayer1",
         "type": "GLOBAL",
         "library_path": "$LAYER_DIR/libVkLayer_BCN_bcn_layer.so",
         "api_version": "1.3.0",
@@ -59,7 +59,7 @@ JSON_EOF
 {
     "file_format_version": "1.2.0",
     "layer": {
-        "name": "VK_LAYER_COMPAT_DxvkMaliCompatLayer",
+        "name": "VK_LAYER_COMPAT_DxvkMaliCompatLayer1",
         "type": "GLOBAL",
         "library_path": "$LAYER_DIR/libVkLayer_COMPAT_dxvk_mali_compat.so",
         "api_version": "1.3.0",

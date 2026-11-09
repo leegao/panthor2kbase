@@ -444,8 +444,20 @@ static void execute_valhall_shader(const struct valhall_shader_desc *spd)
 }
 
 /* Recursively execute CSF command stream instructions (ring or CALL target) */
+static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes,
+                                     uint64_t *cs_regs, struct emu_tiler_heap *heap,
+                                     uint32_t call_depth, bool *io_unwaited_def_sync);
+
 static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
                                uint64_t *cs_regs, struct emu_tiler_heap *heap)
+{
+   bool unwaited_def_sync = false;
+   execute_csf_stream_depth(stream, size_bytes, cs_regs, heap, 0U, &unwaited_def_sync);
+}
+
+static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes,
+                                     uint64_t *cs_regs, struct emu_tiler_heap *heap,
+                                     uint32_t call_depth, bool *io_unwaited_def_sync)
 {
    if (!stream || size_bytes < sizeof(uint64_t))
       return;
@@ -462,14 +474,45 @@ static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
       case 28: /* HW_CSF_OP_SET_STATE_IMM32 (0x1c) */
       case 23: /* HW_CSF_OP_SET_SB_ENTRY (0x17) */
       case CSF_OP_REQ_RESOURCE:
-      case CSF_OP_WAIT:
-      case CSF_OP_FLUSH_CACHE2:
       case CSF_OP_HEAP_SET:
       case 48: /* HW_CSF_OP_HEAP_SET (0x30) */
       case CSF_OP_ERROR_BARRIER:
-      case CSF_OP_SYNC_WAIT32:
-      case CSF_OP_SYNC_WAIT64:
          break;
+
+      case CSF_OP_WAIT:
+      case CSF_OP_FLUSH_CACHE2:
+      case 36: /* HW_CSF_OP_FLUSH_CACHE2 (0x24) when bits [11:0] != 0 */ {
+         if (opcode == 4 && ((insn >> 40) & 0xffULL) != 0ULL) {
+            goto handle_run_compute;
+         }
+         if (opcode == 36 && (insn & 0xfffULL) == 0ULL && ((insn >> 32) & 0xffffULL) == 0ULL) {
+            /* Legacy synthetic CSF_OP_SYNC_SET32 (0x24) */
+            goto handle_sync_set32;
+         }
+         /* Bit 1 of wait_mask (bit 17 of instruction = 0x00020000) drains SB_ID(DEFERRED_SYNC) */
+         if ((insn & (1ULL << 17)) != 0ULL && io_unwaited_def_sync)
+            *io_unwaited_def_sync = false;
+         break;
+      }
+
+      case CSF_OP_SYNC_WAIT32:
+      case 39: /* HW_CSF_OP_SYNC_WAIT32 (0x27) */
+      case CSF_OP_SYNC_WAIT64:
+      case 53: /* HW_CSF_OP_SYNC_WAIT64 (0x35) */ {
+         if (opcode == 39 && (((insn >> 32) & 0xffULL) == 0ULL || (insn & 0xffffffffULL) == 1ULL)) {
+            /* Legacy synthetic CSF_OP_RUN_COMPUTE (0x27) */
+            goto handle_run_compute;
+         }
+         if (opcode == 52 && ((insn >> 40) & 0xffULL) >= 64ULL) {
+            /* Hardware SYNC_SET64 (0x34 = 52) when registers bits [47:32] != 0 */
+            goto handle_sync_add_set64;
+         }
+         /* Catch unwaited deferred SYNC_ADD/SET before SYNC_WAIT32/64 (doco.AXXnH1ZOCT0UtWpCJhU2jA) */
+         if (((insn >> 32) & 0xffffULL) != 0ULL && io_unwaited_def_sync && *io_unwaited_def_sync) {
+            g_stats.unwaited_deferred_sync_errors++;
+         }
+         break;
+      }
 
       case CSF_OP_MOVE48: {
          uint8_t reg = (insn >> 48) & 0xffU;
@@ -489,16 +532,28 @@ static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
          break;
       }
 
-      case CSF_OP_CALL: {
+      case CSF_OP_CALL:
+      case 33: /* HW_CSF_OP_JUMP (0x21) */ {
          uint8_t addr_reg = (insn >> 40) & 0xffU;
          uint8_t sz_reg = (insn >> 32) & 0xffU;
          if (addr_reg < 95 && sz_reg < 96) {
             uint64_t target_va = (cs_regs[addr_reg + 1] << 32) | cs_regs[addr_reg];
             uint32_t target_sz = (uint32_t)cs_regs[sz_reg];
-            if (target_va && target_sz) {
-               g_stats.csf_calls_followed++;
-               execute_csf_stream((const uint64_t *)(uintptr_t)target_va,
-                                  target_sz, cs_regs, heap);
+            if (target_va >= 0x10000ULL && target_sz >= 8U && target_sz <= (4U * 1024U * 1024U)) {
+               if (opcode == CSF_OP_CALL) {
+                  if (call_depth < 8U /* MALI_CSF_MAX_CALL_STACK_DEPTH */) {
+                     g_stats.csf_calls_followed++;
+                     execute_csf_stream_depth((const uint64_t *)(uintptr_t)target_va,
+                                              target_sz, cs_regs, heap,
+                                              call_depth + 1U, io_unwaited_def_sync);
+                  }
+               } else {
+                  g_stats.csf_jumps_followed++;
+                  execute_csf_stream_depth((const uint64_t *)(uintptr_t)target_va,
+                                           target_sz, cs_regs, heap,
+                                           call_depth, io_unwaited_def_sync);
+                  return; /* JUMP is a tail branch to the next chunk */
+               }
             }
          }
          break;
@@ -572,12 +627,16 @@ static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
          break;
       }
 
-      case CSF_OP_SYNC_SET32:
-         /* Opcode 0x24 (36) is HW_CSF_OP_FLUSH_CACHE2 when low cache-mode bits [7:0] != 0 */
-         if ((insn & 0xffULL) != 0ULL)
-            break;
-         /* fallthrough */
+      handle_sync_set32:
       case CSF_OP_SYNC_ADD32: {
+         if (io_unwaited_def_sync) {
+            if ((insn & (1ULL << 17)) != 0ULL)
+               *io_unwaited_def_sync = false;
+            uint64_t sig_slot = (insn >> 48) & 0xfULL;
+            uint64_t defer_mode = (insn >> 52) & 0x1ULL;
+            if (sig_slot == 1ULL || defer_mode == 1ULL)
+               *io_unwaited_def_sync = true;
+         }
          uint8_t addr_reg = (insn >> 40) & 0xffU;
          uint8_t val_reg = (insn >> 32) & 0xffU;
          uint64_t hw_scope = (insn >> 1) & 0x3ULL;
@@ -587,7 +646,7 @@ static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
          if (addr_reg < 95 && val_reg < 96) {
             uint64_t sync_va = (cs_regs[addr_reg + 1] << 32) | cs_regs[addr_reg];
             uint32_t val = (uint32_t)cs_regs[val_reg];
-            if (sync_va) {
+            if (sync_va >= 0x10000ULL) {
                uint32_t *ptr = (uint32_t *)(uintptr_t)sync_va;
                if (opcode == CSF_OP_SYNC_ADD32)
                   *ptr += val;
@@ -599,7 +658,16 @@ static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
       }
 
       case CSF_OP_SYNC_ADD64:
-      case CSF_OP_SYNC_SET64: {
+      case CSF_OP_SYNC_SET64:
+      handle_sync_add_set64: {
+         if (io_unwaited_def_sync) {
+            if ((insn & (1ULL << 17)) != 0ULL)
+               *io_unwaited_def_sync = false;
+            uint64_t sig_slot = (insn >> 48) & 0xfULL;
+            uint64_t defer_mode = (insn >> 52) & 0x1ULL;
+            if (sig_slot == 1ULL || defer_mode == 1ULL)
+               *io_unwaited_def_sync = true;
+         }
          uint8_t addr_reg = (insn >> 40) & 0xffU;
          uint8_t val_reg = (insn >> 32) & 0xffU;
          uint64_t hw_scope = (insn >> 1) & 0x3ULL;
@@ -609,7 +677,7 @@ static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
          if (addr_reg < 95 && val_reg < 95) {
             uint64_t sync_va = (cs_regs[addr_reg + 1] << 32) | cs_regs[addr_reg];
             uint64_t val = (cs_regs[val_reg + 1] << 32) | cs_regs[val_reg];
-            if (sync_va) {
+            if (sync_va >= 0x10000ULL) {
                uint64_t *ptr = (uint64_t *)(uintptr_t)sync_va;
                if (opcode == CSF_OP_SYNC_ADD64)
                   *ptr += val;
@@ -620,10 +688,12 @@ static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
          break;
       }
 
-      case CSF_OP_RUN_COMPUTE:
+      case 6: /* HW_CSF_OP_RUN_IDVS (0x06) */
+      case 7: /* HW_CSF_OP_RUN_FRAGMENT (0x07) */
       case CSF_OP_RUN_IDVS:
-      case CSF_OP_RUN_FRAGMENT: {
-         if (opcode == CSF_OP_RUN_COMPUTE)
+      case CSF_OP_RUN_FRAGMENT:
+      handle_run_compute: {
+         if (opcode == CSF_OP_RUN_COMPUTE || opcode == 4)
             g_stats.compute_jobs_run++;
          else if (opcode == CSF_OP_RUN_IDVS)
             g_stats.idvs_jobs_run++;

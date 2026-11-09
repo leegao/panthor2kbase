@@ -149,6 +149,10 @@ struct DynamicLlvmTable {
     void *handle = nullptr;
     std::string loaded_path;
     LLVMTypeRef (*p_LLVMPointerTypeInContext)(LLVMContextRef, unsigned) = nullptr;
+    void (*p_LLVMContextSetOpaquePointers)(LLVMContextRef, LLVMBool) = nullptr;
+    void (*p_cxx_setOpaquePointers)(LLVMContextRef, bool) = nullptr;
+    void (*p_cxx_enableOpaquePointers)(LLVMContextRef) = nullptr;
+    void (*p_LLVMParseCommandLineOptions)(int, const char *const *, const char *) = nullptr;
 #define DECL_PTR(ret, name, params, args) ret (*p_##name) params = nullptr;
     MALI_LLVM_API_LIST(DECL_PTR)
 #undef DECL_PTR
@@ -165,6 +169,22 @@ struct DynamicLlvmTable {
         loaded_path = path;
         p_LLVMPointerTypeInContext = reinterpret_cast<LLVMTypeRef (*)(LLVMContextRef, unsigned)>(
             dlsym(h, "LLVMPointerTypeInContext"));
+        p_LLVMContextSetOpaquePointers = reinterpret_cast<void (*)(LLVMContextRef, LLVMBool)>(
+            dlsym(h, "LLVMContextSetOpaquePointers"));
+        p_cxx_setOpaquePointers = reinterpret_cast<void (*)(LLVMContextRef, bool)>(
+            dlsym(h, "_ZNK4llvm11LLVMContext17setOpaquePointersEb"));
+        if (!p_cxx_setOpaquePointers) {
+            p_cxx_setOpaquePointers = reinterpret_cast<void (*)(LLVMContextRef, bool)>(
+                dlsym(h, "_ZN4llvm11LLVMContext17setOpaquePointersEb"));
+        }
+        p_cxx_enableOpaquePointers = reinterpret_cast<void (*)(LLVMContextRef)>(
+            dlsym(h, "_ZN4llvm11LLVMContext20enableOpaquePointersEv"));
+        if (!p_cxx_enableOpaquePointers) {
+            p_cxx_enableOpaquePointers = reinterpret_cast<void (*)(LLVMContextRef)>(
+                dlsym(h, "_ZNK4llvm11LLVMContext20enableOpaquePointersEv"));
+        }
+        p_LLVMParseCommandLineOptions = reinterpret_cast<void (*)(int, const char *const *, const char *)>(
+            dlsym(h, "LLVMParseCommandLineOptions"));
 #define LOAD_SYM(ret, name, params, args) \
         p_##name = reinterpret_cast<ret (*) params>(dlsym(h, #name)); \
         if (!p_##name) { std::fprintf(stderr, "[LLVM_LOADER] Missing symbol %s in %s\n", #name, path); return false; }
@@ -221,9 +241,95 @@ static DynamicLlvmTable g_llvm;
 } // namespace
 
 #define DEF_WRAPPER(ret, name, params, args) \
-    static inline ret name params { g_llvm.ensureLoaded(); return g_llvm.p_##name args; }
+    static inline ret raw_##name params { g_llvm.ensureLoaded(); return g_llvm.p_##name args; }
 MALI_LLVM_API_LIST(DEF_WRAPPER)
 #undef DEF_WRAPPER
+
+#define LLVMInitializeX86TargetInfo raw_LLVMInitializeX86TargetInfo
+#define LLVMInitializeX86Target raw_LLVMInitializeX86Target
+#define LLVMInitializeX86TargetMC raw_LLVMInitializeX86TargetMC
+#define LLVMInitializeX86AsmPrinter raw_LLVMInitializeX86AsmPrinter
+#define LLVMInitializeX86AsmParser raw_LLVMInitializeX86AsmParser
+#define LLVMContextDispose raw_LLVMContextDispose
+#define LLVMCreateMemoryBufferWithContentsOfFile raw_LLVMCreateMemoryBufferWithContentsOfFile
+#define LLVMCreateMemoryBufferWithMemoryRangeCopy raw_LLVMCreateMemoryBufferWithMemoryRangeCopy
+#define LLVMParseIRInContext raw_LLVMParseIRInContext
+#define LLVMVerifyModule raw_LLVMVerifyModule
+#define LLVMPrintModuleToFile raw_LLVMPrintModuleToFile
+#define LLVMDisposeMessage raw_LLVMDisposeMessage
+#define LLVMDisposeModule raw_LLVMDisposeModule
+#define LLVMGetModuleContext raw_LLVMGetModuleContext
+#define LLVMVoidTypeInContext raw_LLVMVoidTypeInContext
+#define LLVMInt1TypeInContext raw_LLVMInt1TypeInContext
+#define LLVMInt8TypeInContext raw_LLVMInt8TypeInContext
+#define LLVMInt32TypeInContext raw_LLVMInt32TypeInContext
+#define LLVMInt64TypeInContext raw_LLVMInt64TypeInContext
+#define LLVMPointerType raw_LLVMPointerType
+#define LLVMFunctionType raw_LLVMFunctionType
+#define LLVMConstInt raw_LLVMConstInt
+#define LLVMConstIntGetZExtValue raw_LLVMConstIntGetZExtValue
+#define LLVMGetNamedFunction raw_LLVMGetNamedFunction
+#define LLVMAddFunction raw_LLVMAddFunction
+#define LLVMGetFirstFunction raw_LLVMGetFirstFunction
+#define LLVMGetNextFunction raw_LLVMGetNextFunction
+#define LLVMGetFirstBasicBlock raw_LLVMGetFirstBasicBlock
+#define LLVMGetNextBasicBlock raw_LLVMGetNextBasicBlock
+#define LLVMGetFirstInstruction raw_LLVMGetFirstInstruction
+#define LLVMGetNextInstruction raw_LLVMGetNextInstruction
+#define LLVMIsACallInst raw_LLVMIsACallInst
+#define LLVMGetNumArgOperands raw_LLVMGetNumArgOperands
+#define LLVMGetArgOperand raw_LLVMGetArgOperand
+#define LLVMGetCalledValue raw_LLVMGetCalledValue
+#define LLVMGetValueName2 raw_LLVMGetValueName2
+#define LLVMReplaceAllUsesWith raw_LLVMReplaceAllUsesWith
+#define LLVMInstructionEraseFromParent raw_LLVMInstructionEraseFromParent
+#define LLVMCreateBuilderInContext raw_LLVMCreateBuilderInContext
+#define LLVMPositionBuilderBefore raw_LLVMPositionBuilderBefore
+#define LLVMDisposeBuilder raw_LLVMDisposeBuilder
+#define LLVMBuildAdd raw_LLVMBuildAdd
+#define LLVMBuildAnd raw_LLVMBuildAnd
+#define LLVMBuildZExt raw_LLVMBuildZExt
+#define LLVMBuildTrunc raw_LLVMBuildTrunc
+#define LLVMBuildIntToPtr raw_LLVMBuildIntToPtr
+#define LLVMBuildPtrToInt raw_LLVMBuildPtrToInt
+#define LLVMBuildGEP2 raw_LLVMBuildGEP2
+#define LLVMBuildLoad2 raw_LLVMBuildLoad2
+#define LLVMBuildStore raw_LLVMBuildStore
+#define LLVMBuildCall2 raw_LLVMBuildCall2
+#define LLVMGetTargetFromTriple raw_LLVMGetTargetFromTriple
+#define LLVMCreateTargetMachine raw_LLVMCreateTargetMachine
+#define LLVMDisposeTargetMachine raw_LLVMDisposeTargetMachine
+#define LLVMCreatePassBuilderOptions raw_LLVMCreatePassBuilderOptions
+#define LLVMDisposePassBuilderOptions raw_LLVMDisposePassBuilderOptions
+#define LLVMRunPasses raw_LLVMRunPasses
+#define LLVMGetErrorMessage raw_LLVMGetErrorMessage
+#define LLVMDisposeErrorMessage raw_LLVMDisposeErrorMessage
+#define LLVMTargetMachineEmitToFile raw_LLVMTargetMachineEmitToFile
+
+static inline LLVMContextRef LLVMContextCreate(void) {
+    g_llvm.ensureLoaded();
+    static bool s_cl_parsed = false;
+    if (!s_cl_parsed) {
+        s_cl_parsed = true;
+        if (g_llvm.p_LLVMParseCommandLineOptions &&
+            (g_llvm.loaded_path.find("14") != std::string::npos ||
+             g_llvm.loaded_path.find("15") != std::string::npos)) {
+            const char *argv[] = {"mali_llvm_pass_driver", "-opaque-pointers"};
+            g_llvm.p_LLVMParseCommandLineOptions(2, argv, "");
+        }
+    }
+    LLVMContextRef C = g_llvm.p_LLVMContextCreate();
+    if (C) {
+        if (g_llvm.p_LLVMContextSetOpaquePointers) {
+            g_llvm.p_LLVMContextSetOpaquePointers(C, 1);
+        } else if (g_llvm.p_cxx_setOpaquePointers) {
+            g_llvm.p_cxx_setOpaquePointers(C, true);
+        } else if (g_llvm.p_cxx_enableOpaquePointers) {
+            g_llvm.p_cxx_enableOpaquePointers(C);
+        }
+    }
+    return C;
+}
 
 static inline LLVMTypeRef LLVMPointerTypeInContext(LLVMContextRef C, unsigned AddressSpace) {
     g_llvm.ensureLoaded();

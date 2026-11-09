@@ -57,6 +57,7 @@
 
 #include "xf86drm.h"
 #include "panthor_kbase_adapter.h"
+#include "panthor_drm_capture_replay.h"
 #include "log.h"
 
 namespace {
@@ -254,22 +255,20 @@ struct adapter_subqueue {
    uint64_t job_stream_va[64];
    uint32_t job_stream_size[64];
    struct adapter_flight_entry flight_log[ADAPTER_FLIGHT_LOG_ENTRIES];
-   /* 32-way per-subqueue CS normalization cache for primary & secondary (CSF_OP_CALL) command buffers */
+   /* 32-way per-subqueue compiler-style CS chunk hash cache (full-chunk 64-bit FNV-1a digest
+    * + outgoing CALL/JUMP CFG edges for transitive closure traversal) */
    struct {
       uint64_t va;
       uint32_t sz;
-      uint64_t head;
-      uint64_t mid;
-      uint64_t tail;
+      uint64_t post_norm_fnv1a64;
+      uint32_t edge_count;
+      struct {
+         uint64_t target_va;
+         uint32_t target_sz;
+         uint8_t  is_call;
+      } edges[8];
    } norm_cache[32];
    uint32_t norm_cache_hand;
-   struct {
-      uint64_t va;
-      uint32_t sz;
-      uint64_t head;
-      uint64_t tail;
-   } call_norm_cache[32];
-   uint32_t call_norm_cache_hand;
 };
 
 /* Scheduling group state */
@@ -509,6 +508,16 @@ static void *resolve_gpu_va_to_cpu(uint64_t va, size_t min_bytes)
        va >= g_ctx.event_bo_gpu_va &&
        va + min_bytes <= g_ctx.event_bo_gpu_va + g_ctx.event_bo_size) {
       return g_ctx.event_bo_cpu + (va - g_ctx.event_bo_gpu_va);
+   }
+   if (g_ctx.diag_bo_cpu &&
+       va >= g_ctx.diag_bo_gpu_va &&
+       va + min_bytes <= g_ctx.diag_bo_gpu_va + g_ctx.diag_bo_size) {
+      return g_ctx.diag_bo_cpu + (va - g_ctx.diag_bo_gpu_va);
+   }
+   if (g_ctx.shadow_cs_bo_cpu &&
+       va >= g_ctx.shadow_cs_bo_gpu_va &&
+       va + min_bytes <= g_ctx.shadow_cs_bo_gpu_va + g_ctx.shadow_cs_bo_size) {
+      return g_ctx.shadow_cs_bo_cpu + (va - g_ctx.shadow_cs_bo_gpu_va);
    }
    struct adapter_bo *bo = find_bo_by_va(va);
    if (bo && bo->cpu_ptr && bo->cpu_ptr != MAP_FAILED) {
@@ -1723,6 +1732,12 @@ uint64_t panthor_kbase_adapter_get_bo_gpu_va(uint32_t gem_handle)
  *     every render pass while `frag_end` remains `0` (`frag_end <= vt_end`),
  *     preventing `mali_kbase_csf.c:handle_oom_event` from terminating the CSG!
  */
+static bool is_bug_catching_mode_enabled(void)
+{
+   const char *env = getenv("PANTHOR_ADAPTER_BUG_CATCHING_MODE");
+   return (env && env[0] && atoi(env) != 0);
+}
+
 void panthor_kbase_normalize_cs_stream(uint64_t *stream_cpu,
                                        uint32_t stream_size_bytes,
                                        bool is_initial_submit,
@@ -1815,15 +1830,13 @@ void panthor_kbase_normalize_cs_stream(uint64_t *stream_cpu,
          }
       }
 
-      if (opcode == MALI_CSF_OP_SYNC_ADD32 || opcode == MALI_CSF_OP_SYNC_SET32 ||
-          opcode == MALI_CSF_OP_SYNC_ADD64 || opcode == MALI_CSF_OP_SYNC_SET64) {
+      struct mali_csf_sync_op_fields sync_f;
+      if (mali_csf_unpack_sync_op(insn, &sync_f)) {
          if ((insn & def_wait_bit) != 0ULL)
             may_have_unwaited_deferred_sync = false;
-         uint64_t sig_slot = (insn >> MALI_CSF_INS_SYNC_ADD32_SIGNAL_SLOT_SHIFT) & 0xfULL;
-         if (sig_slot == 1ULL /* SB_ID(DEFERRED_SYNC) */)
+         if (sync_f.is_deferred)
             may_have_unwaited_deferred_sync = true;
-         uint64_t hw_scope = (insn & MALI_CSF_INS_SYNC_ADD32_SCOPE_MASK) >>
-                             MALI_CSF_INS_SYNC_ADD32_SCOPE_SHIFT;
+         uint64_t hw_scope = sync_f.scope;
          const char *force_sys_env = getenv("PANTHOR_ADAPTER_FORCE_SYSTEM_SCOPE");
          bool force_sys = (force_sys_env && force_sys_env[0] && atoi(force_sys_env) != 0);
          bool keep_csg_scope = (!force_sys && g_ctx.active && g_ctx.groups[0].in_use &&
@@ -1886,19 +1899,18 @@ void panthor_kbase_normalize_cs_stream(uint64_t *stream_cpu,
        */
       if ((opcode == MALI_CSF_OP_SYNC_WAIT32 || opcode == MALI_CSF_OP_SYNC_WAIT64) &&
           ((insn >> 32) & 0xffffULL) != 0ULL) {
-         if (may_have_unwaited_deferred_sync) {
-            uint32_t min_j = (i >= 4U) ? (i - 4U) : 0U;
-            for (uint32_t j = i; j > min_j; j--) {
-               uint64_t prev = stream_cpu[j - 1U];
-               if (((prev >> 56) & 0xffULL) == MALI_CSF_OP_WAIT) {
-                  if ((prev & def_wait_bit) == 0ULL) {
-                     stream_cpu[j - 1U] = prev | def_wait_bit;
-                     if (stats)
-                        stats->deferred_sync_waits++;
-                  }
-                  may_have_unwaited_deferred_sync = false;
-                  break;
+         (void)may_have_unwaited_deferred_sync;
+         uint32_t min_j = (i >= 4U) ? (i - 4U) : 0U;
+         for (uint32_t j = i; j > min_j; j--) {
+            uint64_t prev = stream_cpu[j - 1U];
+            if (((prev >> 56) & 0xffULL) == MALI_CSF_OP_WAIT) {
+               if ((prev & def_wait_bit) == 0ULL) {
+                  stream_cpu[j - 1U] = prev | def_wait_bit;
+                  if (stats)
+                     stats->deferred_sync_waits++;
                }
+               may_have_unwaited_deferred_sync = false;
+               break;
             }
          }
          continue;
@@ -2216,7 +2228,12 @@ int panthor_kbase_adapter_open(const char *path, int flags)
    if (priv_mali_fd != raw_fd)
       register_virtual_fd_locked(priv_mali_fd);
 
+   uint32_t cap_gpu_id = g_ctx.gpu_info.gpu_id;
+   uint32_t cap_arch   = g_ctx.arch_major;
+   uint32_t cap_regs   = g_ctx.csif_info.cs_reg_count;
+   uint32_t cap_sbs    = g_ctx.csif_info.scoreboard_slot_count;
    pthread_mutex_unlock(&g_lock);
+   panthor_drm_capture_init_from_env(cap_gpu_id, cap_arch, cap_regs, cap_sbs);
    LOG_INFO("adapter_open: initialized mali_fd=%d user_fd=%d refcnt=%d",
             priv_mali_fd, raw_fd, g_ctx.open_refcount);
    return raw_fd;
@@ -2699,6 +2716,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                LOG_DEBUG("DRM_IOCTL_SYNCOBJ_CREATE -> handle=%u signaled=%d",
                          so->handle, (so->value != 0));
             pthread_mutex_unlock(&g_lock);
+            panthor_drm_capture_record_ioctl(fd, request, arg, 0);
             return 0;
          }
       }
@@ -2898,6 +2916,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
 
          uint64_t last_kick_ns = start_ns;
          uint64_t last_diag_ns = start_ns;
+         uint32_t stall_dump_count = 0;
          bool dumped_stall = false;
 
          while (!check_all_done()) {
@@ -2944,8 +2963,10 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                uint64_t ms = (s_env && *s_env) ? strtoull(s_env, nullptr, 0) : 100ULL;
                stall_dump_ns = ms * 1000000ULL;
             }
-            if (grp && stall_dump_ns > 0ULL && (now_ns - last_diag_ns >= stall_dump_ns)) {
+            uint64_t eff_stall_ns = (stall_dump_count == 0U) ? stall_dump_ns : (stall_dump_ns * 10ULL);
+            if (grp && stall_dump_ns > 0ULL && stall_dump_count < 2U && (now_ns - last_diag_ns >= eff_stall_ns)) {
                last_diag_ns = now_ns;
+               stall_dump_count++;
                dumped_stall = true;
                pthread_mutex_unlock(&g_lock);
                panthor_kbase_dump_csf_diagnostics("SYNCOBJ_WAIT stall threshold exceeded");
@@ -3021,6 +3042,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
 #endif
       LOG_DEBUG("DRM_IOCTL_SYNCOBJ_WAIT/TIMELINE_WAIT count=%u -> OK", count_handles);
       pthread_mutex_unlock(&g_lock);
+      panthor_drm_capture_record_ioctl(fd, request, arg, 0);
       return 0;
    }
    case 0xc4: { /* DRM_IOCTL_SYNCOBJ_RESET */
@@ -3581,16 +3603,22 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
 
    case DRM_PANTHOR_TILER_HEAP_CREATE: {
       auto *hc = static_cast<struct drm_panthor_tiler_heap_create *>(arg);
-      uint32_t max_chunks = hc->max_chunks ? hc->max_chunks : 200U;
-      /*
-       * Pre-allocate at least 32 initial chunks (or max_chunks if smaller) so
-       * high-FPS pipelined rendering does not immediately exhaust the 5-chunk
-       * initial pool and trap to `kbase_queue_oom_event` on frame 5.
-       */
-      uint32_t init_chunks = hc->initial_chunk_count ? hc->initial_chunk_count : 5U;
+      bool bug_mode = is_bug_catching_mode_enabled();
+      uint32_t max_chunks = bug_mode
+                               ? (hc->max_chunks ? (hc->max_chunks < 4U ? hc->max_chunks : 4U) : 4U)
+                               : ((hc->max_chunks >= 200U) ? hc->max_chunks : 200U);
+      const char *env_mc = getenv("PANTHOR_ADAPTER_MAX_TILER_CHUNKS");
+      if (env_mc && env_mc[0] && atoi(env_mc) > 0)
+         max_chunks = static_cast<uint32_t>(atoi(env_mc));
+
+      uint32_t init_chunks = hc->initial_chunk_count ? hc->initial_chunk_count : (bug_mode ? 2U : 5U);
       const char *env_ic = getenv("PANTHOR_ADAPTER_INITIAL_HEAP_CHUNKS");
+      if (!env_ic || !env_ic[0])
+         env_ic = getenv("PANTHOR_ADAPTER_INITIAL_TILER_CHUNKS");
       if (env_ic && env_ic[0] && atoi(env_ic) > 0) {
          init_chunks = static_cast<uint32_t>(atoi(env_ic));
+      } else if (bug_mode) {
+         init_chunks = 2U;
       } else if (init_chunks < 16U) {
          init_chunks = (max_chunks < 16U) ? max_chunks : 16U;
       }
@@ -3924,6 +3952,9 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       }
       auto *qsubs = reinterpret_cast<struct drm_panthor_queue_submit *>(
          static_cast<uintptr_t>(gs->queue_submits.array));
+      if (panthor_drm_capture_is_active() && qsubs && gs->queue_submits.count > 0) {
+         panthor_drm_capture_record_pre_submit(grp->group_handle, qsubs, gs->queue_submits.count);
+      }
 
       uint64_t submit_t0_ns = get_monotonic_ns();
       if (g_ctx.window_start_ns == 0ULL)
@@ -4025,23 +4056,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          if (qs->stream_addr && qs->stream_size >= 8) {
             auto *stream_cpu = reinterpret_cast<uint64_t *>(static_cast<uintptr_t>(qs->stream_addr));
             uint32_t n_qw = qs->stream_size / sizeof(uint64_t);
-            uint64_t sig_head = stream_cpu[0];
-            uint64_t sig_mid  = stream_cpu[n_qw >> 1];
-            uint64_t sig_tail = stream_cpu[n_qw - 1U];
             bool cache_hit = false;
-            if (!is_initial) {
-               for (uint32_t c = 0; c < 32U; c++) {
-                  if (sq->norm_cache[c].va == qs->stream_addr &&
-                      sq->norm_cache[c].sz == qs->stream_size &&
-                      sq->norm_cache[c].head == sig_head &&
-                      sq->norm_cache[c].mid  == sig_mid &&
-                      sq->norm_cache[c].tail == sig_tail) {
-                     cache_hit = true;
-                     break;
-                  }
-               }
-            }
-            if (!cache_hit) {
+            {
                panthor_kbase_normalize_cs_stream(stream_cpu, qs->stream_size, is_initial, &stats);
             if (is_initial && stats.extracted_subq_ctx_va) {
                sq->cached_subq_ctx_va = stats.extracted_subq_ctx_va;
@@ -4113,72 +4129,161 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                   }
                }
             }
-            /* Also scan for CSF_OP_CALL (0x20) to secondary/meta CS streams and normalize + clean them */
+            /* Compiler-style Worklist Algorithm over the transitive closure of reachable
+             * CSF chunks (CSF_OP_CALL bounded by MALI_CSF_MAX_CALL_STACK_DEPTH = 8,
+             * CSF_OP_JUMP unbounded tail chain) with Full-Chunk 64-bit FNV-1a Hashing
+             * (doco.DxclyE60VXtoVPV24H0N7g, doco.YWt5K_8F13z7sSe1GC0DZw, doco.HQxWytIKZO52FEwYGM2FPQ, doco.fdxkj9JdapjjMg1-Mt1DZQ). */
             {
-               uint32_t n_qwords = qs->stream_size / sizeof(uint64_t);
-               uint64_t reg_file[128] = {0};
-               for (uint32_t idx = 0; idx < n_qwords; idx++) {
-                  uint64_t insn = stream_cpu[idx];
-                  uint64_t op = (insn >> 56) & 0xffULL;
-                  if (op == CSF_OP_MOVE48) {
-                     uint8_t dst = static_cast<uint8_t>((insn >> 48) & 0x7fU);
-                     reg_file[dst] = insn & 0xffffffffffffULL;
-                  } else if (op == CSF_OP_MOVE32) {
-                     uint8_t dst = static_cast<uint8_t>((insn >> 48) & 0x7fU);
-                     reg_file[dst] = insn & 0xffffffffULL;
-                  } else if (op == CSF_OP_CALL) {
-                     uint8_t addr_reg = static_cast<uint8_t>((insn >> 40) & 0x7fU);
-                     uint8_t len_reg  = static_cast<uint8_t>((insn >> 32) & 0x7fU);
-                     uint64_t call_va = reg_file[addr_reg];
-                     uint32_t call_sz = static_cast<uint32_t>(reg_file[len_reg]);
-                     if (call_va != 0 && call_sz >= sizeof(uint64_t) && call_sz <= (1U << 20)) {
-                        void *callee_raw = resolve_gpu_va_to_cpu(call_va, call_sz);
-                        if (callee_raw) {
-                           auto *callee_cpu = static_cast<uint64_t *>(callee_raw);
-                           uint32_t c_nqw = call_sz / sizeof(uint64_t);
-                           uint64_t c_head = callee_cpu[0];
-                           uint64_t c_tail = callee_cpu[c_nqw - 1U];
-                           bool call_hit = false;
-                           for (uint32_t cc = 0; cc < 32U; cc++) {
-                              if (sq->call_norm_cache[cc].va == call_va &&
-                                  sq->call_norm_cache[cc].sz == call_sz &&
-                                  sq->call_norm_cache[cc].head == c_head &&
-                                  sq->call_norm_cache[cc].tail == c_tail) {
-                                 call_hit = true;
-                                 break;
+               bool bug_mode = is_bug_catching_mode_enabled();
+               uint64_t root_post_hash = panthor_fnv1a64_bytes(stream_cpu, qs->stream_size);
+               if (panthor_drm_capture_is_active()) {
+                  panthor_drm_capture_record_csf_chunk(
+                     grp->group_handle, qs->queue_index, 0U, 0U, 0U,
+                     qs->stream_addr, qs->stream_size, root_post_hash, root_post_hash, stream_cpu);
+               }
+
+               struct cs_work_item {
+                  uint64_t va;
+                  uint32_t sz;
+                  uint16_t call_depth;
+                  uint16_t is_jump;
+               };
+               cs_work_item worklist[64];
+               uint32_t wl_head = 0U, wl_tail = 0U;
+               uint64_t visited_va[64];
+               uint32_t visited_sz[64];
+               uint32_t visited_cnt = 0U;
+               uint32_t chunk_seq = 0U;
+
+               auto mark_visited = [&](uint64_t v, uint32_t s_bytes) -> bool {
+                  for (uint32_t vi = 0; vi < visited_cnt; vi++) {
+                     if (visited_va[vi] == v && visited_sz[vi] == s_bytes)
+                        return false;
+                  }
+                  if (visited_cnt < 64U) {
+                     visited_va[visited_cnt] = v;
+                     visited_sz[visited_cnt] = s_bytes;
+                     visited_cnt++;
+                     return true;
+                  }
+                  return false;
+               };
+
+               auto scan_and_cache_edges = [&](uint64_t chunk_va, uint64_t *chunk_cpu, uint32_t chunk_sz,
+                                               uint16_t cur_call_depth, uint64_t post_hash) {
+                  uint32_t c_qwords = chunk_sz / sizeof(uint64_t);
+                  uint64_t reg_file[128] = {0};
+                  uint32_t slot_idx = (sq->norm_cache_hand++) & 31U;
+                  for (uint32_t ci = 0; ci < 32U; ci++) {
+                     if (sq->norm_cache[ci].va == chunk_va && sq->norm_cache[ci].sz == chunk_sz) {
+                        slot_idx = ci;
+                        break;
+                     }
+                  }
+                  auto &ce = sq->norm_cache[slot_idx];
+                  ce.va = chunk_va;
+                  ce.sz = chunk_sz;
+                  ce.post_norm_fnv1a64 = post_hash;
+                  ce.edge_count = 0U;
+
+                  for (uint32_t idx = 0; idx < c_qwords; idx++) {
+                     uint64_t insn = chunk_cpu[idx];
+                     uint8_t op = static_cast<uint8_t>((insn >> 56) & 0xffULL);
+                     if (op == MALI_CSF_OP_MOVE48) {
+                        uint8_t dst = static_cast<uint8_t>((insn >> 48) & 0x7fU);
+                        reg_file[dst] = insn & MALI_CSF_INS_MOVE48_IMMEDIATE_MASK;
+                     } else if (op == MALI_CSF_OP_MOVE32) {
+                        uint8_t dst = static_cast<uint8_t>((insn >> 48) & 0x7fU);
+                        reg_file[dst] = insn & MALI_CSF_INS_MOVE32_IMMEDIATE_MASK;
+                     } else {
+                        uint8_t cj_op = 0, addr_reg = 0, len_reg = 0;
+                        if (mali_csf_unpack_call_or_jump(insn, &cj_op, &addr_reg, &len_reg) &&
+                            addr_reg < 128U && len_reg < 128U) {
+                           uint64_t t_va = reg_file[addr_reg];
+                           uint32_t t_sz = static_cast<uint32_t>(reg_file[len_reg]);
+                           if (t_va != 0 && t_sz >= sizeof(uint64_t) && t_sz <= (4U * 1024U * 1024U)) {
+                              bool is_call_op = (cj_op == MALI_CSF_OP_CALL);
+                              if (!is_call_op || (cur_call_depth + 1U < MALI_CSF_MAX_CALL_STACK_DEPTH)) {
+                                 if (ce.edge_count < 8U) {
+                                    ce.edges[ce.edge_count].target_va = t_va;
+                                    ce.edges[ce.edge_count].target_sz = t_sz;
+                                    ce.edges[ce.edge_count].is_call = is_call_op ? 1U : 0U;
+                                    ce.edge_count++;
+                                 }
+                                 if (wl_tail < 64U && mark_visited(t_va, t_sz)) {
+                                    worklist[wl_tail++] = cs_work_item{
+                                       .va = t_va,
+                                       .sz = t_sz,
+                                       .call_depth = static_cast<uint16_t>(is_call_op ? (cur_call_depth + 1U) : cur_call_depth),
+                                       .is_jump = static_cast<uint16_t>(is_call_op ? 0U : 1U)
+                                    };
+                                 }
                               }
-                           }
-                           if (!call_hit) {
-                              struct adapter_cs_patch_stats sub_stats{};
-                              panthor_kbase_normalize_cs_stream(callee_cpu, call_sz, false, &sub_stats);
-                              stats.sync_scope_upgrades += sub_stats.sync_scope_upgrades;
-                              stats.heap_op_nops += sub_stats.heap_op_nops;
-                              stats.finish_frag_stat_clears += sub_stats.finish_frag_stat_clears;
-                              kbase_cpu_cache_clean_range(callee_cpu, call_sz);
-                              uint32_t c_slot = (sq->call_norm_cache_hand++) & 31U;
-                              sq->call_norm_cache[c_slot].va   = call_va;
-                              sq->call_norm_cache[c_slot].sz   = call_sz;
-                              sq->call_norm_cache[c_slot].head = callee_cpu[0];
-                              sq->call_norm_cache[c_slot].tail = callee_cpu[c_nqw - 1U];
                            }
                         }
                      }
                   }
+               };
+
+               mark_visited(qs->stream_addr, qs->stream_size);
+               scan_and_cache_edges(qs->stream_addr, stream_cpu, qs->stream_size, 0U, root_post_hash);
+
+               while (wl_head < wl_tail) {
+                  cs_work_item item = worklist[wl_head++];
+                  void *target_raw = resolve_gpu_va_to_cpu(item.va, item.sz);
+                  if (!target_raw)
+                     continue;
+                  auto *target_cpu = static_cast<uint64_t *>(target_raw);
+                  uint64_t pre_h = panthor_fnv1a64_bytes(target_cpu, item.sz);
+                  bool sub_hit = false;
+                  if (!bug_mode) {
+                     for (uint32_t ci = 0; ci < 32U; ci++) {
+                        const auto &ce = sq->norm_cache[ci];
+                        if (ce.va == item.va && ce.sz == item.sz && ce.post_norm_fnv1a64 == pre_h) {
+                           sub_hit = true;
+                           for (uint32_t ei = 0; ei < ce.edge_count; ei++) {
+                              bool is_c = (ce.edges[ei].is_call != 0U);
+                              if (!is_c || (item.call_depth + 1U < MALI_CSF_MAX_CALL_STACK_DEPTH)) {
+                                 if (wl_tail < 64U && mark_visited(ce.edges[ei].target_va, ce.edges[ei].target_sz)) {
+                                    worklist[wl_tail++] = cs_work_item{
+                                       .va = ce.edges[ei].target_va,
+                                       .sz = ce.edges[ei].target_sz,
+                                       .call_depth = static_cast<uint16_t>(is_c ? (item.call_depth + 1U) : item.call_depth),
+                                       .is_jump = static_cast<uint16_t>(is_c ? 0U : 1U)
+                                    };
+                                 }
+                              }
+                           }
+                           break;
+                        }
+                     }
+                  }
+                  uint64_t post_h = pre_h;
+                  if (!sub_hit) {
+                     struct adapter_cs_patch_stats sub_stats{};
+                     panthor_kbase_normalize_cs_stream(target_cpu, item.sz, false, &sub_stats);
+                     stats.sync_scope_upgrades += sub_stats.sync_scope_upgrades;
+                     stats.deferred_sync_waits += sub_stats.deferred_sync_waits;
+                     stats.heap_op_nops += sub_stats.heap_op_nops;
+                     stats.finish_frag_stat_clears += sub_stats.finish_frag_stat_clears;
+                     kbase_cpu_cache_clean_range(target_cpu, item.sz);
+                     post_h = panthor_fnv1a64_bytes(target_cpu, item.sz);
+                     scan_and_cache_edges(item.va, target_cpu, item.sz, item.call_depth, post_h);
+                  }
+                  if (panthor_drm_capture_is_active()) {
+                     panthor_drm_capture_record_csf_chunk(
+                        grp->group_handle, qs->queue_index, ++chunk_seq,
+                        item.call_depth, item.is_jump, item.va, item.sz,
+                        pre_h, post_h, target_cpu);
+                  }
                }
             }
                kbase_cpu_cache_clean_range(stream_cpu, qs->stream_size);
-               uint32_t slot_c = (sq->norm_cache_hand++) & 31U;
-               sq->norm_cache[slot_c].va   = qs->stream_addr;
-               sq->norm_cache[slot_c].sz   = qs->stream_size;
-               sq->norm_cache[slot_c].head = stream_cpu[0];
-               sq->norm_cache[slot_c].mid  = stream_cpu[n_qw >> 1];
-               sq->norm_cache[slot_c].tail = stream_cpu[n_qw - 1U];
             }
 
             /* Snapshot single-chunk primary CS streams (<= 32 KiB without relative JUMP) into
-             * g_ctx.shadow_cs_bo_cpu so that even if a layer or app resets a command pool
-             * while the GPU is still executing an earlier batch, the CSF stream is immutable. */
-            if (!is_initial && !cache_hit && g_ctx.shadow_cs_bo_cpu &&
+             * g_ctx.shadow_cs_bo_cpu (unless PANTHOR_ADAPTER_BUG_CATCHING_MODE=1 is set). */
+            if (!is_initial && !cache_hit && !is_bug_catching_mode_enabled() && g_ctx.shadow_cs_bo_cpu &&
                 qs->stream_size <= 32768U && g_ctx.shadow_cs_bo_size >= 65536U) {
                bool has_jump = false;
                for (uint32_t idx = 0; idx < n_qw; idx++) {
@@ -4496,6 +4601,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
 
    pthread_mutex_unlock(&g_lock);
    panthor2kbase_log_ioctl_struct_out(request, arg, ret, errno);
+   if (ret == 0)
+      panthor_drm_capture_record_ioctl(fd, request, arg, ret);
    return ret;
 }
 

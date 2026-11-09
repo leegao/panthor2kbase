@@ -44,6 +44,10 @@ Commands:
                                 preserves WAYLAND_DISPLAY and VK_KHR_wayland_surface.
   --run-panvk-app <cmd>         Run ANY generic x86-64 Vulkan application against the host-compiled
                                 patched Mesa PanVK ICD (with libmali_kbase_emu.so + libpanthor_kbase_adapter.so).
+  --capture-drm <out.pandrmcap> <cmd> [args...]  Capture Panthor DRM/CSF/ISA trace to .pandrmcap
+  --replay-drm <in.pandrmcap> [opts...]          Replay .pandrmcap locally over adapter + emulator
+  --capture-vk <out.panvkcap> <cmd> [args...]    Capture Vulkan API + SPIR-V + Memory trace via VK_LAYER_PANTHOR_capture
+  --replay-vk <in.panvkcap> [opts...]            Replay .panvkcap locally on target Vulkan ICD
   --run-dxvk [args...]          Run DXVK 1.10.3 + bcn_layer + compat_layer on AOT-lifted libGLES_mali.so
                                 (delegates to ./scripts/run_dxvk_aot.sh; supports --test / --self-test).
   --run-40-samples              Run the expanded 40 Khronos Vulkan-Samples + PanProbe compliance suite
@@ -267,6 +271,25 @@ for p in props:
         ;;
     --analyze-stall)
         python3 scripts/analyze_csf_stall_log.py "$@"
+        ;;
+    --capture-drm)
+        CAP_FILE="${1:?missing .pandrmcap path}"
+        shift
+        PANTHOR_DRM_CAPTURE_PATH="$CAP_FILE" "$0" --run-panvk-app "$@"
+        ;;
+    --replay-drm)
+        exec "$ROOT_DIR/panthor_drm_replayer" "$@"
+        ;;
+    --capture-vk)
+        CAP_FILE="${1:?missing .panvkcap path}"
+        shift
+        VK_LAYER_PATH="$ROOT_DIR/src/aot/layers:${VK_LAYER_PATH:-}" \
+            VK_INSTANCE_LAYERS="VK_LAYER_PANTHOR_capture:${VK_INSTANCE_LAYERS:-}" \
+            PANTHOR_VK_CAPTURE_PATH="$CAP_FILE" \
+            "$0" --run-app "$@"
+        ;;
+    --replay-vk)
+        exec "$ROOT_DIR/panthor_vk_replayer" "$@"
         ;;
     --run-dxvk)
         exec "$ROOT_DIR/scripts/run_dxvk_aot.sh" "$@"

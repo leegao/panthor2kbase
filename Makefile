@@ -9,6 +9,7 @@ VK_LIB := $(shell if [ -f /usr/lib/x86_64-linux-gnu/libvulkan.so.1 ]; then echo 
 
 all: libpanthor_kbase_adapter.so libmali_kbase_emu.so \
      libvulkan_panfrost_patched.so \
+     panthor_drm_replayer panthor_vk_replayer \
      aot-targets \
      tests/run_vulkan_samples_and_equivalence_suite \
      tests/unit_tests_edge_cases \
@@ -17,12 +18,13 @@ all: libpanthor_kbase_adapter.so libmali_kbase_emu.so \
      tests/test_ludashi_panvk_aot_and_host \
      build/test_dxvk_aot_layers_e2e
 
-libpanthor_kbase_adapter.so: src/adapter/panthor_kbase_adapter.cpp src/adapter/log.cpp src/adapter/log.h src/adapter/drm_mode_stubs.c src/adapter/panthor_kbase_adapter.h
+libpanthor_kbase_adapter.so: src/adapter/panthor_kbase_adapter.cpp src/adapter/panthor_drm_capture_replay.cpp src/adapter/log.cpp src/adapter/log.h src/adapter/drm_mode_stubs.c src/adapter/panthor_kbase_adapter.h include/panthor_drm_capture_replay.h
 	$(CXX) $(CXXFLAGS) -c src/adapter/panthor_kbase_adapter.cpp -o panthor_kbase_adapter.o
+	$(CXX) $(CXXFLAGS) -c src/adapter/panthor_drm_capture_replay.cpp -o panthor_drm_capture_replay.o
 	$(CXX) $(CXXFLAGS) -c src/adapter/log.cpp -o log.o
 	$(CC) $(CFLAGS) -c src/adapter/drm_mode_stubs.c -o drm_mode_stubs.o
-	$(CXX) $(CXXFLAGS) -shared -Wl,-soname,libpanthor_kbase_adapter.so -Wl,-z,nodelete -o $@ panthor_kbase_adapter.o log.o drm_mode_stubs.o -ldl -lpthread
-	rm -f panthor_kbase_adapter.o log.o drm_mode_stubs.o
+	$(CXX) $(CXXFLAGS) -shared -Wl,-soname,libpanthor_kbase_adapter.so -Wl,-z,nodelete -o $@ panthor_kbase_adapter.o panthor_drm_capture_replay.o log.o drm_mode_stubs.o -ldl -lpthread
+	rm -f panthor_kbase_adapter.o panthor_drm_capture_replay.o log.o drm_mode_stubs.o
 
 libmali_kbase_emu.so: src/emulator/mali_kbase_emu.c src/emulator/panfrost_valhall_disasm_gen.c src/emulator/mali_kbase_emu.h include/valhall_disasm_lift.h libpanthor_kbase_adapter.so
 	$(CC) $(CFLAGS) -shared -Wl,-soname,libmali_kbase_emu.so -Wl,-z,nodelete -o $@ src/emulator/mali_kbase_emu.c src/emulator/panfrost_valhall_disasm_gen.c -L. -lpanthor_kbase_adapter -Wl,-rpath,'$$ORIGIN' -ldl -lpthread
@@ -33,8 +35,15 @@ libvulkan_panfrost_patched.so: src/vulkan_android_icd/panvk_android_icd.c libpan
 tests/run_vulkan_samples_and_equivalence_suite: tests/run_vulkan_samples_and_equivalence_suite.c libpanthor_kbase_adapter.so libmali_kbase_emu.so libvulkan_panfrost_patched.so
 	$(CC) $(CFLAGS) -o $@ tests/run_vulkan_samples_and_equivalence_suite.c ./libpanthor_kbase_adapter.so ./libmali_kbase_emu.so -Wl,-rpath,'$$ORIGIN/..' -ldl -lpthread
 
-tests/unit_tests_edge_cases: tests/unit_tests_edge_cases.c libpanthor_kbase_adapter.so libmali_kbase_emu.so
-	$(CC) $(CFLAGS) -o $@ tests/unit_tests_edge_cases.c ./libpanthor_kbase_adapter.so ./libmali_kbase_emu.so -Wl,-rpath,'$$ORIGIN/..' -ldl -lpthread
+panthor_drm_replayer: tools/panthor_drm_replayer.cpp libpanthor_kbase_adapter.so libmali_kbase_emu.so
+	$(CXX) $(CXXFLAGS) tools/panthor_drm_replayer.cpp ./libpanthor_kbase_adapter.so ./libmali_kbase_emu.so -Wl,-rpath,'$$ORIGIN' -ldl -lpthread -o $@
+
+panthor_vk_replayer: tools/panthor_vk_replayer.cpp src/aot/layers/panthor_vk_capture_layer.cpp
+	./src/aot/layers/build_layers.sh
+	$(CXX) $(CXXFLAGS) $(VK_INC) -Isrc/aot/include tools/panthor_vk_replayer.cpp ./src/aot/layers/libVkLayer_PANTHOR_capture.so -Wl,-rpath,'$$ORIGIN/src/aot/layers:$$ORIGIN' -ldl -lpthread -o $@
+
+tests/unit_tests_edge_cases: tests/unit_tests_edge_cases.c libpanthor_kbase_adapter.so libmali_kbase_emu.so panthor_vk_replayer
+	$(CC) $(CFLAGS) -o $@ tests/unit_tests_edge_cases.c ./libpanthor_kbase_adapter.so ./libmali_kbase_emu.so ./src/aot/layers/libVkLayer_PANTHOR_capture.so -Wl,-rpath,'$$ORIGIN/..:$$ORIGIN/../src/aot/layers' -ldl -lpthread
 
 tests/test_wayland_and_vkgears_e2e: tests/test_wayland_and_vkgears_e2e.cpp libpanthor_kbase_adapter.so libmali_kbase_emu.so aot-targets
 	$(CXX) -std=c++17 -O2 $(VK_INC) -Iinclude -Isrc/aot/include tests/test_wayland_and_vkgears_e2e.cpp -o $@ $(VK_LIB) -Wl,-rpath,'$$ORIGIN/..' -ldl -lpthread
@@ -75,7 +84,7 @@ verify: test
 	python3 src/verifier/aarch64_mc_lifter.py mali_kbase.ko
 
 clean:
-	rm -f libpanthor_kbase_adapter.so libmali_kbase_emu.so \
+	rm -f libpanthor_kbase_adapter.so libmali_kbase_emu.so panthor_drm_replayer panthor_vk_replayer \
 	      libvulkan_panfrost_patched.so \
 	      tests/run_vulkan_samples_and_equivalence_suite \
 	      tests/unit_tests_edge_cases \

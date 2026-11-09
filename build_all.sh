@@ -10,13 +10,35 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
+# Auto-detect CMake (system PATH or bundled Android SDK cmake)
+CMAKE_BIN=""
+if command -v cmake >/dev/null 2>&1; then
+    CMAKE_BIN="$(command -v cmake)"
+else
+    for cand in \
+        "$ROOT_DIR/../work/cmake_root/3.22.1/bin/cmake" \
+        "/working_dir/c_3106ac7496559798/work/cmake_root/3.22.1/bin/cmake" \
+        "$HOME/Android/Sdk/cmake/"*/bin/cmake; do
+        if [ -x "$cand" ]; then
+            CMAKE_BIN="$cand"
+            export PATH="$(dirname "$cand"):$PATH"
+            break
+        fi
+    done
+fi
+
 echo "================================================================================"
-echo " [1/4] Building Host x86-64 Panthor-to-Kbase Adapter, /dev/mali0 Emulator & Tests"
+echo " [1/3] Building Host x86-64 Panthor-to-Kbase Adapter, /dev/mali0 Emulator & AOT "
 echo "================================================================================"
+if [ -n "$CMAKE_BIN" ]; then
+    echo "  -> Using CMake: $CMAKE_BIN"
+    "$CMAKE_BIN" -S "$ROOT_DIR" -B "$ROOT_DIR/build-cmake-host" -DCMAKE_BUILD_TYPE=Release
+    "$CMAKE_BIN" --build "$ROOT_DIR/build-cmake-host" -j"$(nproc 2>/dev/null || echo 4)"
+fi
 make all
 
 echo "================================================================================"
-echo " [2/4] Building Generic LD_PRELOAD /dev/mali0 UAPI Tracer (Host & Android NDK) "
+echo " [2/3] Building Generic LD_PRELOAD /dev/mali0 UAPI Tracer (Host & Android NDK) "
 echo "================================================================================"
 gcc -Wall -Wextra -Werror -O2 -fPIC -shared -Iinclude \
     src/tools/mali_uapi_tracer_preload.c -ldl -lpthread \
@@ -42,52 +64,13 @@ if [ -n "$NDK_CLANG" ]; then
     echo "  -> Built Android aarch64: ./build-android-tools/libmali_uapi_tracer_android_aarch64.so"
 fi
 
-echo "================================================================================"
-echo " [3/4] Building Ludashi panvk-kbase-android & Host Patched PanVK Test Harness  "
-echo "================================================================================"
-g++ -std=c++17 -Wall -Wextra -Werror -O2 -Iinclude -Isrc/adapter -Isrc/emulator \
-    tests/test_ludashi_panvk_aot_and_host.cpp \
-    -L. -lpanthor_kbase_adapter -lmali_kbase_emu \
-    -Wl,-rpath,'$ORIGIN/..' -Wl,-rpath,'$ORIGIN' -ldl -lpthread \
-    -o tests/test_ludashi_panvk_aot_and_host
-echo "  -> Built ./tests/test_ludashi_panvk_aot_and_host"
-g++ -std=c++17 -Wall -Wextra -Werror -O2 -Iinclude -Isrc/adapter -Isrc/emulator \
-    tests/panprobe/panprobe_runner_suite.cpp \
-    -L. -lpanthor_kbase_adapter -lmali_kbase_emu \
-    -Wl,-rpath,'$ORIGIN/../..' -Wl,-rpath,'$ORIGIN/..' -Wl,-rpath,'$ORIGIN' -ldl -lpthread \
-    -o tests/panprobe/panprobe_runner_suite
-echo "  -> Built ./tests/panprobe/panprobe_runner_suite"
-
-echo "================================================================================"
-echo " [4/4] Building AOT Translator, Decompiled r54p3 ICD, vkcube & 20-Sample Suite "
-echo "================================================================================"
-g++ -std=c++17 -O2 src/aot/tests/vkcube_wsi_e2e.cpp -o src/aot/bin/vkcube -ldl -lpthread
-g++ -std=c++20 -O2 -Isrc/aot/include src/aot/tests/test_vulkan_samples_compliance.cpp \
-    -o src/aot/bin/test_vulkan_samples_compliance -ldl -lpthread
-g++ -std=c++17 -O2 src/aot/tests/test_vulkan_icd_client.cpp \
-    -o src/aot/bin/test_vulkan_icd_client -ldl -lpthread
-
-if [ -f src/aot/r54p3_vulkan_icd/src/r54p3_vulkan_icd.cpp ]; then
-    g++ -O2 -std=c++17 -fPIC -shared -Isrc/aot/r54p3_vulkan_icd/include \
-        src/aot/r54p3_vulkan_icd/src/r54p3_vulkan_icd.cpp \
-        -L. -lmali_kbase_emu -Wl,-rpath,'$ORIGIN/../../../..:$ORIGIN' -ldl -lpthread \
-        -o src/aot/r54p3_vulkan_icd/lib/libr54p3_vulkan_icd.so
-fi
-
-if [ -f src/aot/build/r54p3-00eac0-6eda07/mali_mbs2_aot.o ]; then
-    g++ -O3 -std=c++17 -fno-strict-aliasing -shared -fPIC -Isrc/aot/include \
-        src/aot/src/mali_vulkan_icd.cpp src/aot/build/r54p3-00eac0-6eda07/mali_mbs2_aot.o \
-        -L. -lmali_kbase_emu -Wl,-rpath,'$ORIGIN/../../../..:$ORIGIN' -ldl -lm \
-        -o src/aot/build/r54p3-00eac0-6eda07/libvulkan_mali_aot_icd.so
-fi
-
 if [ -d mesa ] && [ -d build-android ]; then
     echo "================================================================================"
-    echo " [Optional] Running ./compile.sh for Android aarch64 NDK Mesa PanVK Build      "
+    echo " [3/3] Running ./compile.sh for Android aarch64 NDK Mesa PanVK Build           "
     echo "================================================================================"
     ./compile.sh
 fi
 
 echo "================================================================================"
-echo " [SUCCESS] All Host, AOT, Tracer, and Test Binaries Built Cleanly!             "
+echo " [SUCCESS] All Host, CMake, AOT, Tracer, and Test Binaries Built Cleanly!      "
 echo "================================================================================"

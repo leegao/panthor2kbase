@@ -17,6 +17,8 @@
 #include "panthor_drm.h"
 #include "mali_kbase_uapi.h"
 #include "panthor_kbase_adapter.h"
+#include "panthor_drm_capture_replay.h"
+#include "panthor_vk_capture_replay.h"
 #include "xf86drm.h"
 #include "xf86drmMode.h"
 #include "mali_kbase_emu.h"
@@ -558,7 +560,9 @@ static void test_ringbuffer_multi_wrap_600_jobs(void)
     * crossing the 64 KiB boundary at Job 205 (65,280B) and Job 409/410 (130,880B),
     * and verify DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT succeeds on every single job!
     */
-   for (uint64_t job = 1; job <= 600; job++) {
+   /* Submit 750 consecutive jobs so both 192B/slot (750*192=144,000B > 2*65536B) and
+    * 320B/slot (750*320=240,000B > 3*65536B) modes wrap the 64 KiB ringbuffer >= 2 times! */
+   for (uint64_t job = 1; job <= 750; job++) {
       struct drm_panthor_sync_op sop = {
          .flags = DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ | DRM_PANTHOR_SYNC_OP_SIGNAL,
          .handle = sync_handle,
@@ -585,11 +589,11 @@ static void test_ringbuffer_multi_wrap_600_jobs(void)
    struct adapter_telemetry_snapshot snap;
    memset(&snap, 0, sizeof(snap));
    panthor_kbase_get_telemetry_snapshot(&snap);
-   assert(snap.total_group_submits >= 600ULL);
-   assert(snap.total_subqueue_jobs[0] == 600ULL);
-   assert(snap.completed_subqueue_seqno[0] == 600ULL);
+   assert(snap.total_group_submits >= 750ULL);
+   assert(snap.total_subqueue_jobs[0] == 750ULL);
+   assert(snap.completed_subqueue_seqno[0] == 750ULL);
    assert(snap.ring_wraps[0] >= 2ULL);
-   assert(snap.total_syncobj_waits >= 600ULL);
+   assert(snap.total_syncobj_waits >= 750ULL);
    assert(snap.fast_spin_syncobj_waits > 0ULL);
    assert(snap.active_bos >= 1U);
    assert(snap.active_syncobjs >= 1U);
@@ -799,6 +803,7 @@ static void test_v17_cs_builder_abi_and_ls_tracker_invariants(void)
     * struct cs_chunk fields shifting cur_chunk onto root_chunk or shifting
     * cur_ls_tracker), and contains cs_get_ls_tracker() self-healing. */
    FILE *fp = fopen("mesa_overlay/src/panfrost/genxml/cs_builder.h", "r");
+   if (!fp) fp = fopen("../mesa_overlay/src/panfrost/genxml/cs_builder.h", "r");
    assert(fp != NULL);
    char buf[16384];
    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
@@ -938,6 +943,295 @@ static void test_v18_dogwitch_machick2_user_reg_munmap_guard_and_multigroup_isol
    printf("  -> Checkpoint v18 DOG WITCH / Machick 2 USER_REG_PAGE munmap Guard & Multi-Group Seqno Isolation: PASS\n");
 }
 
+static void test_v19_dogwitch_recycled_cb_jump_chain_and_machick2_v11_defer_sync(void)
+{
+   /* 1. Machick 2 Valhall v11 SYNC_ADD64.defer (bit 52 = 1, sig_slot = 0) + multi-SYNC_WAIT64 test */
+   uint64_t machick_stream[6] = {
+      0x0300000000010000ULL, /* [0] WAIT mask=0x0001 (SB_ID(LS)) before 1st SYNC_WAIT64 */
+      0x3500424420000000ULL, /* [1] SYNC_WAIT64 cond=le, r66, r68 */
+      0x3310424400000005ULL, /* [2] Valhall v11 SYNC_ADD64.csg.defer (defer_mode=1 at bit 52, sig_slot=0) */
+      0x0300000000010000ULL, /* [3] WAIT mask=0x0001 (SB_ID(LS)) before 2nd SYNC_WAIT64 */
+      0x3500424420000000ULL, /* [4] 2nd SYNC_WAIT64 cond=le, r66, r68 */
+      0x0300000000040000ULL, /* [5] WAIT mask=0x0004 */
+   };
+   struct adapter_cs_patch_stats mst;
+   panthor_kbase_normalize_cs_stream(machick_stream, sizeof(machick_stream), false, &mst);
+   assert(machick_stream[0] == 0x0300000000030000ULL);
+   assert(machick_stream[3] == 0x0300000000030000ULL);
+   assert(mst.deferred_sync_waits == 2U);
+
+   /* 2. DogWitch recycled DXVK command buffer + CSF_OP_JUMP (0x21) multi-chunk normalization test */
+   int fd = panthor_kbase_adapter_open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+   assert(fd >= 0);
+   struct drm_panthor_vm_create vmc = { .flags = 0, .user_va_range = (1ULL << 47) };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_CREATE, &vmc) == 0);
+
+   struct drm_panthor_tiler_heap_create thc;
+   memset(&thc, 0, sizeof(thc));
+   thc.vm_id = vmc.id;
+   thc.initial_chunk_count = 5;
+   thc.chunk_size = 2 * 1024 * 1024;
+   thc.max_chunks = 64;
+   thc.target_in_flight = 65535;
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_TILER_HEAP_CREATE, &thc) == 0);
+   assert(thc.handle != 0);
+
+   struct drm_panthor_queue_create q_defs[2];
+   memset(q_defs, 0, sizeof(q_defs));
+   q_defs[0].priority = 1; q_defs[0].ringbuf_size = 65536;
+   q_defs[1].priority = 1; q_defs[1].ringbuf_size = 65536;
+   struct drm_panthor_group_create gc;
+   memset(&gc, 0, sizeof(gc));
+   gc.queues = (struct drm_panthor_obj_array){ .count = 2, .stride = sizeof(q_defs[0]), .array = (uint64_t)(uintptr_t)q_defs };
+   gc.max_compute_cores = 1; gc.max_fragment_cores = 1; gc.max_tiler_cores = 1;
+   gc.compute_core_mask = 1; gc.fragment_core_mask = 1; gc.tiler_core_mask = 1;
+   gc.vm_id = vmc.id;
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_CREATE, &gc) == 0);
+
+   struct drm_panthor_bo_create boc = { .size = 8192, .flags = 0, .exclusive_vm_id = vmc.id };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_CREATE, &boc) == 0);
+   struct drm_panthor_bo_mmap_offset mmo = { .handle = boc.handle };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET, &mmo) == 0);
+   uint64_t *cs_bo = (uint64_t *)panthor_kbase_adapter_mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)mmo.offset);
+   assert(cs_bo != MAP_FAILED && cs_bo != NULL);
+
+   uint64_t *chunk1 = cs_bo;
+   uint64_t *chunk2 = cs_bo + 256;
+   uint64_t chunk2_va = (uint64_t)(uintptr_t)chunk2;
+
+   /* Initial submit on q=1 (FRAG) */
+   chunk1[0] = ((uint64_t)CSF_OP_MOVE48 << 56) | (90ULL << 48) | (uint64_t)(uintptr_t)(cs_bo + 512);
+   chunk1[1] = 0ULL;
+   chunk1[2] = 0x0b004644003f0001ULL; /* FINISH_FRAGMENT inc_frag=1 */
+   chunk1[3] = 0ULL;
+   chunk1[4] = 0x0300000000040000ULL; /* tail WAIT 0x0004 */
+   struct drm_panthor_queue_submit qs1 = { .queue_index = 1, .stream_size = 40, .stream_addr = (uint64_t)(uintptr_t)chunk1, .latest_flush = 1 };
+   struct drm_panthor_group_submit gs1 = { .group_handle = gc.group_handle, .queue_submits = DRM_PANTHOR_OBJ_ARRAY(1, &qs1) };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &gs1) == 0);
+   assert((chunk1[2] & 1ULL) == 0ULL);
+
+   /* Submit #2: populate norm_cache at chunk1 with identical head (chunk1[0]), mid (chunk1[2]=0), tail (chunk1[4]) */
+   chunk1[1] = 0x0b004644003f0001ULL;
+   chunk1[2] = 0ULL;
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &gs1) == 0);
+   assert((chunk1[1] & 1ULL) == 0ULL);
+
+   /* Submit #3 (DogWitch recycled command buffer with identical head, mid, tail, PLUS CSF_OP_JUMP to chunk2!):
+    * Must NOT skip normalization on chunk1[1] OR on chunk2[0..1]! */
+   chunk1[1] = ((uint64_t)CSF_OP_MOVE48 << 56) | (64ULL << 48) | (chunk2_va & 0xffffffffffffULL);
+   chunk1[2] = ((uint64_t)CSF_OP_MOVE32 << 56) | (66ULL << 48) | 24ULL;
+   chunk1[3] = ((uint64_t)CSF_OP_JUMP   << 56) | (64ULL << 40) | (66ULL << 32);
+   chunk2[0] = 0x3100000100040000ULL; /* HEAP_OPERATION VT_END */
+   chunk2[1] = 0x0b004644003f0001ULL; /* FINISH_FRAGMENT inc_frag=1 */
+   chunk2[2] = 0x0300000000040000ULL;
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &gs1) == 0);
+   assert(chunk2[0] == 0x0300000000040000ULL); /* HEAP_OPERATION VT_END in JUMP target normalized! */
+   assert((chunk2[1] & 1ULL) == 0ULL);         /* FINISH_FRAGMENT bit 0 in JUMP target cleared! */
+
+   struct drm_panthor_tiler_heap_destroy thd = { .handle = thc.handle };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_TILER_HEAP_DESTROY, &thd) == 0);
+   assert(drmCloseBufferHandle(fd, boc.handle) == 0);
+   struct drm_panthor_group_destroy gd = { .group_handle = gc.group_handle };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_DESTROY, &gd) == 0);
+   struct drm_panthor_vm_destroy vmd = { .id = vmc.id };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_DESTROY, &vmd) == 0);
+   assert(panthor_kbase_adapter_close(fd) == 0);
+   printf("  -> Checkpoint v19 DogWitch Recycled CB + CSF_OP_JUMP Chain & Machick 2 Valhall v11 SYNC_ADD64.defer: PASS\n");
+}
+
+
+static void test_v20_worklist_chunk_hash_bug_catching_and_dual_capture_replay(void)
+{
+   /* 1. Verify XML-generated typed CSF instruction unpackers (doco.-HqHl3p-B9OHzBasFqSJTA & doco.fdxkj9JdapjjMg1-Mt1DZQ) */
+   assert(MALI_CSF_MAX_CALL_STACK_DEPTH == 8U);
+   struct mali_csf_sync_op_fields sf;
+   assert(mali_csf_unpack_sync_op(0x3310424400000005ULL, &sf) == true);
+   assert(sf.opcode == MALI_CSF_OP_SYNC_ADD64);
+   assert(sf.defer_mode == MALI_CS_DEFER_MODE_DEFER_INDIRECT);
+   assert(sf.signal_slot == 0U);
+   assert(sf.is_deferred == true);
+   assert(mali_csf_sync_op_is_deferred(0x3310424400000005ULL) == true);
+   assert(mali_csf_sync_op_is_deferred(0x2501424400000005ULL) == true);
+   assert(mali_csf_sync_op_is_deferred(0x2500424400000005ULL) == false);
+
+   uint8_t cj_op = 0, cj_addr = 0, cj_len = 0;
+   uint64_t jump_insn = ((uint64_t)CSF_OP_JUMP << 56) | (64ULL << 40) | (66ULL << 32);
+   assert(mali_csf_unpack_call_or_jump(jump_insn, &cj_op, &cj_addr, &cj_len) == true);
+   assert(cj_op == MALI_CSF_OP_JUMP && cj_addr == 64U && cj_len == 66U);
+
+   /* 2. Verify Emulator catches unwaited Valhall v11 SYNC_ADD64.defer before SYNC_WAIT64 (doco.AXXnH1ZOCT0UtWpCJhU2jA) */
+   mali_kbase_emu_reset_stats();
+   {
+      int efd = panthor_kbase_adapter_open("/dev/dri/renderD128", O_RDWR);
+      assert(efd >= 0);
+      struct drm_panthor_vm_create vmc = {0};
+      assert(panthor_kbase_adapter_ioctl(efd, DRM_IOCTL_PANTHOR_VM_CREATE, &vmc) == 0);
+      struct drm_panthor_bo_create boc = { .size = 16384, .flags = 0 };
+      assert(panthor_kbase_adapter_ioctl(efd, DRM_IOCTL_PANTHOR_BO_CREATE, &boc) == 0);
+      struct drm_panthor_vm_bind_op bop = {
+         .flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP,
+         .bo_handle = boc.handle, .bo_offset = 0, .va = 0, .size = 16384
+      };
+      struct drm_panthor_vm_bind vmb = {
+         .vm_id = vmc.id, .flags = 0, .ops = DRM_PANTHOR_OBJ_ARRAY(1, &bop)
+      };
+      assert(panthor_kbase_adapter_ioctl(efd, DRM_IOCTL_PANTHOR_VM_BIND, &vmb) == 0);
+
+      /* Test PANTHOR_ADAPTER_BUG_CATCHING_MODE=1 small tiler heap (doco.Wu9_quJwcH_87YhcCfIFjg) */
+      setenv("PANTHOR_ADAPTER_BUG_CATCHING_MODE", "1", 1);
+      struct drm_panthor_tiler_heap_create thc = {
+         .vm_id = vmc.id, .initial_chunk_count = 5, .chunk_size = 1048576, .max_chunks = 64, .target_in_flight = 65535
+      };
+      assert(panthor_kbase_adapter_ioctl(efd, DRM_IOCTL_PANTHOR_TILER_HEAP_CREATE, &thc) == 0);
+      assert(thc.tiler_heap_ctx_gpu_va != 0);
+      unsetenv("PANTHOR_ADAPTER_BUG_CATCHING_MODE");
+
+      struct drm_panthor_tiler_heap_destroy thd = { .handle = thc.handle };
+      assert(panthor_kbase_adapter_ioctl(efd, DRM_IOCTL_PANTHOR_TILER_HEAP_DESTROY, &thd) == 0);
+      assert(drmCloseBufferHandle(efd, boc.handle) == 0);
+      struct drm_panthor_vm_destroy vmd = { .id = vmc.id };
+      assert(panthor_kbase_adapter_ioctl(efd, DRM_IOCTL_PANTHOR_VM_DESTROY, &vmd) == 0);
+      assert(panthor_kbase_adapter_close(efd) == 0);
+   }
+
+   /* 3. End-to-End Panthor DRM / CSF / Valhall ISA Capture & Local Replay (doco.y11rfnLETNbFbEGlv3C_iQ) */
+   const char *drm_trace_path = "/tmp/test_v20_capture.pandrmcap";
+   unlink(drm_trace_path);
+   assert(panthor_drm_capture_start(drm_trace_path,
+          PANDRM_FLAG_STUB_TEXTURES | PANDRM_FLAG_CAPTURE_ISA | PANDRM_FLAG_POST_NORM_CSF) == 0);
+   assert(panthor_drm_capture_is_active() == true);
+   {
+      int fd = panthor_kbase_adapter_open("/dev/dri/renderD128", O_RDWR);
+      assert(fd >= 0);
+      struct drm_panthor_gpu_info ginfo = {0};
+      struct drm_panthor_dev_query dq = {
+         .type = DRM_PANTHOR_DEV_QUERY_GPU_INFO, .size = sizeof(ginfo), .pointer = (uint64_t)(uintptr_t)&ginfo
+      };
+      assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_DEV_QUERY, &dq) == 0);
+
+      struct drm_panthor_vm_create vmc = {0};
+      assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_CREATE, &vmc) == 0);
+
+      /* Allocate CS BO (16 KiB), Shader Executable BO (4 KiB), and Texture BO (512 KiB to trigger stubbed tex meta) */
+      struct drm_panthor_bo_create cs_boc = { .size = 16384, .flags = 0 };
+      assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_CREATE, &cs_boc) == 0);
+      panthor_kbase_adapter_hint_bo_flags(1U /* ADAPTER_KMOD_BO_FLAG_EXECUTABLE */);
+      struct drm_panthor_bo_create isa_boc = { .size = 4096, .flags = 0 };
+      assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_CREATE, &isa_boc) == 0);
+      struct drm_panthor_bo_create tex_boc = { .size = 524288, .flags = 0 };
+      assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_CREATE, &tex_boc) == 0);
+
+      struct drm_panthor_vm_bind_op bops[3] = {
+         { .flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, .bo_handle = cs_boc.handle, .bo_offset = 0, .va = 0, .size = 16384 },
+         { .flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP | DRM_PANTHOR_VM_BIND_OP_MAP_READONLY, .bo_handle = isa_boc.handle, .bo_offset = 0, .va = 0, .size = 4096 },
+         { .flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, .bo_handle = tex_boc.handle, .bo_offset = 0, .va = 0, .size = 524288 },
+      };
+      struct drm_panthor_vm_bind vmb = { .vm_id = vmc.id, .flags = 0, .ops = DRM_PANTHOR_OBJ_ARRAY(3, bops) };
+      assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_BIND, &vmb) == 0);
+
+      uint64_t *cs_cpu = (uint64_t *)(uintptr_t)bops[0].va;
+      uint64_t *isa_cpu = (uint64_t *)(uintptr_t)panthor_kbase_adapter_get_bo_gpu_va(isa_boc.handle);
+      uint64_t *tex_cpu = (uint64_t *)(uintptr_t)bops[2].va;
+      if (isa_cpu) isa_cpu[0] = 0x0000000091000000ULL; /* Valhall MOV_I32 */
+      if (tex_cpu) tex_cpu[0] = 0xDEADBEEFCAFEBABEULL;
+
+      /* Build a 3-chunk transitive closure: Root -> CALL sub_chunk -> JUMP tail_chunk */
+      uint64_t *root_chunk = cs_cpu;
+      uint64_t *call_chunk = cs_cpu + 64;
+      uint64_t *jump_chunk = cs_cpu + 128;
+      uint64_t call_va = (uint64_t)(uintptr_t)call_chunk;
+      uint64_t jump_va = (uint64_t)(uintptr_t)jump_chunk;
+
+      root_chunk[0] = ((uint64_t)CSF_OP_MOVE48 << 56) | (90ULL << 48) | (uint64_t)(uintptr_t)(cs_cpu + 256);
+      root_chunk[1] = ((uint64_t)CSF_OP_MOVE48 << 56) | (64ULL << 48) | (call_va & 0xffffffffffffULL);
+      root_chunk[2] = ((uint64_t)CSF_OP_MOVE32 << 56) | (66ULL << 48) | 32ULL;
+      root_chunk[3] = ((uint64_t)CSF_OP_CALL   << 56) | (64ULL << 40) | (66ULL << 32);
+      root_chunk[4] = 0x0300000000040000ULL;
+
+      call_chunk[0] = ((uint64_t)CSF_OP_MOVE48 << 56) | (68ULL << 48) | (jump_va & 0xffffffffffffULL);
+      call_chunk[1] = ((uint64_t)CSF_OP_MOVE32 << 56) | (70ULL << 48) | 24ULL;
+      call_chunk[2] = ((uint64_t)CSF_OP_JUMP   << 56) | (68ULL << 40) | (70ULL << 32);
+      call_chunk[3] = 0ULL;
+
+      jump_chunk[0] = 0x3310424400000005ULL; /* Valhall v11 SYNC_ADD64.defer */
+      jump_chunk[1] = 0x0300000000010000ULL; /* WAIT mask=0x0001 -> normalized to 0x0003 */
+      jump_chunk[2] = 0x35005944c0000000ULL; /* SYNC_WAIT64 */
+
+      struct drm_panthor_queue_create qcre[2] = {
+         { .priority = 1, .ringbuf_size = 65536 },
+         { .priority = 1, .ringbuf_size = 65536 }
+      };
+      struct drm_panthor_group_create gc = {
+         .queues = DRM_PANTHOR_OBJ_ARRAY(2, qcre),
+         .max_compute_cores = 1, .max_fragment_cores = 1, .max_tiler_cores = 1,
+         .priority = PANTHOR_GROUP_PRIORITY_MEDIUM,
+         .compute_core_mask = 1, .fragment_core_mask = 1, .tiler_core_mask = 1,
+         .vm_id = vmc.id
+      };
+      assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_CREATE, &gc) == 0);
+
+      struct drm_syncobj_create soc = { .handle = 0, .flags = 0 };
+      assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &soc) == 0);
+      struct drm_panthor_sync_op sop = {
+         .flags = DRM_PANTHOR_SYNC_OP_SIGNAL | DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_SYNCOBJ,
+         .handle = soc.handle, .timeline_value = 0
+      };
+      struct drm_panthor_queue_submit qs = {
+         .queue_index = 0, .stream_size = 40, .stream_addr = (uint64_t)(uintptr_t)root_chunk,
+         .latest_flush = 1, .syncs = DRM_PANTHOR_OBJ_ARRAY(1, &sop)
+      };
+      struct drm_panthor_group_submit gs = {
+         .group_handle = gc.group_handle, .queue_submits = DRM_PANTHOR_OBJ_ARRAY(1, &qs)
+      };
+      assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &gs) == 0);
+      /* Verify worklist followed root -> CALL -> JUMP and upgraded WAIT before SYNC_WAIT64! */
+      assert(jump_chunk[1] == 0x0300000000030000ULL);
+
+      struct drm_syncobj_wait sw = {
+         .handles = (uint64_t)(uintptr_t)&soc.handle, .timeout_nsec = INT64_MAX, .count_handles = 1, .flags = 0
+      };
+      assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &sw) == 0);
+
+      struct drm_syncobj_destroy sod = { .handle = soc.handle, .pad = 0 };
+      assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &sod) == 0);
+      struct drm_panthor_group_destroy gd = { .group_handle = gc.group_handle };
+      assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_DESTROY, &gd) == 0);
+      assert(drmCloseBufferHandle(fd, tex_boc.handle) == 0);
+      assert(drmCloseBufferHandle(fd, isa_boc.handle) == 0);
+      assert(drmCloseBufferHandle(fd, cs_boc.handle) == 0);
+      struct drm_panthor_vm_destroy vmd = { .id = vmc.id };
+      assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_DESTROY, &vmd) == 0);
+      assert(panthor_kbase_adapter_close(fd) == 0);
+   }
+   panthor_drm_capture_stop();
+   assert(panthor_drm_capture_is_active() == false);
+
+   /* Replay captured .pandrmcap locally and verify all invariants */
+   struct pandrm_replay_options drm_ropts = { .verbose = true, .dump_csf = false, .verify_invariants = true, .bug_catching_mode = false };
+   struct pandrm_replay_summary drm_rsum = {0};
+   assert(panthor_drm_replay_trace_file(drm_trace_path, &drm_ropts, &drm_rsum) == 0);
+   assert(drm_rsum.csf_invariant_violations == 0U);
+   assert(drm_rsum.total_bo_creates == 3ULL);
+   assert(drm_rsum.total_csf_chunks_verified == 3ULL); /* root + CALL + JUMP */
+   assert(drm_rsum.total_tex_metas_restored >= 1ULL);
+   assert(drm_rsum.total_group_submits == 1ULL);
+   unlink(drm_trace_path);
+
+   /* 4. End-to-End Vulkan API Layer Capture & Local Replay (.panvkcap) */
+   const char *vk_trace_path = "/tmp/test_v20_capture.panvkcap";
+   unlink(vk_trace_path);
+   assert(panthor_vk_capture_start(vk_trace_path, PANVK_CAP_FLAG_STUB_TEXTURES) == 0);
+   assert(panthor_vk_capture_is_active() == true);
+   panthor_vk_capture_stop();
+   struct panvk_replay_options vk_ropts = { .icd_json_path = NULL, .dump_ppm_path = NULL, .verbose = true };
+   struct panvk_replay_summary vk_rsum = {0};
+   assert(panthor_vk_replay_trace_file(vk_trace_path, &vk_ropts, &vk_rsum) == 0);
+   assert(vk_rsum.final_status == 0);
+   unlink(vk_trace_path);
+
+   printf("  -> Checkpoint v20 Worklist Chunk Hash, Bug-Catching Mode & Dual-Level Capture/Replay: PASS\n");
+}
+
 int main(void)
 {
    printf("[Unit Tests] Running edge cases, mali_kbase.ko flag invariants, and RAII logging suite...\n");
@@ -953,6 +1247,8 @@ int main(void)
    test_dice_a_million_syncobj_wait_and_bcn_layer_race();
    test_v17_cs_builder_abi_and_ls_tracker_invariants();
    test_v18_dogwitch_machick2_user_reg_munmap_guard_and_multigroup_isolation();
+   test_v19_dogwitch_recycled_cb_jump_chain_and_machick2_v11_defer_sync();
+   test_v20_worklist_chunk_hash_bug_catching_and_dual_capture_replay();
    printf("[Unit Tests] ALL EDGE CASES PASSED!\n");
    return 0;
 }

@@ -33,3 +33,7 @@ cat << JSON_EOF > "$DIR/VkLayer_COMPAT_dxvk_mali_compat.json"
     }
 }
 JSON_EOF
+
+g++ -std=c++17 -O2 -fPIC -shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions \
+    -I"$DIR/../../../include" -I"$DIR/../include" \
+    "$DIR/panthor_vk_capture_layer.cpp" -o "$DIR/libVkLayer_PANTHOR_capture.so" -ldl -lpthread

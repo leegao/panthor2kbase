@@ -22,6 +22,9 @@ echo "==========================================================================
 g++ -std=c++17 -Wall -Wextra -Werror -Wno-nonnull-compare -O0 -g --coverage -fPIC \
     -Iinclude -Isrc/adapter -Isrc/emulator \
     -c src/adapter/panthor_kbase_adapter.cpp -o "${COVERAGE_DIR}/panthor_kbase_adapter.o"
+g++ -std=c++17 -Wall -Wextra -O0 -g --coverage -fPIC \
+    -Iinclude -Isrc/adapter -Isrc/emulator \
+    -c src/adapter/panthor_drm_capture_replay.cpp -o "${COVERAGE_DIR}/panthor_drm_capture_replay.o"
 
 g++ -std=c++17 -Wall -Wextra -Werror -Wno-nonnull-compare -O0 -g --coverage -fPIC \
     -Iinclude -Isrc/adapter -Isrc/emulator \
@@ -34,6 +37,7 @@ gcc -Wall -Wextra -Werror -Wno-nonnull-compare -O0 -g --coverage -fPIC \
 g++ -std=c++17 -O0 -g --coverage -fPIC -shared \
     -o "${COVERAGE_DIR}/libpanthor_kbase_adapter.so" \
     "${COVERAGE_DIR}/panthor_kbase_adapter.o" \
+    "${COVERAGE_DIR}/panthor_drm_capture_replay.o" \
     "${COVERAGE_DIR}/log.o" \
     "${COVERAGE_DIR}/drm_mode_stubs.o" \
     -ldl -lpthread
