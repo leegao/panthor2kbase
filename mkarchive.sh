@@ -46,7 +46,7 @@ if [ "$GEMINI_MODE" -eq 1 ]; then
 elif command -v zip >/dev/null 2>&1; then
     FLAGS=(
         -9 -y -r "$TARGET_FILE" .
-        -x ".cache/*" "build*/*" ".git/*" "archives/*"
+        -x ".cache/*" "build*/*" "archives/*"
         "llvm.zip" "include.zip" "AGENTS.md" "CLAUDE.md" "External/*"
         "kittytoy/*" "screenshots/*" "mesa/*" "archive.zip" "*.zip" "*.so" "*.o" "*.whl" "*.ko" "sandbox_bundles/*" "predownloaded/*"
     )
@@ -55,6 +55,7 @@ elif command -v zip >/dev/null 2>&1; then
         FLAGS+=(-x "data/*")
         FLAGS+=(-x "*.pyc")
         FLAGS+=(-x "*.zip")
+        FLAGS+=(-x ".git/*")
     fi
     zip "${FLAGS[@]}"
 else
