@@ -36,9 +36,9 @@ jobs:
         env:
           CC: ${{ matrix.compiler }}
         run: |
-          cmake -B build-host -G Ninja -DPANTHOR_KBASE_BUILD_TESTS=ON
-          cmake --build build-host
-          ctest --test-dir build-host --output-on-failure -V
+          cmake -B build-x86-64 -G Ninja -DPANTHOR_KBASE_BUILD_TESTS=ON
+          cmake --build build-x86-64
+          ctest --test-dir build-x86-64 --output-on-failure -V
 
       - name: Build and Test via Make
         if: matrix.build_system == 'make'
@@ -55,7 +55,8 @@ jobs:
           name: build-and-test-artifacts-${{ matrix.compiler }}-${{ matrix.build_system }}
           path: |
             artifacts/*.json
-            build-host/*.so
+            build-x86-64/*.so
+            build-x86-64/*/*.so
             *.so
 
       - name: Run Ludashi & PanProbe 36-Test Hardware/Emulator Verification Suite

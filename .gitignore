@@ -47,6 +47,7 @@ predownloaded/
 build/
 Build/
 build-*/
+build-host
 
 # CMake generated files
 CMakeFiles/

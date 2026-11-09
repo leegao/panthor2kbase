@@ -1,13 +1,14 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * Panthor2Kbase runtime logging with C++ RAII scoped indentation and
- * full input/output ioctl struct deserialization.
+ * Panthor2Kbase runtime logging with C++ RAII scoped indentation,
+ * poll-loop log coalescing/suppression, and full input/output ioctl struct
+ * deserialization.
  *
  * The minimum log level is controlled by the PANTHOR2KBASE_LOG_LEVEL
  * environment variable. Accepted values are the integer 0..4 or the
  * (case-insensitive) names error, warn, info, debug, trace.
- * When the variable is unset, the default level is TRACE (4).
+ * When the variable is unset, the default level is INFO (2).
  *
  * Every time an interceptor or adapter function is entered, constructing
  * a `panthor2kbase::ScopedLogIndent` (via `PANTHOR2KBASE_LOG_SCOPE(...)`)
@@ -39,13 +40,19 @@ typedef enum {
 /* Lazily initialize the log level/sink from the environment (thread-safe). */
 void panthor2kbase_log_init(void);
 
-/* Current effective log level (initialized on first use; default TRACE). */
+/* Current effective log level (initialized on first use; default INFO). */
 extern panthor2kbase_log_level_t panthor2kbase_log_level;
 
 /* Thread-local indentation depth accessors (used by C++ RAII ScopedLogIndent). */
 int panthor2kbase_log_get_indent(void);
 void panthor2kbase_log_inc_indent(void);
 void panthor2kbase_log_dec_indent(void);
+
+/* Thread-local poll-loop log suppression accessors (prevents 2,800+ lines/sec
+ * System.out / logcat / winlator_log.txt floods during repetitive syncobj/group
+ * polling when no new GPU work has been submitted). */
+bool panthor2kbase_log_is_poll_suppressed(void);
+void panthor2kbase_log_set_poll_suppressed(bool suppressed);
 
 /* Core printf-style loggers. */
 void panthor2kbase_logv(panthor2kbase_log_level_t level, const char *fmt, va_list ap);
@@ -61,6 +68,8 @@ void panthor2kbase_log(panthor2kbase_log_level_t level, const char *fmt, ...)
 static inline bool panthor2kbase_log_level_enabled(panthor2kbase_log_level_t level)
 {
     panthor2kbase_log_init();
+    if (level >= PANTHOR2KBASE_LOG_DEBUG && panthor2kbase_log_is_poll_suppressed())
+        return false;
     return level <= panthor2kbase_log_level;
 }
 
@@ -86,6 +95,32 @@ int panthor2kbase_adapter_ioctl(int fd, unsigned long request, void *arg, const 
 namespace panthor2kbase {
 
 /*
+ * RAII Poll-Loop Suppression Guard:
+ *  - Sets thread-local poll suppression flag on entry and restores previous
+ *    state on scope exit.
+ */
+class ScopedPollLogSuppress {
+public:
+    explicit ScopedPollLogSuppress(bool suppress) noexcept
+        : prev_(panthor2kbase_log_is_poll_suppressed())
+    {
+        if (suppress)
+            panthor2kbase_log_set_poll_suppressed(true);
+    }
+
+    ~ScopedPollLogSuppress() noexcept
+    {
+        panthor2kbase_log_set_poll_suppressed(prev_);
+    }
+
+    ScopedPollLogSuppress(const ScopedPollLogSuppress &) = delete;
+    ScopedPollLogSuppress &operator=(const ScopedPollLogSuppress &) = delete;
+
+private:
+    bool prev_;
+};
+
+/*
  * RAII Scoped Indentation Guard:
  *  - Logs entry at TRACE level at current indentation depth, then increments
  *    thread-local indentation depth by +1 for all inner logs/calls.
@@ -94,9 +129,10 @@ namespace panthor2kbase {
 class ScopedLogIndent {
 public:
     explicit ScopedLogIndent(const char *func_name) noexcept
-        : func_name_(func_name)
+        : func_name_(func_name),
+          suppressed_(panthor2kbase_log_is_poll_suppressed())
     {
-        if (panthor2kbase_log_level_enabled(PANTHOR2KBASE_LOG_TRACE)) {
+        if (!suppressed_ && panthor2kbase_log_level_enabled(PANTHOR2KBASE_LOG_TRACE)) {
             panthor2kbase_log(PANTHOR2KBASE_LOG_TRACE, "-> %s {", func_name_);
         }
         panthor2kbase_log_inc_indent();
@@ -104,9 +140,10 @@ public:
 
     ScopedLogIndent(const char *func_name, const char *fmt, ...) noexcept
         __attribute__((format(printf, 3, 4)))
-        : func_name_(func_name)
+        : func_name_(func_name),
+          suppressed_(panthor2kbase_log_is_poll_suppressed())
     {
-        if (panthor2kbase_log_level_enabled(PANTHOR2KBASE_LOG_TRACE)) {
+        if (!suppressed_ && panthor2kbase_log_level_enabled(PANTHOR2KBASE_LOG_TRACE)) {
             char detail[256];
             va_list ap;
             va_start(ap, fmt);
@@ -120,7 +157,8 @@ public:
     ~ScopedLogIndent() noexcept
     {
         panthor2kbase_log_dec_indent();
-        if (panthor2kbase_log_level_enabled(PANTHOR2KBASE_LOG_TRACE)) {
+        if (!suppressed_ && !panthor2kbase_log_is_poll_suppressed() &&
+            panthor2kbase_log_level_enabled(PANTHOR2KBASE_LOG_TRACE)) {
             panthor2kbase_log(PANTHOR2KBASE_LOG_TRACE, "} // %s", func_name_);
         }
     }
@@ -130,6 +168,7 @@ public:
 
 private:
     const char *func_name_;
+    bool suppressed_;
 };
 
 } /* namespace panthor2kbase */

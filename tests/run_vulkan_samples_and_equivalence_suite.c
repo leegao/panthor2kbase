@@ -297,10 +297,14 @@ static void run_extended_stress_workloads_7_to_20(int drm_fd, uint32_t vm_id, ui
 static void *open_patched_panvk_library(void)
 {
    const char *candidates[] = {
+      "./build-x86-64/libvulkan_panfrost_patched.so",
+      "./build-x86-64/adapter/libvulkan_panfrost_patched.so",
       "./libvulkan_panfrost_patched.so",
       "./coverage_output/libvulkan_panfrost_patched.so",
       "./build-host/libvulkan_panfrost_patched.so",
       "./build-cmake-host/libvulkan_panfrost_patched.so",
+      "../build-x86-64/libvulkan_panfrost_patched.so",
+      "../build-x86-64/adapter/libvulkan_panfrost_patched.so",
       "../libvulkan_panfrost_patched.so",
       "../coverage_output/libvulkan_panfrost_patched.so",
       "../build-host/libvulkan_panfrost_patched.so",

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build-x86-64}"
+export LD_LIBRARY_PATH="$BUILD_DIR:$BUILD_DIR/adapter:$BUILD_DIR/emulator:$BUILD_DIR/aot:${LD_LIBRARY_PATH:-}"
+exec "$BUILD_DIR/tests/test_dxvk_aot_layers_e2e" "$@"

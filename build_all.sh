@@ -10,61 +10,46 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-# Auto-detect CMake (system PATH or bundled Android SDK cmake)
-CMAKE_BIN=""
-if command -v cmake >/dev/null 2>&1; then
-    CMAKE_BIN="$(command -v cmake)"
-else
-    for cand in \
-        "$ROOT_DIR/../work/cmake_root/3.22.1/bin/cmake" \
-        "/working_dir/c_3106ac7496559798/work/cmake_root/3.22.1/bin/cmake" \
-        "$HOME/Android/Sdk/cmake/"*/bin/cmake; do
-        if [ -x "$cand" ]; then
-            CMAKE_BIN="$cand"
-            export PATH="$(dirname "$cand"):$PATH"
-            break
-        fi
-    done
-fi
+# Auto-detect CMake via centralized locator
+CMAKE_BIN="$("${ROOT_DIR}/scripts/find_cmake.sh")"
+export PATH="$(dirname "$CMAKE_BIN"):$PATH"
 
 echo "================================================================================"
 echo " [1/3] Building Host x86-64 Panthor-to-Kbase Adapter, /dev/mali0 Emulator & AOT "
 echo "================================================================================"
-if [ -n "$CMAKE_BIN" ]; then
-    echo "  -> Using CMake: $CMAKE_BIN"
-    "$CMAKE_BIN" -S "$ROOT_DIR" -B "$ROOT_DIR/build-cmake-host" -DCMAKE_BUILD_TYPE=Release
-    "$CMAKE_BIN" --build "$ROOT_DIR/build-cmake-host" -j"$(nproc 2>/dev/null || echo 4)"
-fi
-make all
+echo "  -> Using CMake: $CMAKE_BIN"
+"$CMAKE_BIN" -S "$ROOT_DIR" -B "$ROOT_DIR/build-x86-64" -DCMAKE_BUILD_TYPE=Release
+"$CMAKE_BIN" --build "$ROOT_DIR/build-x86-64" -j"$(nproc 2>/dev/null || echo 4)"
 
 echo "================================================================================"
-echo " [2/3] Building Generic LD_PRELOAD /dev/mali0 UAPI Tracer (Host & Android NDK) "
+echo " [2/3] Building Android Panthor-to-Kbase Adapter, /dev/mali0 Emulator & Tracer  "
 echo "================================================================================"
-gcc -Wall -Wextra -Werror -O2 -fPIC -shared -Iinclude \
-    src/tools/mali_uapi_tracer_preload.c -ldl -lpthread \
-    -o libmali_uapi_tracer.so
-echo "  -> Built host x86-64: ./libmali_uapi_tracer.so"
-
-NDK_CLANG=""
+NDK_TOOLCHAIN=""
 for cand in \
-    "${ANDROID_NDK_HOME:-}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang" \
-    "$HOME/Android/Sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang" \
-    "/working_dir/c_3106ac7496559798/work/ndk/android-ndk-r27d/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang"; do
-    if [ -x "$cand" ]; then
-        NDK_CLANG="$cand"
+    "${ANDROID_NDK_HOME:-}/build/cmake/android.toolchain.cmake" \
+    "$HOME/Android/Sdk/ndk/27.0.12077973/build/cmake/android.toolchain.cmake" \
+    "/working_dir/c_3106ac7496559798/work/ndk/android-ndk-r27d/build/cmake/android.toolchain.cmake"; do
+    if [ -f "$cand" ]; then
+        NDK_TOOLCHAIN="$cand"
         break
     fi
 done
 
-if [ -n "$NDK_CLANG" ]; then
-    mkdir -p build-android-tools
-    "$NDK_CLANG" -Wall -Wextra -Werror -O2 -fPIC -shared -Iinclude \
-        src/tools/mali_uapi_tracer_preload.c -ldl \
-        -o build-android-tools/libmali_uapi_tracer_android_aarch64.so
-    echo "  -> Built Android aarch64: ./build-android-tools/libmali_uapi_tracer_android_aarch64.so"
+if [ -n "$NDK_TOOLCHAIN" ]; then
+    echo "  -> Using Android NDK Toolchain: $NDK_TOOLCHAIN"
+    "$CMAKE_BIN" -S "$ROOT_DIR" -B "$ROOT_DIR/build-android" \
+        -DCMAKE_TOOLCHAIN_FILE="$NDK_TOOLCHAIN" \
+        -DANDROID_ABI=arm64-v8a \
+        -DANDROID_PLATFORM=android-30 \
+        -DPANTHOR_KBASE_BUILD_TESTS=OFF \
+        -DPANTHOR_KBASE_BUILD_AOT=OFF
+    "$CMAKE_BIN" --build "$ROOT_DIR/build-android" -j"$(nproc 2>/dev/null || echo 4)"
+    echo "  -> Built Android aarch64 native libraries in build-android/"
+else
+    echo "  -> Android NDK toolchain not found, skipping Android CMake build."
 fi
 
-if [ -d mesa ] && [ -d build-android ]; then
+if [ -d mesa ] && ([ -d build-android/mesa ] || [ -d build-android ]); then
     echo "================================================================================"
     echo " [3/3] Running ./compile.sh for Android aarch64 NDK Mesa PanVK Build           "
     echo "================================================================================"

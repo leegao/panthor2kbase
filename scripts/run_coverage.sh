@@ -2,103 +2,93 @@
 # scripts/run_coverage.sh
 # -----------------------
 # Compiles the C++ Panthor-to-Kbase adapter and /dev/mali0 emulator with GCC code
-# coverage instrumentation (--coverage), executes the full 20-workload Vulkan
-# sample suite and supplementary unit test suites, generates gcov reports,
-# and calculates line and branch coverage statistics.
+# coverage instrumentation (--coverage) via CMake, executes the full Vulkan
+# sample and unit/integration test suites, generates gcov reports,
+# and calculates line coverage statistics.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 
+CMAKE_BIN="$("${SCRIPT_DIR}/find_cmake.sh")"
 COVERAGE_DIR="${ROOT_DIR}/coverage_output"
+COVERAGE_BUILD_DIR="${ROOT_DIR}/build-coverage"
+
 mkdir -p "${COVERAGE_DIR}" "${ROOT_DIR}/artifacts"
 rm -f "${COVERAGE_DIR}"/* "${ROOT_DIR}"/*.gcda "${ROOT_DIR}"/*.gcno "${ROOT_DIR}"/*.gcov
 
 echo "================================================================================"
-echo " Building Panthor-Kbase Suite with Code Coverage Instrumentation"
+echo " Building Panthor-Kbase Suite with Code Coverage Instrumentation via CMake"
 echo "================================================================================"
 
-g++ -std=c++17 -Wall -Wextra -Werror -Wno-nonnull-compare -O0 -g --coverage -fPIC \
-    -Iinclude -Isrc/adapter -Isrc/emulator \
-    -c src/adapter/panthor_kbase_adapter.cpp -o "${COVERAGE_DIR}/panthor_kbase_adapter.o"
-g++ -std=c++17 -Wall -Wextra -O0 -g --coverage -fPIC \
-    -Iinclude -Isrc/adapter -Isrc/emulator \
-    -c src/adapter/panthor_drm_capture_replay.cpp -o "${COVERAGE_DIR}/panthor_drm_capture_replay.o"
+"$CMAKE_BIN" -S "${ROOT_DIR}" -B "${COVERAGE_BUILD_DIR}" \
+    -DPANTHOR_KBASE_ENABLE_COVERAGE=ON \
+    -DCMAKE_BUILD_TYPE=Debug
 
-g++ -std=c++17 -Wall -Wextra -Werror -Wno-nonnull-compare -O0 -g --coverage -fPIC \
-    -Iinclude -Isrc/adapter -Isrc/emulator \
-    -c src/adapter/log.cpp -o "${COVERAGE_DIR}/log.o"
-
-gcc -Wall -Wextra -Werror -Wno-nonnull-compare -O0 -g --coverage -fPIC \
-    -Iinclude -Isrc/adapter -Isrc/emulator \
-    -c src/adapter/drm_mode_stubs.c -o "${COVERAGE_DIR}/drm_mode_stubs.o"
-
-g++ -std=c++17 -O0 -g --coverage -fPIC -shared \
-    -o "${COVERAGE_DIR}/libpanthor_kbase_adapter.so" \
-    "${COVERAGE_DIR}/panthor_kbase_adapter.o" \
-    "${COVERAGE_DIR}/panthor_drm_capture_replay.o" \
-    "${COVERAGE_DIR}/log.o" \
-    "${COVERAGE_DIR}/drm_mode_stubs.o" \
-    -ldl -lpthread
-
-gcc -Wall -Wextra -Werror -Wno-nonnull-compare -O0 -g --coverage -fPIC -shared \
-    -Iinclude -Isrc/adapter -Isrc/emulator \
-    -o "${COVERAGE_DIR}/libmali_kbase_emu.so" \
-    src/emulator/mali_kbase_emu.c \
-    src/emulator/panfrost_valhall_disasm_gen.c \
-    "${COVERAGE_DIR}/libpanthor_kbase_adapter.so" -Wl,-rpath,"${COVERAGE_DIR}" -ldl -lpthread
-
-gcc -Wall -Wextra -Werror -Wno-nonnull-compare -O0 -g -fPIC -DPANTHOR_KBASE_PATCHED_KMOD=1 -shared \
-    -Iinclude -Isrc/adapter -Isrc/emulator \
-    -o "${COVERAGE_DIR}/libvulkan_panfrost_patched.so" src/vulkan_android_icd/panvk_android_icd.c \
-    "${COVERAGE_DIR}/libpanthor_kbase_adapter.so" -Wl,-rpath,"${COVERAGE_DIR}" -ldl -lpthread
-
-cp -f "${COVERAGE_DIR}/libvulkan_panfrost_patched.so" "${ROOT_DIR}/libvulkan_panfrost_patched.so"
-
-gcc -Wall -Wextra -Werror -Wno-nonnull-compare -O0 -g --coverage \
-    -Iinclude -Isrc/adapter -Isrc/emulator \
-    -o "${COVERAGE_DIR}/run_vulkan_samples_and_equivalence_suite" \
-    tests/run_vulkan_samples_and_equivalence_suite.c \
-    "${COVERAGE_DIR}/libpanthor_kbase_adapter.so" "${COVERAGE_DIR}/libmali_kbase_emu.so" \
-    -Wl,-rpath,"${COVERAGE_DIR}" -ldl -lpthread
-
-gcc -Wall -Wextra -Werror -O0 -g \
-    -Iinclude -Isrc/adapter -Isrc/emulator \
-    -o "${COVERAGE_DIR}/unit_tests_edge_cases" \
-    tests/unit_tests_edge_cases.c \
-    "${COVERAGE_DIR}/libpanthor_kbase_adapter.so" "${COVERAGE_DIR}/libmali_kbase_emu.so" \
-    -Wl,-rpath,"${COVERAGE_DIR}" -ldl -lpthread
+"$CMAKE_BIN" --build "${COVERAGE_BUILD_DIR}" --target \
+    panthor_kbase_adapter \
+    mali_kbase_emu \
+    vulkan_panfrost_patched \
+    run_vulkan_samples_and_equivalence_suite \
+    unit_tests_edge_cases \
+    panprobe_runner_suite \
+    test_ludashi_panvk_aot_and_host \
+    test_wayland_and_vkgears_e2e \
+    test_dxvk_aot_layers_e2e \
+    -j"$(nproc)"
 
 echo "================================================================================"
 echo " Executing Test Suites under Coverage Profiling"
 echo "================================================================================"
 
-"${COVERAGE_DIR}/run_vulkan_samples_and_equivalence_suite"
-"${COVERAGE_DIR}/unit_tests_edge_cases"
+RUN_TEST() {
+    local t="$1"
+    if [ -x "${COVERAGE_BUILD_DIR}/tests/$t" ]; then
+        "${COVERAGE_BUILD_DIR}/tests/$t"
+    elif [ -x "${COVERAGE_BUILD_DIR}/$t" ]; then
+        "${COVERAGE_BUILD_DIR}/$t"
+    elif [ -x "${ROOT_DIR}/tests/$t" ]; then
+        "${ROOT_DIR}/tests/$t"
+    fi
+}
+
+RUN_TEST run_vulkan_samples_and_equivalence_suite
+RUN_TEST unit_tests_edge_cases
+RUN_TEST panprobe_runner_suite
+RUN_TEST test_ludashi_panvk_aot_and_host
+RUN_TEST test_wayland_and_vkgears_e2e
+RUN_TEST test_dxvk_aot_layers_e2e
 
 echo "================================================================================"
 echo " Generating Gcov Coverage Reports & Parsing Metrics"
 echo "================================================================================"
 
-mv "${ROOT_DIR}"/*.gcda "${ROOT_DIR}"/*.gcno "${COVERAGE_DIR}/" 2>/dev/null || true
+python3 - << PYEOF
+import os, glob, subprocess
 
-python3 - << 'PYEOF'
-import os, glob, subprocess, json
+cov_dir = "${COVERAGE_DIR}"
+build_dir = "${COVERAGE_BUILD_DIR}"
+gcda_files = glob.glob(os.path.join(build_dir, "**", "*.gcda"), recursive=True)
 
-cov_dir = "coverage_output"
-files = glob.glob(os.path.join(cov_dir, "*.gcda"))
-for f in files:
-    subprocess.run(["gcov", "-b", "-c", "-o", cov_dir, f], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+for f in gcda_files:
+    obj_dir = os.path.dirname(f)
+    subprocess.run(["gcov", "-b", "-c", "-o", obj_dir, f], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 for g in glob.glob("*.gcov"):
     os.replace(g, os.path.join(cov_dir, g))
+PYEOF
 
+python3 - << 'PYEOF'
+import os, glob, json
+
+cov_dir = "coverage_output"
 gcov_files = [
     f for f in os.listdir(cov_dir)
     if (f.endswith(".c.gcov") or f.endswith(".cpp.gcov"))
     and not f.startswith("usr#")
     and f != "panfrost_valhall_disasm_gen.c.gcov"
+    and not f.startswith("panthor_vk_capture_layer")
 ]
 coverage_data = {}
 total_lines = 0

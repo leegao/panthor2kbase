@@ -234,7 +234,17 @@ suite = [
     ("bachata_s4_vertex_attribute_div", "bachata_s4", "VK_EXT_vertex_attribute_divisor"),
 ]
 
+cands = [
+    "build-x86-64/libvulkan_panfrost_patched.so",
+    "build-x86-64/adapter/libvulkan_panfrost_patched.so",
+    "build-cmake-host/libvulkan_panfrost_patched.so",
+    "libvulkan_panfrost_patched.so"
+]
 so_path = "libvulkan_panfrost_patched.so"
+for c in cands:
+    if os.path.exists(c):
+        so_path = c
+        break
 with open(so_path, "rb") as f:
     so_sha = hashlib.sha256(f.read()).hexdigest()
 

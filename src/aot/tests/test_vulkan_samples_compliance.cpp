@@ -96,10 +96,21 @@ int main(int argc, char** argv) {
             exe_buf[n] = '\0';
             if (char* sl = strrchr(exe_buf, '/')) { *sl = '\0'; exe_dir = exe_buf; }
         }
-        std::string cand = exe_dir + "/../build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json";
-        if (access(cand.c_str(), R_OK) == 0) {
-            char rp[4096]{};
-            setenv("VK_ICD_FILENAMES", realpath(cand.c_str(), rp) ? rp : cand.c_str(), 1);
+        std::vector<std::string> candidates = {
+            exe_dir + "/../mali_aot_icd.x86_64.json",
+            exe_dir + "/mali_aot_icd.x86_64.json",
+            exe_dir + "/../../src/aot/build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json",
+            exe_dir + "/../build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json",
+            "build-x86-64/mali_aot_icd.x86_64.json",
+            "src/aot/build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json",
+            "src/aot/r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json"
+        };
+        for (const auto& cand : candidates) {
+            if (access(cand.c_str(), R_OK) == 0) {
+                char rp[4096]{};
+                setenv("VK_ICD_FILENAMES", realpath(cand.c_str(), rp) ? rp : cand.c_str(), 1);
+                break;
+            }
         }
     }
 

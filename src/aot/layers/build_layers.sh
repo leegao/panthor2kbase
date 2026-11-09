@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
+# src/aot/layers/build_layers.sh
+# Builds DXVK and Panthor Vulkan capture layers via centralized CMake
 set -euo pipefail
+
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-g++ -std=c++17 -O2 -fPIC -shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions \
-    "$DIR/bcn_layer_host.cpp" -o "$DIR/libVkLayer_BCN_bcn_layer.so" -lpthread
-g++ -std=c++17 -O2 -fPIC -shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions \
-    "$DIR/compat_layer_host.cpp" -o "$DIR/libVkLayer_COMPAT_dxvk_mali_compat.so" -lpthread
+ROOT_DIR="$(cd "$DIR/../../.." && pwd)"
+
+CMAKE_BIN="$("${ROOT_DIR}/scripts/find_cmake.sh")"
+BUILD_TARGET="$ROOT_DIR/build-x86-64"
+[ ! -d "$BUILD_TARGET" ] && [ -d "$ROOT_DIR/build-cmake-host" ] && BUILD_TARGET="$ROOT_DIR/build-cmake-host"
+"$CMAKE_BIN" -S "$ROOT_DIR" -B "$BUILD_TARGET" -DCMAKE_BUILD_TYPE=Release
+"$CMAKE_BIN" --build "$BUILD_TARGET" --target VkLayer_BCN_bcn_layer VkLayer_COMPAT_dxvk_mali_compat VkLayer_PANTHOR_capture
 
 cat << JSON_EOF > "$DIR/VkLayer_BCN_bcn_layer.json"
 {
@@ -33,7 +39,3 @@ cat << JSON_EOF > "$DIR/VkLayer_COMPAT_dxvk_mali_compat.json"
     }
 }
 JSON_EOF
-
-g++ -std=c++17 -O2 -fPIC -shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions \
-    -I"$DIR/../../../include" -I"$DIR/../include" \
-    "$DIR/panthor_vk_capture_layer.cpp" -o "$DIR/libVkLayer_PANTHOR_capture.so" -ldl -lpthread

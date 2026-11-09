@@ -31,9 +31,7 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     exit 0
 fi
 
-if [ ! -f "$ROOT_DIR/libpanthor_kbase_adapter.so" ] || [ ! -f "$ROOT_DIR/libmali_kbase_emu.so" ]; then
-    make libpanthor_kbase_adapter.so libmali_kbase_emu.so
-fi
+
 
 LAYER_DIR="$ROOT_DIR/src/aot/layers"
 if [ ! -f "$LAYER_DIR/libVkLayer_BCN_bcn_layer.so" ] || \
@@ -42,6 +40,7 @@ if [ ! -f "$LAYER_DIR/libVkLayer_BCN_bcn_layer.so" ] || \
 else
     # Always rewrite layer JSON manifests with current host $LAYER_DIR absolute paths
     # so running from an archive unpacked at a different directory works out-of-the-box
+    # TODO(leegao): locally, I'm using my own layers, so I'm naming these VK_LAYER_BCN_BCnLayer1 and VK_LAYER_COMPAT_DxvkMaliCompatLayer1
     cat << JSON_EOF > "$LAYER_DIR/VkLayer_BCN_bcn_layer.json"
 {
     "file_format_version": "1.2.0",
@@ -105,14 +104,16 @@ export DXVK_HUD="${DXVK_HUD:-devinfo,fps,submissions}"
 export MALI_AOT_ICD_LOG="${MALI_AOT_ICD_LOG:-1}"
 
 if [ $# -eq 0 ] || [ "${1:-}" = "--self-test" ] || [ "${1:-}" = "--test" ] || [ "${1:-}" = "-t" ]; then
-    if [ ! -x "$ROOT_DIR/build/test_dxvk_aot_layers_e2e" ] || \
-       [ "$ROOT_DIR/tests/test_dxvk_aot_layers_e2e.cpp" -nt "$ROOT_DIR/build/test_dxvk_aot_layers_e2e" ]; then
-        echo "[Build] Compiling $ROOT_DIR/build/test_dxvk_aot_layers_e2e..."
-        mkdir -p "$ROOT_DIR/build"
-        g++ -std=c++17 -O2 -Iinclude -Iinclude/uapi -Isrc/aot/include \
-            "$ROOT_DIR/tests/test_dxvk_aot_layers_e2e.cpp" \
-            -L"$ROOT_DIR" -lpanthor_kbase_adapter -lmali_kbase_emu -ldl -lpthread \
-            -Wl,-rpath,'$ORIGIN/..' -o "$ROOT_DIR/build/test_dxvk_aot_layers_e2e"
+    TEST_BIN="$ROOT_DIR/build-x86-64/tests/test_dxvk_aot_layers_e2e"
+    [ ! -x "$TEST_BIN" ] && [ -x "$ROOT_DIR/build/test_dxvk_aot_layers_e2e" ] && TEST_BIN="$ROOT_DIR/build/test_dxvk_aot_layers_e2e"
+    if [ ! -x "$TEST_BIN" ] || [ "$ROOT_DIR/tests/test_dxvk_aot_layers_e2e.cpp" -nt "$TEST_BIN" ]; then
+        echo "[Build] Compiling test_dxvk_aot_layers_e2e via CMake..."
+        CMAKE_BIN="$("${ROOT_DIR}/scripts/find_cmake.sh")"
+        BUILD_TARGET="$ROOT_DIR/build-x86-64"
+        "$CMAKE_BIN" -S "$ROOT_DIR" -B "$BUILD_TARGET" -DCMAKE_BUILD_TYPE=Release
+        "$CMAKE_BIN" --build "$BUILD_TARGET" --target test_dxvk_aot_layers_e2e
+        TEST_BIN="$BUILD_TARGET/tests/test_dxvk_aot_layers_e2e"
+        [ ! -x "$TEST_BIN" ] && TEST_BIN="$BUILD_TARGET/test_dxvk_aot_layers_e2e"
     fi
     echo "================================================================================"
     echo " [DXVK 1.10.3 on AOT-Lifted libGLES_mali.so] Running End-to-End Verification"
@@ -122,7 +123,7 @@ if [ $# -eq 0 ] || [ "${1:-}" = "--self-test" ] || [ "${1:-}" = "--test" ] || [ 
     echo "   VK_INSTANCE_LAYERS: $VK_INSTANCE_LAYERS"
     echo "   DXVK_FILTER_DEVICE: $DXVK_FILTER_DEVICE_NAME"
     echo "================================================================================"
-    exec "$ROOT_DIR/build/test_dxvk_aot_layers_e2e"
+    exec "$TEST_BIN"
 fi
 
 CUSTOM_WINE=""

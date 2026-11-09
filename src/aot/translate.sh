@@ -138,23 +138,53 @@ if [ -f "$OUT_DIR/mali_lifted_16384.o" ]; then
     EXTRA_AOT_OBJS+=("$OUT_DIR/mali_lifted_16384.o")
 fi
 
+BUILD_HOST_DIR="${2:-${BUILD_DIR:-$REPO_ROOT/build-x86-64}}"
+[ ! -d "$BUILD_HOST_DIR" ] && [ -d "$REPO_ROOT/build-cmake-host" ] && BUILD_HOST_DIR="$REPO_ROOT/build-cmake-host"
+STATIC_EMU=""
+if [ -f "$BUILD_HOST_DIR/libmali_kbase_emu.a" ] && [ -f "$BUILD_HOST_DIR/libpanthor_kbase_adapter.a" ]; then
+    STATIC_EMU="-Wl,--whole-archive $BUILD_HOST_DIR/libmali_kbase_emu.a $BUILD_HOST_DIR/libpanthor_kbase_adapter.a -Wl,--no-whole-archive"
+elif [ -f "$BUILD_HOST_DIR/emulator/libmali_kbase_emu.a" ] && [ -f "$BUILD_HOST_DIR/adapter/libpanthor_kbase_adapter.a" ]; then
+    STATIC_EMU="-Wl,--whole-archive $BUILD_HOST_DIR/emulator/libmali_kbase_emu.a $BUILD_HOST_DIR/adapter/libpanthor_kbase_adapter.a -Wl,--no-whole-archive"
+elif [ -f "$REPO_ROOT/build-cmake-host/libmali_kbase_emu.a" ] && [ -f "$REPO_ROOT/build-cmake-host/libpanthor_kbase_adapter.a" ]; then
+    STATIC_EMU="-Wl,--whole-archive $REPO_ROOT/build-cmake-host/libmali_kbase_emu.a $REPO_ROOT/build-cmake-host/libpanthor_kbase_adapter.a -Wl,--no-whole-archive"
+elif [ -f "$REPO_ROOT/libmali_kbase_emu.a" ] && [ -f "$REPO_ROOT/libpanthor_kbase_adapter.a" ]; then
+    STATIC_EMU="-Wl,--whole-archive $REPO_ROOT/libmali_kbase_emu.a $REPO_ROOT/libpanthor_kbase_adapter.a -Wl,--no-whole-archive"
+fi
+
 # NOTE: $OUT_DIR is at src/aot/build/<tag> (4 directory levels below $REPO_ROOT).
 # Including both $ORIGIN/../../../.. and $ORIGIN/../../.. in DT_RUNPATH ensures
 # libmali_kbase_emu.so at repo root is ALWAYS found whether invoked via
 # ./src/aot/bin/vkcube, ./scripts/run_aot_lifter.sh, or system libvulkan.so.1.
-RPATH_FLAGS="-Wl,-rpath,\$ORIGIN/../../../..:\$ORIGIN/../../..:\$ORIGIN:$REPO_ROOT"
+RPATH_FLAGS="-Wl,-rpath,\$ORIGIN/../../../..:\$ORIGIN/../../..:\$ORIGIN:$REPO_ROOT:$BUILD_HOST_DIR"
 
-g++ -O3 -fno-strict-aliasing -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
-    "$ROOT_DIR/src/mali_aot_runner.cpp" "$OUT_DIR/mali_mbs2_aot.o" "${EXTRA_AOT_OBJS[@]}" \
-    -L"$REPO_ROOT" -lmali_kbase_emu $RPATH_FLAGS -ldl -lpthread \
-    -o "$OUT_DIR/mali_aot_runner"
+if [ -n "$STATIC_EMU" ]; then
+    echo "[Link] Statically linking mali_kbase_emu + panthor_kbase_adapter into runner and ICD..."
+    g++ -O3 -fno-strict-aliasing -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
+        -I"$REPO_ROOT/include" -I"$REPO_ROOT/src/adapter" -I"$REPO_ROOT/src/emulator" \
+        "$ROOT_DIR/src/mali_aot_runner.cpp" "$OUT_DIR/mali_mbs2_aot.o" "${EXTRA_AOT_OBJS[@]}" \
+        $STATIC_EMU -ldl -lpthread \
+        -o "$OUT_DIR/mali_aot_runner"
 
-g++ -O3 -std=c++17 -fno-strict-aliasing -shared -fPIC \
-    -Wl,-Bsymbolic -Wl,-Bsymbolic-functions \
-    -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
-    "$ROOT_DIR/src/mali_vulkan_icd.cpp" "$OUT_DIR/mali_mbs2_aot.o" "${EXTRA_AOT_OBJS[@]}" \
-    -L"$REPO_ROOT" -lmali_kbase_emu $RPATH_FLAGS -ldl -lm -lpthread \
-    -o "$OUT_DIR/libvulkan_mali_aot_icd.so"
+    g++ -O3 -std=c++17 -fno-strict-aliasing -shared -fPIC \
+        -Wl,-Bsymbolic -Wl,-Bsymbolic-functions \
+        -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
+        -I"$REPO_ROOT/include" -I"$REPO_ROOT/src/adapter" -I"$REPO_ROOT/src/emulator" \
+        "$ROOT_DIR/src/mali_vulkan_icd.cpp" "$OUT_DIR/mali_mbs2_aot.o" "${EXTRA_AOT_OBJS[@]}" \
+        $STATIC_EMU -ldl -lm -lpthread \
+        -o "$OUT_DIR/libvulkan_mali_aot_icd.so"
+else
+    g++ -O3 -fno-strict-aliasing -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
+        "$ROOT_DIR/src/mali_aot_runner.cpp" "$OUT_DIR/mali_mbs2_aot.o" "${EXTRA_AOT_OBJS[@]}" \
+        -L"$BUILD_HOST_DIR" -L"$REPO_ROOT" -lmali_kbase_emu $RPATH_FLAGS -ldl -lpthread \
+        -o "$OUT_DIR/mali_aot_runner"
+
+    g++ -O3 -std=c++17 -fno-strict-aliasing -shared -fPIC \
+        -Wl,-Bsymbolic -Wl,-Bsymbolic-functions \
+        -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
+        "$ROOT_DIR/src/mali_vulkan_icd.cpp" "$OUT_DIR/mali_mbs2_aot.o" "${EXTRA_AOT_OBJS[@]}" \
+        -L"$BUILD_HOST_DIR" -L"$REPO_ROOT" -lmali_kbase_emu $RPATH_FLAGS -ldl -lm -lpthread \
+        -o "$OUT_DIR/libvulkan_mali_aot_icd.so"
+fi
 
 if [ "${MALI_AOT_KEEP_LL:-0}" != "1" ]; then
     rm -f "$OUT_DIR/mali_mbs2_unopt.ll" "$OUT_DIR/mali_mbs2_opt.ll"
@@ -168,6 +198,14 @@ cat << JSON_EOF > "$OUT_DIR/mali_aot_icd.x86_64.json"
     }
 }
 JSON_EOF
+
+if [ -d "$BUILD_HOST_DIR" ]; then
+    mkdir -p "$BUILD_HOST_DIR/aot"
+    cp -f "$OUT_DIR/libvulkan_mali_aot_icd.so" "$BUILD_HOST_DIR/libvulkan_mali_aot_icd.so" 2>/dev/null || true
+    cp -f "$OUT_DIR/libvulkan_mali_aot_icd.so" "$BUILD_HOST_DIR/aot/libvulkan_mali_aot_icd.so" 2>/dev/null || true
+    cp -f "$OUT_DIR/mali_aot_runner" "$BUILD_HOST_DIR/mali_aot_runner" 2>/dev/null || true
+    cp -f "$OUT_DIR/mali_aot_runner" "$BUILD_HOST_DIR/aot/mali_aot_runner" 2>/dev/null || true
+fi
 
 echo "================================================================================"
 echo " [SUCCESS] 64-Bit C++ LLVM AOT Translation Complete!"

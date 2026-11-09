@@ -9,7 +9,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TRACER_SO="$ROOT_DIR/build-android-tools/libmali_uapi_tracer_android_aarch64.so"
+TRACER_SO="$ROOT_DIR/build-android/libmali_uapi_tracer.so"
+[ ! -f "$TRACER_SO" ] && [ -f "$ROOT_DIR/build-android/adapter/libmali_uapi_tracer.so" ] && TRACER_SO="$ROOT_DIR/build-android/adapter/libmali_uapi_tracer.so"
+[ ! -f "$TRACER_SO" ] && [ -f "$ROOT_DIR/build-android-tools/libmali_uapi_tracer_android_aarch64.so" ] && TRACER_SO="$ROOT_DIR/build-android-tools/libmali_uapi_tracer_android_aarch64.so"
 REMOTE_DIR="/data/local/tmp"
 REMOTE_TRACE="/sdcard/Download/mali_uapi_trace.jsonl"
 

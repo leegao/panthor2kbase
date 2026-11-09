@@ -154,6 +154,9 @@ struct emu_mem_region {
    uint64_t gpu_va;
    void *cpu_ptr;
    size_t size;
+   uint64_t va_pages;
+   uint64_t commit_pages;
+   uint64_t extension;
    uint64_t flags;
    int backing_fd;
 };
@@ -757,10 +760,12 @@ static int emu_handle_mem_alloc(uint64_t va_pages, uint64_t commit_pages,
       return -1;
    }
 
-   /* 5. kbase_check_alloc_sizes+0x40 (0x7084): GROW_ON_GPF (1<<9) requires extension != 0 */
-   if ((in_flags & BASE_MEM_GROW_ON_GPF) && extension == 0) {
-      errno = ENOMEM;
-      return -1;
+   /* 5. kbase_check_alloc_sizes+0x40 (0x7084): GROW_ON_GPF (1<<9) requires extension != 0 and power-of-2 */
+   if (in_flags & BASE_MEM_GROW_ON_GPF) {
+      if (extension == 0 || (extension & (extension - 1ULL)) != 0ULL) {
+         errno = ENOMEM;
+         return -1;
+      }
    }
 
    /* 6. Require EXEC_VA zone initialization before GPU_EX allocations */
@@ -781,6 +786,9 @@ static int emu_handle_mem_alloc(uint64_t va_pages, uint64_t commit_pages,
          memset(reg, 0, sizeof(*reg));
          reg->active = true;
          reg->size = sz;
+         reg->va_pages = va_pages;
+         reg->commit_pages = commit_pages;
+         reg->extension = extension;
          reg->flags = in_flags;
          reg->cookie_or_va = (uint64_t)(g_kfile.next_cookie++) << 12;
          if (!(in_flags & BASE_MEM_SAME_VA)) {
@@ -1003,9 +1011,16 @@ int ioctl(int fd, unsigned long request, ...)
       case 6: { /* KBASE_IOCTL_MEM_QUERY */
          union kbase_ioctl_mem_query *mq = (union kbase_ioctl_mem_query *)arg;
          uint64_t addr = mq->in.gpu_addr;
+         uint64_t qtype = mq->in.query;
          for (size_t i = 0; i < 512; i++) {
-            if (g_kfile.regions[i].active && g_kfile.regions[i].gpu_va == addr) {
-               mq->out.value = g_kfile.regions[i].size >> 12;
+            if (g_kfile.regions[i].active &&
+                (g_kfile.regions[i].gpu_va == addr || g_kfile.regions[i].cookie_or_va == addr)) {
+               if (qtype == KBASE_MEM_QUERY_COMMIT_SIZE)
+                  mq->out.value = g_kfile.regions[i].commit_pages ? g_kfile.regions[i].commit_pages : (g_kfile.regions[i].size >> 12);
+               else if (qtype == KBASE_MEM_QUERY_FLAGS)
+                  mq->out.value = g_kfile.regions[i].flags;
+               else
+                  mq->out.value = g_kfile.regions[i].va_pages ? g_kfile.regions[i].va_pages : (g_kfile.regions[i].size >> 12);
                pthread_mutex_unlock(&g_emu_lock);
                return 0;
             }
@@ -1030,9 +1045,40 @@ int ioctl(int fd, unsigned long request, ...)
          return 0;
       }
       case 15: /* KBASE_IOCTL_MEM_SYNC */
-      case 20: /* KBASE_IOCTL_MEM_COMMIT */
          pthread_mutex_unlock(&g_emu_lock);
          return 0;
+      case 20: { /* KBASE_IOCTL_MEM_COMMIT (mali_kbase_mem_linux.c:1244 kbase_mem_commit) */
+         struct kbase_ioctl_mem_commit *mc = (struct kbase_ioctl_mem_commit *)arg;
+         if (!mc) {
+            pthread_mutex_unlock(&g_emu_lock);
+            errno = EINVAL;
+            return -1;
+         }
+         for (size_t i = 0; i < 512; i++) {
+            struct emu_mem_region *reg = &g_kfile.regions[i];
+            if (reg->active &&
+                (reg->gpu_va == mc->gpu_addr || reg->cookie_or_va == mc->gpu_addr)) {
+               if (mc->pages > reg->va_pages || !(reg->flags & BASE_MEM_GROW_ON_GPF)) {
+                  record_trace_ioctl("KBASE_IOCTL_MEM_COMMIT", request, reg->va_pages, mc->pages,
+                                     reg->extension, reg->flags, mc->gpu_addr, reg->gpu_va, -1, EINVAL);
+                  pthread_mutex_unlock(&g_emu_lock);
+                  errno = EINVAL;
+                  return -1;
+               }
+               if (reg->cpu_ptr && mc->pages > reg->commit_pages) {
+                  mprotect(reg->cpu_ptr, (size_t)mc->pages * 4096U, PROT_READ | PROT_WRITE);
+               }
+               reg->commit_pages = mc->pages;
+               record_trace_ioctl("KBASE_IOCTL_MEM_COMMIT", request, reg->va_pages, mc->pages,
+                                  reg->extension, reg->flags, mc->gpu_addr, reg->gpu_va, 0, 0);
+               pthread_mutex_unlock(&g_emu_lock);
+               return 0;
+            }
+         }
+         pthread_mutex_unlock(&g_emu_lock);
+         errno = EINVAL;
+         return -1;
+      }
       case 21: { /* KBASE_IOCTL_MEM_ALIAS */
          union kbase_ioctl_mem_alias *al = (union kbase_ioctl_mem_alias *)arg;
          /* Enforce kbase_mem_alias (mali_kbase_mem_linux.c:2022-2085) flag & target invariants */
@@ -1089,10 +1135,21 @@ int ioctl(int fd, unsigned long request, ...)
       }
       case 22: { /* KBASE_IOCTL_MEM_IMPORT */
          union kbase_ioctl_mem_import *imp = (union kbase_ioctl_mem_import *)arg;
-         int dmabuf_fd = *(int *)(uintptr_t)imp->in.phandle;
+         int dmabuf_fd = -1;
+         if (imp->in.phandle < 0x10000ULL) {
+            dmabuf_fd = (int)imp->in.phandle;
+         } else {
+            dmabuf_fd = *(int *)(uintptr_t)imp->in.phandle;
+         }
          struct stat st;
-         size_t sz = (fstat(dmabuf_fd, &st) == 0 && st.st_size > 0) ? (size_t)st.st_size : 65536U;
-         void *ptr = orig_mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, dmabuf_fd, 0);
+         size_t sz = (dmabuf_fd >= 0 && fstat(dmabuf_fd, &st) == 0 && st.st_size > 0) ? (size_t)st.st_size : 65536U;
+         void *ptr = MAP_FAILED;
+         if (dmabuf_fd >= 0) {
+            ptr = orig_mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, dmabuf_fd, 0);
+         }
+         if (ptr == MAP_FAILED) {
+            ptr = orig_mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+         }
          if (ptr == MAP_FAILED) {
             pthread_mutex_unlock(&g_emu_lock);
             errno = EINVAL;
@@ -1395,6 +1452,15 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
             if (p != MAP_FAILED) {
                g_kfile.regions[i].cpu_ptr = p;
                g_kfile.regions[i].gpu_va = (uintptr_t)p;
+               const char *strict_commit = getenv("PANTHOR_EMU_STRICT_CPU_COMMIT");
+               if (strict_commit && strict_commit[0] == '1' &&
+                   (g_kfile.regions[i].flags & BASE_MEM_GROW_ON_GPF) &&
+                   g_kfile.regions[i].commit_pages < g_kfile.regions[i].va_pages) {
+                  size_t committed_bytes = (size_t)g_kfile.regions[i].commit_pages * 4096U;
+                  if (committed_bytes < length) {
+                     mprotect((uint8_t *)p + committed_bytes, length - committed_bytes, PROT_NONE);
+                  }
+               }
             }
             pthread_mutex_unlock(&g_emu_lock);
             return p;

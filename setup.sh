@@ -5,10 +5,13 @@ if [ ! -d "$(dirname "$0")/mesa" ]; then
     exit 1
 fi
 
-export ANDROID_NDK_HOME="$HOME/Android/Sdk/ndk/27.0.12077973"
+export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$HOME/Android/Sdk/ndk/27.0.12077973}"
 export MESON_WORKING_DIR="$PWD"
 
-meson setup build-host mesa \
+# Sync mesa_overlay, subproject, and adapter sources into transient mesa directory
+"$MESON_WORKING_DIR/scripts/apply_mesa_overlay.sh" "$MESON_WORKING_DIR/mesa"
+
+meson setup build-x86-64/mesa mesa \
     -Dplatforms=[] \
     -Dgallium-drivers=[] \
     -Dvulkan-drivers=[] \
@@ -18,19 +21,19 @@ meson setup build-host mesa \
     -Dllvm=enabled \
     -Dmesa-clc=enabled -Dinstall-mesa-clc=true
 
-ninja -C build-host src/compiler/clc/mesa_clc src/compiler/spirv/vtn_bindgen2 src/panfrost/clc/panfrost_compile
+ninja -C build-x86-64/mesa src/compiler/clc/mesa_clc src/compiler/spirv/vtn_bindgen2 src/panfrost/clc/panfrost_compile
 
-ln -sf "$MESON_WORKING_DIR/build-host/src/compiler/clc/mesa_clc" "$MESON_WORKING_DIR/build-host/src/compiler/clc/mesa-clc"
-ln -sf "$MESON_WORKING_DIR/build-host/src/compiler/spirv/vtn_bindgen2" "$MESON_WORKING_DIR/build-host/src/compiler/spirv/vtn-bindgen2"
-ln -sf "$MESON_WORKING_DIR/build-host/src/compiler/spirv/panfrost_compile" "$MESON_WORKING_DIR/build-host/src/compiler/spirv/panfrost-compile"
+ln -sf "$MESON_WORKING_DIR/build-x86-64/mesa/src/compiler/clc/mesa_clc" "$MESON_WORKING_DIR/build-x86-64/mesa/src/compiler/clc/mesa-clc"
+ln -sf "$MESON_WORKING_DIR/build-x86-64/mesa/src/compiler/spirv/vtn_bindgen2" "$MESON_WORKING_DIR/build-x86-64/mesa/src/compiler/spirv/vtn-bindgen2"
+ln -sf "$MESON_WORKING_DIR/build-x86-64/mesa/src/panfrost/clc/panfrost_compile" "$MESON_WORKING_DIR/build-x86-64/mesa/src/panfrost/clc/panfrost-compile"
 
-export PATH="$MESON_WORKING_DIR/build-host/src/compiler/clc:$MESON_WORKING_DIR/build-host/src/compiler/spirv:$MESON_WORKING_DIR/build-host/src/panfrost/clc:$PATH"
+export PATH="$MESON_WORKING_DIR/build-x86-64/mesa/src/compiler/clc:$MESON_WORKING_DIR/build-x86-64/mesa/src/compiler/spirv:$MESON_WORKING_DIR/build-x86-64/mesa/src/panfrost/clc:$PATH"
 
 export PKG_CONFIG_LIBDIR=$MESON_WORKING_DIR/shims
 
 envsubst < android.toml > /tmp/android_wrapper.toml
 
-meson setup build-android mesa --reconfigure \
+meson setup build-android/mesa mesa --reconfigure \
     --cross-file /tmp/android_wrapper.toml \
     -Dbuildtype=debugoptimized \
     -Dplatforms=android,x11 \

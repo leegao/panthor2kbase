@@ -91,17 +91,17 @@ jobs:
       - name: Build C++ Adapter & Verification Tooling via CMake (Host & Android NDK)
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
-          cmake -B build-cmake-host -G Ninja -DPANTHOR_KBASE_BUILD_TESTS=ON
-          cmake --build build-cmake-host
-          cp -f build-cmake-host/libvulkan_panfrost_patched.so ./libvulkan_panfrost_patched.so
-          ctest --test-dir build-cmake-host --output-on-failure
+          cmake -B build-x86-64 -G Ninja -DPANTHOR_KBASE_BUILD_TESTS=ON
+          cmake --build build-x86-64
+          cp -f build-x86-64/libvulkan_panfrost_patched.so ./libvulkan_panfrost_patched.so
+          ctest --test-dir build-x86-64 --output-on-failure
 
-          cmake -B build-cmake-android -G Ninja \
+          cmake -B build-android -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-30 \
             -DPANTHOR_KBASE_BUILD_TESTS=OFF
-          cmake --build build-cmake-android
+          cmake --build build-android
 
       - name: Generate Shims
         run: |
@@ -109,14 +109,14 @@ jobs:
           chmod +x scripts/generate_shims.sh
           ./scripts/generate_shims.sh
 
-      - name: Generate Host Tools (build-host BEFORE applying mesa_overlay)
+      - name: Generate Host Tools (build-x86-64/mesa BEFORE applying mesa_overlay)
         env:
           LLVM_CONFIG: /usr/bin/llvm-config-20
         run: |
           export MESON_WORKING_DIR="$GITHUB_WORKSPACE"
           export LLVM_CONFIG=/usr/bin/llvm-config-20
 
-          meson setup build-host mesa \
+          meson setup build-x86-64/mesa mesa \
               -Dplatforms=[] \
               -Dgallium-drivers=[] \
               -Dvulkan-drivers=[] \
@@ -126,22 +126,22 @@ jobs:
               -Dllvm=enabled \
               -Dmesa-clc=enabled -Dinstall-mesa-clc=true
 
-          ninja -C build-host src/compiler/clc/mesa_clc src/compiler/spirv/vtn_bindgen2 src/panfrost/clc/panfrost_compile
-          ln -sf "$MESON_WORKING_DIR/build-host/src/compiler/clc/mesa_clc" "$MESON_WORKING_DIR/build-host/src/compiler/clc/mesa-clc"
-          ln -sf "$MESON_WORKING_DIR/build-host/src/compiler/spirv/vtn_bindgen2" "$MESON_WORKING_DIR/build-host/src/compiler/spirv/vtn-bindgen2"
-          echo "$MESON_WORKING_DIR/build-host/src/compiler/clc" >> $GITHUB_PATH
-          echo "$MESON_WORKING_DIR/build-host/src/compiler/spirv" >> $GITHUB_PATH
-          echo "$MESON_WORKING_DIR/build-host/src/panfrost/clc" >> $GITHUB_PATH
+          ninja -C build-x86-64/mesa src/compiler/clc/mesa_clc src/compiler/spirv/vtn_bindgen2 src/panfrost/clc/panfrost_compile
+          ln -sf "$MESON_WORKING_DIR/build-x86-64/mesa/src/compiler/clc/mesa_clc" "$MESON_WORKING_DIR/build-x86-64/mesa/src/compiler/clc/mesa-clc"
+          ln -sf "$MESON_WORKING_DIR/build-x86-64/mesa/src/compiler/spirv/vtn_bindgen2" "$MESON_WORKING_DIR/build-x86-64/mesa/src/compiler/spirv/vtn-bindgen2"
+          echo "$MESON_WORKING_DIR/build-x86-64/mesa/src/compiler/clc" >> $GITHUB_PATH
+          echo "$MESON_WORKING_DIR/build-x86-64/mesa/src/compiler/spirv" >> $GITHUB_PATH
+          echo "$MESON_WORKING_DIR/build-x86-64/mesa/src/panfrost/clc" >> $GITHUB_PATH
 
       - name: Build Variant B — Unpatched Upstream Android PanVK + Runtime Hook Shim
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
           export MESON_WORKING_DIR="$GITHUB_WORKSPACE"
-          export PATH="$MESON_WORKING_DIR/build-host/src/compiler/clc:$MESON_WORKING_DIR/build-host/src/compiler/spirv:$MESON_WORKING_DIR/build-host/src/panfrost/clc:$PATH"
+          export PATH="$MESON_WORKING_DIR/build-x86-64/mesa/src/compiler/clc:$MESON_WORKING_DIR/build-x86-64/mesa/src/compiler/spirv:$MESON_WORKING_DIR/build-x86-64/mesa/src/panfrost/clc:$PATH"
           export PKG_CONFIG_LIBDIR="$MESON_WORKING_DIR/shims"
 
           envsubst < android.toml > /tmp/android_wrapper.toml
-          meson setup build-android-unpatched mesa \
+          meson setup build-android/mesa-unpatched mesa \
               --cross-file /tmp/android_wrapper.toml \
               -Dbuildtype=${{ matrix.build-type }} \
               -Dplatforms=android,x11 \
@@ -164,22 +164,22 @@ jobs:
               -Dvulkan-drivers=panfrost \
               -Dllvm=disabled
 
-          meson compile -C build-android-unpatched
+          meson compile -C build-android/mesa-unpatched
           mkdir -p dist-artifact
-          cp build-android-unpatched/src/panfrost/vulkan/libvulkan_panfrost.so dist-artifact/libvulkan_panfrost_unpatched.so
+          cp build-android/mesa-unpatched/src/panfrost/vulkan/libvulkan_panfrost.so dist-artifact/libvulkan_panfrost_unpatched.so
 
       - name: Apply Idempotent Mesa Full-File Overlay (mesa_overlay/) & Build Variant A (Patched Android PanVK)
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
           export MESON_WORKING_DIR="$GITHUB_WORKSPACE"
-          export PATH="$MESON_WORKING_DIR/build-host/src/compiler/clc:$MESON_WORKING_DIR/build-host/src/compiler/spirv:$MESON_WORKING_DIR/build-host/src/panfrost/clc:$PATH"
+          export PATH="$MESON_WORKING_DIR/build-x86-64/mesa/src/compiler/clc:$MESON_WORKING_DIR/build-x86-64/mesa/src/compiler/spirv:$MESON_WORKING_DIR/build-x86-64/mesa/src/panfrost/clc:$PATH"
           export PKG_CONFIG_LIBDIR="$MESON_WORKING_DIR/shims"
 
           chmod +x scripts/apply_mesa_overlay.sh
           ./scripts/apply_mesa_overlay.sh mesa
 
           envsubst < android.toml > /tmp/android_wrapper.toml
-          meson setup build-android mesa --reconfigure \
+          meson setup build-android/mesa mesa --reconfigure \
               --cross-file /tmp/android_wrapper.toml \
               -Dbuildtype=${{ matrix.build-type }} \
               -Dplatforms=android,x11 \
@@ -202,11 +202,14 @@ jobs:
               -Dvulkan-drivers=panfrost \
               -Dllvm=disabled
 
-          meson compile -C build-android
+          meson compile -C build-android/mesa
           mkdir -p dist-artifact
-          cp build-android/src/panfrost/vulkan/libvulkan_panfrost.so dist-artifact/libvulkan_panfrost.so
-          cp build-cmake-android/libpanthor_kbase_adapter.so dist-artifact/
-          cp build-cmake-android/libmali_kbase_emu.so dist-artifact/
+          cp build-android/mesa/src/panfrost/vulkan/libvulkan_panfrost.so build-android/libvulkan_panfrost.unstripped.so
+          $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip -o build-android/libvulkan_panfrost.so build-android/libvulkan_panfrost.unstripped.so
+          cp build-android/libvulkan_panfrost.so dist-artifact/libvulkan_panfrost.so
+          cp build-android/libvulkan_panfrost.unstripped.so dist-artifact/libvulkan_panfrost.unstripped.so
+          cp build-android/libpanthor_kbase_adapter.so dist-artifact/
+          cp build-android/libmali_kbase_emu.so dist-artifact/
 
       - name: Upload Vulkan libvulkan_panfrost Artifacts (Patched & Unpatched Variants + Formal Reports)
         uses: actions/upload-artifact@v4
@@ -214,6 +217,7 @@ jobs:
           name: libvulkan_panfrost-aarch64-dual-${{ matrix.build-type }}
           path: |
             dist-artifact/libvulkan_panfrost.so
+            dist-artifact/libvulkan_panfrost.unstripped.so
             dist-artifact/libvulkan_panfrost_unpatched.so
             dist-artifact/libpanthor_kbase_adapter.so
             dist-artifact/libmali_kbase_emu.so

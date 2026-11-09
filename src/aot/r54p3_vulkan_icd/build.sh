@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
+# src/aot/r54p3_vulkan_icd/build.sh
+# Builds decompiled r54p3 Vulkan ICD via centralized CMake
 set -euo pipefail
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-mkdir -p "$ROOT_DIR/lib" "$ROOT_DIR/bin"
 
-echo "[1/2] Compiling decompiled r54p3 Vulkan 1.3 ICD (libr54p3_vulkan_icd.so & libr54p3_vulkan_icd.a)..."
-g++ -std=c++17 -O2 -fPIC -shared     -I"$ROOT_DIR/include"     "$ROOT_DIR/src/r54p3_vulkan_icd.cpp"     "$ROOT_DIR/../../../libmali_kbase_emu.so" -Wl,-rpath,"$ROOT_DIR/../../.." -ldl -lpthread     -o "$ROOT_DIR/lib/libr54p3_vulkan_icd.so"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
-g++ -std=c++17 -O2 -fPIC -c     -I"$ROOT_DIR/include"     "$ROOT_DIR/src/r54p3_vulkan_icd.cpp"     -o "$ROOT_DIR/lib/r54p3_vulkan_icd.o"
-ar rcs "$ROOT_DIR/lib/libr54p3_vulkan_icd.a" "$ROOT_DIR/lib/r54p3_vulkan_icd.o"
+CMAKE_BIN="$("${REPO_ROOT}/scripts/find_cmake.sh")"
+BUILD_TARGET="$REPO_ROOT/build-x86-64"
+[ ! -d "$BUILD_TARGET" ] && [ -d "$REPO_ROOT/build-cmake-host" ] && BUILD_TARGET="$REPO_ROOT/build-cmake-host"
+"$CMAKE_BIN" -S "$REPO_ROOT" -B "$BUILD_TARGET" -DCMAKE_BUILD_TYPE=Release
+"$CMAKE_BIN" --build "$BUILD_TARGET" --target r54p3_vulkan_icd
 
-cat << JSON_EOF > "$ROOT_DIR/lib/r54p3_decompiled_icd.x86_64.json"
+cat << JSON_EOF > "$SCRIPT_DIR/lib/r54p3_decompiled_icd.x86_64.json"
 {
     "file_format_version": "1.0.0",
     "ICD": {
-        "library_path": "$ROOT_DIR/lib/libr54p3_vulkan_icd.so",
+        "library_path": "$SCRIPT_DIR/lib/libr54p3_vulkan_icd.so",
         "api_version": "1.3.250"
     }
 }
 JSON_EOF
-echo "[2/2] Built $ROOT_DIR/lib/libr54p3_vulkan_icd.so and r54p3_decompiled_icd.x86_64.json"
+echo "[SUCCESS] Built $SCRIPT_DIR/lib/libr54p3_vulkan_icd.so and r54p3_decompiled_icd.x86_64.json via CMake"

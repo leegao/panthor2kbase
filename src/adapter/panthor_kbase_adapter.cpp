@@ -169,6 +169,12 @@ struct adapter_bo {
    bool is_same_va;
    bool is_executable;
    bool is_csf_event;
+   bool is_growable;
+   bool user_mmapped;
+   uint32_t vm_bind_count;
+   uint64_t va_pages;
+   uint64_t committed_pages;
+   uint64_t extension_pages;
    char label[64];
 };
 
@@ -355,6 +361,14 @@ struct adapter_ctx {
    /* Cumulative & Windowed Telemetry Counters */
    uint64_t total_group_submits;
    uint64_t munmap_guard_hits;
+   uint64_t total_va_bo_bytes;
+   uint64_t total_committed_bo_bytes;
+   uint64_t grow_on_gpf_bo_count;
+   uint64_t mem_commit_upgrades;
+   uint64_t hv_chunk_stepdowns;
+   uint64_t last_rejected_hv_bo_size;
+   uint64_t consecutive_poll_ioctls;
+   uint64_t suppressed_poll_ioctls;
    uint64_t total_syncobj_waits;
    uint64_t fast_spin_syncobj_waits;
    uint64_t poll_sleep_syncobj_waits;
@@ -605,6 +619,124 @@ static int alloc_kbase_mem(int mali_fd,
    if (out_gpu_va)
       *out_gpu_va = req.out.gpu_va;
    return 0;
+}
+
+static double read_mem_available_mb()
+{
+   FILE *fp = fopen("/proc/meminfo", "r");
+   if (!fp)
+      return 0.0;
+   char line[128];
+   unsigned long avail_kb = 0;
+   while (fgets(line, sizeof(line), fp)) {
+      if (sscanf(line, "MemAvailable: %lu kB", &avail_kb) == 1)
+         break;
+   }
+   fclose(fp);
+   return static_cast<double>(avail_kb) / 1024.0;
+}
+
+static void apply_panvk_lowmem_env_defaults()
+{
+   /* When running through panthor_kmod, pdev->kbase_node_path[0] is empty inside
+    * libvulkan_panfrost.so, so patch 228 (get_utrace_clone_mem_size) defaults to
+    * 10 MiB (0xa00000) per VkDevice unless PANVK_UTRACE_CLONE_MEM_SIZE is set!
+    * Setting 65536 (64 KiB) saves 19.88 MiB across two VkDevices. */
+   if (!getenv("MESA_GPU_TRACES"))
+      setenv("PANVK_UTRACE_CLONE_MEM_SIZE", "65536", 0);
+   /* Enable PanVK memory-pressure budget (patch 0108) with a 1024 MiB Android
+    * system reserve so DXVK compacts & returns idle chunks before kswapd/LMK triggers. */
+   setenv("PANVK_MEM_BUDGET_PRESSURE", "1", 0);
+   setenv("PANVK_MEM_BUDGET_RESERVE_MB", "1024", 0);
+   setenv("PANVK_CMD_SLAB_CACHE", "1", 0);
+   setenv("PANVK_CS_CHUNK_KB", "4", 0);
+}
+
+/*
+ * Ensure a BASE_MEM_GROW_ON_GPF BO has all va_pages physically committed via
+ * KBASE_IOCTL_MEM_COMMIT before CPU mapping or aliasing:
+ *  - In mali_kbase_mt6878_r44.ko (mali_kbase_mem_linux.c:2690, kbase_cpu_vm_fault),
+ *    CPU page faults check `if (fault_pgoff >= nents) return VM_FAULT_SIGBUS;` and
+ *    do NOT grow `nents` on CPU faults (only GPU faults in `page_fault_worker` grow).
+ *  - Calling KBASE_IOCTL_MEM_COMMIT (mali_kbase_mem_linux.c:2458, kbase_mem_commit)
+ *    allocates the remaining `va_pages - old_pages` physical pages, inserts them into
+ *    the GPU MMU (`kbase_mem_mmu_insert_pages`), and updates `reg->cpu_alloc->nents`
+ *    so subsequent CPU accesses across `[0, bo->size)` fault in cleanly with zero SIGBUS.
+ */
+static int ensure_bo_committed_locked(struct adapter_bo *bo, const char *caller)
+{
+   if (!bo || !bo->in_use || !bo->is_growable || bo->committed_pages >= bo->va_pages)
+      return 0;
+
+   struct kbase_ioctl_mem_commit mc;
+   memset(&mc, 0, sizeof(mc));
+   mc.gpu_addr = bo->gpu_va;
+   mc.pages = bo->va_pages;
+   if (adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_COMMIT, &mc) < 0) {
+      LOG_WARN("%s: KBASE_IOCTL_MEM_COMMIT(bo=%u, va=0x%llx, pages=%llu->%llu) failed: %s",
+               caller ? caller : "ensure_bo_committed",
+               bo->gem_handle, static_cast<unsigned long long>(bo->gpu_va),
+               static_cast<unsigned long long>(bo->committed_pages),
+               static_cast<unsigned long long>(bo->va_pages), strerror(errno));
+      return -1;
+   }
+
+   uint64_t added_pages = bo->va_pages - bo->committed_pages;
+   uint64_t added_bytes = added_pages * 4096ULL;
+   bo->committed_pages = bo->va_pages;
+   g_ctx.total_committed_bo_bytes += added_bytes;
+   g_ctx.mem_commit_upgrades++;
+   LOG_INFO("%s: committed growable BO handle=%u va=0x%llx pages=%llu (+%llu MiB -> total_committed=%.1f MiB)",
+            caller ? caller : "ensure_bo_committed",
+            bo->gem_handle, static_cast<unsigned long long>(bo->gpu_va),
+            static_cast<unsigned long long>(bo->va_pages),
+            static_cast<unsigned long long>(added_bytes >> 20),
+            static_cast<double>(g_ctx.total_committed_bo_bytes) / (1024.0 * 1024.0));
+   return 0;
+}
+
+static bool should_suppress_poll_log_locked(unsigned long request)
+{
+   static int poll_verbose = -1;
+   if (poll_verbose < 0) {
+      const char *pv = getenv("PANTHOR_ADAPTER_LOG_POLL_VERBOSE");
+      if (!pv || !pv[0])
+         pv = getenv("PANTHOR2KBASE_LOG_POLL_VERBOSE");
+      poll_verbose = (pv && pv[0] && atoi(pv) != 0) ? 1 : 0;
+   }
+   if (poll_verbose)
+      return false;
+
+   unsigned int type = _IOC_TYPE(request);
+   unsigned int nr = _IOC_NR(request);
+   if (type != 'd')
+      return false;
+
+   bool is_poll_req =
+      (nr == 0xc3 /* DRM_IOCTL_SYNCOBJ_WAIT */ ||
+       nr == 0xca /* DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT */ ||
+       nr == 0xcb /* DRM_IOCTL_SYNCOBJ_QUERY */ ||
+       nr == (DRM_COMMAND_BASE + DRM_PANTHOR_GROUP_GET_STATE) ||
+       nr == (DRM_COMMAND_BASE + DRM_PANTHOR_VM_GET_STATE));
+
+   if (!is_poll_req) {
+      if (g_ctx.suppressed_poll_ioctls > 0 &&
+          nr == (DRM_COMMAND_BASE + DRM_PANTHOR_GROUP_SUBMIT)) {
+         LOG_DEBUG("[POLL_COALESCED] suppressed %llu repetitive syncobj/group state polls prior to submit #%llu",
+                   static_cast<unsigned long long>(g_ctx.suppressed_poll_ioctls),
+                   static_cast<unsigned long long>(g_ctx.total_group_submits + 1ULL));
+         g_ctx.suppressed_poll_ioctls = 0;
+      }
+      g_ctx.consecutive_poll_ioctls = 0;
+      return false;
+   }
+
+   g_ctx.consecutive_poll_ioctls++;
+   if (g_ctx.consecutive_poll_ioctls <= 2ULL)
+      return false;
+
+   g_ctx.suppressed_poll_ioctls++;
+   return true;
 }
 
 /* Parse TLV stream from KBASE_IOCTL_GET_GPUPROPS into drm_panthor_gpu_info */
@@ -950,12 +1082,12 @@ static int init_kbase_context(struct adapter_ctx *ctx, int mali_fd)
       }
    }
 
-   /* Step 10c: Allocate 8 MiB (2048 pages) SAME_VA Shadow CS Ring BO so dynamic command
-    * streams cannot be overwritten in-place while in flight on the GPU. */
+   /* Step 10c: Allocate 1 MiB (256 pages) SAME_VA Shadow CS Ring BO so dynamic command
+    * streams (<= 32 KiB) cannot be overwritten in-place while in flight on the GPU. */
    const char *sh_env = getenv("PANTHOR_ADAPTER_SHADOW_CS");
    bool enable_shadow_cs = (!sh_env || !sh_env[0] || atoi(sh_env) != 0);
    if (enable_shadow_cs) {
-      uint64_t sh_pages = 2048ULL; /* 8 MiB */
+      uint64_t sh_pages = 256ULL; /* 1 MiB (32 x 32 KiB slots, saves 7 MiB vs 8 MiB) */
       uint64_t sh_out_flags = 0;
       uint64_t sh_cookie = 0;
       if (alloc_kbase_mem(mali_fd, sh_pages, sh_pages, 0, diag_flags, &sh_out_flags, &sh_cookie) == 0) {
@@ -1677,6 +1809,9 @@ void panthor_kbase_get_telemetry_snapshot(struct adapter_telemetry_snapshot *out
       if (g_ctx.bos[i].in_use) {
          out->active_bos++;
          out->active_bo_bytes += g_ctx.bos[i].size;
+         out->committed_bo_bytes += (g_ctx.bos[i].committed_pages
+                                        ? (g_ctx.bos[i].committed_pages * 4096ULL)
+                                        : g_ctx.bos[i].size);
          if (g_ctx.bos[i].kbase_flags & BASE_MEM_CACHED_CPU)
             out->cached_cpu_bos++;
          if (g_ctx.bos[i].is_imported)
@@ -1707,6 +1842,26 @@ void panthor_kbase_get_telemetry_snapshot(struct adapter_telemetry_snapshot *out
 void panthor_kbase_adapter_hint_bo_flags(uint32_t kmod_flags)
 {
    g_tls_next_bo_kmod_flags = kmod_flags;
+}
+
+void panthor_kbase_adapter_get_memory_stats(uint64_t *out_va_bytes,
+                                            uint64_t *out_committed_bytes,
+                                            uint64_t *out_growable_bos,
+                                            uint64_t *out_commit_upgrades,
+                                            uint64_t *out_hv_stepdowns)
+{
+   pthread_mutex_lock(&g_lock);
+   if (out_va_bytes)
+      *out_va_bytes = g_ctx.total_va_bo_bytes;
+   if (out_committed_bytes)
+      *out_committed_bytes = g_ctx.total_committed_bo_bytes;
+   if (out_growable_bos)
+      *out_growable_bos = g_ctx.grow_on_gpf_bo_count;
+   if (out_commit_upgrades)
+      *out_commit_upgrades = g_ctx.mem_commit_upgrades;
+   if (out_hv_stepdowns)
+      *out_hv_stepdowns = g_ctx.hv_chunk_stepdowns;
+   pthread_mutex_unlock(&g_lock);
 }
 
 uint64_t panthor_kbase_adapter_get_bo_gpu_va(uint32_t gem_handle)
@@ -2320,6 +2475,27 @@ int panthor_kbase_adapter_close(int fd)
             struct kbase_ioctl_kcpu_queue_delete del = { .id = g_ctx.kcpu_queue_id, .padding = {0} };
             adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_KCPU_QUEUE_DELETE, &del);
          }
+         size_t bo_lim = g_ctx.max_bo_slot_used ? g_ctx.max_bo_slot_used : ADAPTER_MAX_BOS;
+         if (bo_lim > ADAPTER_MAX_BOS)
+            bo_lim = ADAPTER_MAX_BOS;
+         for (size_t b = 0; b < bo_lim; b++) {
+            struct adapter_bo *bo = &g_ctx.bos[b];
+            if (!bo->in_use)
+               continue;
+            if (bo->alias_ptr && bo->alias_size > 0)
+               real_munmap(bo->alias_ptr, bo->alias_size);
+            if (bo->gpu_mapping && bo->gpu_mapping != bo->cpu_ptr && bo->gpu_mapping_size > 0)
+               real_munmap(bo->gpu_mapping, bo->gpu_mapping_size);
+            if (bo->cpu_ptr && bo->cpu_size > 0)
+               real_munmap(bo->cpu_ptr, bo->cpu_size);
+            if ((bo->is_imported || (!bo->is_same_va && !bo->gpu_mapping)) && bo->gpu_va) {
+               struct kbase_ioctl_mem_free mf = { .gpu_addr = bo->gpu_va };
+               adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_FREE, &mf);
+            }
+            if (bo->dmabuf_fd >= 0)
+               real_close(bo->dmabuf_fd);
+            memset(bo, 0, sizeof(*bo));
+         }
          if (g_ctx.stream_fd >= 0 && g_ctx.stream_fd != g_ctx.mali_fd)
             real_close(g_ctx.stream_fd);
          if (g_ctx.shadow_cs_bo_cpu)
@@ -2368,6 +2544,21 @@ bool panthor_kbase_adapter_is_virtual_drm_fd(int fd)
 
 int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
 {
+   bool pre_suppress = false;
+   if (g_ctx.active && _IOC_TYPE(request) == 'd') {
+      unsigned int pre_nr = _IOC_NR(request);
+      if ((pre_nr == 0xc3 || pre_nr == 0xca || pre_nr == 0xcb ||
+           pre_nr == (DRM_COMMAND_BASE + DRM_PANTHOR_GROUP_GET_STATE) ||
+           pre_nr == (DRM_COMMAND_BASE + DRM_PANTHOR_VM_GET_STATE)) &&
+          g_ctx.consecutive_poll_ioctls >= 2ULL) {
+         const char *pv = getenv("PANTHOR_ADAPTER_LOG_POLL_VERBOSE");
+         if (!pv || !pv[0])
+            pv = getenv("PANTHOR2KBASE_LOG_POLL_VERBOSE");
+         if (!pv || !pv[0] || atoi(pv) == 0)
+            pre_suppress = true;
+      }
+   }
+   ::panthor2kbase::ScopedPollLogSuppress poll_guard(pre_suppress);
    PANTHOR2KBASE_LOG_SCOPE("panthor_kbase_adapter_ioctl", "fd=%d, req=%s(0x%lx)",
                            fd, panthor2kbase_ioctl_req_name(request), request);
    resolve_real_funcs();
@@ -2399,6 +2590,10 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
    unsigned int type = _IOC_TYPE(request);
    int ret = 0;
 
+   bool suppress_this_poll = should_suppress_poll_log_locked(request);
+   if (suppress_this_poll)
+      panthor2kbase_log_set_poll_suppressed(true);
+
    bool is_hot_ioctl = (type == 'd') &&
       (nr == 0xbf || nr == 0xc0 || nr == 0xc3 || nr == 0xc4 || nr == 0xc5 ||
        nr == 0xca || nr == 0xcb || nr == 0xcc || nr == 0xcd ||
@@ -2406,16 +2601,18 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
        nr == (DRM_COMMAND_BASE + DRM_PANTHOR_GROUP_GET_STATE) ||
        nr == (DRM_COMMAND_BASE + DRM_PANTHOR_VM_GET_STATE) ||
        nr == (DRM_COMMAND_BASE + DRM_PANTHOR_BO_SYNC));
-   if (is_hot_ioctl && g_ctx.total_group_submits >= 5ULL) {
-      LOG_DEBUG("ioctl intercepted: req=%s(0x%lx) fd=%d nr=%u type=%c",
-                panthor2kbase_ioctl_req_name(request), request, fd, nr,
-                type ? static_cast<char>(type) : '?');
-   } else {
-      LOG_INFO("ioctl intercepted: req=%s(0x%lx) fd=%d nr=%u type=%c",
-               panthor2kbase_ioctl_req_name(request), request, fd, nr,
-               type ? static_cast<char>(type) : '?');
+   if (!suppress_this_poll) {
+      if (is_hot_ioctl && (g_ctx.total_group_submits >= 2ULL || g_ctx.consecutive_poll_ioctls > 1ULL)) {
+         LOG_DEBUG("ioctl intercepted: req=%s(0x%lx) fd=%d nr=%u type=%c",
+                   panthor2kbase_ioctl_req_name(request), request, fd, nr,
+                   type ? static_cast<char>(type) : '?');
+      } else {
+         LOG_INFO("ioctl intercepted: req=%s(0x%lx) fd=%d nr=%u type=%c",
+                  panthor2kbase_ioctl_req_name(request), request, fd, nr,
+                  type ? static_cast<char>(type) : '?');
+      }
+      panthor2kbase_log_ioctl_struct_in(request, arg);
    }
-   panthor2kbase_log_ioctl_struct_in(request, arg);
 
    if (type != 'd') {
       pthread_mutex_unlock(&g_lock);
@@ -2534,9 +2731,23 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          void *unmap_ptr = (bo->cpu_ptr && bo->is_same_va) ? bo->cpu_ptr : nullptr;
          void *exec_cpu_ptr = (bo->cpu_ptr && !bo->is_same_va) ? bo->cpu_ptr : nullptr;
          size_t unmap_sz = bo->cpu_size;
-         uint64_t free_va = (!bo->is_same_va && !gpu_map_ptr && bo->gpu_va) ? bo->gpu_va : 0;
+         /* Imported dma-buf regions (KBASE_MEM_TYPE_IMPORTED_UMM) have map->free_on_close = 0
+          * in mali_kbase_mem_linux.c:3102, so KBASE_IOCTL_MEM_FREE MUST always be called on them! */
+         uint64_t free_va = ((bo->is_imported || (!bo->is_same_va && !gpu_map_ptr)) && bo->gpu_va)
+                               ? bo->gpu_va
+                               : 0;
          uint32_t h = bo->gem_handle;
          uint64_t va = bo->gpu_va;
+         uint64_t bo_va_bytes = bo->size;
+         uint64_t bo_comm_bytes = bo->committed_pages ? (bo->committed_pages * 4096ULL) : bo->size;
+         if (g_ctx.total_va_bo_bytes >= bo_va_bytes)
+            g_ctx.total_va_bo_bytes -= bo_va_bytes;
+         else
+            g_ctx.total_va_bo_bytes = 0;
+         if (g_ctx.total_committed_bo_bytes >= bo_comm_bytes)
+            g_ctx.total_committed_bo_bytes -= bo_comm_bytes;
+         else
+            g_ctx.total_committed_bo_bytes = 0;
          if (bo->dmabuf_fd >= 0)
             real_close(bo->dmabuf_fd);
          memset(bo, 0, sizeof(*bo));
@@ -2545,18 +2756,18 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             real_munmap(alias_ptr, alias_sz);
          if (gpu_map_ptr && gpu_map_ptr != unmap_ptr && gpu_map_ptr != exec_cpu_ptr && gpu_map_sz > 0)
             real_munmap(gpu_map_ptr, gpu_map_sz);
-         if (unmap_ptr) {
+         if (unmap_ptr)
             real_munmap(unmap_ptr, unmap_sz);
-         } else {
-            if (exec_cpu_ptr)
-               real_munmap(exec_cpu_ptr, unmap_sz);
-            if (free_va) {
-               struct kbase_ioctl_mem_free mf = { .gpu_addr = free_va };
-               adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_FREE, &mf);
-            }
+         if (exec_cpu_ptr)
+            real_munmap(exec_cpu_ptr, unmap_sz);
+         if (free_va) {
+            struct kbase_ioctl_mem_free mf = { .gpu_addr = free_va };
+            adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_FREE, &mf);
          }
-         LOG_INFO("DRM_IOCTL_GEM_CLOSE handle=%u -> freed va=0x%llx",
-                  h, static_cast<unsigned long long>(va));
+         LOG_INFO("DRM_IOCTL_GEM_CLOSE handle=%u -> freed va=0x%llx (va_mb=%.1f committed_mb=%.1f)",
+                  h, static_cast<unsigned long long>(va),
+                  static_cast<double>(g_ctx.total_va_bo_bytes) / (1024.0 * 1024.0),
+                  static_cast<double>(g_ctx.total_committed_bo_bytes) / (1024.0 * 1024.0));
          return 0;
       }
       LOG_WARN("DRM_IOCTL_GEM_CLOSE handle=%u not found", cl ? cl->handle : 0);
@@ -2572,6 +2783,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          errno = ENOENT;
          return -1;
       }
+      ensure_bo_committed_locked(bo, "DRM_IOCTL_PRIME_HANDLE_TO_FD");
       if (bo->dmabuf_fd < 0) {
          int mfd = memfd_create("panvk-dmabuf-export", MFD_CLOEXEC);
          if (mfd >= 0 && ftruncate(mfd, static_cast<off_t>(bo->size)) == 0) {
@@ -2674,6 +2886,10 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             bo->dmabuf_ino = have_stat ? static_cast<uint64_t>(st.st_ino) : 0;
             bo->is_imported = true;
             bo->is_same_va = (imported_cpu_ptr != nullptr && imported_cpu_ptr == gpu_map_ptr);
+            bo->va_pages = bo_sz >> 12;
+            bo->committed_pages = bo->va_pages;
+            g_ctx.total_va_bo_bytes += bo_sz;
+            g_ctx.total_committed_bo_bytes += bo_sz;
             ph->handle = bo->gem_handle;
             LOG_INFO("DRM_IOCTL_PRIME_FD_TO_HANDLE fd=%d -> KBASE_IOCTL_MEM_IMPORT va=0x%llx handle=%u",
                      ph->fd, static_cast<unsigned long long>(bo->gpu_va), bo->gem_handle);
@@ -3333,6 +3549,10 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
        * explicitly requested; all PanVK subqueue/ringbuf syncobjs are redirected into
        * `g_ctx.event_bo` automatically during `DRM_PANTHOR_GROUP_SUBMIT`!
        */
+      uint64_t committed_pages = pages;
+      uint64_t ext_pages = 0;
+      bool used_grow_on_gpf = false;
+
       if (!is_exec && (kmod_flags & ADAPTER_KMOD_BO_FLAG_CSF_EVENT) != 0) {
          uint64_t ev_flags = (kflags & ~(BASE_MEM_COHERENT_LOCAL | BASE_MEM_CACHED_CPU | BASE_MEM_UNCACHED_GPU)) |
                              BASE_MEM_CSF_EVENT;
@@ -3340,6 +3560,62 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          if (alloc_rc == 0)
             kflags = ev_flags;
       }
+
+      /*
+       * On-Demand Physical Page Backing (BASE_MEM_GROW_ON_GPF) for Large BOs (>= 2 MiB):
+       *  - DXVK sub-allocates 128 MiB DEVICE_LOCAL slabs (32,768 pages) and 64 MiB slabs.
+       *  - Upfront 100% physical commitment (`commit_pages == va_pages`) pins 640 MiB to
+       *    2.27 GiB of unswappable kernel page-pool memory (`kbdev->memdev.used_pages`),
+       *    causing Android `kswapd` watermark exhaustion and `lowmemorykiller` killing
+       *    `com.ludashi.benchmark` (Winlator).
+       *  - Allocating BOs >= 2 MiB with `BASE_MEM_GROW_ON_GPF`, `commit_pages = 512` (2 MiB),
+       *    and `extension = 512` (2 MiB) commits only 2 MiB upfront (64x reduction on 128 MiB
+       *    slabs) and lets `mali_kbase.ko` (`page_fault_worker`) grow GPU-only slabs in 2 MiB
+       *    increments on GPU page faults.
+       *  - If userspace later maps the BO on the CPU (`DRM_PANTHOR_BO_MMAP_OFFSET` / `adapter_mmap`),
+       *    `ensure_bo_committed_locked()` issues `KBASE_IOCTL_MEM_COMMIT` to back all `va_pages`
+       *    before any CPU dereference so `kbase_cpu_vm_fault` never raises `VM_FAULT_SIGBUS`.
+       */
+      if (alloc_rc < 0 && !is_exec && (kmod_flags & ADAPTER_KMOD_BO_FLAG_CSF_EVENT) == 0) {
+         const char *no_grow_env = getenv("PANTHOR_ADAPTER_DISABLE_GROW_ON_GPF");
+         bool allow_grow = (!no_grow_env || !no_grow_env[0] || atoi(no_grow_env) == 0);
+         uint64_t grow_thresh_kb = 2048ULL; /* 2 MiB default threshold */
+         const char *gt_env = getenv("PANTHOR_ADAPTER_GROW_THRESHOLD_KB");
+         if (gt_env && gt_env[0] && strtoull(gt_env, nullptr, 0) >= 64ULL)
+            grow_thresh_kb = strtoull(gt_env, nullptr, 0);
+
+         uint64_t init_commit_kb = 2048ULL; /* 2 MiB initial commit */
+         const char *ic_env = getenv("PANTHOR_ADAPTER_INITIAL_COMMIT_KB");
+         if (ic_env && ic_env[0] && strtoull(ic_env, nullptr, 0) >= 4ULL)
+            init_commit_kb = strtoull(ic_env, nullptr, 0);
+
+         uint64_t grow_ext_kb = 2048ULL; /* 2 MiB power-of-2 growth step */
+         const char *ge_env = getenv("PANTHOR_ADAPTER_GROW_EXT_KB");
+         if (ge_env && ge_env[0] && strtoull(ge_env, nullptr, 0) >= 4ULL)
+            grow_ext_kb = strtoull(ge_env, nullptr, 0);
+
+         uint64_t thresh_pages = (grow_thresh_kb * 1024ULL) >> 12;
+         uint64_t init_pages = (init_commit_kb * 1024ULL) >> 12;
+         if (init_pages == 0)
+            init_pages = 1ULL;
+         uint64_t step_pages = (grow_ext_kb * 1024ULL) >> 12;
+         if (step_pages == 0 || (step_pages & (step_pages - 1ULL)) != 0)
+            step_pages = 512ULL;
+
+         if (allow_grow && pages >= thresh_pages && pages > init_pages) {
+            uint64_t grow_flags = kflags | BASE_MEM_GROW_ON_GPF;
+            alloc_rc = alloc_kbase_mem(g_ctx.mali_fd, pages, init_pages, step_pages,
+                                       grow_flags, &out_flags, &out_cookie_or_va);
+            if (alloc_rc == 0) {
+               kflags = grow_flags;
+               committed_pages = init_pages;
+               ext_pages = step_pages;
+               used_grow_on_gpf = true;
+               g_ctx.grow_on_gpf_bo_count++;
+            }
+         }
+      }
+
       if (alloc_rc < 0 &&
           alloc_kbase_mem(g_ctx.mali_fd, pages, pages, 0, kflags, &out_flags, &out_cookie_or_va) < 0) {
          LOG_ERROR("DRM_PANTHOR_BO_CREATE: alloc_kbase_mem(pages=%llu, flags=0x%llx) failed: %s",
@@ -3360,13 +3636,11 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          ret = -1;
          break;
       }
-      /* mali_kbase.ko already zeroes newly allocated physical pages in the kernel; only zero
-       * small control/ring/sync BOs (<= 64 KiB) + the first 4 KiB header in userspace so
-       * 64 MiB / 128 MiB DXVK heaps do not dirty 32,768+ CPU cache lines or stall for 75 ms! */
+      /* mali_kbase.ko already zeroes newly allocated physical pages in the kernel page pool
+       * (see panvk-kbase-android patch 0105). Only zero small control/ring/sync BOs (<= 64 KiB)
+       * in userspace so large BOs do NOT trigger kbase_cpu_vm_fault to populate 32,768+ CPU PTEs! */
       if (aligned_sz <= 65536ULL) {
          memset(cpu, 0, static_cast<size_t>(aligned_sz));
-      } else {
-         memset(cpu, 0, 4096U);
       }
 
       struct adapter_bo *bo = nullptr;
@@ -3397,17 +3671,42 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       bo->is_same_va = !is_exec && ((bo->kbase_flags & BASE_MEM_SAME_VA) != 0);
       bo->is_executable = is_exec;
       bo->is_csf_event = (bo->kbase_flags & BASE_MEM_CSF_EVENT) != 0;
+      bo->is_growable = used_grow_on_gpf;
+      bo->user_mmapped = false;
+      bo->vm_bind_count = 0;
+      bo->va_pages = pages;
+      bo->committed_pages = committed_pages;
+      bo->extension_pages = ext_pages;
       bo->gpu_va = bo->is_same_va ? reinterpret_cast<uintptr_t>(cpu) : out_cookie_or_va;
       bo->cpu_ptr = cpu;
       bo->cpu_size = static_cast<size_t>(aligned_sz);
       bo->dmabuf_fd = -1;
 
+      g_ctx.total_va_bo_bytes += aligned_sz;
+      g_ctx.total_committed_bo_bytes += (committed_pages * 4096ULL);
+
       bc->handle = bo->gem_handle;
       bc->size = aligned_sz;
-      LOG_INFO("DRM_PANTHOR_BO_CREATE size=%llu -> handle=%u va=0x%llx cpu=%p flags=0x%llx exec=%d csf_ev=%d",
-               static_cast<unsigned long long>(aligned_sz), bo->gem_handle,
-               static_cast<unsigned long long>(bo->gpu_va), cpu,
-               static_cast<unsigned long long>(bo->kbase_flags), is_exec, bo->is_csf_event);
+      if (aligned_sz >= (16ULL << 20)) {
+         LOG_INFO("DRM_PANTHOR_BO_CREATE size=%llu (%llu MiB) -> handle=%u va=0x%llx cpu=%p flags=0x%llx grow=%d committed=%llu/%llu pages (va_mb=%.1f committed_mb=%.1f avail_mb=%.1f)",
+                  static_cast<unsigned long long>(aligned_sz),
+                  static_cast<unsigned long long>(aligned_sz >> 20),
+                  bo->gem_handle,
+                  static_cast<unsigned long long>(bo->gpu_va), cpu,
+                  static_cast<unsigned long long>(bo->kbase_flags),
+                  bo->is_growable ? 1 : 0,
+                  static_cast<unsigned long long>(bo->committed_pages),
+                  static_cast<unsigned long long>(bo->va_pages),
+                  static_cast<double>(g_ctx.total_va_bo_bytes) / (1024.0 * 1024.0),
+                  static_cast<double>(g_ctx.total_committed_bo_bytes) / (1024.0 * 1024.0),
+                  read_mem_available_mb());
+      } else {
+         LOG_INFO("DRM_PANTHOR_BO_CREATE size=%llu -> handle=%u va=0x%llx cpu=%p flags=0x%llx exec=%d csf_ev=%d grow=%d",
+                  static_cast<unsigned long long>(aligned_sz), bo->gem_handle,
+                  static_cast<unsigned long long>(bo->gpu_va), cpu,
+                  static_cast<unsigned long long>(bo->kbase_flags), is_exec, bo->is_csf_event,
+                  bo->is_growable ? 1 : 0);
+      }
       trace_log("DRM_PANTHOR_BO_CREATE size=%llu -> KBASE_IOCTL_MEM_ALLOC handle=%u va=0x%llx\n",
                 static_cast<unsigned long long>(aligned_sz), bo->gem_handle,
                 static_cast<unsigned long long>(bo->gpu_va));
@@ -3416,6 +3715,54 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
 
    case DRM_PANTHOR_BO_MMAP_OFFSET: {
       auto *mo = static_cast<struct drm_panthor_bo_mmap_offset *>(arg);
+      struct adapter_bo *bo = find_bo(mo ? mo->handle : 0);
+      if (bo) {
+         /*
+          * DXVK 64-bit `DxvkMemoryAllocator::tryAllocFromType` (dxvk_memory.cpp:299, 344-351)
+          * attempts `chunkSize = 64 MiB` for each `HOST_VISIBLE` memory type / hint bucket
+          * (`for (uint32_t i = 0; i < 6 && (chunkSize >> i) >= size && !devMem.memHandle; i++)`),
+          * calling `vkAllocateMemory` -> `DRM_PANTHOR_BO_CREATE` -> `DRM_PANTHOR_VM_BIND`
+          * (`bo->vm_bind_count > 0`) followed immediately by `vkMapMemory` (`DRM_PANTHOR_BO_MMAP_OFFSET`).
+          * By contrast, internal PanVK driver BOs (`panvk_priv_bo_create`, e.g. `gpu_prerast_arena`)
+          * call `DRM_PANTHOR_BO_MMAP_OFFSET` BEFORE `DRM_PANTHOR_VM_BIND` (`bo->vm_bind_count == 0`).
+          *
+          * When `bo->vm_bind_count > 0` and `bo->size > max_hv_chunk_bytes` (default 16 MiB, matching
+          * DXVK 32-bit `env::is32BitHostPlatform() ? 16 : 64` at dxvk_memory.cpp:381):
+          *  - Rejecting the first oversized sub-allocation chunk attempt (`bo->size != g_ctx.last_rejected_hv_bo_size`)
+          *    causes DXVK to immediately free the 64 MiB / 32 MiB chunk and retry `chunkSize >> i` (16 MiB),
+          *    saving 48 MiB of pinned physical RAM per `HOST_VISIBLE` bucket (192 MiB across 4 buckets)!
+          *  - If the application genuinely requested a single dedicated `> 16 MiB` `HOST_VISIBLE` buffer,
+          *    DXVK retries the exact same `bo->size` with `IgnoreConstraints` (dxvk_memory.cpp:205),
+          *    matching `bo->size == g_ctx.last_rejected_hv_bo_size`, which we allow and commit!
+          */
+         uint64_t max_hv_mb = 16ULL;
+         const char *hv_env = getenv("PANTHOR_ADAPTER_MAX_HOST_VISIBLE_MB");
+         if (hv_env && hv_env[0])
+            max_hv_mb = strtoull(hv_env, nullptr, 0);
+         uint64_t max_hv_bytes = max_hv_mb * 1024ULL * 1024ULL;
+
+         if (max_hv_bytes > 0 && bo->vm_bind_count > 0 && !bo->user_mmapped &&
+             bo->size > max_hv_bytes && bo->size != g_ctx.last_rejected_hv_bo_size) {
+            g_ctx.last_rejected_hv_bo_size = bo->size;
+            g_ctx.hv_chunk_stepdowns++;
+            LOG_INFO("DRM_PANTHOR_BO_MMAP_OFFSET: steering oversized HOST_VISIBLE chunk handle=%u size=%llu MiB -> <=%llu MiB (stepdown #%llu)",
+                     bo->gem_handle,
+                     static_cast<unsigned long long>(bo->size >> 20),
+                     static_cast<unsigned long long>(max_hv_mb),
+                     static_cast<unsigned long long>(g_ctx.hv_chunk_stepdowns));
+            errno = ENOMEM;
+            ret = -1;
+            break;
+         }
+         g_ctx.last_rejected_hv_bo_size = 0;
+
+         if (ensure_bo_committed_locked(bo, "DRM_PANTHOR_BO_MMAP_OFFSET") < 0) {
+            errno = ENOMEM;
+            ret = -1;
+            break;
+         }
+         bo->user_mmapped = true;
+      }
       mo->offset = 0x1000000000ULL | (static_cast<uint64_t>(mo->handle) << 12);
       LOG_DEBUG("DRM_PANTHOR_BO_MMAP_OFFSET handle=%u -> offset=0x%llx",
                 mo->handle, static_cast<unsigned long long>(mo->offset));
@@ -3436,6 +3783,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
           ops[0].size == ops[1].size) {
          struct adapter_bo *bo = find_bo(ops[0].bo_handle);
          if (bo) {
+            ensure_bo_committed_locked(bo, "DRM_PANTHOR_VM_BIND(ALIAS)");
+            bo->vm_bind_count++;
             uint64_t page_cnt = ops[0].size >> 12;
             struct base_mem_aliasing_info ai[2] = {
                { .handle = bo->gpu_va, .offset = 0, .length = page_cnt },
@@ -3518,6 +3867,11 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                         bo->gpu_va = exec_gpu_va;
                         bo->kbase_cookie_or_va = exec_gpu_va;
                         bo->kbase_flags = exec_out_flags ? exec_out_flags : exec_kflags;
+                        if (bo->is_growable && bo->committed_pages < bo->va_pages) {
+                           g_ctx.total_committed_bo_bytes += (bo->va_pages - bo->committed_pages) * 4096ULL;
+                           bo->committed_pages = bo->va_pages;
+                           bo->is_growable = false;
+                        }
                         bo->is_executable = true;
                         bo->is_same_va = false;
                         LOG_INFO("DRM_PANTHOR_VM_BIND upgraded bo=%u to EXEC_VA va=0x%llx cpu=%p",
@@ -3527,6 +3881,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                         free(saved);
                   }
                }
+               bo->vm_bind_count++;
                ops[i].va = bo->gpu_va + ops[i].bo_offset;
                LOG_INFO("DRM_PANTHOR_VM_BIND MAP bo=%u -> kbase_va=0x%llx",
                         bo->gem_handle, static_cast<unsigned long long>(ops[i].va));
@@ -3611,7 +3966,11 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       if (env_mc && env_mc[0] && atoi(env_mc) > 0)
          max_chunks = static_cast<uint32_t>(atoi(env_mc));
 
-      uint32_t init_chunks = hc->initial_chunk_count ? hc->initial_chunk_count : (bug_mode ? 2U : 5U);
+      /* Right-size initial tiler heap chunks (matching panvk-kbase-android patch 224):
+       * Pre-allocating 16 x 2 MiB = 32 MiB per VkDevice (64 MiB across 2 VkDevices) wasted
+       * 44-48 MiB of unswappable kernel pages upfront when FINISH_FRAGMENT chunk recycling
+       * and incremental tiler OOM growth (`vt_end == 0, frag_end == 0`) only need 4-5 initial chunks! */
+      uint32_t init_chunks = hc->initial_chunk_count ? hc->initial_chunk_count : (bug_mode ? 2U : 4U);
       const char *env_ic = getenv("PANTHOR_ADAPTER_INITIAL_HEAP_CHUNKS");
       if (!env_ic || !env_ic[0])
          env_ic = getenv("PANTHOR_ADAPTER_INITIAL_TILER_CHUNKS");
@@ -3619,8 +3978,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          init_chunks = static_cast<uint32_t>(atoi(env_ic));
       } else if (bug_mode) {
          init_chunks = 2U;
-      } else if (init_chunks < 16U) {
-         init_chunks = (max_chunks < 16U) ? max_chunks : 16U;
+      } else if (init_chunks > 8U) {
+         init_chunks = 8U;
       }
       if (init_chunks > max_chunks)
          init_chunks = max_chunks;
@@ -4560,7 +4919,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          uint64_t s0 = grp->subqueues[0].seqno_cpu_ptr ? *grp->subqueues[0].seqno_cpu_ptr : 0ULL;
          uint64_t s1 = (grp->queue_count > 1 && grp->subqueues[1].seqno_cpu_ptr) ? *grp->subqueues[1].seqno_cpu_ptr : 0ULL;
          uint64_t s2 = (grp->queue_count > 2 && grp->subqueues[2].seqno_cpu_ptr) ? *grp->subqueues[2].seqno_cpu_ptr : 0ULL;
-         LOG_INFO("[TELEMETRY] submits=%llu jobs(vt=%llu,seq=%llu/%llu/%llu) fps=%.1f submit_us(avg=%.1f,max=%.1f: norm=%.1f,clean=%.1f,kick=%.1f) wait_us(avg=%.1f,max=%.1f,fast=%llu,poll=%llu) bos=%u(%.1fMB,cached=%u,imp=%u,rss=%.1fMB,guards=%llu) syncobjs=%u wraps=%llu/%llu/%llu",
+         LOG_INFO("[TELEMETRY] submits=%llu jobs(vt=%llu,seq=%llu/%llu/%llu) fps=%.1f submit_us(avg=%.1f,max=%.1f: norm=%.1f,clean=%.1f,kick=%.1f) wait_us(avg=%.1f,max=%.1f,fast=%llu,poll=%llu) bos=%u(va=%.1fMB,committed=%.1fMB,grow=%llu,stepdown=%llu,cached=%u,imp=%u,rss=%.1fMB,avail=%.1fMB,guards=%llu) syncobjs=%u wraps=%llu/%llu/%llu",
                   static_cast<unsigned long long>(g_ctx.total_group_submits),
                   static_cast<unsigned long long>(j0),
                   static_cast<unsigned long long>(s0),
@@ -4572,8 +4931,13 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                   g_ctx.last_avg_sync_wait_us, g_ctx.last_max_sync_wait_us,
                   static_cast<unsigned long long>(g_ctx.fast_spin_syncobj_waits),
                   static_cast<unsigned long long>(g_ctx.poll_sleep_syncobj_waits),
-                  act_bos, static_cast<double>(act_bo_bytes) / (1024.0 * 1024.0), cached_bos, imp_bos,
-                  rss_mb, static_cast<unsigned long long>(g_ctx.munmap_guard_hits),
+                  act_bos, static_cast<double>(act_bo_bytes) / (1024.0 * 1024.0),
+                  static_cast<double>(g_ctx.total_committed_bo_bytes) / (1024.0 * 1024.0),
+                  static_cast<unsigned long long>(g_ctx.grow_on_gpf_bo_count),
+                  static_cast<unsigned long long>(g_ctx.hv_chunk_stepdowns),
+                  cached_bos, imp_bos,
+                  rss_mb, read_mem_available_mb(),
+                  static_cast<unsigned long long>(g_ctx.munmap_guard_hits),
                   act_so,
                   static_cast<unsigned long long>(grp->subqueues[0].ring_wraps),
                   static_cast<unsigned long long>(grp->queue_count > 1 ? grp->subqueues[1].ring_wraps : 0ULL),
@@ -4642,6 +5006,12 @@ void *panthor_kbase_adapter_mmap(void *addr, size_t length, int prot, int flags,
       uint32_t handle = static_cast<uint32_t>((uoff >> 12) & 0xfffffU);
       struct adapter_bo *bo = find_bo(handle);
       if (bo) {
+         if (ensure_bo_committed_locked(bo, "panthor_kbase_adapter_mmap") < 0) {
+            pthread_mutex_unlock(&g_lock);
+            errno = ENOMEM;
+            return MAP_FAILED;
+         }
+         bo->user_mmapped = true;
          if (bo->cpu_ptr && (addr == nullptr || addr == bo->cpu_ptr)) {
             LOG_DEBUG("adapter_mmap: BO handle=%u returning cached cpu_ptr=%p",
                       bo->gem_handle, bo->cpu_ptr);
@@ -4736,6 +5106,7 @@ int panthor_kbase_adapter_munmap(void *addr, size_t length)
 
 static drmDevicePtr alloc_synthetic_panthor_drm_device()
 {
+   apply_panvk_lowmem_env_defaults();
    const char *node_path = "/dev/dri/renderD128";
    const char *env_path = getenv("PANVK_KBASE_NODE_PATH");
    bool has_emu = (dlsym(RTLD_DEFAULT, "mali_kbase_emu_get_stats") != nullptr);
@@ -4979,6 +5350,7 @@ int drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles,
                    int64_t timeout_nsec, unsigned flags,
                    uint32_t *first_signaled)
 {
+   ::panthor2kbase::ScopedPollLogSuppress _poll_sup(g_ctx.active && g_ctx.consecutive_poll_ioctls >= 2ULL);
    PANTHOR2KBASE_LOG_SCOPE("drmSyncobjWait", "fd=%d, num=%u, timeout=%lld",
                            fd, num_handles, static_cast<long long>(timeout_nsec));
    struct drm_syncobj_wait arg = {
@@ -5000,6 +5372,7 @@ int drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points,
                            unsigned num_handles, int64_t timeout_nsec,
                            unsigned flags, uint32_t *first_signaled)
 {
+   ::panthor2kbase::ScopedPollLogSuppress _poll_sup(g_ctx.active && g_ctx.consecutive_poll_ioctls >= 2ULL);
    PANTHOR2KBASE_LOG_SCOPE("drmSyncobjTimelineWait", "fd=%d, num=%u, timeout=%lld",
                            fd, num_handles, static_cast<long long>(timeout_nsec));
    struct drm_syncobj_timeline_wait arg = {
@@ -5171,6 +5544,7 @@ int drmSyncobjTimelineSignal(int fd, const uint32_t *handles,
 
 int drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points, uint32_t handle_count)
 {
+   ::panthor2kbase::ScopedPollLogSuppress _poll_sup(g_ctx.active && g_ctx.consecutive_poll_ioctls >= 2ULL);
    PANTHOR2KBASE_LOG_SCOPE("drmSyncobjQuery", "fd=%d, count=%u", fd, handle_count);
    struct drm_syncobj_timeline_array arg = {
       .handles = reinterpret_cast<uintptr_t>(handles),
@@ -5184,6 +5558,7 @@ int drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points, uint32_t handle
 int drmSyncobjQuery2(int fd, uint32_t *handles, uint64_t *points,
                      uint32_t handle_count, uint32_t flags)
 {
+   ::panthor2kbase::ScopedPollLogSuppress _poll_sup(g_ctx.active && g_ctx.consecutive_poll_ioctls >= 2ULL);
    PANTHOR2KBASE_LOG_SCOPE("drmSyncobjQuery2", "fd=%d, count=%u, flags=0x%x",
                            fd, handle_count, flags);
    struct drm_syncobj_timeline_array arg = {

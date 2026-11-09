@@ -24,13 +24,14 @@
 #include "panthor_drm.h"
 #include "mali_kbase_uapi.h"
 
-panthor2kbase_log_level_t panthor2kbase_log_level = PANTHOR2KBASE_LOG_TRACE;
+panthor2kbase_log_level_t panthor2kbase_log_level = PANTHOR2KBASE_LOG_INFO;
 static bool g_log_initialized = false;
 static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 static FILE *g_log_fp = nullptr;
 
 /* Thread-local call-stack indentation depth for RAII ScopedLogIndent */
 static thread_local int g_log_indent_depth = 0;
+static thread_local bool g_log_poll_suppressed = false;
 
 static const char *const g_level_names[PANTHOR2KBASE_LOG_LEVEL_COUNT] = {
     "ERROR",
@@ -81,6 +82,16 @@ extern "C" void panthor2kbase_log_dec_indent(void)
         --g_log_indent_depth;
 }
 
+extern "C" bool panthor2kbase_log_is_poll_suppressed(void)
+{
+    return g_log_poll_suppressed;
+}
+
+extern "C" void panthor2kbase_log_set_poll_suppressed(bool suppressed)
+{
+    g_log_poll_suppressed = suppressed;
+}
+
 extern "C" void panthor2kbase_log_init(void)
 {
     if (g_log_initialized)
@@ -101,6 +112,8 @@ extern "C" void panthor2kbase_log_init(void)
 extern "C" void panthor2kbase_logv(panthor2kbase_log_level_t level, const char *fmt, va_list ap)
 {
     panthor2kbase_log_init();
+    if (level >= PANTHOR2KBASE_LOG_DEBUG && g_log_poll_suppressed)
+        return;
     if (level > panthor2kbase_log_level)
         return;
 

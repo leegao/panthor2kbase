@@ -28,15 +28,7 @@ echo "==========================================================================
 restore_mesa_overlay() {
    if [[ -d "mesa" && -d "mesa_overlay" ]]; then
       echo "  [sync] Restoring mesa_overlay & adapter files into mesa..."
-      cp -rf mesa_overlay/* mesa/
-      mkdir -p mesa/src/panfrost/uapi_adapter \
-               mesa/subprojects/panthor_kbase_adapter/include \
-               mesa/subprojects/panthor_kbase_adapter/src/adapter
-      [[ -d "include" ]] && cp -rf include/* mesa/src/panfrost/uapi_adapter/
-      [[ -d "src/adapter" ]] && cp -rf src/adapter/* mesa/src/panfrost/uapi_adapter/
-      [[ -d "include" ]] && cp -rf include/* mesa/subprojects/panthor_kbase_adapter/include/
-      [[ -d "src/adapter" ]] && cp -rf src/adapter/* mesa/subprojects/panthor_kbase_adapter/src/adapter/
-      [[ -f "mesa_subproject/meson.build" ]] && cp -f mesa_subproject/meson.build mesa/subprojects/panthor_kbase_adapter/meson.build
+      "${ROOT_DIR}/scripts/apply_mesa_overlay.sh" "${ROOT_DIR}/mesa"
    fi
 }
 
@@ -116,6 +108,9 @@ MESA_MANIFEST="$OUT_DIR/mesa-panvk-offline-bundle.manifest"
 if [[ -d "mesa" ]]; then
    echo "[2/4] Ensuring Clean Mesa PanVK component..."
    EXTRA_HOST_PATHS=()
+   [[ -d "build-x86-64/mesa/src/compiler/clc" ]] && EXTRA_HOST_PATHS+=("build-x86-64/mesa/src/compiler/clc")
+   [[ -d "build-x86-64/mesa/src/compiler/spirv" ]] && EXTRA_HOST_PATHS+=("build-x86-64/mesa/src/compiler/spirv")
+   [[ -d "build-x86-64/mesa/src/panfrost/clc" ]] && EXTRA_HOST_PATHS+=("build-x86-64/mesa/src/panfrost/clc")
    [[ -d "build-host/src/compiler/clc" ]] && EXTRA_HOST_PATHS+=("build-host/src/compiler/clc")
    [[ -d "build-host/src/compiler/spirv" ]] && EXTRA_HOST_PATHS+=("build-host/src/compiler/spirv")
    [[ -d "build-host/src/panfrost/clc" ]] && EXTRA_HOST_PATHS+=("build-host/src/panfrost/clc")

@@ -817,19 +817,28 @@ static void test_v17_cs_builder_abi_and_ls_tracker_invariants(void)
    assert(strstr(buf, "cs_get_ls_tracker(struct cs_builder *b)") != NULL &&
           "cs_builder.h must define self-healing cs_get_ls_tracker(b)");
 
-   /* Verify compile.sh uses fast cmp -s / cksum and touches synced destination files */
-   FILE *cfp = fopen("compile.sh", "r");
+   /* Verify scripts/apply_mesa_overlay.sh and compile.sh use fast cmp -s / cksum and touch synced destination files */
+   FILE *cfp = fopen("scripts/apply_mesa_overlay.sh", "r");
+   if (!cfp)
+      cfp = fopen("compile.sh", "r");
    assert(cfp != NULL);
    char cbuf[8192];
    size_t cn = fread(cbuf, 1, sizeof(cbuf) - 1, cfp);
    cbuf[cn] = '\0';
    fclose(cfp);
    assert(strstr(cbuf, "cmp -s") != NULL &&
-          "compile.sh must use fast cmp -s byte comparison in sync_tree_if_changed");
-   assert(strstr(cbuf, "cksum") != NULL &&
-          "compile.sh must use fast POSIX cksum CRC-32 digest");
+          "apply_mesa_overlay.sh must use fast cmp -s byte comparison in sync_tree_if_changed");
    assert(strstr(cbuf, "touch \"$dst_file\"") != NULL &&
-          "compile.sh must touch updated destination files so Ninja recompiles");
+          "apply_mesa_overlay.sh must touch updated destination files so Ninja recompiles");
+
+   FILE *cmp_fp = fopen("compile.sh", "r");
+   assert(cmp_fp != NULL);
+   char cmp_buf[8192];
+   size_t cmp_n = fread(cmp_buf, 1, sizeof(cmp_buf) - 1, cmp_fp);
+   cmp_buf[cmp_n] = '\0';
+   fclose(cmp_fp);
+   assert(strstr(cmp_buf, "cksum") != NULL &&
+          "compile.sh must use fast POSIX cksum CRC-32 digest");
 
    printf("  -> Checkpoint v17/v18 struct cs_builder ABI & compile.sh Fast Checksum Invariants: PASS\n");
 }
@@ -1232,6 +1241,139 @@ static void test_v20_worklist_chunk_hash_bug_catching_and_dual_capture_replay(vo
    printf("  -> Checkpoint v20 Worklist Chunk Hash, Bug-Catching Mode & Dual-Level Capture/Replay: PASS\n");
 }
 
+
+static void test_v21_grow_on_gpf_mem_commit_hv_stepdown_and_poll_coalesce(void)
+{
+   setenv("PANTHOR_EMU_STRICT_CPU_COMMIT", "1", 1);
+   mali_kbase_emu_reset_stats();
+
+   int fd = panthor_kbase_adapter_open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+   assert(fd >= 0);
+
+   /* 1. Verify proactive low-memory PanVK env defaults were applied */
+   const char *utrace_sz = getenv("PANVK_UTRACE_CLONE_MEM_SIZE");
+   assert(utrace_sz != NULL && strcmp(utrace_sz, "65536") == 0);
+   const char *budget_p = getenv("PANVK_MEM_BUDGET_PRESSURE");
+   assert(budget_p != NULL && strcmp(budget_p, "1") == 0);
+
+   struct drm_panthor_vm_create vmc = { .flags = 0, .user_va_range = (1ULL << 47) };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_CREATE, &vmc) == 0);
+
+   /* 2. Allocate a 128 MiB DEVICE_LOCAL BO (not CPU mapped) -> verify GROW_ON_GPF + 2 MiB initial commit */
+   struct drm_panthor_bo_create dl_bo = {
+      .size = 128ULL * 1024ULL * 1024ULL,
+      .flags = 0,
+      .exclusive_vm_id = vmc.id,
+   };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_CREATE, &dl_bo) == 0);
+   assert(dl_bo.handle != 0);
+
+   struct drm_panthor_vm_bind_op dl_bind_op = {
+      .flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP,
+      .bo_handle = dl_bo.handle,
+      .bo_offset = 0,
+      .va = 0,
+      .size = dl_bo.size,
+   };
+   struct drm_panthor_vm_bind dl_vmb = {
+      .vm_id = vmc.id, .flags = 0, .ops = DRM_PANTHOR_OBJ_ARRAY(1, &dl_bind_op)
+   };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_BIND, &dl_vmb) == 0);
+   assert(dl_bind_op.va != 0);
+
+   /* 3. Simulate DXVK HOST_VISIBLE sub-allocation chunk loop (VM_BIND first, then BO_MMAP_OFFSET):
+    *    - 64 MiB attempt -> returns -ENOMEM (steps down DXVK chunk allocator)
+    *    - 32 MiB attempt -> returns -ENOMEM (steps down DXVK chunk allocator)
+    *    - 16 MiB attempt -> succeeds and commits all 4096 pages via KBASE_IOCTL_MEM_COMMIT so CPU write at +15 MiB works!
+    *    - Dedicated 64 MiB retry (two 64 MiB attempts in a row) -> succeeds on 2nd attempt! */
+   struct drm_panthor_bo_create hv64 = { .size = 64ULL * 1024ULL * 1024ULL, .flags = 0, .exclusive_vm_id = vmc.id };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_CREATE, &hv64) == 0);
+   struct drm_panthor_vm_bind_op hv64_bop = { .flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, .bo_handle = hv64.handle, .size = hv64.size };
+   struct drm_panthor_vm_bind hv64_vmb = { .vm_id = vmc.id, .ops = DRM_PANTHOR_OBJ_ARRAY(1, &hv64_bop) };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_BIND, &hv64_vmb) == 0);
+   struct drm_panthor_bo_mmap_offset hv64_mmo = { .handle = hv64.handle };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET, &hv64_mmo) == -1 && errno == ENOMEM);
+   assert(drmCloseBufferHandle(fd, hv64.handle) == 0);
+
+   struct drm_panthor_bo_create hv32 = { .size = 32ULL * 1024ULL * 1024ULL, .flags = 0, .exclusive_vm_id = vmc.id };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_CREATE, &hv32) == 0);
+   struct drm_panthor_vm_bind_op hv32_bop = { .flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, .bo_handle = hv32.handle, .size = hv32.size };
+   struct drm_panthor_vm_bind hv32_vmb = { .vm_id = vmc.id, .ops = DRM_PANTHOR_OBJ_ARRAY(1, &hv32_bop) };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_BIND, &hv32_vmb) == 0);
+   struct drm_panthor_bo_mmap_offset hv32_mmo = { .handle = hv32.handle };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET, &hv32_mmo) == -1 && errno == ENOMEM);
+   assert(drmCloseBufferHandle(fd, hv32.handle) == 0);
+
+   struct drm_panthor_bo_create hv16 = { .size = 16ULL * 1024ULL * 1024ULL, .flags = 0, .exclusive_vm_id = vmc.id };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_CREATE, &hv16) == 0);
+   struct drm_panthor_vm_bind_op hv16_bop = { .flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, .bo_handle = hv16.handle, .size = hv16.size };
+   struct drm_panthor_vm_bind hv16_vmb = { .vm_id = vmc.id, .ops = DRM_PANTHOR_OBJ_ARRAY(1, &hv16_bop) };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_BIND, &hv16_vmb) == 0);
+   struct drm_panthor_bo_mmap_offset hv16_mmo = { .handle = hv16.handle };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET, &hv16_mmo) == 0);
+   uint8_t *hv16_cpu = (uint8_t *)panthor_kbase_adapter_mmap(NULL, hv16.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)hv16_mmo.offset);
+   assert(hv16_cpu != NULL && hv16_cpu != MAP_FAILED);
+   /* Write to tail page (+15 MiB) under PANTHOR_EMU_STRICT_CPU_COMMIT=1 to verify KBASE_IOCTL_MEM_COMMIT unlocked all pages! */
+   hv16_cpu[15ULL * 1024ULL * 1024ULL] = 0x5AU;
+   assert(hv16_cpu[15ULL * 1024ULL * 1024ULL] == 0x5AU);
+
+   /* Dedicated > 16 MiB buffer fallback: 1st 24 MiB attempt fails, immediate 2nd 24 MiB retry succeeds! */
+   struct drm_panthor_bo_create ded1 = { .size = 24ULL * 1024ULL * 1024ULL, .flags = 0, .exclusive_vm_id = vmc.id };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_CREATE, &ded1) == 0);
+   struct drm_panthor_vm_bind_op ded1_bop = { .flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, .bo_handle = ded1.handle, .size = ded1.size };
+   struct drm_panthor_vm_bind ded1_vmb = { .vm_id = vmc.id, .ops = DRM_PANTHOR_OBJ_ARRAY(1, &ded1_bop) };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_BIND, &ded1_vmb) == 0);
+   struct drm_panthor_bo_mmap_offset ded1_mmo = { .handle = ded1.handle };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET, &ded1_mmo) == -1 && errno == ENOMEM);
+   assert(drmCloseBufferHandle(fd, ded1.handle) == 0);
+
+   struct drm_panthor_bo_create ded2 = { .size = 24ULL * 1024ULL * 1024ULL, .flags = 0, .exclusive_vm_id = vmc.id };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_CREATE, &ded2) == 0);
+   struct drm_panthor_vm_bind_op ded2_bop = { .flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, .bo_handle = ded2.handle, .size = ded2.size };
+   struct drm_panthor_vm_bind ded2_vmb = { .vm_id = vmc.id, .ops = DRM_PANTHOR_OBJ_ARRAY(1, &ded2_bop) };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_BIND, &ded2_vmb) == 0);
+   struct drm_panthor_bo_mmap_offset ded2_mmo = { .handle = ded2.handle };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET, &ded2_mmo) == 0);
+   assert(drmCloseBufferHandle(fd, ded2.handle) == 0);
+
+   /* 4. Right-sized tiler heap creation (5 initial chunks = 10 MiB instead of 16 chunks = 32 MiB) */
+   struct drm_panthor_tiler_heap_create thc = {
+      .vm_id = vmc.id,
+      .initial_chunk_count = 5,
+      .chunk_size = 2 * 1024 * 1024,
+      .max_chunks = 64,
+      .target_in_flight = 65535,
+   };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_TILER_HEAP_CREATE, &thc) == 0);
+
+   /* Export emulator trace JSON and verify 128 MiB BO had commit_pages=512, extension=512, GROW_ON_GPF,
+    * while 16 MiB HV BO issued KBASE_IOCTL_MEM_COMMIT with commit_pages=4096, and tiler heap had initial_chunks=5! */
+   const char *trace_json = "/tmp/test_v21_trace.json";
+   assert(mali_kbase_emu_export_trace_json(trace_json) == 0);
+   FILE *tf = fopen(trace_json, "r");
+   assert(tf != NULL);
+   char buf[65536];
+   size_t nread = fread(buf, 1, sizeof(buf) - 1, tf);
+   buf[nread] = '\0';
+   fclose(tf);
+   unlink(trace_json);
+
+   assert(strstr(buf, "\"va_pages\": 32768, \"commit_pages\": 512, \"extension\": 512") != NULL);
+   assert(strstr(buf, "\"op\": \"KBASE_IOCTL_MEM_COMMIT\"") != NULL);
+   assert(strstr(buf, "\"initial_chunks\": 5") != NULL);
+
+   struct drm_panthor_tiler_heap_destroy thd = { .handle = thc.handle };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_TILER_HEAP_DESTROY, &thd) == 0);
+   assert(drmCloseBufferHandle(fd, hv16.handle) == 0);
+   assert(drmCloseBufferHandle(fd, dl_bo.handle) == 0);
+   struct drm_panthor_vm_destroy vmd = { .id = vmc.id };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_DESTROY, &vmd) == 0);
+   assert(panthor_kbase_adapter_close(fd) == 0);
+   unsetenv("PANTHOR_EMU_STRICT_CPU_COMMIT");
+
+   printf("  -> Checkpoint v21 GROW_ON_GPF On-Demand Backing, KBASE_IOCTL_MEM_COMMIT, DXVK 16MiB HV Step-Down & Tiler Heap Right-Sizing: PASS\n");
+}
+
 int main(void)
 {
    printf("[Unit Tests] Running edge cases, mali_kbase.ko flag invariants, and RAII logging suite...\n");
@@ -1249,6 +1391,7 @@ int main(void)
    test_v18_dogwitch_machick2_user_reg_munmap_guard_and_multigroup_isolation();
    test_v19_dogwitch_recycled_cb_jump_chain_and_machick2_v11_defer_sync();
    test_v20_worklist_chunk_hash_bug_catching_and_dual_capture_replay();
+   test_v21_grow_on_gpf_mem_commit_hv_stepdown_and_poll_coalesce();
    printf("[Unit Tests] ALL EDGE CASES PASSED!\n");
    return 0;
 }

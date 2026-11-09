@@ -162,6 +162,13 @@ int panthor_kbase_adapter_munmap(void *addr, size_t length);
 void panthor_kbase_adapter_hint_bo_flags(uint32_t kmod_flags);
 uint64_t panthor_kbase_adapter_get_bo_gpu_va(uint32_t gem_handle);
 
+/* Query on-demand physical memory backing & chunk step-down statistics */
+void panthor_kbase_adapter_get_memory_stats(uint64_t *out_va_bytes,
+                                            uint64_t *out_committed_bytes,
+                                            uint64_t *out_growable_bos,
+                                            uint64_t *out_commit_upgrades,
+                                            uint64_t *out_hv_stepdowns);
+
 /* CSF Bytecode Normalizer, Ring Emitter & Diagnostic Inspector */
 struct adapter_cs_patch_stats {
    uint32_t total_instructions;
@@ -220,6 +227,7 @@ struct adapter_telemetry_snapshot {
    uint32_t cached_cpu_bos;
    uint32_t imported_bos;
    uint64_t active_bo_bytes;
+   uint64_t committed_bo_bytes;
    uint32_t active_syncobjs;
    double   window_fps;
    double   avg_submit_us;

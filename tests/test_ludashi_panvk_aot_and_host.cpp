@@ -164,8 +164,21 @@ int main() {
 
     mali_kbase_emu_reset_stats();
 
-    void* patched_icd = dlopen("./libvulkan_panfrost_patched.so", RTLD_NOW | RTLD_LOCAL);
-    assert(patched_icd != nullptr && "Failed to dlopen ./libvulkan_panfrost_patched.so");
+    const char* patched_paths[] = {
+        "./build-x86-64/libvulkan_panfrost_patched.so",
+        "./build-x86-64/adapter/libvulkan_panfrost_patched.so",
+        "./build-cmake-host/libvulkan_panfrost_patched.so",
+        "./libvulkan_panfrost_patched.so",
+        "../build-x86-64/libvulkan_panfrost_patched.so",
+        "../build-cmake-host/libvulkan_panfrost_patched.so",
+        "libvulkan_panfrost_patched.so"
+    };
+    void* patched_icd = nullptr;
+    for (const char* p : patched_paths) {
+        patched_icd = dlopen(p, RTLD_NOW | RTLD_LOCAL);
+        if (patched_icd) break;
+    }
+    assert(patched_icd != nullptr && "Failed to dlopen libvulkan_panfrost_patched.so");
 
     typedef void (*PFN_vkVoidFunction)(void);
     typedef PFN_vkVoidFunction (*PFN_vk_icdGetInstanceProcAddr)(void*, const char*);

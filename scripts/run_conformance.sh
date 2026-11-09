@@ -14,24 +14,25 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 mkdir -p "${ROOT_DIR}/artifacts"
 
+CMAKE_BIN="$("${ROOT_DIR}/scripts/find_cmake.sh")"
+
 echo "================================================================================"
-echo " 1. Building Panthor-Kbase Libraries and Test Executables (Release Mode)"
+echo " 1. Building Panthor-Kbase Libraries and Test Executables (Release Mode via CMake)"
 echo "================================================================================"
-make clean
-make all
-gcc -Wall -Wextra -Werror -O2 -Iinclude -Isrc/adapter -Isrc/emulator \
-    -o tests/unit_tests_edge_cases tests/unit_tests_edge_cases.c \
-    ./libpanthor_kbase_adapter.so ./libmali_kbase_emu.so ./src/aot/layers/libVkLayer_PANTHOR_capture.so -Wl,-rpath,'$ORIGIN/..:$ORIGIN/../src/aot/layers' -ldl -lpthread
+BUILD_DIR="${ROOT_DIR}/build-x86-64"
+"$CMAKE_BIN" -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release
+"$CMAKE_BIN" --build "${BUILD_DIR}" -j"$(nproc 2>/dev/null || echo 4)"
+export LD_LIBRARY_PATH="${BUILD_DIR}:${BUILD_DIR}/adapter:${BUILD_DIR}/emulator:${BUILD_DIR}/aot:${LD_LIBRARY_PATH:-}"
 
 echo "================================================================================"
 echo " 2. Running State Machine & Precondition Boundary Validation"
 echo "================================================================================"
-./tests/unit_tests_edge_cases
+"${BUILD_DIR}/tests/unit_tests_edge_cases"
 
 echo "================================================================================"
 echo " 3. Running 5-Stage Real Vulkan Sample & Workload Conformance Suite"
 echo "================================================================================"
-./tests/run_vulkan_samples_and_equivalence_suite
+"${BUILD_DIR}/tests/run_vulkan_samples_and_equivalence_suite"
 
 echo "================================================================================"
 echo " 4. Running Google OR-Tools CP-SAT Formal Mathematical Equivalence Prover"
