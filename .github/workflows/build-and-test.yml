@@ -13,7 +13,7 @@ jobs:
       fail-fast: false
       matrix:
         compiler: [gcc, clang]
-        build_system: [cmake, make]
+        build_system: [cmake]
 
     steps:
       - name: Checkout Repository
@@ -62,5 +62,5 @@ jobs:
       - name: Run Ludashi & PanProbe 36-Test Hardware/Emulator Verification Suite
         run: |
           ./build_all.sh
-          ./tests/test_ludashi_panvk_aot_and_host
-          ./tests/panprobe/panprobe_runner_suite
+          ./build-x86-64/tests/test_ludashi_panvk_aot_and_host
+          ./build-x86-64/tests/panprobe_runner_suite

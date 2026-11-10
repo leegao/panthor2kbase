@@ -138,12 +138,14 @@ set_target_properties(drm_shim PROPERTIES
    OUTPUT_NAME drm
    ARCHIVE_OUTPUT_DIRECTORY "${ADAPTER_DIR}"
 )
-add_custom_command(TARGET drm_shim POST_BUILD
-   COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:drm_shim> "${CMAKE_BINARY_DIR}/libdrm.a"
-   COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/shims/lib"
-   COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:drm_shim> "${CMAKE_CURRENT_SOURCE_DIR}/shims/lib/libdrm.a"
-   COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:drm_shim> "${CMAKE_CURRENT_SOURCE_DIR}/shims/libdrm.a"
-)
+if(ANDROID)
+   add_custom_command(TARGET drm_shim POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:drm_shim> "${CMAKE_BINARY_DIR}/libdrm.a"
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/shims/lib"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:drm_shim> "${CMAKE_CURRENT_SOURCE_DIR}/shims/lib/libdrm.a"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:drm_shim> "${CMAKE_CURRENT_SOURCE_DIR}/shims/libdrm.a"
+   )
+endif()
 
 # -----------------------------------------------------------------------------
 # 3. User-Space /dev/mali0 Kbase CSF & Valhall ISA Emulator (Shared & Static)
