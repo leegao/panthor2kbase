@@ -70,6 +70,16 @@ trap 'rm -rf "${BUILD_TMP}"' EXIT
 
 "${CXX}" -std=c++17 -O2 -fPIC -fno-emulated-tls -fno-exceptions -fno-unwind-tables \
    -Wall -I"${ROOT_DIR}/include" -I"${ROOT_DIR}/src/adapter" \
+   -c "${ROOT_DIR}/src/adapter/mali_kbase_caps.cpp" \
+   -o "${BUILD_TMP}/mali_kbase_caps.o"
+
+"${CXX}" -std=c++17 -O2 -fPIC -fno-emulated-tls -fno-exceptions -fno-unwind-tables \
+   -Wall -I"${ROOT_DIR}/include" -I"${ROOT_DIR}/src/adapter" -I"${ROOT_DIR}/src/emulator" \
+   -c "${ROOT_DIR}/src/adapter/panthor_drm_capture_replay.cpp" \
+   -o "${BUILD_TMP}/panthor_drm_capture_replay.o"
+
+"${CXX}" -std=c++17 -O2 -fPIC -fno-emulated-tls -fno-exceptions -fno-unwind-tables \
+   -Wall -I"${ROOT_DIR}/include" -I"${ROOT_DIR}/src/adapter" \
    -c "${ROOT_DIR}/src/adapter/log.cpp" \
    -o "${BUILD_TMP}/log.o"
 
@@ -79,16 +89,24 @@ trap 'rm -rf "${BUILD_TMP}"' EXIT
 
 "${AR}" rcs "${SHIMS_DIR}/lib/libdrm.a" \
    "${BUILD_TMP}/panthor_kbase_adapter.o" \
+   "${BUILD_TMP}/mali_kbase_caps.o" \
+   "${BUILD_TMP}/panthor_drm_capture_replay.o" \
    "${BUILD_TMP}/log.o" \
    "${BUILD_TMP}/drm_mode_stubs.o"
+cp -f "${SHIMS_DIR}/lib/libdrm.a" "${SHIMS_DIR}/libdrm.a"
 
 "${AR}" rcs "${SHIMS_DIR}/lib/libpanthor_kbase_adapter.a" \
    "${BUILD_TMP}/panthor_kbase_adapter.o" \
+   "${BUILD_TMP}/mali_kbase_caps.o" \
+   "${BUILD_TMP}/panthor_drm_capture_replay.o" \
    "${BUILD_TMP}/log.o" \
    "${BUILD_TMP}/drm_mode_stubs.o"
+cp -f "${SHIMS_DIR}/lib/libpanthor_kbase_adapter.a" "${SHIMS_DIR}/libpanthor_kbase_adapter.a"
 
 "${CXX}" -shared -O2 -fPIC -fno-emulated-tls -fno-exceptions -static-libstdc++ -Wl,-z,nodelete \
    "${BUILD_TMP}/panthor_kbase_adapter.o" \
+   "${BUILD_TMP}/mali_kbase_caps.o" \
+   "${BUILD_TMP}/panthor_drm_capture_replay.o" \
    "${BUILD_TMP}/log.o" \
    "${BUILD_TMP}/drm_mode_stubs.o" \
    -ldl -llog -lm \
