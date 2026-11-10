@@ -148,25 +148,6 @@ add_custom_command(TARGET drm_shim POST_BUILD
 # -----------------------------------------------------------------------------
 # 3. User-Space /dev/mali0 Kbase CSF & Valhall ISA Emulator (Shared & Static)
 # -----------------------------------------------------------------------------
-add_custom_command(
-   OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.ll"
-          "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.h"
-          "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.c"
-   COMMAND $<TARGET_FILE:horizon2llvm> --lift-ko-dual
-           "${CMAKE_CURRENT_SOURCE_DIR}/kernel/mali_kbase_mt6878_r44p1.ko"
-           "${CMAKE_CURRENT_SOURCE_DIR}/kernel/mali_kbase_husky_r54p1.ko"
-           "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.h"
-           "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.c"
-           --out-ir "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.ll"
-           --out-obj-x86 "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko_x86_64.o"
-           --out-obj-arm64 ""
-   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-   DEPENDS horizon2llvm
-           "${CMAKE_CURRENT_SOURCE_DIR}/kernel/mali_kbase_mt6878_r44p1.ko"
-           "${CMAKE_CURRENT_SOURCE_DIR}/kernel/mali_kbase_husky_r54p1.ko"
-   COMMENT "Lifting kernel modules -> lifted_kbase_ko.ll via horizon2llvm"
-)
-
 if(NOT ANDROID)
    file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/bin")
    add_executable(horizon2llvm
@@ -201,6 +182,25 @@ if(NOT ANDROID)
    endif()
    target_link_libraries(horizon2llvm PRIVATE dl ${PLATFORM_LIBS})
    target_copy_to_source_tree(horizon2llvm "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/bin/horizon2llvm")
+
+   add_custom_command(
+      OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.ll"
+             "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.h"
+             "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.c"
+      COMMAND $<TARGET_FILE:horizon2llvm> --lift-ko-dual
+              "${CMAKE_CURRENT_SOURCE_DIR}/kernel/mali_kbase_mt6878_r44p1.ko"
+              "${CMAKE_CURRENT_SOURCE_DIR}/kernel/mali_kbase_husky_r54p1.ko"
+              "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.h"
+              "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.c"
+              --out-ir "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.ll"
+              --out-obj-x86 "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko_x86_64.o"
+              --out-obj-arm64 ""
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+      DEPENDS horizon2llvm
+              "${CMAKE_CURRENT_SOURCE_DIR}/kernel/mali_kbase_mt6878_r44p1.ko"
+              "${CMAKE_CURRENT_SOURCE_DIR}/kernel/mali_kbase_husky_r54p1.ko"
+      COMMENT "Lifting kernel modules -> lifted_kbase_ko.ll via horizon2llvm"
+   )
 endif()
 
 if(ANDROID)

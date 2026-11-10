@@ -93,6 +93,8 @@ jobs:
 
       - name: Build C++ Adapter & Verification Tooling via CMake (Host & Android NDK)
         run: |
+          ls -lh /usr/lib/llvm-*/lib/libLLVM*.so*
+          ls -lh /usr/lib/x86_64-linux-gnu/libLLVM*
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
           cmake -B build-x86-64 -G Ninja -DPANTHOR_KBASE_BUILD_TESTS=ON
           cmake --build build-x86-64

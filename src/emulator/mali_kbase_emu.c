@@ -2080,49 +2080,94 @@ int munmap(void *addr, size_t length)
    return orig_munmap(addr, length);
 }
 
-
 __attribute__((visibility("default")))
 int mali_kbase_emu_export_trace_json(const char *path)
 {
-   if (!path)
+   if (!path || !path[0] || g_trace_count == 0)
       return -1;
    FILE *fp = fopen(path, "w");
    if (!fp)
       return -1;
-   fprintf(fp, "{\n");
-   fprintf(fp, "  \"device\": \"Mali-G615 MC2 (arch=11, gpu_id=0xb8031030, kbase=1.21)\",\n");
-   fprintf(fp, "  \"event_count\": %u,\n", g_trace_count);
-   fprintf(fp, "  \"events\": [\n");
+
+   bool is_jsonl = (strstr(path, ".jsonl") != NULL);
+
+   if (!is_jsonl) {
+      fprintf(fp, "{\n");
+      fprintf(fp, "  \"device\": \"Mali-G615 MC2 (arch=11, gpu_id=0xb8031030, kbase=1.21)\",\n");
+      fprintf(fp, "  \"event_count\": %u,\n", g_trace_count);
+      fprintf(fp, "  \"events\": [\n");
+   }
+
    for (uint32_t i = 0; i < g_trace_count; i++) {
       const struct kbase_emu_trace_event *e = &g_trace[i];
-      fprintf(fp,
-              "    {\"seq\": %u, \"op\": \"%s\", \"cmd\": \"0x%lx\", "
-              "\"va_pages\": %llu, \"commit_pages\": %llu, \"extension\": %llu, "
-              "\"flags\": \"0x%llx\", \"fixed_address\": \"0x%llx\", \"out_va\": \"0x%llx\", "
-              "\"mmap_offset\": \"0x%llx\", \"mmap_len\": %llu, "
-              "\"buffer_size\": %u, \"buffer_gpu_addr\": \"0x%llx\", "
-              "\"chunk_size\": %u, \"initial_chunks\": %u, \"max_chunks\": %u, "
-              "\"ret\": %d, \"errno\": %d}%s\n",
-              i, e->op, e->cmd,
-              (unsigned long long)e->va_pages,
-              (unsigned long long)e->commit_pages,
-              (unsigned long long)e->extension,
-              (unsigned long long)e->flags,
-              (unsigned long long)e->fixed_address,
-              (unsigned long long)e->out_va,
-              (unsigned long long)e->mmap_offset,
-              (unsigned long long)e->mmap_len,
-              e->buffer_size,
-              (unsigned long long)e->buffer_gpu_addr,
-              e->chunk_size, e->initial_chunks, e->max_chunks,
-              e->ret, e->err,
-              (i + 1 < g_trace_count) ? "," : "");
+
+      if (is_jsonl) {
+         fprintf(fp,
+                 "{\"seq\":%u,\"op\":\"%s\",\"cmd\":\"0x%lx\","
+                 "\"va_pages\":%llu,\"commit_pages\":%llu,\"flags\":\"0x%llx\","
+                 "\"out_va\":\"0x%llx\",\"buffer_size\":%u,\"buffer_gpu_addr\":\"0x%llx\","
+                 "\"ret\":%d,\"errno\":%d}\n",
+                 i, e->op, e->cmd,
+                 (unsigned long long)e->va_pages,
+                 (unsigned long long)e->commit_pages,
+                 (unsigned long long)e->flags,
+                 (unsigned long long)e->out_va,
+                 e->buffer_size,
+                 (unsigned long long)e->buffer_gpu_addr,
+                 e->ret, e->err);
+      } else {
+         fprintf(fp,
+                 "    {\"seq\": %u, \"op\": \"%s\", \"cmd\": \"0x%lx\", "
+                 "\"va_pages\": %llu, \"commit_pages\": %llu, \"extension\": %llu, "
+                 "\"flags\": \"0x%llx\", \"fixed_address\": \"0x%llx\", \"out_va\": \"0x%llx\", "
+                 "\"mmap_offset\": \"0x%llx\", \"mmap_len\": %llu, "
+                 "\"buffer_size\": %u, \"buffer_gpu_addr\": \"0x%llx\", "
+                 "\"chunk_size\": %u, \"initial_chunks\": %u, \"max_chunks\": %u, "
+                 "\"ret\": %d, \"errno\": %d}%s\n",
+                 i, e->op, e->cmd,
+                 (unsigned long long)e->va_pages,
+                 (unsigned long long)e->commit_pages,
+                 (unsigned long long)e->extension,
+                 (unsigned long long)e->flags,
+                 (unsigned long long)e->fixed_address,
+                 (unsigned long long)e->out_va,
+                 (unsigned long long)e->mmap_offset,
+                 (unsigned long long)e->mmap_len,
+                 e->buffer_size,
+                 (unsigned long long)e->buffer_gpu_addr,
+                 e->chunk_size, e->initial_chunks, e->max_chunks,
+                 e->ret, e->err,
+                 (i + 1 < g_trace_count) ? "," : "");
+      }
    }
-   fprintf(fp, "  ]\n}\n");
+
+   if (!is_jsonl) {
+      fprintf(fp, "  ]\n}\n");
+   }
+
    fclose(fp);
    return 0;
 }
 
+__attribute__((destructor))
+static void mali_kbase_emu_auto_dump_trace_on_exit(void)
+{
+   static bool s_already_dumped = false;
+   if (s_already_dumped)
+      return;
+
+   const char *out_path = getenv("MALI_UAPI_TRACE_OUT");
+   if (!out_path || !out_path[0])
+      out_path = getenv("KBASE_EMU_TRACE_OUT");
+
+   if (out_path && out_path[0] && g_trace_count > 0) {
+      s_already_dumped = true;
+      if (mali_kbase_emu_export_trace_json(out_path) == 0) {
+         fprintf(stderr, "[mali_kbase_emu] Dumped %u UAPI trace events to %s\n",
+                 g_trace_count, out_path);
+      }
+   }
+}
 
 /* Direct C API for AOT-translated libGLES_mali.so & r54p3_vulkan_icd integration */
 __attribute__((visibility("default")))

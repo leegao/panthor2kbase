@@ -17,7 +17,7 @@ Per Doc 53 and doco.1txF5t3FgEjpV6xYe0pcEg:
      wrapping `mali_csffw.bin`'s exact memory sections (with `max_regs=96` at
      VA `0x0202dce4` and `max_sb=16` at VA `0x0202dcee`), executes the real
      `mali_csffw.bin` Thumb-2 opcode handlers natively under
-     `predownloaded/qemu-arm-static -B 0x200000000`, and proves bit-exact register
+     `kernel/qemu-arm-static -B 0x200000000`, and proves bit-exact register
      and state equivalence against `lifted_csffw_dispatch_opcode` in `libmali_kbase_emu.so`.
   4. Emits a machine-readable formal operational semantics verification report at
      `artifacts/csffw_formal_semantics_report.json`.
@@ -170,7 +170,7 @@ def build_and_run_qemu_csffw_harness(fw: bytes, repo_root: str) -> dict:
         f.write(body)
     os.chmod(elf_path, 0o755)
 
-    qemu_bin = os.path.join(repo_root, "predownloaded", "qemu-arm-static")
+    qemu_bin = os.path.join(repo_root, "kernel", "qemu-arm-static")
     out = subprocess.check_output([qemu_bin, "-B", "0x200000000", elf_path])
     r4, r5, r6, r7 = struct.unpack("<4I", out)
     in_val64 = (r5 << 32) | r4
@@ -179,7 +179,7 @@ def build_and_run_qemu_csffw_harness(fw: bytes, repo_root: str) -> dict:
     assert in_val64 == 0x1122334455667780, f"unexpected input reg pair: {hex(in_val64)}"
     assert out_val64 == expected_val64, f"QEMU mismatch: got {hex(out_val64)} vs {hex(expected_val64)}"
     return {
-        "qemu_binary": "predownloaded/qemu-arm-static",
+        "qemu_binary": "kernel/qemu-arm-static",
         "elf_harness": "build-x86-64/csffw_qemu_runner.elf",
         "guest_base": "0x200000000",
         "input_reg4_5": f"0x{in_val64:016x}",
@@ -191,7 +191,7 @@ def build_and_run_qemu_csffw_harness(fw: bytes, repo_root: str) -> dict:
 
 def main() -> int:
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    fw_path = os.path.join(repo_root, "predownloaded", "mali_csffw.bin")
+    fw_path = os.path.join(repo_root, "kernel", "mali_csffw.bin")
     with open(fw_path, "rb") as f:
         fw = f.read()
 

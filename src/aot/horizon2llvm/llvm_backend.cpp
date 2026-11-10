@@ -33,6 +33,12 @@ LibLLVM& LibLLVM::instance() {
 LibLLVM::LibLLVM() {
     const char* cands[] = {
         std::getenv("MALI_HOST_LIBLLVM"),
+        "/usr/lib/x86_64-linux-gnu/libLLVM.so.22.1",
+        "/usr/lib/x86_64-linux-gnu/libLLVM-21.so.1",
+        "/usr/lib/x86_64-linux-gnu/libLLVM.so.21.1",
+        "/usr/lib/x86_64-linux-gnu/libLLVM-20.so.1",
+        "/usr/lib/x86_64-linux-gnu/libLLVM.so.20.1",
+        "/usr/lib/x86_64-linux-gnu/libLLVM-19.so.1",
         "/usr/lib/x86_64-linux-gnu/libLLVM-18.so.1",
         "/usr/lib/x86_64-linux-gnu/libLLVM-17.so.1",
         "/usr/lib/x86_64-linux-gnu/libLLVM-16.so.1",
