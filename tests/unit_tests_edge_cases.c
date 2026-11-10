@@ -1690,9 +1690,9 @@ static void test_v26_csffw_lifting_qemu_and_pruned_indirect_dispatch(void)
 {
    printf("[Unit Test 19] Verifying Checkpoint v26 mali_csffw.bin binary parser, ARMv7-M Thumb-2 lifted CSF opcode semantics, QEMU equivalence, and pruned indirect_br_dispatch tables in lifted_kbase_ko.ll...\n");
 
-   /* 1. Parse and verify predownloaded/mali_csffw.bin (Doc 53) */
+   /* 1. Parse and verify kernel/mali_csffw.bin (Doc 53) */
    struct csffw_parsed_image img;
-   assert(csffw_parse_binary_file("predownloaded/mali_csffw.bin", &img));
+   assert(csffw_parse_binary_file("kernel/mali_csffw.bin", &img));
    assert(img.valid);
    assert(img.magic == CSFFW_BIN_MAGIC);
    assert(img.ver_major == 0U && img.ver_minor == 3U);

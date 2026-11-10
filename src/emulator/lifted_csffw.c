@@ -36,6 +36,9 @@ bool csffw_parse_binary_file(const char *path, struct csffw_parsed_image *out_im
         "predownloaded/mali_csffw.bin",
         "../predownloaded/mali_csffw.bin",
         "../../predownloaded/mali_csffw.bin",
+        "kernel/mali_csffw.bin",
+        "../kernel/mali_csffw.bin",
+        "../../kernel/mali_csffw.bin",
         "mali_csffw.bin",
         NULL
     };

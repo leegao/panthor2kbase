@@ -11,7 +11,7 @@ Supports:
   2. Full Mode (--full / default):
      Generates a standalone repository package (<100 MB for sandbox sharing) including
      kernel modules (kernel/mali_kbase_mt6878_r44p1.ko, kernel/mali_kbase_husky_r54p1.ko),
-     firmware (predownloaded/mali_csffw.bin), qemu-arm-static, shims/lib/libdrm.a,
+     firmware (kernel/mali_csffw.bin), qemu-arm-static, shims/lib/libdrm.a,
      all tests, and the complete mesa_overlay/ tree, while excluding the 1+ GB upstream mesa/ checkout,
      .git, .cache, and build directories.
 """

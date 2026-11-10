@@ -5,7 +5,7 @@ Disassembly, QEMU-ARM-Static Execution & Formal Operational Semantics Verifier
 (src/verifier/csffw_formal_semantics_verifier.py)
 
 Per Doc 53 and doco.1txF5t3FgEjpV6xYe0pcEg:
-  1. Parses `predownloaded/mali_csffw.bin` (magic 0xC3F13A6E, version 0.3, 968-byte
+  1. Parses `kernel/mali_csffw.bin` (magic 0xC3F13A6E, version 0.3, 968-byte
      header, 27 entries, 8 IFACE virtual memory sections, 167 FUNC_LIST tracepoint
      call sites across 25 timeline emitters, and the 129-entry 64-bit CSF opcode
      dispatch table `g_csffw_opcode_table` at VA 0x004100BC / file offset 0x00125C).
@@ -206,7 +206,7 @@ def main() -> int:
     qemu_res = build_and_run_qemu_csffw_harness(fw, repo_root)
 
     report = {
-        "firmware_file": "predownloaded/mali_csffw.bin",
+        "firmware_file": "kernel/mali_csffw.bin",
         "file_size_bytes": len(fw),
         "magic": f"0x{magic:08x}",
         "version": f"{major}.{minor}",
