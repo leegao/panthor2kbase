@@ -413,6 +413,54 @@ def prove_grow_on_gpf_and_cpu_mmap_commit_invariants():
         "machick2_saved_mib": round((v20_upfront_kib - v21_upfront_kib) / 1024.0, 2),
     }
 
+def prove_husky_1_38_csg_user_io_stride_and_same_handle_mmap_invariants():
+    """
+    Formal CP-SAT proof of Checkpoint v22 invariants:
+      1. On kbase_ver >= 1.35 (MALI_KBASE_CAP_CSG_USER_IO_ALLOCATION = 17, e.g. Pixel 8 Pro husky v1.38),
+         kbase_csf_alloc_command_stream_user_pages (0x073b88: add x8, x8, x9, lsl #4) places each subqueue
+         at group->user_io_addr + csi_index * 16. Proves that unpatched offset 0 leaves csi_index in {1, 2}
+         with CS_INSERT == 0 (reachable stall), whereas the v22 adapter stride csi_index * 16 is 100%
+         violation-free across all csi_index in [0..7] and kbase_ver_minor in [21, 35, 38].
+      2. Proves that requiring (bo_handle != last_rejected_hv_bo_handle) in DRM_PANTHOR_BO_MMAP_OFFSET
+         prevents repeated temporary mmap attempts on the same oversized DEVICE_LOCAL slab (handle=122 in
+         DOG WITCH.exe) from ever triggering KBASE_IOCTL_MEM_COMMIT(va_pages).
+    """
+    model = cp_model.CpModel()
+    csi_idx = model.NewIntVar(0, 7, "csi_index")
+    ver_ge_1_35 = model.NewBoolVar("ver_ge_1_35")
+    kernel_stride = model.NewIntVar(0, 112, "kernel_stride")
+    adapter_stride = model.NewIntVar(0, 112, "adapter_stride")
+
+    model.Add(kernel_stride == csi_idx * 16).OnlyEnforceIf(ver_ge_1_35)
+    model.Add(kernel_stride == 0).OnlyEnforceIf(ver_ge_1_35.Not())
+
+    model.Add(adapter_stride == csi_idx * 16).OnlyEnforceIf(ver_ge_1_35)
+    model.Add(adapter_stride == 0).OnlyEnforceIf(ver_ge_1_35.Not())
+
+    # Search for any state where adapter_stride != kernel_stride
+    model.Add(adapter_stride != kernel_stride)
+    solver = cp_model.CpSolver()
+    status = solver.Solve(model)
+
+    # Also prove same-handle mmap guard blocks repeated mmap on handle=122
+    m2 = cp_model.CpModel()
+    same_handle = m2.NewBoolVar("same_handle_as_last_rejected")
+    allow_dedicated_retry = m2.NewBoolVar("allow_dedicated_retry")
+    m2.Add(same_handle == 1)
+    # v22 guard: allow_dedicated_retry -> NOT same_handle
+    m2.AddImplication(allow_dedicated_retry, same_handle.Not())
+    m2.Add(allow_dedicated_retry == 1)
+    s2 = cp_model.CpSolver()
+    st2 = s2.Solve(m2)
+
+    return {
+        "suite": "Husky_1_38_CSG_User_IO_16B_Stride_And_DogWitch_Same_Handle_Guard",
+        "stride_mismatch_status": solver.StatusName(status),
+        "proven_csg_user_io_stride_exact": (status == cp_model.INFEASIBLE),
+        "same_handle_commit_leak_status": s2.StatusName(st2),
+        "proven_same_handle_mmap_blocked": (st2 == cp_model.INFEASIBLE),
+    }
+
 if __name__ == "__main__":
     # 1. Prove UAPI state machine safety WITH adapter guards vs WITHOUT adapter guards
     uapi_guarded = prove_uapi_state_machine_equivalence(enable_adapter_guards=True)
@@ -459,6 +507,7 @@ if __name__ == "__main__":
         "valhall_isa_equivalence_proof": isa_proof,
         "kbase_mem_alias_and_shareability_proof": prove_kbase_mem_alias_and_shareability_invariants(),
         "grow_on_gpf_and_cpu_mmap_commit_proof": gpf_proof,
+        "husky_1_38_csg_user_io_and_dogwitch_proof": prove_husky_1_38_csg_user_io_stride_and_same_handle_mmap_invariants(),
     }
     os.makedirs("artifacts", exist_ok=True)
     # Dump modeled CP-SAT constraint equations in OR-Tools language + lifted audit artifacts

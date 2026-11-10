@@ -233,7 +233,7 @@ def main():
     if args.log_file:
         return parse_winlator_log(Path(args.log_file), spec)
 
-    default_log = Path("/working_dir/c_3106ac7496559798/user_uploaded_files/ttl=63d/user_uploaded/winlator_log.txt")
+    default_log = ROOT_DIR / "winlator_log.txt"
     if default_log.exists():
         return parse_winlator_log(default_log, spec)
 

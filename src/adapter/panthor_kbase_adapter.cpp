@@ -57,6 +57,7 @@
 
 #include "xf86drm.h"
 #include "panthor_kbase_adapter.h"
+#include "mali_kbase_caps.h"
 #include "panthor_drm_capture_replay.h"
 #include "log.h"
 
@@ -367,6 +368,10 @@ struct adapter_ctx {
    uint64_t mem_commit_upgrades;
    uint64_t hv_chunk_stepdowns;
    uint64_t last_rejected_hv_bo_size;
+   uint32_t last_rejected_hv_bo_handle;
+   uint64_t last_rejected_dl_bo_size;
+   uint64_t dl_chunk_stepdowns;
+   uint64_t last_stall_dump_ns;
    uint64_t consecutive_poll_ioctls;
    uint64_t suppressed_poll_ioctls;
    uint64_t total_syncobj_waits;
@@ -390,6 +395,22 @@ struct adapter_ctx {
    double   last_avg_kick_us;
    double   last_avg_sync_wait_us;
    double   last_max_sync_wait_us;
+   /* Per-frame & render-pass timing profiler (doco.qJl93Qf4NSz6GSRUxbXzLA) */
+   uint64_t total_frames;
+   uint64_t last_frame_ts_ns;
+   uint64_t cur_frame_render_ns;
+   uint64_t cur_frame_wait_ns;
+   uint64_t frame_dt_ring_ns[128];
+   uint64_t frame_render_ring_ns[128];
+   uint64_t frame_wait_ring_ns[128];
+   uint32_t frame_ring_count;
+   uint32_t frame_ring_head;
+   double   last_real_fps;
+   double   last_avg_frame_ms;
+   double   last_p99_frame_ms;
+   double   last_max_frame_ms;
+   double   last_avg_render_ms;
+   double   last_avg_wait_ms;
 
    struct adapter_bo bos[ADAPTER_MAX_BOS];
    struct adapter_syncobj syncobjs[ADAPTER_MAX_SYNCOBJS];
@@ -424,7 +445,73 @@ static bool is_single_csg_enabled(uint32_t arch_major)
     *    BASE_CSF_TILER_OOM_EXCEPTION_FLAG so hardware MALI_CS_SYNC_SCOPE_CSG
     *    and the FRAG TILER_OOM exception handler work seamlessly.
     */
+   if (g_ctx.kbase_ver_major > 1U || (g_ctx.kbase_ver_major == 1U && g_ctx.kbase_ver_minor >= 35U))
+      return true;
    return (arch_major >= 11 && arch_major <= 13);
+}
+
+static bool has_active_shared_csg_locked()
+{
+   if (!g_ctx.active)
+      return false;
+   if (g_ctx.kbase_ver_major > 1U || (g_ctx.kbase_ver_major == 1U && g_ctx.kbase_ver_minor >= 35U))
+      return true;
+   for (size_t g = 0; g < ADAPTER_MAX_GROUPS; g++) {
+      if (g_ctx.groups[g].in_use && g_ctx.groups[g].single_csg_mode)
+         return true;
+   }
+   return false;
+}
+
+static void record_frame_boundary_locked(uint64_t now_ns)
+{
+   if (g_ctx.last_frame_ts_ns != 0ULL && now_ns >= g_ctx.last_frame_ts_ns) {
+      uint64_t dt_ns = now_ns - g_ctx.last_frame_ts_ns;
+      uint32_t idx = g_ctx.frame_ring_head % 128U;
+      g_ctx.frame_dt_ring_ns[idx]     = dt_ns;
+      g_ctx.frame_render_ring_ns[idx] = g_ctx.cur_frame_render_ns;
+      g_ctx.frame_wait_ring_ns[idx]   = g_ctx.cur_frame_wait_ns;
+      g_ctx.frame_ring_head++;
+      if (g_ctx.frame_ring_count < 128U)
+         g_ctx.frame_ring_count++;
+      g_ctx.total_frames++;
+
+      uint32_t n = g_ctx.frame_ring_count;
+      uint64_t sorted_dt[128];
+      uint64_t sum_dt = 0ULL, max_dt = 0ULL, sum_ren = 0ULL, sum_wt = 0ULL;
+      for (uint32_t i = 0; i < n; i++) {
+         uint64_t d = g_ctx.frame_dt_ring_ns[i];
+         sorted_dt[i] = d;
+         sum_dt  += d;
+         sum_ren += g_ctx.frame_render_ring_ns[i];
+         sum_wt  += g_ctx.frame_wait_ring_ns[i];
+         if (d > max_dt)
+            max_dt = d;
+      }
+      for (uint32_t i = 1; i < n; i++) {
+         uint64_t key = sorted_dt[i];
+         int j = static_cast<int>(i) - 1;
+         while (j >= 0 && sorted_dt[j] > key) {
+            sorted_dt[j + 1] = sorted_dt[j];
+            j--;
+         }
+         sorted_dt[j + 1] = key;
+      }
+      uint32_t p99_idx = (n > 1U) ? ((n * 99U) / 100U) : 0U;
+      if (p99_idx >= n)
+         p99_idx = n - 1U;
+      g_ctx.last_avg_frame_ms  = (static_cast<double>(sum_dt) / static_cast<double>(n)) / 1e6;
+      g_ctx.last_p99_frame_ms  = static_cast<double>(sorted_dt[p99_idx]) / 1e6;
+      g_ctx.last_max_frame_ms  = static_cast<double>(max_dt) / 1e6;
+      g_ctx.last_avg_render_ms = (static_cast<double>(sum_ren) / static_cast<double>(n)) / 1e6;
+      g_ctx.last_avg_wait_ms   = (static_cast<double>(sum_wt) / static_cast<double>(n)) / 1e6;
+      g_ctx.last_real_fps      = (g_ctx.last_avg_frame_ms > 1e-6)
+                                    ? (1000.0 / g_ctx.last_avg_frame_ms)
+                                    : 0.0;
+   }
+   g_ctx.last_frame_ts_ns    = now_ns;
+   g_ctx.cur_frame_render_ns = 0ULL;
+   g_ctx.cur_frame_wait_ns   = 0ULL;
 }
 
 static void register_virtual_fd_locked(int fd)
@@ -588,8 +675,7 @@ static int alloc_kbase_mem(int mali_fd,
    /* Strip any kernel-only bits (0xa0) defensively */
    in_flags &= ~BASEP_MEM_FLAGS_KERNEL_ONLY;
 
-   if (g_ctx.kbase_ver_major > 1 ||
-       (g_ctx.kbase_ver_major == 1 && g_ctx.kbase_ver_minor >= 9)) {
+   if (mali_kbase_supports_mem_alloc_ex(mali_kbase_make_api_version(g_ctx.kbase_ver_major, g_ctx.kbase_ver_minor))) {
       union kbase_ioctl_mem_alloc_ex req_ex;
       memset(&req_ex, 0, sizeof(req_ex));
       req_ex.in.va_pages = va_pages;
@@ -648,6 +734,7 @@ static void apply_panvk_lowmem_env_defaults()
     * system reserve so DXVK compacts & returns idle chunks before kswapd/LMK triggers. */
    setenv("PANVK_MEM_BUDGET_PRESSURE", "1", 0);
    setenv("PANVK_MEM_BUDGET_RESERVE_MB", "1024", 0);
+   setenv("PANVK_MAX_HEAP_MB", "900", 0);
    setenv("PANVK_CMD_SLAB_CACHE", "1", 0);
    setenv("PANVK_CS_CHUNK_KB", "4", 0);
 }
@@ -1351,6 +1438,24 @@ static int create_kbase_csg_with_fallback(uint64_t tiler_mask,
             return 0;
          }
 
+         union kbase_ioctl_cs_queue_group_create_56 csg56;
+         memset(&csg56, 0, sizeof(csg56));
+         csg56.in.tiler_mask = tiler_mask;
+         csg56.in.fragment_mask = fragment_mask;
+         csg56.in.compute_mask = compute_mask;
+         csg56.in.cs_min = cs_min;
+         csg56.in.priority = prio;
+         csg56.in.tiler_max = tiler_max;
+         csg56.in.fragment_max = fragment_max;
+         csg56.in.compute_max = compute_max;
+         csg56.in.csi_handlers = csi_handlers;
+         if (adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE, &csg56) == 0) {
+            *out_group_handle = csg56.out.group_handle;
+            if (out_layout)
+               *out_layout = 56U;
+            return 0;
+         }
+
          union kbase_ioctl_cs_queue_group_create_112 csg112;
          memset(&csg112, 0, sizeof(csg112));
          csg112.in.tiler_mask = tiler_mask;
@@ -1388,6 +1493,48 @@ static int create_kbase_csg_with_fallback(uint64_t tiler_mask,
       }
    }
    return -1;
+}
+
+static inline bool is_kbase_csg_user_io_stride_1_35_locked()
+{
+   const char *env = getenv("PANTHOR_ADAPTER_CSG_USER_IO_STRIDE");
+   if (env && env[0])
+      return atoi(env) != 0;
+   return mali_kbase_supports_csg_user_io(mali_kbase_make_api_version(g_ctx.kbase_ver_major, g_ctx.kbase_ver_minor));
+}
+
+static inline size_t subqueue_user_io_csi_byte_offset(const struct adapter_subqueue *sq)
+{
+   if (!sq || !is_kbase_csg_user_io_stride_1_35_locked())
+      return 0U;
+   return static_cast<size_t>(sq->csi_index) * CS_USER_IO_CSI_STRIDE_1_35;
+}
+
+static inline volatile uint64_t *subqueue_user_io_input_u64(const struct adapter_subqueue *sq)
+{
+   if (!sq || !sq->user_io_ptr)
+      return nullptr;
+   return reinterpret_cast<volatile uint64_t *>(
+      static_cast<uint8_t *>(sq->user_io_ptr) + CS_USER_IO_INPUT_PAGE_OFFSET +
+      subqueue_user_io_csi_byte_offset(sq));
+}
+
+static inline const volatile uint64_t *subqueue_user_io_output_u64(const struct adapter_subqueue *sq)
+{
+   if (!sq || !sq->user_io_ptr)
+      return nullptr;
+   return reinterpret_cast<const volatile uint64_t *>(
+      static_cast<const uint8_t *>(sq->user_io_ptr) + CS_USER_IO_OUTPUT_PAGE_OFFSET +
+      subqueue_user_io_csi_byte_offset(sq));
+}
+
+static inline const volatile uint32_t *subqueue_user_io_output_u32(const struct adapter_subqueue *sq)
+{
+   if (!sq || !sq->user_io_ptr)
+      return nullptr;
+   return reinterpret_cast<const volatile uint32_t *>(
+      static_cast<const uint8_t *>(sq->user_io_ptr) + CS_USER_IO_OUTPUT_PAGE_OFFSET +
+      subqueue_user_io_csi_byte_offset(sq));
 }
 
 } /* anonymous namespace */
@@ -1480,24 +1627,25 @@ void panthor_kbase_dump_csf_diagnostics(const char *reason)
          uint32_t heap_vt_start = 0, heap_vt_end = 0, heap_frag_end = 0;
 
          if (sq->user_io_ptr) {
-            const auto *in_u64 = reinterpret_cast<const volatile uint64_t *>(
-               static_cast<const uint8_t *>(sq->user_io_ptr) + CS_USER_IO_INPUT_PAGE_OFFSET);
-            const auto *out_u64 = reinterpret_cast<const volatile uint64_t *>(
+            const auto *in_u64 = subqueue_user_io_input_u64(sq);
+            const auto *out_u64 = subqueue_user_io_output_u64(sq);
+            const auto *out_u32 = subqueue_user_io_output_u32(sq);
+            const auto *base_out_u64 = reinterpret_cast<const volatile uint64_t *>(
                static_cast<const uint8_t *>(sq->user_io_ptr) + CS_USER_IO_OUTPUT_PAGE_OFFSET);
-            const auto *out_u32 = reinterpret_cast<const volatile uint32_t *>(
+            const auto *base_out_u32 = reinterpret_cast<const volatile uint32_t *>(
                static_cast<const uint8_t *>(sq->user_io_ptr) + CS_USER_IO_OUTPUT_PAGE_OFFSET);
 
             cs_insert       = in_u64[0];
             cs_extract_init = in_u64[1];
             cs_extract      = out_u64[0];
             cs_active       = out_u32[2];
-            cs_fault        = out_u32[0x80 / 4];
-            cs_fatal        = out_u32[0x84 / 4];
-            cs_fault_info   = out_u64[0x88 / 8];
-            cs_fatal_info   = out_u64[0x90 / 8];
-            heap_vt_start   = out_u32[0xc0 / 4];
-            heap_vt_end     = out_u32[0xc4 / 4];
-            heap_frag_end   = out_u32[0xcc / 4];
+            cs_fault        = base_out_u32[0x80 / 4];
+            cs_fatal        = base_out_u32[0x84 / 4];
+            cs_fault_info   = base_out_u64[0x88 / 8];
+            cs_fatal_info   = base_out_u64[0x90 / 8];
+            heap_vt_start   = base_out_u32[0xc0 / 4];
+            heap_vt_end     = base_out_u32[0xc4 / 4];
+            heap_frag_end   = base_out_u32[0xcc / 4];
          }
 
          uint64_t seqno_val = 0, seqno_err = 0, ls_copy = 0;
@@ -1682,7 +1830,8 @@ void panthor_kbase_dump_csf_diagnostics(const char *reason)
                      shadow_regs[creg + 1] = sq->cached_subq_ctx_va >> 32;
                   }
                }
-               for (uint32_t idx = 0; idx < n_insns && idx < 256; idx++) {
+               uint32_t max_dis_insns = (reason && strstr(reason, "stall threshold") != nullptr) ? 32U : 256U;
+               for (uint32_t idx = 0; idx < n_insns && idx < max_dis_insns; idx++) {
                   uint64_t insn = cs_ptr[idx];
                   uint8_t op = static_cast<uint8_t>((insn >> 56) & 0xffU);
                   char dis[160];
@@ -1801,6 +1950,13 @@ void panthor_kbase_get_telemetry_snapshot(struct adapter_telemetry_snapshot *out
    out->avg_kick_us              = g_ctx.last_avg_kick_us;
    out->avg_sync_wait_us         = g_ctx.last_avg_sync_wait_us;
    out->max_sync_wait_us         = g_ctx.last_max_sync_wait_us;
+   out->total_frames             = g_ctx.total_frames;
+   out->real_fps                 = g_ctx.last_real_fps;
+   out->avg_frame_ms             = g_ctx.last_avg_frame_ms;
+   out->p99_frame_ms             = g_ctx.last_p99_frame_ms;
+   out->max_frame_ms             = g_ctx.last_max_frame_ms;
+   out->avg_render_ms            = g_ctx.last_avg_render_ms;
+   out->avg_wait_ms              = g_ctx.last_avg_wait_ms;
 
    size_t bo_limit = g_ctx.max_bo_slot_used ? g_ctx.max_bo_slot_used : ADAPTER_MAX_BOS;
    if (bo_limit > ADAPTER_MAX_BOS)
@@ -1836,6 +1992,13 @@ void panthor_kbase_get_telemetry_snapshot(struct adapter_telemetry_snapshot *out
             out->completed_subqueue_seqno[q] = *sq->seqno_cpu_ptr;
       }
    }
+   pthread_mutex_unlock(&g_lock);
+}
+
+void panthor_kbase_mark_frame_boundary(void)
+{
+   pthread_mutex_lock(&g_lock);
+   record_frame_boundary_locked(get_monotonic_ns());
    pthread_mutex_unlock(&g_lock);
 }
 
@@ -1994,8 +2157,7 @@ void panthor_kbase_normalize_cs_stream(uint64_t *stream_cpu,
          uint64_t hw_scope = sync_f.scope;
          const char *force_sys_env = getenv("PANTHOR_ADAPTER_FORCE_SYSTEM_SCOPE");
          bool force_sys = (force_sys_env && force_sys_env[0] && atoi(force_sys_env) != 0);
-         bool keep_csg_scope = (!force_sys && g_ctx.active && g_ctx.groups[0].in_use &&
-                                g_ctx.groups[0].single_csg_mode);
+         bool keep_csg_scope = (!force_sys && has_active_shared_csg_locked());
          if (keep_csg_scope) {
             /*
              * On non-coherent MT6878 (system_coherency = COHERENCY_NONE), dev->mempools.rw
@@ -2474,6 +2636,48 @@ int panthor_kbase_adapter_close(int fd)
          if (g_ctx.has_kcpu_queue) {
             struct kbase_ioctl_kcpu_queue_delete del = { .id = g_ctx.kcpu_queue_id, .padding = {0} };
             adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_KCPU_QUEUE_DELETE, &del);
+         }
+         /* Explicitly unmap all subqueue USER_IO & ringbuffer VMAs and terminate all CSGs and
+          * tiler heaps before closing mali_fd! In Linux mm/mmap.c, every active VMA holds a
+          * vma->vm_file reference (f_count > 0) that prevents kbase_release() from executing
+          * on close(mali_fd) and keeps the Mali CSF MCU & GED power domain awake on idle! */
+         for (size_t g_i = 0; g_i < ADAPTER_MAX_GROUPS; g_i++) {
+            struct adapter_group *grp = &g_ctx.groups[g_i];
+            if (!grp->in_use)
+               continue;
+            for (uint32_t q = 0; q < grp->queue_count && q < ADAPTER_MAX_SUBQUEUES; q++) {
+               struct adapter_subqueue *sq = &grp->subqueues[q];
+               if (sq->bound) {
+                  if (sq->user_io_ptr) {
+                     void *uptr = sq->user_io_ptr;
+                     real_munmap(uptr, 3 * 4096);
+                     for (uint32_t q2 = q; q2 < grp->queue_count && q2 < ADAPTER_MAX_SUBQUEUES; q2++) {
+                        if (grp->subqueues[q2].user_io_ptr == uptr)
+                           grp->subqueues[q2].user_io_ptr = nullptr;
+                     }
+                  }
+                  struct kbase_ioctl_cs_queue_terminate qt = { .buffer_gpu_addr = sq->ring_gpu_va };
+                  adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_TERMINATE, &qt);
+                  if (sq->ring_cpu_ptr) {
+                     real_munmap(sq->ring_cpu_ptr, sq->ring_alloc_size ? sq->ring_alloc_size : sq->ringbuf_size);
+                     sq->ring_cpu_ptr = nullptr;
+                  }
+                  if (sq->kbase_group_handle != 0 && sq->kbase_group_handle != grp->kbase_group_handle) {
+                     struct kbase_ioctl_cs_queue_group_term sgt = { .group_handle = sq->kbase_group_handle, .padding = {0} };
+                     adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_GROUP_TERMINATE, &sgt);
+                  }
+               }
+            }
+            struct kbase_ioctl_cs_queue_group_term gt = { .group_handle = grp->kbase_group_handle, .padding = {0} };
+            adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_GROUP_TERMINATE, &gt);
+            memset(grp, 0, sizeof(*grp));
+         }
+         for (size_t h_i = 0; h_i < ADAPTER_MAX_HEAPS; h_i++) {
+            if (g_ctx.heaps[h_i].in_use) {
+               struct kbase_ioctl_cs_tiler_heap_term ht = { .gpu_heap_va = g_ctx.heaps[h_i].gpu_heap_va };
+               adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_TILER_HEAP_TERM, &ht);
+               memset(&g_ctx.heaps[h_i], 0, sizeof(g_ctx.heaps[h_i]));
+            }
          }
          size_t bo_lim = g_ctx.max_bo_slot_used ? g_ctx.max_bo_slot_used : ADAPTER_MAX_BOS;
          if (bo_lim > ADAPTER_MAX_BOS)
@@ -3172,16 +3376,20 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             }
 
             /* Configurable stall diagnostic threshold via PANTHOR_ADAPTER_STALL_DUMP_MS
-             * (default 100 ms; 0 disables periodic stall dumps). */
+             * (default 500 ms; 0 disables periodic stall dumps) with a 5-second global
+             * cooldown on non-fatal dumps so transient Android kswapd stalls never cascade! */
             static uint64_t stall_dump_ns = UINT64_MAX;
             if (stall_dump_ns == UINT64_MAX) {
                const char *s_env = getenv("PANTHOR_ADAPTER_STALL_DUMP_MS");
-               uint64_t ms = (s_env && *s_env) ? strtoull(s_env, nullptr, 0) : 100ULL;
+               uint64_t ms = (s_env && *s_env) ? strtoull(s_env, nullptr, 0) : 500ULL;
                stall_dump_ns = ms * 1000000ULL;
             }
             uint64_t eff_stall_ns = (stall_dump_count == 0U) ? stall_dump_ns : (stall_dump_ns * 10ULL);
-            if (grp && stall_dump_ns > 0ULL && stall_dump_count < 2U && (now_ns - last_diag_ns >= eff_stall_ns)) {
+            if (grp && stall_dump_ns > 0ULL && stall_dump_count < 1U &&
+                (now_ns - last_diag_ns >= eff_stall_ns) &&
+                (g_ctx.last_stall_dump_ns == 0ULL || now_ns - g_ctx.last_stall_dump_ns >= 5000000000ULL)) {
                last_diag_ns = now_ns;
+               g_ctx.last_stall_dump_ns = now_ns;
                stall_dump_count++;
                dumped_stall = true;
                pthread_mutex_unlock(&g_lock);
@@ -3234,6 +3442,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             g_ctx.fast_spin_syncobj_waits++;
          g_ctx.window_sync_waits++;
          g_ctx.window_sync_wait_ns_sum += wait_dur_ns;
+         g_ctx.cur_frame_wait_ns       += wait_dur_ns;
          if (wait_dur_ns > g_ctx.window_sync_wait_ns_max)
             g_ctx.window_sync_wait_ns_max = wait_dur_ns;
       } else {
@@ -3324,11 +3533,11 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                            const_cast<uint64_t *>(sq->seqno_cpu_ptr), ADAPTER_SEQNO_CELL_STRIDE);
                         if (*sq->seqno_cpu_ptr < need) {
                            gpu_done = false;
-                           break;
+                              break;
+                           }
                         }
                      }
                   }
-               }
                if (gpu_done)
                   so->completed_value = so->value;
                points[i] = gpu_done ? so->value : so->completed_value;
@@ -3520,6 +3729,47 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       uint64_t pages = aligned_sz >> 12;
 
       bool is_exec = (kmod_flags & ADAPTER_KMOD_BO_FLAG_EXECUTABLE) != 0;
+      bool is_wb_mmap = ((bc->flags & DRM_PANTHOR_BO_WB_MMAP) != 0) ||
+                        ((kmod_flags & ADAPTER_KMOD_BO_FLAG_WB_MMAP) != 0);
+
+      /*
+       * Steer DXVK DEVICE_LOCAL sub-allocation chunks (128 MiB -> 32 MiB) when
+       * multiple large slabs are allocated or PANTHOR_ADAPTER_MAX_DEVICE_LOCAL_MB is set:
+       *  - In `dxvk_memory.cpp:344-351`, `DxvkMemoryAllocator::tryAllocFromType` loops
+       *    `for (uint32_t i = 0; i < 6 && (chunkSize >> i) >= size && !devMem.memHandle; i++)`
+       *    starting at `chunkSize = 128 MiB` for `DEVICE_LOCAL`.
+       *  - In `winlator_log.txt` (DOG WITCH.exe), DXVK allocated 16 x 128 MiB = 2,048 MiB of
+       *    `DEVICE_LOCAL` chunks whose physical pages grew via `KBASE_REG_PF_GROW` until
+       *    `MemAvailable` dropped to 51.5 MiB (`kswapd` direct-reclaim thrashing).
+       *  - Once the first large growable BO is allocated (`g_ctx.grow_on_gpf_bo_count >= 1`,
+       *    preserving single-128-MiB-BO unit tests) or `PANTHOR_ADAPTER_MAX_DEVICE_LOCAL_MB`
+       *    is explicitly set, rejecting oversized (> 32 MiB) sub-allocation chunk attempts
+       *    causes DXVK to step down `128 MiB -> 64 MiB -> 32 MiB` immediately, while allowing
+       *    dedicated > 32 MiB resources on the immediate retry (`aligned_sz == g_ctx.last_rejected_dl_bo_size`).
+       */
+      if (!is_exec && !is_wb_mmap && (kmod_flags & ADAPTER_KMOD_BO_FLAG_CSF_EVENT) == 0) {
+         const char *dl_env = getenv("PANTHOR_ADAPTER_MAX_DEVICE_LOCAL_MB");
+         uint64_t max_dl_mb = (dl_env && dl_env[0]) ? strtoull(dl_env, nullptr, 0) : 32ULL;
+         bool active_dl_steer = (dl_env && dl_env[0]) ? (max_dl_mb > 0ULL) : (g_ctx.grow_on_gpf_bo_count >= 1ULL);
+         uint64_t max_dl_bytes = max_dl_mb * 1024ULL * 1024ULL;
+         if (active_dl_steer && max_dl_bytes > 0ULL && aligned_sz > max_dl_bytes) {
+            if (aligned_sz != g_ctx.last_rejected_dl_bo_size && aligned_sz >= (128ULL << 20)) {
+               g_ctx.last_rejected_dl_bo_size = aligned_sz;
+               g_ctx.dl_chunk_stepdowns++;
+               g_ctx.hv_chunk_stepdowns++;
+               LOG_INFO("DRM_PANTHOR_BO_CREATE: steering oversized DEVICE_LOCAL chunk size=%llu MiB -> <=%llu MiB (dl_stepdown #%llu)",
+                        static_cast<unsigned long long>(aligned_sz >> 20),
+                        static_cast<unsigned long long>(max_dl_mb),
+                        static_cast<unsigned long long>(g_ctx.dl_chunk_stepdowns));
+               errno = ENOMEM;
+               ret = -1;
+               break;
+            }
+            g_ctx.last_rejected_dl_bo_size = 0;
+         } else {
+            g_ctx.last_rejected_dl_bo_size = 0;
+         }
+      }
       uint64_t kflags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
                         BASE_MEM_PROT_GPU_RD | BASE_MEM_COHERENT_LOCAL;
       if (is_exec) {
@@ -3552,6 +3802,37 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       uint64_t committed_pages = pages;
       uint64_t ext_pages = 0;
       bool used_grow_on_gpf = false;
+
+      if (!is_exec && (kmod_flags & ADAPTER_KMOD_BO_FLAG_CSF_EVENT) == 0 &&
+          aligned_sz > (16ULL << 20)) {
+         double cur_avail_mb = read_mem_available_mb();
+         uint64_t cur_va_mb = g_ctx.total_va_bo_bytes >> 20;
+         uint64_t max_dl_mb = 0ULL;
+         if (cur_avail_mb > 0.0 && cur_avail_mb < 450.0)
+            max_dl_mb = 16ULL;
+         else if (cur_va_mb >= 512ULL || (cur_avail_mb > 0.0 && cur_avail_mb < 650.0))
+            max_dl_mb = 32ULL;
+         const char *dl_env = getenv("PANTHOR_ADAPTER_MAX_BO_CHUNK_MB");
+         if (dl_env && dl_env[0])
+            max_dl_mb = strtoull(dl_env, nullptr, 0);
+         if (max_dl_mb > 0ULL && aligned_sz > (max_dl_mb << 20)) {
+            static uint64_t last_rejected_bo_create_sz = 0ULL;
+            if (aligned_sz != last_rejected_bo_create_sz) {
+               last_rejected_bo_create_sz = aligned_sz;
+               g_ctx.hv_chunk_stepdowns++;
+               LOG_INFO("DRM_PANTHOR_BO_CREATE: steering oversized chunk size=%llu MiB -> <=%llu MiB (va_mb=%llu avail_mb=%.1f stepdown #%llu)",
+                        static_cast<unsigned long long>(aligned_sz >> 20),
+                        static_cast<unsigned long long>(max_dl_mb),
+                        static_cast<unsigned long long>(cur_va_mb),
+                        cur_avail_mb,
+                        static_cast<unsigned long long>(g_ctx.hv_chunk_stepdowns));
+               errno = ENOMEM;
+               ret = -1;
+               break;
+            }
+            last_rejected_bo_create_sz = 0ULL;
+         }
+      }
 
       if (!is_exec && (kmod_flags & ADAPTER_KMOD_BO_FLAG_CSF_EVENT) != 0) {
          uint64_t ev_flags = (kflags & ~(BASE_MEM_COHERENT_LOCAL | BASE_MEM_CACHED_CPU | BASE_MEM_UNCACHED_GPU)) |
@@ -3741,11 +4022,19 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             max_hv_mb = strtoull(hv_env, nullptr, 0);
          uint64_t max_hv_bytes = max_hv_mb * 1024ULL * 1024ULL;
 
+         /* Require a newly allocated BO handle (`bo->gem_handle != g_ctx.last_rejected_hv_bo_handle`)
+          * to qualify as a dedicated DXVK retry! This prevents repeated temporary `pan_kmod_bo_mmap`
+          * calls (such as `panvk_image_plane_bind_mem` CRC zero-init on multiple images sub-allocated
+          * from the SAME 128 MiB `DEVICE_LOCAL` slab `handle=122` in `winlator_log.txt`) from
+          * mistaking the 2nd call on `handle=122` for a dedicated retry and force-committing 128 MiB! */
+         bool is_dedicated_hv_retry = (bo->size == g_ctx.last_rejected_hv_bo_size &&
+                                       bo->gem_handle != g_ctx.last_rejected_hv_bo_handle);
          if (max_hv_bytes > 0 && bo->vm_bind_count > 0 && !bo->user_mmapped &&
-             bo->size > max_hv_bytes && bo->size != g_ctx.last_rejected_hv_bo_size) {
+             bo->size > max_hv_bytes && !is_dedicated_hv_retry) {
             g_ctx.last_rejected_hv_bo_size = bo->size;
+            g_ctx.last_rejected_hv_bo_handle = bo->gem_handle;
             g_ctx.hv_chunk_stepdowns++;
-            LOG_INFO("DRM_PANTHOR_BO_MMAP_OFFSET: steering oversized HOST_VISIBLE chunk handle=%u size=%llu MiB -> <=%llu MiB (stepdown #%llu)",
+            LOG_INFO("DRM_PANTHOR_BO_MMAP_OFFSET: steering oversized HOST_VISIBLE/CRC mmap handle=%u size=%llu MiB -> <=%llu MiB (stepdown #%llu)",
                      bo->gem_handle,
                      static_cast<unsigned long long>(bo->size >> 20),
                      static_cast<unsigned long long>(max_hv_mb),
@@ -3755,6 +4044,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             break;
          }
          g_ctx.last_rejected_hv_bo_size = 0;
+         g_ctx.last_rejected_hv_bo_handle = 0;
 
          if (ensure_bo_committed_locked(bo, "DRM_PANTHOR_BO_MMAP_OFFSET") < 0) {
             errno = ENOMEM;
@@ -4221,6 +4511,10 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          }
          sq->user_io_ptr = uio;
          sq->bound = true;
+         if (volatile uint64_t *init_in = subqueue_user_io_input_u64(sq)) {
+            init_in[0] = 0ULL;
+            init_in[1] = 0ULL;
+         }
 
          /* Isolate seqno & breadcrumb cells per (g_slot, q) across all 8 groups (32 * 64B = 2048B)
           * so multi-device / multi-group apps (DOG WITCH.exe, Machick 2.exe, bcn_layer + DXVK)
@@ -4415,9 +4709,28 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          if (qs->stream_addr && qs->stream_size >= 8) {
             auto *stream_cpu = reinterpret_cast<uint64_t *>(static_cast<uintptr_t>(qs->stream_addr));
             uint32_t n_qw = qs->stream_size / sizeof(uint64_t);
+            bool bug_mode = is_bug_catching_mode_enabled();
             bool cache_hit = false;
+            bool root_has_jump = false;
+            uint32_t root_cache_slot = 0U;
+            uint64_t root_pre_hash = 0ULL;
+            if (!is_initial && !bug_mode) {
+               for (uint32_t ci = 0; ci < 32U; ci++) {
+                  const auto &ce = sq->norm_cache[ci];
+                  if (ce.va == qs->stream_addr && ce.sz == qs->stream_size) {
+                     if (root_pre_hash == 0ULL)
+                        root_pre_hash = panthor_fnv1a64_bytes(stream_cpu, qs->stream_size);
+                     if (ce.post_norm_fnv1a64 == root_pre_hash) {
+                        cache_hit = true;
+                        root_cache_slot = ci;
+                        break;
+                     }
+                  }
+               }
+            }
             {
-               panthor_kbase_normalize_cs_stream(stream_cpu, qs->stream_size, is_initial, &stats);
+               if (!cache_hit)
+                  panthor_kbase_normalize_cs_stream(stream_cpu, qs->stream_size, is_initial, &stats);
             if (is_initial && stats.extracted_subq_ctx_va) {
                sq->cached_subq_ctx_va = stats.extracted_subq_ctx_va;
                sq->cached_subq_ctx_reg = stats.extracted_subq_ctx_reg;
@@ -4493,14 +4806,6 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
              * CSF_OP_JUMP unbounded tail chain) with Full-Chunk 64-bit FNV-1a Hashing
              * (doco.DxclyE60VXtoVPV24H0N7g, doco.YWt5K_8F13z7sSe1GC0DZw, doco.HQxWytIKZO52FEwYGM2FPQ, doco.fdxkj9JdapjjMg1-Mt1DZQ). */
             {
-               bool bug_mode = is_bug_catching_mode_enabled();
-               uint64_t root_post_hash = panthor_fnv1a64_bytes(stream_cpu, qs->stream_size);
-               if (panthor_drm_capture_is_active()) {
-                  panthor_drm_capture_record_csf_chunk(
-                     grp->group_handle, qs->queue_index, 0U, 0U, 0U,
-                     qs->stream_addr, qs->stream_size, root_post_hash, root_post_hash, stream_cpu);
-               }
-
                struct cs_work_item {
                   uint64_t va;
                   uint32_t sz;
@@ -4528,25 +4833,44 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                   return false;
                };
 
-               auto scan_and_cache_edges = [&](uint64_t chunk_va, uint64_t *chunk_cpu, uint32_t chunk_sz,
-                                               uint16_t cur_call_depth, uint64_t post_hash) {
+               /* Single-pass 64-bit word-aligned FNV-1a hash + CALL/JUMP CFG edge extractor:
+                * Reads each 64-bit CSF instruction from Write-Combine (`MT_NORMAL_NC`) memory
+                * once into a CPU register to compute `post_norm_fnv1a64`, detect `CSF_OP_JUMP`,
+                * and populate `sq->norm_cache[slot_idx].edges`. */
+               auto scan_and_cache_edges_and_hash = [&](uint64_t chunk_va, uint64_t *chunk_cpu,
+                                                        uint32_t chunk_sz, uint16_t cur_call_depth,
+                                                        bool *out_has_jump) -> uint64_t {
                   uint32_t c_qwords = chunk_sz / sizeof(uint64_t);
                   uint64_t reg_file[128] = {0};
-                  uint32_t slot_idx = (sq->norm_cache_hand++) & 31U;
+                  uint32_t slot_idx = UINT32_MAX;
+                  uint64_t chunk_end = chunk_va + static_cast<uint64_t>(chunk_sz);
                   for (uint32_t ci = 0; ci < 32U; ci++) {
-                     if (sq->norm_cache[ci].va == chunk_va && sq->norm_cache[ci].sz == chunk_sz) {
-                        slot_idx = ci;
-                        break;
+                     auto &existing = sq->norm_cache[ci];
+                     if (existing.sz == 0U)
+                        continue;
+                     uint64_t ex_end = existing.va + static_cast<uint64_t>(existing.sz);
+                     /* Interval intersection check: [chunk_va, chunk_end) intersects [existing.va, ex_end) */
+                     if (chunk_va < ex_end && existing.va < chunk_end) {
+                        if (slot_idx == UINT32_MAX) {
+                           slot_idx = ci;
+                        } else {
+                           /* Invalidate any additional partially overlapping entry in norm_cache */
+                           memset(&existing, 0, sizeof(existing));
+                        }
                      }
                   }
+                  if (slot_idx == UINT32_MAX)
+                     slot_idx = (sq->norm_cache_hand++) & 31U;
                   auto &ce = sq->norm_cache[slot_idx];
                   ce.va = chunk_va;
                   ce.sz = chunk_sz;
-                  ce.post_norm_fnv1a64 = post_hash;
                   ce.edge_count = 0U;
 
+                  uint64_t h = UINT64_C(0xcbf29ce484222325);
+                  bool found_jump = false;
                   for (uint32_t idx = 0; idx < c_qwords; idx++) {
                      uint64_t insn = chunk_cpu[idx];
+                     h = panthor_fnv1a64_qword_step(h, insn);
                      uint8_t op = static_cast<uint8_t>((insn >> 56) & 0xffULL);
                      if (op == MALI_CSF_OP_MOVE48) {
                         uint8_t dst = static_cast<uint8_t>((insn >> 48) & 0x7fU);
@@ -4554,7 +4878,9 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                      } else if (op == MALI_CSF_OP_MOVE32) {
                         uint8_t dst = static_cast<uint8_t>((insn >> 48) & 0x7fU);
                         reg_file[dst] = insn & MALI_CSF_INS_MOVE32_IMMEDIATE_MASK;
-                     } else {
+                     } else if (op == MALI_CSF_OP_CALL || op == MALI_CSF_OP_JUMP) {
+                        if (op == MALI_CSF_OP_JUMP)
+                           found_jump = true;
                         uint8_t cj_op = 0, addr_reg = 0, len_reg = 0;
                         if (mali_csf_unpack_call_or_jump(insn, &cj_op, &addr_reg, &len_reg) &&
                             addr_reg < 128U && len_reg < 128U) {
@@ -4582,10 +4908,42 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                         }
                      }
                   }
+                  ce.post_norm_fnv1a64 = h;
+                  if (out_has_jump)
+                     *out_has_jump = found_jump;
+                  return h;
                };
 
                mark_visited(qs->stream_addr, qs->stream_size);
-               scan_and_cache_edges(qs->stream_addr, stream_cpu, qs->stream_size, 0U, root_post_hash);
+               uint64_t root_post_hash = root_pre_hash;
+               if (cache_hit) {
+                  const auto &ce = sq->norm_cache[root_cache_slot];
+                  for (uint32_t ei = 0; ei < ce.edge_count; ei++) {
+                     bool is_c = (ce.edges[ei].is_call != 0U);
+                     if (!is_c)
+                        root_has_jump = true;
+                     if (!is_c || (1U < MALI_CSF_MAX_CALL_STACK_DEPTH)) {
+                        if (wl_tail < 64U && mark_visited(ce.edges[ei].target_va, ce.edges[ei].target_sz)) {
+                           worklist[wl_tail++] = cs_work_item{
+                              .va = ce.edges[ei].target_va,
+                              .sz = ce.edges[ei].target_sz,
+                              .call_depth = static_cast<uint16_t>(is_c ? 1U : 0U),
+                              .is_jump = static_cast<uint16_t>(is_c ? 0U : 1U)
+                           };
+                        }
+                     }
+                  }
+               } else {
+                  root_post_hash = scan_and_cache_edges_and_hash(
+                     qs->stream_addr, stream_cpu, qs->stream_size, 0U, &root_has_jump);
+               }
+               if (panthor_drm_capture_is_active()) {
+                  panthor_drm_capture_record_csf_chunk(
+                     grp->group_handle, qs->queue_index, 0U, 0U, 0U,
+                     qs->stream_addr, qs->stream_size,
+                     root_pre_hash ? root_pre_hash : root_post_hash,
+                     root_post_hash, stream_cpu);
+               }
 
                while (wl_head < wl_tail) {
                   cs_work_item item = worklist[wl_head++];
@@ -4593,27 +4951,31 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                   if (!target_raw)
                      continue;
                   auto *target_cpu = static_cast<uint64_t *>(target_raw);
-                  uint64_t pre_h = panthor_fnv1a64_bytes(target_cpu, item.sz);
+                  uint64_t pre_h = panthor_drm_capture_is_active() ? panthor_fnv1a64_bytes(target_cpu, item.sz) : 0ULL;
                   bool sub_hit = false;
                   if (!bug_mode) {
                      for (uint32_t ci = 0; ci < 32U; ci++) {
                         const auto &ce = sq->norm_cache[ci];
-                        if (ce.va == item.va && ce.sz == item.sz && ce.post_norm_fnv1a64 == pre_h) {
-                           sub_hit = true;
-                           for (uint32_t ei = 0; ei < ce.edge_count; ei++) {
-                              bool is_c = (ce.edges[ei].is_call != 0U);
-                              if (!is_c || (item.call_depth + 1U < MALI_CSF_MAX_CALL_STACK_DEPTH)) {
-                                 if (wl_tail < 64U && mark_visited(ce.edges[ei].target_va, ce.edges[ei].target_sz)) {
-                                    worklist[wl_tail++] = cs_work_item{
-                                       .va = ce.edges[ei].target_va,
-                                       .sz = ce.edges[ei].target_sz,
-                                       .call_depth = static_cast<uint16_t>(is_c ? (item.call_depth + 1U) : item.call_depth),
-                                       .is_jump = static_cast<uint16_t>(is_c ? 0U : 1U)
-                                    };
+                        if (ce.va == item.va && ce.sz == item.sz) {
+                           if (pre_h == 0ULL)
+                              pre_h = panthor_fnv1a64_bytes(target_cpu, item.sz);
+                           if (ce.post_norm_fnv1a64 == pre_h) {
+                              sub_hit = true;
+                              for (uint32_t ei = 0; ei < ce.edge_count; ei++) {
+                                 bool is_c = (ce.edges[ei].is_call != 0U);
+                                 if (!is_c || (item.call_depth + 1U < MALI_CSF_MAX_CALL_STACK_DEPTH)) {
+                                    if (wl_tail < 64U && mark_visited(ce.edges[ei].target_va, ce.edges[ei].target_sz)) {
+                                       worklist[wl_tail++] = cs_work_item{
+                                          .va = ce.edges[ei].target_va,
+                                          .sz = ce.edges[ei].target_sz,
+                                          .call_depth = static_cast<uint16_t>(is_c ? (item.call_depth + 1U) : item.call_depth),
+                                          .is_jump = static_cast<uint16_t>(is_c ? 0U : 1U)
+                                       };
+                                    }
                                  }
                               }
+                              break;
                            }
-                           break;
                         }
                      }
                   }
@@ -4626,8 +4988,8 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                      stats.heap_op_nops += sub_stats.heap_op_nops;
                      stats.finish_frag_stat_clears += sub_stats.finish_frag_stat_clears;
                      kbase_cpu_cache_clean_range(target_cpu, item.sz);
-                     post_h = panthor_fnv1a64_bytes(target_cpu, item.sz);
-                     scan_and_cache_edges(item.va, target_cpu, item.sz, item.call_depth, post_h);
+                     post_h = scan_and_cache_edges_and_hash(
+                        item.va, target_cpu, item.sz, item.call_depth, nullptr);
                   }
                   if (panthor_drm_capture_is_active()) {
                      panthor_drm_capture_record_csf_chunk(
@@ -4637,22 +4999,16 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                   }
                }
             }
-               kbase_cpu_cache_clean_range(stream_cpu, qs->stream_size);
+               if (!cache_hit)
+                  kbase_cpu_cache_clean_range(stream_cpu, qs->stream_size);
             }
 
             /* Snapshot single-chunk primary CS streams (<= 32 KiB without relative JUMP) into
              * g_ctx.shadow_cs_bo_cpu (unless PANTHOR_ADAPTER_BUG_CATCHING_MODE=1 is set). */
-            if (!is_initial && !cache_hit && !is_bug_catching_mode_enabled() && g_ctx.shadow_cs_bo_cpu &&
+            (void)n_qw;
+            if (!is_initial && !cache_hit && !bug_mode && g_ctx.shadow_cs_bo_cpu &&
                 qs->stream_size <= 32768U && g_ctx.shadow_cs_bo_size >= 65536U) {
-               bool has_jump = false;
-               for (uint32_t idx = 0; idx < n_qw; idx++) {
-                  uint64_t op = (stream_cpu[idx] >> 56) & 0xffULL;
-                  if (op == CSF_OP_JUMP) {
-                     has_jump = true;
-                     break;
-                  }
-               }
-               if (!has_jump) {
+               if (!root_has_jump) {
                   size_t aligned_sz = (static_cast<size_t>(qs->stream_size) + 63U) & ~static_cast<size_t>(63U);
                   if (g_ctx.shadow_cs_write_off + aligned_sz > g_ctx.shadow_cs_bo_size)
                      g_ctx.shadow_cs_write_off = 0;
@@ -4669,8 +5025,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          /* 2. Ensure the 64 KiB ring buffer has space (never overwrite unextracted CSF commands) */
          uint64_t extract_at_sub = 0;
          if (sq->user_io_ptr) {
-            const auto *out_u64 = reinterpret_cast<const volatile uint64_t *>(
-               static_cast<const uint8_t *>(sq->user_io_ptr) + CS_USER_IO_OUTPUT_PAGE_OFFSET);
+            const auto *out_u64 = subqueue_user_io_output_u64(sq);
             for (unsigned wait_ring = 0; wait_ring < 500; wait_ring++) {
                extract_at_sub = out_u64[0];
                if ((sq->insert_offset + ADAPTER_RING_SLOT_MAX_BYTES * 2) - extract_at_sub <= sq->ringbuf_size)
@@ -4840,18 +5195,26 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          if (!(touched_subqueues & (1U << q)))
             continue;
          struct adapter_subqueue *sq = &grp->subqueues[q];
-         auto *input_page = reinterpret_cast<volatile uint64_t *>(
-             static_cast<uint8_t *>(sq->user_io_ptr) + CS_USER_IO_INPUT_PAGE_OFFSET);
+         auto *input_page = subqueue_user_io_input_u64(sq);
+         const auto *output_page = subqueue_user_io_output_u64(sq);
          auto *doorbell_page = reinterpret_cast<volatile uint32_t *>(
             static_cast<uint8_t *>(sq->user_io_ptr) + CS_USER_IO_DOORBELL_OFFSET);
 
+         /* Authoritative libGLES_mali.so doorbell/kick sequence (doco.TDJkQNs5--xlABzJq4lQiw):
+          * 1. Write CS_INSERT + inner-shareable release barrier (dmb ish).
+          * 2. Ring hardware doorbell MMIO page (*doorbell_page = 1) + full system barrier (dmb sy).
+          * 3. Read CS_ACTIVE (offset +0x08 of USER_IO output slot, i.e. output_page[1]).
+          * 4. Issue KBASE_IOCTL_CS_QUEUE_KICK iff CS_ACTIVE == 0 (CSI off-slot/asleep or sync emu). */
          input_page[0] = sq->insert_offset;
-         __atomic_thread_fence(__ATOMIC_SEQ_CST);
+         __atomic_thread_fence(__ATOMIC_RELEASE);
          doorbell_page[0] = 1U;
          __atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-         struct kbase_ioctl_cs_queue_kick kick = { .buffer_gpu_addr = sq->ring_gpu_va };
-         adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_KICK, &kick);
+         uint32_t cs_active = output_page ? static_cast<uint32_t>(output_page[1] & 0x1ULL) : 0U;
+         if (cs_active == 0U) {
+            struct kbase_ioctl_cs_queue_kick kick = { .buffer_gpu_addr = sq->ring_gpu_va };
+            adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_CS_QUEUE_KICK, &kick);
+         }
       }
       uint64_t submit_t1_ns = get_monotonic_ns();
       uint64_t submit_dur_ns = (submit_t1_ns >= submit_t0_ns) ? (submit_t1_ns - submit_t0_ns) : 0ULL;
@@ -4861,6 +5224,10 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
       g_ctx.total_group_submits++;
       g_ctx.window_submits++;
       g_ctx.window_submit_ns_sum      += submit_dur_ns;
+      g_ctx.cur_frame_render_ns       += submit_dur_ns;
+      if ((touched_subqueues & 0x3U) != 0U) {
+         record_frame_boundary_locked(submit_t1_ns);
+      }
       if (submit_dur_ns > g_ctx.window_submit_ns_max)
          g_ctx.window_submit_ns_max = submit_dur_ns;
       g_ctx.window_cs_norm_ns_sum     += submit_norm_ns;
@@ -4919,13 +5286,15 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
          uint64_t s0 = grp->subqueues[0].seqno_cpu_ptr ? *grp->subqueues[0].seqno_cpu_ptr : 0ULL;
          uint64_t s1 = (grp->queue_count > 1 && grp->subqueues[1].seqno_cpu_ptr) ? *grp->subqueues[1].seqno_cpu_ptr : 0ULL;
          uint64_t s2 = (grp->queue_count > 2 && grp->subqueues[2].seqno_cpu_ptr) ? *grp->subqueues[2].seqno_cpu_ptr : 0ULL;
-         LOG_INFO("[TELEMETRY] submits=%llu jobs(vt=%llu,seq=%llu/%llu/%llu) fps=%.1f submit_us(avg=%.1f,max=%.1f: norm=%.1f,clean=%.1f,kick=%.1f) wait_us(avg=%.1f,max=%.1f,fast=%llu,poll=%llu) bos=%u(va=%.1fMB,committed=%.1fMB,grow=%llu,stepdown=%llu,cached=%u,imp=%u,rss=%.1fMB,avail=%.1fMB,guards=%llu) syncobjs=%u wraps=%llu/%llu/%llu",
+         LOG_INFO("[TELEMETRY] submits=%llu jobs(vt=%llu,seq=%llu/%llu/%llu) fps=%.1f frame_ms(avg=%.2f,p99=%.2f,max=%.2f,render=%.2f,wait=%.2f,real_fps=%.1f) submit_us(avg=%.1f,max=%.1f: norm=%.1f,clean=%.1f,kick=%.1f) wait_us(avg=%.1f,max=%.1f,fast=%llu,poll=%llu) bos=%u(va=%.1fMB,committed=%.1fMB,grow=%llu,stepdown=%llu,cached=%u,imp=%u,rss=%.1fMB,avail=%.1fMB,guards=%llu) syncobjs=%u wraps=%llu/%llu/%llu",
                   static_cast<unsigned long long>(g_ctx.total_group_submits),
                   static_cast<unsigned long long>(j0),
                   static_cast<unsigned long long>(s0),
                   static_cast<unsigned long long>(s1),
                   static_cast<unsigned long long>(s2),
                   g_ctx.last_window_fps,
+                  g_ctx.last_avg_frame_ms, g_ctx.last_p99_frame_ms, g_ctx.last_max_frame_ms,
+                  g_ctx.last_avg_render_ms, g_ctx.last_avg_wait_ms, g_ctx.last_real_fps,
                   g_ctx.last_avg_submit_us, g_ctx.last_max_submit_us,
                   g_ctx.last_avg_cs_norm_us, g_ctx.last_avg_cache_clean_us, g_ctx.last_avg_kick_us,
                   g_ctx.last_avg_sync_wait_us, g_ctx.last_max_sync_wait_us,
@@ -4943,6 +5312,48 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
                   static_cast<unsigned long long>(grp->queue_count > 1 ? grp->subqueues[1].ring_wraps : 0ULL),
                   static_cast<unsigned long long>(grp->queue_count > 2 ? grp->subqueues[2].ring_wraps : 0ULL));
 
+         static int sample_counters_flag = -1;
+         static uint64_t last_counter_dump_ns = 0ULL;
+         if (sample_counters_flag < 0) {
+            const char *sc_env = getenv("PANTHOR_ADAPTER_SAMPLE_COUNTERS");
+            sample_counters_flag = (sc_env && sc_env[0] && atoi(sc_env) != 0) ? 1 : 0;
+         }
+         if (sample_counters_flag > 0 && (last_counter_dump_ns == 0ULL || (submit_t1_ns - last_counter_dump_ns) >= 5000000000ULL)) {
+            last_counter_dump_ns = submit_t1_ns;
+            uint64_t queried_phys_pages = 0ULL;
+            for (size_t b = 0; b < bo_lim; b++) {
+               if (g_ctx.bos[b].in_use && g_ctx.bos[b].gpu_va != 0ULL) {
+                  union kbase_ioctl_mem_query mq{};
+                  mq.in.gpu_addr = g_ctx.bos[b].gpu_va;
+                  mq.in.query = KBASE_MEM_QUERY_COMMIT_SIZE;
+                  if (adapter_ioctl(g_ctx.mali_fd, KBASE_IOCTL_MEM_QUERY, &mq) == 0)
+                     queried_phys_pages += mq.out.value;
+                  else
+                     queried_phys_pages += g_ctx.bos[b].committed_pages;
+               }
+            }
+            double kbase_phys_mb = (static_cast<double>(queried_phys_pages) * 4096.0) / (1024.0 * 1024.0);
+            uint64_t q0_backlog = 0ULL, q1_backlog = 0ULL;
+            if (grp->subqueues[0].user_io_ptr) {
+               uint64_t ext0 = subqueue_user_io_output_u64(&grp->subqueues[0])[0];
+               if (grp->subqueues[0].insert_offset >= ext0)
+                  q0_backlog = grp->subqueues[0].insert_offset - ext0;
+            }
+            if (grp->queue_count > 1 && grp->subqueues[1].user_io_ptr) {
+               uint64_t ext1 = subqueue_user_io_output_u64(&grp->subqueues[1])[0];
+               if (grp->subqueues[1].insert_offset >= ext1)
+                  q1_backlog = grp->subqueues[1].insert_offset - ext1;
+            }
+            LOG_INFO("[KBASE_COUNTERS] kbase_phys=%.1fMB committed=%.1fMB va=%.1fMB rss=%.1fMB avail=%.1fMB csg_backlog_bytes(vt=%llu,frag=%llu) grow_bos=%llu stepdowns=%llu",
+                     kbase_phys_mb,
+                     static_cast<double>(g_ctx.total_committed_bo_bytes) / (1024.0 * 1024.0),
+                     static_cast<double>(act_bo_bytes) / (1024.0 * 1024.0),
+                     rss_mb, read_mem_available_mb(),
+                     static_cast<unsigned long long>(q0_backlog),
+                     static_cast<unsigned long long>(q1_backlog),
+                     static_cast<unsigned long long>(g_ctx.grow_on_gpf_bo_count),
+                     static_cast<unsigned long long>(g_ctx.hv_chunk_stepdowns));
+         }
          g_ctx.window_start_ns           = submit_t1_ns;
          g_ctx.window_submits            = 0;
          g_ctx.window_submit_ns_sum      = 0;

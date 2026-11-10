@@ -41,6 +41,7 @@ jobs:
               libdrm-dev \
               libvulkan-dev \
               libvulkan1 \
+              mesa-vulkan-drivers \
               libxcb1-dev \
               libx11-xcb-dev \
               libxcb-randr0-dev \

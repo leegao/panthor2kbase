@@ -237,9 +237,17 @@ struct adapter_telemetry_snapshot {
    double   avg_kick_us;
    double   avg_sync_wait_us;
    double   max_sync_wait_us;
+   uint64_t total_frames;
+   double   real_fps;
+   double   avg_frame_ms;
+   double   p99_frame_ms;
+   double   max_frame_ms;
+   double   avg_render_ms;
+   double   avg_wait_ms;
 };
 
 void panthor_kbase_get_telemetry_snapshot(struct adapter_telemetry_snapshot *out);
+void panthor_kbase_mark_frame_boundary(void);
 
 #ifdef __cplusplus
 }

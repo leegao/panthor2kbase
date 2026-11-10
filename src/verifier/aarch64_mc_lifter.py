@@ -570,7 +570,7 @@ class AArch64MCLifter:
 
     def lift_all_guards(self):
         return {
-            "binary_path": self.binary_path,
+            "binary_path": os.path.basename(self.binary_path),
             "llvm_mc_api": f"Pure libLLVM ({self.mc_disasm.soname}: LLVMInitializeAArch64* + LLVMCreateDisasm + LLVMDisasmInstruction)",
             "static_uapi_bitfield_and_abi_check": self.verify_static_uapi_bitfield_and_abi_guards(),
             "kbase_check_flags": self.lift_check_flags(),

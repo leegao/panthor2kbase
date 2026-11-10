@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <dlfcn.h>
+#include <unistd.h>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -130,6 +131,16 @@ public:
             dlclose(handle);
             return false;
         }
+        auto getPropsTest = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(fn(test_inst, "vkGetPhysicalDeviceProperties"));
+        if (getPropsTest && std::strstr(so_path, "libvulkan.so") != nullptr) {
+            uint8_t testProps[1024]{};
+            getPropsTest(test_pd, testProps);
+            const char* pdName = reinterpret_cast<const char*>(testProps + 20);
+            if (std::strstr(pdName, "Mali") != nullptr || std::strstr(pdName, "AOT") != nullptr) {
+                dlclose(handle);
+                return false;
+            }
+        }
         vk_lib   = handle;
         gipa     = fn;
         instance = test_inst;
@@ -140,6 +151,13 @@ public:
 
     bool init() {
         if (device) return true;
+        static thread_local bool s_in_lvp_init = false;
+        if (s_in_lvp_init) return false;
+        struct ReentrancyGuard {
+            bool& flag;
+            ReentrancyGuard(bool& f) : flag(f) { flag = true; }
+            ~ReentrancyGuard() { flag = false; }
+        } guard(s_in_lvp_init);
         const char* env_backend = getenv("MALI0_EMU_BACKEND");
         backend_mode_requested = env_backend ? env_backend : "llvmpipe";
 
@@ -182,14 +200,24 @@ public:
                 }
             }
             if (!opened_lvp) {
+                const char* lvp_json = "/usr/share/vulkan/icd.d/lvp_icd.x86_64.json";
+                if (access(lvp_json, R_OK) != 0) return false;
                 const char* prev_icd = getenv("VK_ICD_FILENAMES");
+                const char* prev_drv = getenv("VK_DRIVER_FILES");
                 std::string saved_icd = prev_icd ? prev_icd : "";
-                setenv("VK_ICD_FILENAMES", "/usr/share/vulkan/icd.d/lvp_icd.x86_64.json", 1);
+                std::string saved_drv = prev_drv ? prev_drv : "";
+                setenv("VK_ICD_FILENAMES", lvp_json, 1);
+                setenv("VK_DRIVER_FILES", lvp_json, 1);
                 bool ok = tryOpenBackendIcdLibrary("libvulkan.so.1");
                 if (!saved_icd.empty()) {
                     setenv("VK_ICD_FILENAMES", saved_icd.c_str(), 1);
                 } else {
                     unsetenv("VK_ICD_FILENAMES");
+                }
+                if (!saved_drv.empty()) {
+                    setenv("VK_DRIVER_FILES", saved_drv.c_str(), 1);
+                } else {
+                    unsetenv("VK_DRIVER_FILES");
                 }
                 if (!ok) return false;
             }

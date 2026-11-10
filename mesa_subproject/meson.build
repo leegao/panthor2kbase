@@ -19,6 +19,7 @@ libpanthor_kbase_adapter = static_library(
   'panthor_kbase_adapter',
   files(
     'src/adapter/panthor_kbase_adapter.cpp',
+  'src/adapter/mali_kbase_caps.cpp',
     'src/adapter/panthor_drm_capture_replay.cpp',
     'src/adapter/log.cpp',
   ),

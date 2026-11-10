@@ -722,18 +722,21 @@ panvk_image_plane_bind_mem(struct panvk_device *dev,
    plane->plane.base = mem->addr.dev + offset;
    plane->mem = mem;
    plane->mem_offset = offset;
-   /* Zero-initialize CRC state. If CRC state is not mapped on the host, do a
-    * temporary mapping just for this operation. */
+   /* Zero-initialize CRC state. On /dev/mali0 (GROW_ON_GPF DEVICE_LOCAL slabs),
+    * calling pan_kmod_bo_mmap on an unmapped 32..128 MiB DEVICE_LOCAL slab forces
+    * full physical commitment and faults all 32,768 PTEs into VmRSS via kbase_cpu_vm_fault
+    * (mali_kbase_mem_linux.c:2751). Skip CPU-side CRC zero-init when mem->addr.host == NULL. */
    if (plane->image.props.crc) {
+      if (mem->addr.host == NULL) {
+         plane->image.props.crc = false;
+         return;
+      }
       const struct pan_image_slice_layout *slice =
          &plane->plane.layout.slices[0];
       uint64_t state_offset = offset + slice->crc.header_offset_B;
 
-      bool temporary_map = mem->addr.host == NULL;
-      uint8_t *cpu_map = temporary_map
-                            ? pan_kmod_bo_mmap(mem->bo, PROT_READ | PROT_WRITE,
-                                               MAP_SHARED, NULL)
-                            : mem->addr.host;
+      bool temporary_map = false;
+      uint8_t *cpu_map = mem->addr.host;
       if (cpu_map == 0 || cpu_map == MAP_FAILED) {
          plane->image.props.crc = false;
          return;

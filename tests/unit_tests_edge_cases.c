@@ -22,6 +22,7 @@
 #include "xf86drm.h"
 #include "xf86drmMode.h"
 #include "mali_kbase_emu.h"
+#include "mali_kbase_caps.h"
 
 static void test_mali_kbase_ko_flag_bit_positions(void)
 {
@@ -1374,6 +1375,385 @@ static void test_v21_grow_on_gpf_mem_commit_hv_stepdown_and_poll_coalesce(void)
    printf("  -> Checkpoint v21 GROW_ON_GPF On-Demand Backing, KBASE_IOCTL_MEM_COMMIT, DXVK 16MiB HV Step-Down & Tiler Heap Right-Sizing: PASS\n");
 }
 
+#include "lifted_kbase_ko.h"
+#include "lifted_csffw.h"
+#include "panthor_drm_capture_replay.h"
+
+static void test_v22_husky_1_38_csg_user_io_stride_and_lifted_ko_emu(void)
+{
+   printf("[Unit Tests] Testing Checkpoint v22: Husky r54p3 (kbase v1.38) CSG USER_IO 16-Byte Stride, Lifted .ko Execution & DOG WITCH Same-Handle MMAP Guard...\n");
+
+   /* 1. Verify 64-bit word-aligned panthor_fnv1a64_bytes matches byte-by-byte FNV-1a across aligned & unaligned lengths */
+   uint8_t sample[263];
+   for (size_t i = 0; i < sizeof(sample); i++)
+      sample[i] = (uint8_t)((i * 131U) ^ 0x5aU);
+   for (size_t len = 0; len <= sizeof(sample); len++) {
+      uint64_t ref = 0xcbf29ce484222325ULL;
+      for (size_t k = 0; k < len; k++) {
+         ref ^= (uint64_t)sample[k];
+         ref *= 0x100000001b3ULL;
+      }
+      uint64_t fast = panthor_fnv1a64_bytes(sample, len);
+      assert(fast == ref);
+   }
+
+   /* 2. Switch /dev/mali0 emulator to Pixel 8 Pro (husky, r54p1/r54p3, kbase v1.38) profile */
+   mali_kbase_emu_reset_stats();
+   mali_kbase_emu_set_profile(MALI_EMU_PROFILE_HUSKY_R54);
+   assert(mali_kbase_emu_get_profile() == MALI_EMU_PROFILE_HUSKY_R54);
+
+   int fd = panthor_kbase_adapter_open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+   assert(fd >= 0);
+
+   /* Verify DEV_QUERY reports Pixel 8 Pro Tensor G3 Mali-G715 MC7 (gpu_id=0xb8a21020, shader_present=0x1fc, core_features=0x4) */
+   struct drm_panthor_gpu_info ginfo;
+   memset(&ginfo, 0, sizeof(ginfo));
+   struct drm_panthor_dev_query dq = {
+      .type = DRM_PANTHOR_DEV_QUERY_GPU_INFO,
+      .size = sizeof(ginfo),
+      .pointer = (uintptr_t)&ginfo,
+   };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_DEV_QUERY, &dq) == 0);
+   assert(ginfo.gpu_id == 0xb8a21020U);
+   assert(ginfo.shader_present == 0x1fcULL);
+   assert(ginfo.core_features == 0x4U);
+
+   struct drm_panthor_vm_create vmc = {0};
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_CREATE, &vmc) == 0);
+
+   /* 3. Verify DOG WITCH handle=122 bug fix: repeated DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET on the SAME
+    *    oversized (>16 MiB) BO handle (e.g. panvk_image_plane_bind_mem temporary mmap) MUST fail
+    *    with -ENOMEM every time without committing all 32,768 pages, whereas a dedicated retry on a
+    *    NEW BO handle of the same size succeeds! */
+   struct drm_panthor_bo_create same_bo = { .size = 64ULL * 1024ULL * 1024ULL, .flags = 0, .exclusive_vm_id = vmc.id };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_CREATE, &same_bo) == 0);
+   struct drm_panthor_vm_bind_op same_bop = { .flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, .bo_handle = same_bo.handle, .size = same_bo.size };
+   struct drm_panthor_vm_bind same_vmb = { .vm_id = vmc.id, .ops = DRM_PANTHOR_OBJ_ARRAY(1, &same_bop) };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_BIND, &same_vmb) == 0);
+   for (int attempt = 0; attempt < 4; attempt++) {
+      struct drm_panthor_bo_mmap_offset same_mmo = { .handle = same_bo.handle };
+      assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET, &same_mmo) == -1 && errno == ENOMEM);
+   }
+   assert(drmCloseBufferHandle(fd, same_bo.handle) == 0);
+
+   /* 4. Create a 3-subqueue (VT=0, FRAG=1, COMPUTE=2) Panthor group on Husky (kbase_ver=1.38)
+    *    and submit jobs to all 3 subqueues. Before the v22 fix, FRAG(1) and COMPUTE(2) wrote
+    *    CS_INSERT to +0x1000 instead of +0x1010 and +0x1020, causing vkCreateDevice (panvk_utrace_copy_buffer)
+    *    to time out in SYNCOBJ_TIMELINE_WAIT and return VK_ERROR_INITIALIZATION_FAILED (-3)! */
+   struct drm_panthor_queue_create q_defs[3];
+   memset(q_defs, 0, sizeof(q_defs));
+   for (int q = 0; q < 3; q++) {
+      q_defs[q].priority = 1;
+      q_defs[q].ringbuf_size = 65536;
+   }
+   struct drm_panthor_group_create gc;
+   memset(&gc, 0, sizeof(gc));
+   gc.vm_id = vmc.id;
+   gc.queues = (struct drm_panthor_obj_array)DRM_PANTHOR_OBJ_ARRAY(3, q_defs);
+   gc.max_compute_cores = 7;
+   gc.max_fragment_cores = 7;
+   gc.max_tiler_cores = 1;
+   gc.priority = PANTHOR_GROUP_PRIORITY_MEDIUM;
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_CREATE, &gc) == 0);
+   assert(gc.group_handle > 0);
+
+   struct drm_panthor_bo_create cs_bo = { .size = 4096, .flags = 0, .exclusive_vm_id = vmc.id };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_CREATE, &cs_bo) == 0);
+   struct drm_panthor_vm_bind_op cs_bop = { .flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, .bo_handle = cs_bo.handle, .size = cs_bo.size };
+   struct drm_panthor_vm_bind cs_vmb = { .vm_id = vmc.id, .ops = DRM_PANTHOR_OBJ_ARRAY(1, &cs_bop) };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_BIND, &cs_vmb) == 0);
+   struct drm_panthor_bo_mmap_offset cs_mmo = { .handle = cs_bo.handle };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET, &cs_mmo) == 0);
+   uint64_t *cs_cpu = (uint64_t *)panthor_kbase_adapter_mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)cs_mmo.offset);
+   assert(cs_cpu != NULL && cs_cpu != MAP_FAILED);
+   cs_cpu[0] = (0x01ULL << 56) | (40ULL << 48) | 0x1234ULL; /* MOVE48 r40, 0x1234 */
+   cs_cpu[1] = 0ULL; /* NOP */
+
+   struct drm_syncobj_create soc = { .flags = 0 };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &soc) == 0);
+
+   /* Submit across all 3 subqueues (VT=0, FRAG=1, COMPUTE=2) and signal timeline syncobj value=77 */
+   struct drm_panthor_sync_op s_op = {
+      .flags = DRM_PANTHOR_SYNC_OP_SIGNAL | DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ,
+      .handle = soc.handle,
+      .timeline_value = 77ULL,
+   };
+   struct drm_panthor_queue_submit q_subs[3];
+   memset(q_subs, 0, sizeof(q_subs));
+   for (int q = 0; q < 3; q++) {
+      q_subs[q].queue_index = (uint32_t)q;
+      q_subs[q].stream_size = 16;
+      q_subs[q].stream_addr = cs_bop.va;
+      q_subs[q].latest_flush = 1;
+      if (q == 2) {
+         q_subs[q].syncs = (struct drm_panthor_obj_array)DRM_PANTHOR_OBJ_ARRAY(1, &s_op);
+      }
+   }
+   struct drm_panthor_group_submit gsub = {
+      .group_handle = gc.group_handle,
+      .queue_submits = DRM_PANTHOR_OBJ_ARRAY(3, q_subs),
+   };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &gsub) == 0);
+
+   uint64_t wait_pt = 77ULL;
+   struct drm_syncobj_timeline_wait tw = {
+      .handles = (uintptr_t)&soc.handle,
+      .points = (uintptr_t)&wait_pt,
+      .count_handles = 1,
+      .timeout_nsec = 1000000000LL,
+   };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &tw) == 0);
+
+   /* 5. Verify shared-CSG scope preservation on 1.37+ (1.38) (doco.lA_aFsyE5a0NKZ77bU6pMg):
+    *    When shared CSGs are active, SYNC_ADD64 with Scope=CSG(2) must stay Scope=CSG(2)! */
+   uint64_t csg_sync_stream[2] = {
+      (0x33ULL << 56) | (92ULL << 40) | (94ULL << 32) | (0x00ffULL << 16) | (2ULL << 1) | 1ULL,
+      0ULL
+   };
+   struct adapter_cs_patch_stats csg_pstats;
+   memset(&csg_pstats, 0, sizeof(csg_pstats));
+   panthor_kbase_normalize_cs_stream(csg_sync_stream, sizeof(csg_sync_stream), false, &csg_pstats);
+   assert(((csg_sync_stream[0] >> 1) & 0x3ULL) == 2ULL);
+   assert(csg_pstats.sync_scope_upgrades == 0U);
+
+   /* 6. Verify frame & render-time profiler (doco.qJl93Qf4NSz6GSRUxbXzLA) and Host ABI table */
+   const struct kbase_ko_host_abi *habi = mali_kbase_emu_get_host_abi();
+   assert(habi != NULL && habi->os_copy_from_user != NULL && habi->mmu_create_context != NULL &&
+          habi->isa2spirv_execute_shader != NULL);
+   usleep(1000);
+   panthor_kbase_mark_frame_boundary();
+   usleep(1000);
+   panthor_kbase_mark_frame_boundary();
+   struct adapter_telemetry_snapshot fsnap;
+   memset(&fsnap, 0, sizeof(fsnap));
+   panthor_kbase_get_telemetry_snapshot(&fsnap);
+   assert(fsnap.total_frames >= 2ULL);
+   assert(fsnap.avg_frame_ms > 0.0 && fsnap.p99_frame_ms >= fsnap.avg_frame_ms && fsnap.real_fps > 0.0);
+
+   /* Verify telemetry and lifted .ko execution counters */
+   struct kbase_emu_stats estats;
+   mali_kbase_emu_get_stats(&estats);
+   assert(estats.active_profile == MALI_EMU_PROFILE_HUSKY_R54);
+   assert(estats.kbase_ver_major == 1 && estats.kbase_ver_minor == 38);
+   assert(estats.lifted_ko_calls_executed >= 20);
+   assert(estats.lifted_ko_insns_executed >= 10000);
+   printf("  -> Husky r54p3 (kbase v1.38) 3-subqueue CSG USER_IO 16B stride + shared-CSG scope + frame profiler (avg=%.2fms, p99=%.2fms, fps=%.1f) + lifted .ko stats (calls=%u, insns=%llu): PASS\n",
+          fsnap.avg_frame_ms, fsnap.p99_frame_ms, fsnap.real_fps,
+          estats.lifted_ko_calls_executed, (unsigned long long)estats.lifted_ko_insns_executed);
+
+   struct drm_syncobj_destroy sod = { .handle = soc.handle };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &sod) == 0);
+   struct drm_panthor_group_destroy gd = { .group_handle = gc.group_handle };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_DESTROY, &gd) == 0);
+   assert(drmCloseBufferHandle(fd, cs_bo.handle) == 0);
+   struct drm_panthor_vm_destroy vmd = { .id = vmc.id };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_DESTROY, &vmd) == 0);
+   assert(panthor_kbase_adapter_close(fd) == 0);
+
+   /* Restore default MT6878 r44p1 profile */
+   mali_kbase_emu_set_profile(MALI_EMU_PROFILE_MT6878_R44);
+}
+
+
+static void test_v24_unified_horizon2llvm_ko_rodata_caps_and_heap_uaf(void)
+{
+   printf("[Unit Test 17] Verifying Checkpoint v24 Unified Horizon2LLVM .ko lifter, direct .ko .rodata image mapping, all 18 capabilities (mali_kbase_caps), and LiftedKoHeap double-free/UAF sanitizer...\n");
+
+   /* 1. Verify direct .ko ELF image .rodata mapping (doco.uqfzZX4qyjrCf86OOyGQUg) */
+   size_t r44_ro_sz = 0, husky_ro_sz = 0;
+   assert(lifted_ko_is_image_mapped("r44p1", &r44_ro_sz));
+   assert(r44_ro_sz > 67800U);
+   assert(lifted_ko_is_image_mapped("husky_r54p1", &husky_ro_sz));
+   assert(husky_ro_sz > 89160U);
+
+   const uint16_t *r44_caps = (const uint16_t *)lifted_ko_rodata_ptr(NULL, "r44p1", 67800U, NULL);
+   assert(r44_caps != NULL);
+   assert(r44_caps[0] == 1U && r44_caps[1] == 0U); /* SYSTEM_MONITOR CSF 1.0 */
+   const uint16_t *husky_caps = (const uint16_t *)lifted_ko_rodata_ptr(NULL, "husky_r54p1", 89160U, NULL);
+   assert(husky_caps != NULL);
+   assert(husky_caps[28] == 1U && husky_caps[29] == 0x20U); /* TIMELINE_TRACKING CSF 1.32 */
+   assert(husky_caps[34] == 1U && husky_caps[35] == 0x23U); /* CSG_USER_IO CSF 1.35 */
+
+   /* 2. Verify authoritative capability checking module across all 18 capabilities (doco.Wjky240wdWQ22pF1G66qJw) */
+   uint64_t ver_1_21 = mali_kbase_make_api_version(1, 21);
+   uint64_t ver_1_38 = mali_kbase_make_api_version(1, 38);
+   uint64_t ver_11_35 = mali_kbase_make_api_version(11, 35);
+   for (int c = 0; c < (int)MALI_KBASE_NUM_CAPS; c++) {
+      const struct mali_kbase_cap_descriptor *desc = mali_kbase_get_cap_descriptor((enum mali_kbase_cap)c);
+      assert(desc != NULL && desc->name != NULL && desc->kernel_source_ref != NULL);
+      assert(strcmp(mali_kbase_cap_name((enum mali_kbase_cap)c), desc->name) == 0);
+   }
+   assert(mali_kbase_supports_system_monitor(ver_1_21));
+   assert(mali_kbase_supports_mem_grow_on_gpf(ver_1_21));
+   assert(mali_kbase_supports_mem_alloc_ex(ver_1_21));
+   assert(!mali_kbase_supports_timeline_tracking(ver_1_21));
+   assert(!mali_kbase_supports_csg_user_io(ver_1_21));
+   assert(!mali_kbase_supports_shared_csg_sync_scope(ver_1_21));
+
+   assert(mali_kbase_supports_timeline_tracking(ver_1_38));
+   assert(mali_kbase_supports_csg_user_io(ver_1_38));
+   assert(mali_kbase_supports_shared_csg_sync_scope(ver_1_38));
+   assert(mali_kbase_supports_cap_query(ver_1_38, MALI_KBASE_CAP_HUSKY_R54P3_EXTENDED_CSI));
+   assert(mali_kbase_supports_timeline_tracking(ver_11_35));
+   assert(!mali_kbase_supports_csg_user_io(ver_11_35));
+
+   /* 3. Verify struct LiftedKoHeap double-free and use-after-free detection (doco.fye2LblI44z3tNk1mh5Euw & doco.mbTC_NolEN_X7AF0b4BFRQ) */
+   LiftedKbaseCPU *cpu = (LiftedKbaseCPU *)calloc(1, sizeof(LiftedKbaseCPU));
+   assert(cpu != NULL);
+   lifted_kbase_cpu_init(cpu, NULL, NULL);
+   uint8_t *blk = (uint8_t *)lifted_ko_heap_alloc(cpu, 128);
+   assert(blk != NULL);
+   assert(cpu->heap.alloc_count == 1U && cpu->heap.free_count == 0U);
+   assert(lifted_ko_check_mem_access(cpu, blk + 16, 8, true));
+   assert(cpu->heap.uaf_errors == 0U);
+
+   assert(lifted_ko_heap_free(cpu, blk) == 0);
+   assert(cpu->heap.free_count == 1U);
+   assert(blk[0] == LIFTED_KO_POISON_FREE_BYTE);
+
+   /* Use-after-free access to freed heap block must be caught and increment uaf_errors */
+   assert(!lifted_ko_check_mem_access(cpu, blk + 16, 8, false));
+   assert(cpu->heap.uaf_errors == 1U);
+
+   /* Double-free (free-after-free) on already-freed block must be caught and increment double_free_errors */
+   assert(lifted_ko_heap_free(cpu, blk) == -1);
+   assert(cpu->heap.double_free_errors == 1U);
+   free(cpu);
+
+   printf("  -> Unified Horizon2LLVM .ko lifter + direct .rodata image map (r44=%zuB, husky=%zuB) + 18-cap table + LiftedKoHeap double-free/UAF sanitizer: PASS\n",
+          r44_ro_sz, husky_ro_sz);
+}
+
+static void test_v25_llvm_ir_ko_lowering_and_recompilation(void)
+{
+   printf("[Unit Test 18] Verifying Checkpoint v25 Direct AArch64-to-LLVM-IR (.ll -> .o) .ko lowering & recompilation in horizon2llvm...\n");
+
+   /* 1. Verify lifted_kbase_ko.ll exists (> 5 MB of SSA LLVM IR) and lifted_kbase_ko.c has ZERO lifted .ko functions */
+   FILE *f_ll = fopen("src/emulator/lifted_kbase_ko.ll", "rb");
+   assert(f_ll != NULL);
+   fseek(f_ll, 0, SEEK_END);
+   long ll_sz = ftell(f_ll);
+   fclose(f_ll);
+   assert(ll_sz > 4000000L);
+
+   FILE *f_c = fopen("src/emulator/lifted_kbase_ko.c", "rb");
+   assert(f_c != NULL);
+   fseek(f_c, 0, SEEK_END);
+   long c_sz = ftell(f_c);
+   fseek(f_c, 0, SEEK_SET);
+   char *c_buf = (char *)calloc(1, (size_t)c_sz + 1);
+   assert(c_buf != NULL);
+   (void)fread(c_buf, 1, (size_t)c_sz, f_c);
+   fclose(f_c);
+   assert(strstr(c_buf, "lifted_r44p1_kbase_ioctl(") == NULL);
+   assert(strstr(c_buf, "lifted_husky_r54p1_kbase_ioctl(") == NULL);
+   free(c_buf);
+
+   /* 2. Execute LLVM-IR-compiled functions directly from lifted_kbase_ko_x86_64.o */
+   LiftedKbaseCPU *cpu = (LiftedKbaseCPU *)calloc(1, sizeof(LiftedKbaseCPU));
+   assert(cpu != NULL);
+   lifted_kbase_cpu_init(cpu, NULL, NULL);
+
+   /* Test lifted_r44p1_mali_kbase_supports_cap and lifted_husky_r54p1_mali_kbase_supports_cap */
+   cpu->x[0] = ((uint64_t)1ULL << 52) | ((uint64_t)21ULL << 36); /* CSF v1.21 */
+   cpu->x[1] = 0; /* SYSTEM_MONITOR */
+   int64_t r44_cap0 = lifted_r44p1_mali_kbase_supports_cap(cpu);
+   assert(r44_cap0 == 1);
+
+   cpu->x[0] = ((uint64_t)1ULL << 52) | ((uint64_t)38ULL << 36); /* CSF v1.38 */
+   cpu->x[1] = 17; /* CSG_USER_IO (index 17 in Husky r54p1 table, min v1.35) */
+   int64_t husky_cap17 = lifted_husky_r54p1_mali_kbase_supports_cap(cpu);
+   assert(husky_cap17 == 1);
+   assert(cpu->insns_executed > 20ULL);
+
+   free(cpu);
+   printf("  -> Direct AArch64-to-LLVM-IR (lifted_kbase_ko.ll=%ld bytes, lifted_kbase_ko.c=%ld bytes, 0 C-lowered .ko fns) + native .o execution: PASS\n",
+          ll_sz, c_sz);
+}
+
+static void test_v26_csffw_lifting_qemu_and_pruned_indirect_dispatch(void)
+{
+   printf("[Unit Test 19] Verifying Checkpoint v26 mali_csffw.bin binary parser, ARMv7-M Thumb-2 lifted CSF opcode semantics, QEMU equivalence, and pruned indirect_br_dispatch tables in lifted_kbase_ko.ll...\n");
+
+   /* 1. Parse and verify predownloaded/mali_csffw.bin (Doc 53) */
+   struct csffw_parsed_image img;
+   assert(csffw_parse_binary_file("predownloaded/mali_csffw.bin", &img));
+   assert(img.valid);
+   assert(img.magic == CSFFW_BIN_MAGIC);
+   assert(img.ver_major == 0U && img.ver_minor == 3U);
+   assert(img.hdr_size == 968U);
+   assert(img.file_size == 278528U);
+   assert(img.num_entries == 27U);
+   assert(img.num_iface_sections == 8U);
+   assert(img.initial_sp == 0x02030000U);
+   assert(img.reset_handler_va == 0x00801FC1U);
+   assert(img.systick_handler_va == 0x00800015U);
+   assert(img.irq0_handler_va == 0x008000C5U);
+   assert(img.glb_group_num == 8U && img.glb_group_stride == 0xA0U && img.glb_instr_features == 0x71U);
+   assert(img.csg_stream_num == 8U && img.csg_stream_stride == 0x0CU);
+   assert(img.func_list_count == 167U && img.unique_tl_emitters == 25U);
+   assert(img.non_null_opcode_handlers == 23U);
+   assert(img.opcode_table[0x20] == 0x00811715U); /* CALL */
+   assert(img.opcode_table[0x21] == 0x0081182FU); /* JUMP */
+   assert(img.opcode_table[0x22] == 0x00806CEDU); /* REQ_RESOURCE */
+   assert(img.opcode_table[0x24] == 0x008014B1U); /* FLUSH_CACHE */
+   assert(img.opcode_table[0x25] == 0x00801651U); /* SYNC_ADD32 */
+   assert(img.opcode_table[0x26] == 0x00801651U); /* SYNC_SET32 */
+   assert(img.opcode_table[0x27] == 0x0080195DU); /* SYNC_WAIT32 */
+   assert(img.opcode_table[0x2A] == 0x008125F1U); /* LOAD_ITER_STATE */
+   assert(img.opcode_table[0x2B] == 0x00812579U); /* STORE_ITER_STATE */
+   assert(img.opcode_table[0x2C] == 0x0081284BU); /* FINISH_FRAGMENT */
+   assert(img.opcode_table[0x30] == 0x00807673U); /* HEAP_OPERATION */
+   assert(img.opcode_table[0x33] == 0x00801651U); /* SYNC_ADD64 */
+   assert(img.opcode_table[0x34] == 0x00801651U); /* SYNC_SET64 */
+   assert(img.opcode_table[0x35] == 0x0080195DU); /* SYNC_WAIT64 */
+   assert(img.opcode_table[0x80] == 0x00806B3DU); /* NOP_TRAP */
+
+   /* 2. Verify lifted_csffw_dispatch_opcode matches QEMU execution of 0x2A + 0x2C + 0x2B + 0x80 */
+   struct csffw_emu_state st;
+   csffw_emu_state_init(&st);
+   st.cshwif_regs[4] = 0x55667780U;
+   st.cshwif_regs[5] = 0x11223344U;
+   assert(lifted_csffw_dispatch_opcode(&st, 0, 0x00000000U, 0x2A000400U) == CSFFW_OP_RET_COMPLETED);
+   assert(st.cshwif_iter_state64 == 0x1122334455667780ULL);
+   assert(lifted_csffw_dispatch_opcode(&st, 0, 0x00000000U, 0x2C000001U) == CSFFW_OP_RET_COMPLETED);
+   assert(st.cshwif_iter_state64 == 0x1122334455667781ULL);
+   assert(lifted_csffw_dispatch_opcode(&st, 0, 0x00000000U, 0x2B060000U) == CSFFW_OP_RET_COMPLETED);
+   assert(st.cshwif_regs[6] == 0x55667781U && st.cshwif_regs[7] == 0x11223344U);
+   assert(lifted_csffw_dispatch_opcode(&st, 0, 0x00000000U, 0x80000000U) == CSFFW_OP_RET_COMPLETED);
+
+   /* Verify REQ_RESOURCE (0x22) and out-of-range register fault (CS_INVALID_INSTRUCTION = 73) */
+   assert(lifted_csffw_dispatch_opcode(&st, 0, 0x00000007U, 0x22000000U) == CSFFW_OP_RET_COMPLETED);
+   assert(st.csi_req_res_mask == 0x07U && st.csi_granted_res_mask == 0x07U);
+   assert(lifted_csffw_dispatch_opcode(&st, 0, 0x00000000U, 0x2A006000U) == CSFFW_OP_RET_FAULT);
+   assert(st.fault_code == 73U && st.csi_state == CSFFW_CSI_FAULT);
+
+   /* 3. Verify pruned indirect_br_dispatch tables in src/emulator/lifted_kbase_ko.ll (Doc 54) */
+   FILE *f_ll = fopen("src/emulator/lifted_kbase_ko.ll", "rb");
+   if (!f_ll) f_ll = fopen("../src/emulator/lifted_kbase_ko.ll", "rb");
+   if (!f_ll) f_ll = fopen("../../src/emulator/lifted_kbase_ko.ll", "rb");
+   assert(f_ll != NULL);
+   fseek(f_ll, 0, SEEK_END);
+   long ll_sz = ftell(f_ll);
+   fseek(f_ll, 0, SEEK_SET);
+   char *ll_buf = (char *)calloc(1, (size_t)ll_sz + 1);
+   assert(ll_buf != NULL);
+   (void)fread(ll_buf, 1, (size_t)ll_sz, f_ll);
+   fclose(f_ll);
+
+   uint32_t ind_bb_count = 0;
+   const char *p = ll_buf;
+   while ((p = strstr(p, "indirect_br_dispatch:")) != NULL) {
+      ind_bb_count++;
+      p += 21;
+   }
+   free(ll_buf);
+   assert(ind_bb_count == 4U); /* Only the 4 functions with BR Xn emit indirect_br_dispatch: */
+
+   printf("  -> mali_csffw.bin (23 Thumb-2 opcode handlers, 167 FUNC_LIST trace sites) + QEMU equivalence + pruned indirect_br_dispatch (%u fns): PASS\n",
+          ind_bb_count);
+}
+
 int main(void)
 {
    printf("[Unit Tests] Running edge cases, mali_kbase.ko flag invariants, and RAII logging suite...\n");
@@ -1392,6 +1772,10 @@ int main(void)
    test_v19_dogwitch_recycled_cb_jump_chain_and_machick2_v11_defer_sync();
    test_v20_worklist_chunk_hash_bug_catching_and_dual_capture_replay();
    test_v21_grow_on_gpf_mem_commit_hv_stepdown_and_poll_coalesce();
+   test_v22_husky_1_38_csg_user_io_stride_and_lifted_ko_emu();
+   test_v24_unified_horizon2llvm_ko_rodata_caps_and_heap_uaf();
+   test_v25_llvm_ir_ko_lowering_and_recompilation();
+   test_v26_csffw_lifting_qemu_and_pruned_indirect_dispatch();
    printf("[Unit Tests] ALL EDGE CASES PASSED!\n");
    return 0;
 }

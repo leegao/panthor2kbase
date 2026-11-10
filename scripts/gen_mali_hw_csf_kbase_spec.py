@@ -21,15 +21,15 @@ import xml.etree.ElementTree as ET
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 GENXML_V10_CANDIDATES = [
-    "/working_dir/c_3106ac7496559798/work/mesa_upstream/mesa-5a07217f034b3e50d8c7c7794f97a2df1742613b/src/panfrost/genxml/v10.xml",
+    os.path.join(ROOT_DIR, "mesa/src/panfrost/genxml/v10.xml"),
     os.path.join(ROOT_DIR, "../work/mesa_upstream/mesa-5a07217f034b3e50d8c7c7794f97a2df1742613b/src/panfrost/genxml/v10.xml"),
 ]
 GENXML_V11_CANDIDATES = [
-    "/working_dir/c_3106ac7496559798/work/mesa_upstream/mesa-5a07217f034b3e50d8c7c7794f97a2df1742613b/src/panfrost/genxml/v11.xml",
+    os.path.join(ROOT_DIR, "mesa/src/panfrost/genxml/v11.xml"),
     os.path.join(ROOT_DIR, "../work/mesa_upstream/mesa-5a07217f034b3e50d8c7c7794f97a2df1742613b/src/panfrost/genxml/v11.xml"),
 ]
 KBASE_R44_DIR_CANDIDATES = [
-    "/working_dir/c_3106ac7496559798/mt6878_r44_src/android_kernel_modules_nothing_mt6878-mt6878-Tetris-u/gpu/gpu_mali/mali_avalon/mali-r44p1/drivers/gpu/arm/midgard",
+    os.path.join(ROOT_DIR, "include"),
 ]
 
 
@@ -95,7 +95,7 @@ def build_spec():
     v10_path = first_existing(GENXML_V10_CANDIDATES)
     enums_v11, insns_v11 = parse_genxml(v11_path or v10_path)
 
-    # Canonical fallback if run in CI container without full Mesa checkout mounted at /working_dir
+    # Canonical fallback if run without a full local Mesa checkout
     if not enums_v11:
         spec_json_path = os.path.join(ROOT_DIR, "specs", "mali_csf_kbase_spec.json")
         if os.path.exists(spec_json_path):

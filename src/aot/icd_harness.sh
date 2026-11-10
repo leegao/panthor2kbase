@@ -2,11 +2,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$ROOT_DIR/../.." && pwd)"
 DEFAULT_SO="$ROOT_DIR/libGLES_mali.so"
-if [ ! -f "$DEFAULT_SO" ] && [ -f "/working_dir/c_24f54338d69d9705/user_uploaded_files/ttl=63d/user_uploaded/libGLES_mali.so" ]; then
-    DEFAULT_SO="/working_dir/c_24f54338d69d9705/user_uploaded_files/ttl=63d/user_uploaded/libGLES_mali.so"
-elif [ ! -f "$DEFAULT_SO" ] && [ -f "/working_dir/c_a3c1acfa7b15211d/work/libGLES_mali.so" ]; then
-    DEFAULT_SO="/working_dir/c_a3c1acfa7b15211d/work/libGLES_mali.so"
+if [ ! -f "$DEFAULT_SO" ] && [ -f "$REPO_ROOT/libGLES_mali.so" ]; then
+    DEFAULT_SO="$REPO_ROOT/libGLES_mali.so"
 fi
 
 SO_PATH="${1:-$DEFAULT_SO}"

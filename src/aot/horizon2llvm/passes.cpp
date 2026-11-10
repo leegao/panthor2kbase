@@ -267,7 +267,7 @@ bool PassPipelineConfig::set_pass_enabled(const std::string& name, bool en) {
 }
 
 void build_aarch64_lowering_pipeline(ModulePassManager& MPM, const PassPipelineConfig& cfg) {
-    MPM.addPass(std::make_unique<AArch64SysBarrierLoweringPass>());
+    MPM.addPass(std::make_unique<AArch64SysBarrierLoweringPass>(cfg.mode));
     MPM.addPass(std::make_unique<GuestStackAndAlignmentPass>(cfg.enable_stack_alignment));
     MPM.addPass(std::make_unique<AArch64IdiomDeconstructPass>(cfg.enable_idiom_deconstruct));
     MPM.addPass(std::make_unique<JumpTableLoweringPass>());

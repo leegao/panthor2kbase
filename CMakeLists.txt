@@ -43,7 +43,7 @@ if(PANTHOR_KBASE_ENABLE_COVERAGE AND NOT ANDROID)
    add_compile_options(--coverage -fprofile-arcs -ftest-coverage -O0 -g -UNDEBUG)
    add_link_options(--coverage)
 else()
-   add_compile_options(-O2 -g -Wall -Wextra -Wno-unused-parameter -UNDEBUG)
+   add_compile_options(-O2 -g -ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=. -ffile-prefix-map=${CMAKE_BINARY_DIR}=. -Wall -Wextra -Wno-unused-parameter -UNDEBUG)
 endif()
 
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,nodelete")
@@ -68,7 +68,8 @@ file(MAKE_DIRECTORY "${TESTS_DIR}")
 file(MAKE_DIRECTORY "${SCRATCH_DIR}")
 
 # RPATH configuration: ensures binaries resolve libraries across build subdirectories
-set(ROOT_RPATH "$ORIGIN;$ORIGIN/..;$ORIGIN/../adapter;$ORIGIN/../emulator;$ORIGIN/../aot;$ORIGIN/../../build-x86-64;$ORIGIN/../../build-x86-64/adapter;$ORIGIN/../../build-x86-64/emulator;$ORIGIN/../../build-x86-64/aot;${CMAKE_BINARY_DIR};${ADAPTER_DIR};${EMULATOR_DIR};${AOT_DIR};${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/src/aot/layers")
+set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
+set(ROOT_RPATH "$ORIGIN;$ORIGIN/..;$ORIGIN/../..;$ORIGIN/../../..;$ORIGIN/../adapter;$ORIGIN/../emulator;$ORIGIN/../aot;$ORIGIN/../../build-x86-64;$ORIGIN/../../build-x86-64/adapter;$ORIGIN/../../build-x86-64/emulator;$ORIGIN/../../build-x86-64/aot;$ORIGIN/../../src/aot/layers;$ORIGIN/../../../build-x86-64;$ORIGIN/../../../build-x86-64/adapter;$ORIGIN/../../../build-x86-64/emulator;$ORIGIN/../../../build-x86-64/aot")
 set(CMAKE_BUILD_RPATH "${ROOT_RPATH}")
 set(CMAKE_INSTALL_RPATH "${ROOT_RPATH}")
 set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
@@ -94,6 +95,7 @@ endfunction()
 # -----------------------------------------------------------------------------
 add_library(panthor_kbase_adapter SHARED
    src/adapter/panthor_kbase_adapter.cpp
+   src/adapter/mali_kbase_caps.cpp
    src/adapter/panthor_drm_capture_replay.cpp
    src/adapter/log.cpp
    src/adapter/drm_mode_stubs.c
@@ -109,6 +111,7 @@ add_custom_command(TARGET panthor_kbase_adapter POST_BUILD
 
 add_library(panthor_kbase_adapter_static STATIC
    src/adapter/panthor_kbase_adapter.cpp
+   src/adapter/mali_kbase_caps.cpp
    src/adapter/panthor_drm_capture_replay.cpp
    src/adapter/log.cpp
    src/adapter/drm_mode_stubs.c
@@ -126,6 +129,7 @@ add_custom_command(TARGET panthor_kbase_adapter_static POST_BUILD
 # -----------------------------------------------------------------------------
 add_library(drm_shim STATIC
    src/adapter/panthor_kbase_adapter.cpp
+   src/adapter/mali_kbase_caps.cpp
    src/adapter/panthor_drm_capture_replay.cpp
    src/adapter/log.cpp
    src/adapter/drm_mode_stubs.c
@@ -144,8 +148,18 @@ add_custom_command(TARGET drm_shim POST_BUILD
 # -----------------------------------------------------------------------------
 # 3. User-Space /dev/mali0 Kbase CSF & Valhall ISA Emulator (Shared & Static)
 # -----------------------------------------------------------------------------
+if(ANDROID)
+   set(LIFTED_KBASE_KO_LL_OBJ "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko_arm64.o")
+else()
+   set(LIFTED_KBASE_KO_LL_OBJ "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko_x86_64.o")
+endif()
+set_source_files_properties(${LIFTED_KBASE_KO_LL_OBJ} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+
 add_library(mali_kbase_emu SHARED
    src/emulator/mali_kbase_emu.c
+   src/emulator/lifted_kbase_ko.c
+   src/emulator/lifted_csffw.c
+   ${LIFTED_KBASE_KO_LL_OBJ}
    src/emulator/panfrost_valhall_disasm_gen.c
 )
 target_link_libraries(mali_kbase_emu PRIVATE panthor_kbase_adapter ${PLATFORM_LIBS})
@@ -159,6 +173,9 @@ add_custom_command(TARGET mali_kbase_emu POST_BUILD
 
 add_library(mali_kbase_emu_static STATIC
    src/emulator/mali_kbase_emu.c
+   src/emulator/lifted_kbase_ko.c
+   src/emulator/lifted_csffw.c
+   ${LIFTED_KBASE_KO_LL_OBJ}
    src/emulator/panfrost_valhall_disasm_gen.c
 )
 set_target_properties(mali_kbase_emu_static PROPERTIES
@@ -306,6 +323,39 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
       LIBRARY_OUTPUT_DIRECTORY "${AOT_DIR}"
    )
 
+   add_executable(horizon2llvm
+      src/aot/horizon2llvm/main.cpp
+      src/aot/horizon2llvm/ko_lifter.cpp
+      src/aot/horizon2llvm/llvm_backend.cpp
+      src/aot/horizon2llvm/passes.cpp
+      src/aot/horizon2llvm/aarch64/aarch64_lifter.cpp
+      src/aot/horizon2llvm/lowering/pass_aapcs64_abi_contract.cpp
+      src/aot/horizon2llvm/lowering/pass_aarch64_idiom_deconstruct.cpp
+      src/aot/horizon2llvm/lowering/pass_cpu_state_promotion.cpp
+      src/aot/horizon2llvm/lowering/pass_fcmp_predicate_fusion.cpp
+      src/aot/horizon2llvm/lowering/pass_guest_stack_alignment.cpp
+      src/aot/horizon2llvm/lowering/pass_jump_table_lowering.cpp
+      src/aot/horizon2llvm/lowering/pass_link_register_elision.cpp
+      src/aot/horizon2llvm/lowering/pass_nzcv_dead_flag_elim.cpp
+      src/aot/horizon2llvm/lowering/pass_nzcv_predicate_fusion.cpp
+      src/aot/horizon2llvm/lowering/pass_tail_call_devirt.cpp
+   )
+   target_include_directories(horizon2llvm PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/horizon2llvm")
+   set_target_properties(horizon2llvm PROPERTIES
+      CXX_STANDARD 20
+      RUNTIME_OUTPUT_DIRECTORY "${AOT_DIR}"
+   )
+   option(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS "Compile horizon2llvm against system C++ LLVM headers instead of self-contained llvm_compat_standalone.hpp" OFF)
+   if(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS)
+      target_compile_definitions(horizon2llvm PRIVATE HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS=1)
+      find_library(SYSTEM_LLVM_SHARED_LIB NAMES LLVM LLVM-18 LLVM-17 LLVM-16 LLVM-15)
+      if(SYSTEM_LLVM_SHARED_LIB)
+         target_link_libraries(horizon2llvm PRIVATE "${SYSTEM_LLVM_SHARED_LIB}")
+      endif()
+   endif()
+   target_link_libraries(horizon2llvm PRIVATE dl ${PLATFORM_LIBS})
+   target_copy_to_source_tree(horizon2llvm "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/bin/horizon2llvm")
+
    add_executable(mali_llvm_pass_driver
       src/aot/src/mali_llvm_passes.cpp
    )
@@ -318,7 +368,7 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
    add_custom_target(aot_targets ALL
       COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/translate.sh" libGLES_mali.so "${CMAKE_BINARY_DIR}"
       WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-      DEPENDS mali_kbase_emu_static panthor_kbase_adapter_static mali_llvm_pass_driver
+      DEPENDS mali_kbase_emu_static panthor_kbase_adapter_static mali_llvm_pass_driver horizon2llvm
       COMMENT "Running 64-bit Mali AOT translation pipeline (translate.sh)"
    )
 endif()
@@ -342,6 +392,9 @@ if(PANTHOR_KBASE_BUILD_TESTS AND NOT ANDROID)
    set_target_properties(unit_tests_edge_cases PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${TESTS_DIR}"
    )
+   if(TARGET aot_targets)
+      add_dependencies(unit_tests_edge_cases aot_targets)
+   endif()
    add_test(NAME edge_case_unit_tests COMMAND unit_tests_edge_cases WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
    add_executable(run_vulkan_samples_and_equivalence_suite
@@ -441,5 +494,9 @@ if(PANTHOR_KBASE_BUILD_TESTS AND NOT ANDROID)
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/src/verifier/aarch64_mc_lifter.py ${CMAKE_CURRENT_SOURCE_DIR}/mali_kbase.ko
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
       )
+   add_test(NAME csffw_formal_semantics_verifier
+      COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/src/verifier/csffw_formal_semantics_verifier.py"
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+   )
    endif()
 endif()

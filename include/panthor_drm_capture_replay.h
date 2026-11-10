@@ -300,12 +300,39 @@ int panthor_drm_replay_trace_file(const char *filepath,
                                   const struct pandrm_replay_options *opts,
                                   struct pandrm_replay_summary *out_summary);
 
-/* 64-bit FNV-1a hash helper shared with CSF worklist chunk hash cache */
+/*
+ * 64-bit FNV-1a hash helper shared with CSF worklist chunk hash cache:
+ * Uses 64-bit word-aligned register loads (`ldr xN`) when `data` is 8-byte aligned
+ * so Write-Combine (`MT_NORMAL_NC`) command stream buffers are read once per 8-byte
+ * CSF instruction instead of issuing 8 uncached byte-by-byte (`ldrb`) bus transactions,
+ * while computing the exact bit-identical FNV-1a 64-bit digest.
+ */
+static inline uint64_t panthor_fnv1a64_qword_step(uint64_t h, uint64_t w)
+{
+   h ^= (w & 0xffULL);         h *= UINT64_C(0x100000001b3);
+   h ^= ((w >> 8) & 0xffULL);  h *= UINT64_C(0x100000001b3);
+   h ^= ((w >> 16) & 0xffULL); h *= UINT64_C(0x100000001b3);
+   h ^= ((w >> 24) & 0xffULL); h *= UINT64_C(0x100000001b3);
+   h ^= ((w >> 32) & 0xffULL); h *= UINT64_C(0x100000001b3);
+   h ^= ((w >> 40) & 0xffULL); h *= UINT64_C(0x100000001b3);
+   h ^= ((w >> 48) & 0xffULL); h *= UINT64_C(0x100000001b3);
+   h ^= ((w >> 56) & 0xffULL); h *= UINT64_C(0x100000001b3);
+   return h;
+}
+
 static inline uint64_t panthor_fnv1a64_bytes(const void *data, size_t len)
 {
    const uint8_t *p = (const uint8_t *)data;
    uint64_t h = UINT64_C(0xcbf29ce484222325);
-   for (size_t i = 0; i < len; i++) {
+   size_t i = 0;
+   if (len >= 8U && (((uintptr_t)p & 7U) == 0U)) {
+      const uint64_t *qw = (const uint64_t *)p;
+      size_t qcount = len >> 3;
+      for (size_t q = 0; q < qcount; q++)
+         h = panthor_fnv1a64_qword_step(h, qw[q]);
+      i = qcount << 3;
+   }
+   for (; i < len; i++) {
       h ^= (uint64_t)p[i];
       h *= UINT64_C(0x100000001b3);
    }

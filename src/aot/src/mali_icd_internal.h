@@ -714,10 +714,12 @@ struct MaliAotGlobalRuntime {
             *reinterpret_cast<uint64_t*>(mapper.base + 0x031462a0ULL) = reinterpret_cast<uint64_t>(cfg_blob);
         }
 
+        // Mark initialized = true BEFORE probing Host Vulkan so any re-entrant loader probe
+        // into libvulkan_mali_aot_icd.so returns immediately instead of deadlocking g_aot_rt.mtx!
+        initialized = true;
+
         // 4. Initialize Host Vulkan (llvmpipe or host GPU) in mali0_emu
         g_icd_kbase_emu.lvp_executor.init();
-
-        initialized = true;
         return true;
     }
 };

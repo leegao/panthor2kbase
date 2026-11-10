@@ -541,7 +541,7 @@ bash run_all_tests.sh
 #### 4. Output & Interpretation
 ```
 ================================================================================
- [ALL SUITES PASSED] Every Test, Verifier, and Equivalence Artifact Succeeded! 
+ [ALL SUITES PASSED] Every Test, Verifier, and Equivalence Artifact Succeeded!
 ================================================================================
 ```
 
@@ -780,4 +780,26 @@ Enables migrating the complete development and verification environment into off
 #### 3. How to run it
 ```bash
 bash scripts/pack_sandbox_bundles.sh
+```
+
+---
+
+### `src/emulator/lift_kbase_ko.py` & `src/emulator/lifted_kbase_ko.c`
+
+#### 1. What it does
+Parses the AArch64 ELF relocatable kernel modules `mali_kbase.ko` (MediaTek MT6878 r44p1, `kbase_ver=1.20`) and `predownloaded/mali_kbase_husky.ko` (Google Pixel 8 Pro Tensor G3 r54p1, `kbase_ver=1.38`), resolves `.rela.text` relocations (`R_AARCH64_CALL26`, `R_AARCH64_JUMP26`, `R_AARCH64_ADR_PREL_PG_HI21`, `R_AARCH64_ADD_ABS_LO12_NC`, and PC-relative `.rodata` switch jump tables), extracts byte-exact `.rodata` capability and property tables (`kbase_caps_table` and `gpu_property_mapping`), and generates `src/emulator/lifted_kbase_ko.h` and `src/emulator/lifted_kbase_ko.c` (24 lifted kernel functions).
+
+#### 2. How to run it
+```bash
+python3 src/emulator/lift_kbase_ko.py
+```
+
+### Selecting `/dev/mali0` Emulator Profiles (`KBASE_EMU_PROFILE`)
+`libmali_kbase_emu.so` supports runtime selection between the MediaTek MT6878 (`r44p1`) and Google Pixel 8 Pro Husky (`r54p1`) hardware and kernel profiles:
+```bash
+# Default: MediaTek Dimensity 7300 (mt6878, Mali-G615 MC2, raw_gpu_id=0xc0801001, kbase_ver=1.20)
+KBASE_EMU_PROFILE=mt6878 ./build-x86-64/tests/unit_tests_edge_cases
+
+# Pixel 8 Pro (husky, Tensor G3, Mali-G715 MC7, raw_gpu_id=0xb8a21020, kbase_ver=1.38, shared CSG USER_IO stride)
+KBASE_EMU_PROFILE=husky ./build-x86-64/tests/unit_tests_edge_cases
 ```

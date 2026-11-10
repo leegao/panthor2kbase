@@ -41,6 +41,8 @@
 #include <vulkan/vulkan.h>
 
 #include "mali_kbase_emu.h"
+#include "lifted_kbase_ko.h"
+#include "lifted_csffw.h"
 #include "panthor_csf_instr.h"
 #include "valhall_disasm_lift.h"
 #include "panthor_kbase_adapter.h"
@@ -192,8 +194,12 @@ struct emu_kfile {
    enum kfile_setup_state state;
    bool exec_va_initialized;
    bool jit_initialized;
+   bool csg_user_io_cap;
+   uint16_t kbase_ver_major;
+   uint16_t kbase_ver_minor;
    void *tracking_page;
    void *user_reg_page;
+   void *group_user_io_pages[16]; /* CSG-shared 3*4096 USER_IO pages when kbase_ver >= 1.35 */
    uint32_t next_cookie;
    uint32_t next_user_io_cookie;
    uint8_t next_group_handle;
@@ -201,9 +207,210 @@ struct emu_kfile {
    struct emu_mem_region regions[512];
    struct emu_cs_queue queues[32];
    struct emu_tiler_heap heaps[16];
+   uint8_t sim_kctx[65536] __attribute__((aligned(16)));
+   uint8_t sim_kbdev[65536] __attribute__((aligned(16)));
+   uint8_t sim_regdump[4096] __attribute__((aligned(16)));
+   uint8_t sim_csg[16][1024] __attribute__((aligned(16)));
+   uint8_t sim_queue[32][512] __attribute__((aligned(16)));
+   uint8_t sim_inode[256] __attribute__((aligned(16)));
+   uint8_t sim_filp[512] __attribute__((aligned(16)));
+   uint8_t sim_kfile_buf[256] __attribute__((aligned(16)));
+   uint8_t gpuprops_blob[1024] __attribute__((aligned(16)));
+   uint32_t gpuprops_blob_size;
+   uint64_t cur_ioctl_in_flags;
+   bool has_cur_ioctl_in_flags;
+   int cur_ioctl_errno;
 };
 
 static struct emu_kfile g_kfile;
+static int g_emu_profile_override = -1;
+static LiftedKbaseCPU g_lifted_cpu;
+
+static enum mali_kbase_emu_profile resolve_active_emu_profile(void)
+{
+   if (g_emu_profile_override >= 0)
+      return (enum mali_kbase_emu_profile)g_emu_profile_override;
+   const char *e1 = getenv("KBASE_EMU_PROFILE");
+   const char *e2 = getenv("PANTHOR_EMU_PROFILE");
+   const char *ev = (e1 && e1[0]) ? e1 : e2;
+   if (ev && (strcasecmp(ev, "husky") == 0 || strcasecmp(ev, "r54") == 0 ||
+              strcasecmp(ev, "r54p1") == 0 || strcasecmp(ev, "r54p3") == 0 ||
+              strcmp(ev, "1") == 0)) {
+      return MALI_EMU_PROFILE_HUSKY_R54;
+   }
+   return MALI_EMU_PROFILE_MT6878_R44;
+}
+
+__attribute__((visibility("default")))
+void mali_kbase_emu_set_profile(enum mali_kbase_emu_profile profile)
+{
+   pthread_mutex_lock(&g_emu_lock);
+   g_emu_profile_override = (int)profile;
+   g_stats.active_profile = (uint32_t)profile;
+   pthread_mutex_unlock(&g_emu_lock);
+}
+
+__attribute__((visibility("default")))
+enum mali_kbase_emu_profile mali_kbase_emu_get_profile(void)
+{
+   pthread_mutex_lock(&g_emu_lock);
+   enum mali_kbase_emu_profile p = resolve_active_emu_profile();
+   pthread_mutex_unlock(&g_emu_lock);
+   return p;
+}
+
+static uint64_t host_abi_os_copy_from_user(void *dst, const void *user_src, size_t n)
+{
+   if (!dst || !user_src || n == 0)
+      return n;
+   memcpy(dst, user_src, n);
+   return 0ULL;
+}
+
+static uint64_t host_abi_os_copy_to_user(void *user_dst, const void *src, size_t n)
+{
+   if (!user_dst || !src || n == 0)
+      return n;
+   memcpy(user_dst, src, n);
+   return 0ULL;
+}
+
+static void *host_abi_os_kmalloc(LiftedKbaseCPU *cpu, size_t sz, uint32_t gfp_flags)
+{
+   (void)gfp_flags;
+   return lifted_ko_heap_alloc(cpu, sz);
+}
+
+static void host_abi_os_kfree(LiftedKbaseCPU *cpu, void *ptr)
+{
+   (void)lifted_ko_heap_free(cpu, ptr);
+}
+
+static void *host_abi_mmu_device_get_list(LiftedKbaseCPU *cpu)
+{
+   cpu->dev_list_head[0] = (uint64_t)(uintptr_t)(g_kfile.sim_kbdev + 24);
+   *(uint64_t *)(g_kfile.sim_kbdev + 24) = (uint64_t)(uintptr_t)&cpu->dev_list_head[0];
+   *(uint32_t *)(g_kfile.sim_kbdev + 48) = 0U;
+   return &cpu->dev_list_head[0];
+}
+
+static void *host_abi_mmu_create_context(LiftedKbaseCPU *cpu, void *kbdev, bool is_compat,
+                                         uint32_t flags, uint64_t api_version, void *kfile)
+{
+   (void)is_compat;
+   (void)flags;
+   (void)kfile;
+   *(uint64_t *)(g_kfile.sim_kctx + 8) = (uint64_t)(uintptr_t)(kbdev ? kbdev : g_kfile.sim_kbdev);
+   *(uint64_t *)(g_kfile.sim_kctx + 36968) = api_version;
+   *(uint32_t *)(g_kfile.sim_kctx + 37072) = 0x800U;
+   *(uint64_t *)(g_kfile.sim_kctx + 37072 + 7128) = *(uint64_t *)(cpu->task_struct + 1304);
+   *(uint64_t *)(g_kfile.sim_kctx + 37072 + 7504) = *(uint64_t *)(cpu->task_struct + 1440);
+   return g_kfile.sim_kctx;
+}
+
+static void host_abi_mmu_destroy_context(LiftedKbaseCPU *cpu, void *kctx)
+{
+   (void)cpu;
+   (void)kctx;
+}
+
+static void lifted_emu_shim_hook(LiftedKbaseCPU *cpu, const char *ko_prof, const char *callee)
+{
+   (void)ko_prof;
+   if (strcmp(callee, "kbase_device_get_list") == 0) {
+      cpu->x[0] = (uint64_t)(uintptr_t)host_abi_mmu_device_get_list(cpu);
+   } else if (strcmp(callee, "kbase_create_context") == 0) {
+      cpu->x[0] = (uint64_t)(uintptr_t)host_abi_mmu_create_context(
+         cpu, (void *)(uintptr_t)cpu->x[0], cpu->x[1] != 0,
+         (uint32_t)cpu->x[2], cpu->x[3], (void *)(uintptr_t)cpu->x[4]);
+   } else if (strcmp(callee, "kbase_destroy_context") == 0) {
+      host_abi_mmu_destroy_context(cpu, (void *)(uintptr_t)cpu->x[0]);
+      cpu->x[0] = 0ULL;
+   } else if (strcmp(callee, "kbase_mem_pool_alloc_pages") == 0) {
+      cpu->x[0] = 2ULL;
+   } else if (strcmp(callee, "kernel_map_user_io_pages") == 0 ||
+              strcmp(callee, "kernel_alloc_user_io_pages") == 0) {
+      uint8_t *qptr = (uint8_t *)(uintptr_t)cpu->x[1];
+      if (qptr && *(uint64_t *)(qptr + 32) == 0ULL) {
+         void *uio = orig_mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE,
+                               MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+         *(uint64_t *)(qptr + 32) = (uint64_t)(uintptr_t)uio;
+      }
+      cpu->x[0] = 0ULL;
+   } else if (strcmp(callee, "kbase_mem_alloc") == 0) {
+      /* Return non-NULL region pointer so kbase_api_mem_alloc_ex writes out.flags & out.gpu_va */
+      cpu->x[0] = (uint64_t)(uintptr_t)&g_kfile.regions[0];
+   } else if (strcmp(callee, "kbase_mem_alias") == 0) {
+      cpu->x[0] = (uint64_t)(g_kfile.next_cookie << 12);
+   } else if (strcmp(callee, "kbase_csf_firmware_get_glb_iface") == 0) {
+      if (cpu->x[5]) *(uint32_t *)(uintptr_t)cpu->x[5] = (1U << 26) | (1U << 20);
+      if (cpu->x[6]) *(uint32_t *)(uintptr_t)cpu->x[6] = 0x7U;
+      if (cpu->x[7]) *(uint32_t *)(uintptr_t)cpu->x[7] = 8U;
+      cpu->x[0] = 24ULL;
+   } else if (strcmp(callee, "csf_queue_register_internal") == 0 ||
+              strcmp(callee, "create_queue_group") == 0 ||
+              strcmp(callee, "kbase_csf_queue_group_create") == 0 ||
+              strcmp(callee, "kbase_csf_tiler_heap_init") == 0) {
+      cpu->x[0] = 0ULL;
+   } else {
+      cpu->x[0] = 0ULL;
+   }
+}
+
+static int g_lifted_cpu_depth = 0;
+
+static inline void ensure_lifted_cpu_ready_locked(void)
+{
+   if (g_lifted_cpu.sp == 0ULL || g_lifted_cpu.x[18] == 0ULL)
+      lifted_kbase_cpu_init(&g_lifted_cpu, &g_kfile, lifted_emu_shim_hook);
+   if (g_lifted_cpu_depth == 0) {
+      g_lifted_cpu.sp = (uint64_t)(uintptr_t)(g_lifted_cpu.stack + sizeof(g_lifted_cpu.stack) - 256);
+      g_lifted_cpu.x[18] = (uint64_t)(uintptr_t)&g_lifted_cpu.scs_stack[16];
+   }
+}
+
+static int64_t call_nested_lifted_fn_locked(int64_t (*fn)(LiftedKbaseCPU *),
+                                            uint64_t a0, uint64_t a1, uint64_t a2,
+                                            uint64_t a3, uint64_t a4)
+{
+   ensure_lifted_cpu_ready_locked();
+   uint64_t saved_x[31];
+   memcpy(saved_x, g_lifted_cpu.x, sizeof(saved_x));
+   uint64_t saved_sp = g_lifted_cpu.sp;
+   uint64_t saved_x18 = g_lifted_cpu.x[18];
+   uint8_t saved_n = g_lifted_cpu.n, saved_z = g_lifted_cpu.z;
+   uint8_t saved_c = g_lifted_cpu.c, saved_v = g_lifted_cpu.v;
+   if (g_lifted_cpu_depth > 0) {
+      g_lifted_cpu.sp = (saved_sp - 1024ULL) & ~15ULL;
+   }
+   g_lifted_cpu.x[0] = a0;
+   g_lifted_cpu.x[1] = a1;
+   g_lifted_cpu.x[2] = a2;
+   g_lifted_cpu.x[3] = a3;
+   g_lifted_cpu.x[4] = a4;
+   uint64_t prev_insns = g_lifted_cpu.insns_executed;
+   g_lifted_cpu_depth++;
+   int64_t rc = fn(&g_lifted_cpu);
+   g_lifted_cpu_depth--;
+   g_stats.lifted_ko_calls_executed++;
+   if (g_lifted_cpu.insns_executed >= prev_insns)
+      g_stats.lifted_ko_insns_executed += (g_lifted_cpu.insns_executed - prev_insns);
+   memcpy(g_lifted_cpu.x, saved_x, sizeof(saved_x));
+   g_lifted_cpu.sp = saved_sp;
+   g_lifted_cpu.x[18] = saved_x18;
+   g_lifted_cpu.n = saved_n;
+   g_lifted_cpu.z = saved_z;
+   g_lifted_cpu.c = saved_c;
+   g_lifted_cpu.v = saved_v;
+   return rc;
+}
+
+static void sync_lifted_stats_locked(uint64_t prev_insns)
+{
+   g_stats.lifted_ko_calls_executed++;
+   if (g_lifted_cpu.insns_executed >= prev_insns)
+      g_stats.lifted_ko_insns_executed += (g_lifted_cpu.insns_executed - prev_insns);
+}
 
 static bool is_emulated_mali_fd(int fd)
 {
@@ -294,6 +501,10 @@ bool mali_kbase_emu_init_lavapipe_bridge(void)
 void mali_kbase_emu_get_stats(struct kbase_emu_stats *out)
 {
    pthread_mutex_lock(&g_emu_lock);
+   g_stats.active_profile = (uint32_t)resolve_active_emu_profile();
+   g_stats.kbase_ver_major = g_kfile.kbase_ver_major ? g_kfile.kbase_ver_major : 1U;
+   g_stats.kbase_ver_minor = g_kfile.kbase_ver_minor ? g_kfile.kbase_ver_minor :
+      (g_stats.active_profile == MALI_EMU_PROFILE_HUSKY_R54 ? 38U : 21U);
    if (out)
       *out = g_stats;
    pthread_mutex_unlock(&g_emu_lock);
@@ -323,13 +534,92 @@ static size_t append_gpuprop_tlv(uint8_t *buf, size_t cap, size_t off,
 static size_t build_valhall_gpuprops_blob(uint8_t *buf, size_t cap)
 {
    size_t off = 0;
+   enum mali_kbase_emu_profile prof = resolve_active_emu_profile();
    /*
-    * Default to Mali-G615 MC2 (Valhall v11, arch=11.8.3, 0xb8031030) to match
-    * the user's target device, or Mali-G610 (v10, 0xa8070000) if KBASE_EMU_ARCH_MAJOR=10.
+    * Execute the lifted kbase_gpuprops_parse_gpu_id + kbase_gpuprops_populate_user_buffer
+    * from mali_kbase.ko (MT6878 r44p1) or mali_kbase_husky.ko (Pixel 8 Pro Tensor G3 r54p1)
+    * to exercise the real .ko .rodata gpu_property_mapping table and TLV encoder loop!
     */
-   uint64_t gpu_id = (11ULL << 28) | (8ULL << 24) | (3ULL << 16) | 0x1030ULL; /* Mali-G615 v11 */
-   uint32_t core_features = 0x2U; /* Matches user's Mali-G615 MC2 device (normalized to 4 by adapter) */
-   uint64_t shader_present = 0x3ULL; /* MC2 (or 0x130013 / 0x3f) */
+   ensure_lifted_cpu_ready_locked();
+   uint64_t prev_insns = g_lifted_cpu.insns_executed;
+   uint8_t *kbdev = g_kfile.sim_kbdev;
+   uint8_t *regdump = g_kfile.sim_regdump;
+   memset(kbdev, 0, 16384);
+   memset(regdump, 0, sizeof(g_kfile.sim_regdump));
+   if (prof == MALI_EMU_PROFILE_HUSKY_R54) {
+      *(uint64_t *)(kbdev + 10576) = (uint64_t)(uintptr_t)regdump;
+      *(uint32_t *)(regdump + 40) = 0x07140206U;
+      *(uint64_t *)(regdump + 48) = 0x00000809ULL;
+      *(uint64_t *)(regdump + 56) = 0x00000101ULL;
+      *(uint64_t *)(regdump + 64) = 0x00002830ULL;
+      *(uint64_t *)(regdump + 72) = 0x00000004ULL;
+      *(uint32_t *)(regdump + 168) = 0xb8a21020U;
+      *(uint16_t *)(regdump + 170) = 0x7020U;
+      *(uint32_t *)(regdump + 176) = 0x0a04ffffU;
+      *(uint32_t *)(regdump + 180) = 2048U;
+      *(uint32_t *)(regdump + 184) = 1024U;
+      *(uint32_t *)(regdump + 188) = (0x0aU << 24) | 1024U;
+      *(uint32_t *)(regdump + 196) = 65536U;
+      *(uint64_t *)(kbdev + 10288) = 0x1fcULL;
+      *(uint64_t *)(kbdev + 10296) = 0x1ULL;
+      *(uint64_t *)(kbdev + 10304) = 0x1ULL;
+      *(uint64_t *)(kbdev + 10312) = 0x1ULL;
+      *(uint32_t *)(kbdev + 10340) = 7U;
+      *(uint32_t *)(kbdev + 10344) = 1U;
+      *(uint32_t *)(kbdev + 10348) = 12U;
+      *(uint32_t *)(kbdev + 10356) = 64U;
+      g_lifted_cpu.x[0] = (uint64_t)(uintptr_t)(kbdev + 10337 + 123);
+      g_lifted_cpu.x[1] = 0xb8a21020U;
+      (void)lifted_husky_r54p1_kbase_gpuprops_parse_gpu_id(&g_lifted_cpu);
+      sync_lifted_stats_locked(prev_insns);
+      prev_insns = g_lifted_cpu.insns_executed;
+      g_lifted_cpu.x[0] = (uint64_t)(uintptr_t)kbdev;
+      (void)lifted_husky_r54p1_kbase_gpuprops_populate_user_buffer(&g_lifted_cpu);
+      sync_lifted_stats_locked(prev_insns);
+      void *kbuf = *(void **)(kbdev + 10568);
+      if (kbuf) {
+         *(void **)(kbdev + 10568) = NULL;
+      }
+   } else {
+      *(uint64_t *)(kbdev + 11064) = (uint64_t)(uintptr_t)regdump;
+      *(uint32_t *)(regdump + 40) = 0x07130206U;
+      *(uint64_t *)(regdump + 48) = 0x00000809ULL;
+      *(uint64_t *)(regdump + 56) = 0x00000101ULL;
+      *(uint64_t *)(regdump + 64) = 0x00002830ULL;
+      *(uint64_t *)(regdump + 72) = 0x00000002ULL;
+      *(uint32_t *)(regdump + 168) = 0xb8031030U;
+      *(uint16_t *)(regdump + 170) = 0x6030U;
+      *(uint32_t *)(regdump + 176) = 0x0a04ffffU;
+      *(uint32_t *)(regdump + 180) = 2048U;
+      *(uint32_t *)(regdump + 184) = 1024U;
+      *(uint32_t *)(regdump + 188) = (0x0aU << 24) | 1024U;
+      *(uint32_t *)(regdump + 196) = 65536U;
+      *(uint64_t *)(kbdev + 10792) = 0x3ULL;
+      *(uint64_t *)(kbdev + 10800) = 0x1ULL;
+      *(uint64_t *)(kbdev + 10808) = 0x1ULL;
+      *(uint64_t *)(kbdev + 10816) = 0x1ULL;
+      *(uint32_t *)(kbdev + 10832) = 1U;
+      *(uint32_t *)(kbdev + 10836) = 12U;
+      *(uint32_t *)(kbdev + 10844) = 64U;
+      g_lifted_cpu.x[0] = (uint64_t)(uintptr_t)(kbdev + 10825 + 123);
+      g_lifted_cpu.x[1] = 0xb8031030U;
+      (void)lifted_r44p1_kbase_gpuprops_parse_gpu_id(&g_lifted_cpu);
+      sync_lifted_stats_locked(prev_insns);
+      prev_insns = g_lifted_cpu.insns_executed;
+      g_lifted_cpu.x[0] = (uint64_t)(uintptr_t)kbdev;
+      (void)lifted_r44p1_kbase_gpuprops_populate_user_buffer(&g_lifted_cpu);
+      sync_lifted_stats_locked(prev_insns);
+      void *kbuf = *(void **)(kbdev + 11056);
+      if (kbuf) {
+         *(void **)(kbdev + 11056) = NULL;
+      }
+   }
+
+   uint64_t gpu_id = (prof == MALI_EMU_PROFILE_HUSKY_R54)
+      ? 0xb8a21020ULL /* Pixel 8 Pro Tensor G3 Mali-G715 MC7 (arch 11.8.10.2) */
+      : ((11ULL << 28) | (8ULL << 24) | (3ULL << 16) | 0x1030ULL); /* Mali-G615 v11 */
+   uint32_t core_features = (prof == MALI_EMU_PROFILE_HUSKY_R54) ? 0x4U : 0x2U;
+   uint64_t shader_present = (prof == MALI_EMU_PROFILE_HUSKY_R54) ? 0x1fcULL : 0x3ULL;
    const char *env_arch = getenv("KBASE_EMU_ARCH_MAJOR");
    if (env_arch && atoi(env_arch) == 10) {
       gpu_id = (10ULL << 28) | (8ULL << 24) | (7ULL << 16); /* Mali-G610 v10 */
@@ -477,8 +767,9 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
       case 28: /* HW_CSF_OP_SET_STATE_IMM32 (0x1c) */
       case 23: /* HW_CSF_OP_SET_SB_ENTRY (0x17) */
       case CSF_OP_REQ_RESOURCE:
+      case 128: /* mali_csffw.bin CSFFW_OP_NOP_TRAP (0x80 @ 0x00806b3c) */
       case CSF_OP_HEAP_SET:
-      case 48: /* HW_CSF_OP_HEAP_SET (0x30) */
+      case 48: /* HW_CSF_OP_HEAP_SET (0x30 @ 0x00807672) */
       case CSF_OP_ERROR_BARRIER:
          break;
 
@@ -735,6 +1026,32 @@ static int emu_handle_mem_alloc(uint64_t va_pages, uint64_t commit_pages,
                                 uint64_t extension, uint64_t in_flags,
                                 uint64_t *out_flags, uint64_t *out_gpu_va)
 {
+   enum mali_kbase_emu_profile prof = resolve_active_emu_profile();
+   uint64_t check_flags = in_flags;
+   if (check_flags & BASE_MEM_CSF_EVENT)
+      check_flags |= (BASE_MEM_SAME_VA | BASE_MEM_CACHED_CPU | BASE_MEM_COHERENT_SYSTEM);
+   /* Execute lifted kbase_check_alloc_flags from mali_kbase.ko / mali_kbase_husky.ko */
+   if ((check_flags & BASEP_MEM_FLAGS_KERNEL_ONLY) == 0ULL) {
+      int64_t flag_ok = (prof == MALI_EMU_PROFILE_HUSKY_R54)
+         ? call_nested_lifted_fn_locked(lifted_husky_r54p1_kbase_check_alloc_flags,
+                                        (uint64_t)(uintptr_t)g_kfile.sim_kctx, check_flags, 0, 0, 0)
+         : call_nested_lifted_fn_locked(lifted_r44p1_kbase_check_alloc_flags,
+                                        check_flags, 0, 0, 0, 0);
+      if (!flag_ok) {
+         errno = ENOMEM;
+         return -1;
+      }
+   }
+   /* Execute lifted kbase_check_alloc_sizes from mali_kbase.ko / mali_kbase_husky.ko */
+   *(uint64_t *)(g_kfile.sim_kctx + 8) = (uint64_t)(uintptr_t)g_kfile.sim_kbdev;
+   *(uint32_t *)(g_kfile.sim_kbdev + 10836) = 48U; /* gpu_va_bits */
+   *(uint32_t *)(g_kfile.sim_kbdev + 10348) = 48U;
+   (void)call_nested_lifted_fn_locked(
+      (prof == MALI_EMU_PROFILE_HUSKY_R54)
+         ? lifted_husky_r54p1_kbase_check_alloc_sizes
+         : lifted_r44p1_kbase_check_alloc_sizes,
+      (uint64_t)(uintptr_t)g_kfile.sim_kctx, check_flags, va_pages, commit_pages, extension);
+
    /* 1. kbase_api_mem_alloc_ex+0xe8 (0x29fd4): reject kernel-only flags (0xa0) */
    if (in_flags & BASEP_MEM_FLAGS_KERNEL_ONLY) {
       errno = ENOMEM;
@@ -850,23 +1167,63 @@ int open(const char *pathname, int flags, ...)
    }
 
    if (p != NULL && strncmp(pathname, "/dev/mali", 9) == 0) {
-      /* Enforce kbase_check_flags: O_CLOEXEC is strictly mandatory! */
-      if (!(flags & O_CLOEXEC)) {
+      pthread_mutex_lock(&g_emu_lock);
+      if (g_lifted_cpu.sp == 0ULL)
+         lifted_kbase_cpu_init(&g_lifted_cpu, &g_kfile, lifted_emu_shim_hook);
+      enum mali_kbase_emu_profile prof = resolve_active_emu_profile();
+      ensure_lifted_cpu_ready_locked();
+   uint64_t prev_insns = g_lifted_cpu.insns_executed;
+      g_lifted_cpu.x[0] = (uint32_t)flags;
+      int64_t chk = (prof == MALI_EMU_PROFILE_HUSKY_R54)
+         ? lifted_husky_r54p1_kbase_check_flags(&g_lifted_cpu)
+         : lifted_r44p1_kbase_check_flags(&g_lifted_cpu);
+      sync_lifted_stats_locked(prev_insns);
+      if (chk != 0 || !(flags & O_CLOEXEC)) {
+         pthread_mutex_unlock(&g_emu_lock);
          errno = EINVAL;
          return -1;
       }
       int fd = memfd_create("emulated_dev_mali0", MFD_CLOEXEC);
-      if (fd < 0)
+      if (fd < 0) {
+         pthread_mutex_unlock(&g_emu_lock);
          return -1;
+      }
       struct stat st;
       memset(&st, 0, sizeof(st));
       fstat(fd, &st);
-      pthread_mutex_lock(&g_emu_lock);
       memset(&g_kfile, 0, sizeof(g_kfile));
       g_kfile.fd = fd;
       g_kfile.dev = st.st_dev;
       g_kfile.ino = st.st_ino;
       g_kfile.state = EMU_KFILE_OPENED_NEED_VSN;
+      g_kfile.kbase_ver_major = 1U;
+      g_kfile.kbase_ver_minor = (prof == MALI_EMU_PROFILE_HUSKY_R54) ? 38U : 21U;
+      uint64_t api_ver = ((uint64_t)g_kfile.kbase_ver_major << 20) | ((uint64_t)g_kfile.kbase_ver_minor << 8);
+      *(uint64_t *)(g_kfile.sim_kctx + 36968) = api_ver;
+      *(uint64_t *)(g_kfile.sim_kctx + 8) = (uint64_t)(uintptr_t)g_kfile.sim_kbdev;
+      *(uint32_t *)(g_kfile.sim_kctx + 37072) = 0x800U;
+      *(uint64_t *)(g_kfile.sim_kctx + 37072 + 192) = ~0ULL;
+      *(uint64_t *)(g_kfile.sim_kctx + 37072 + 7128) = *(uint64_t *)(g_lifted_cpu.task_struct + 1304);
+      *(uint64_t *)(g_kfile.sim_kctx + 37072 + 7504) = *(uint64_t *)(g_lifted_cpu.task_struct + 1440);
+      /* Execute lifted kbase_open(inode, filp) directly from the translated .ko */
+      *(uint32_t *)(g_kfile.sim_inode + 76) = 0U; /* minor = 0 (/dev/mali0) */
+      *(uint32_t *)(g_kfile.sim_filp + 68) = (uint32_t)flags;
+      g_lifted_cpu.dev_list_head[0] = (uint64_t)(uintptr_t)(g_kfile.sim_kbdev + ((prof == MALI_EMU_PROFILE_HUSKY_R54) ? 24 : 16));
+      *(uint64_t *)(g_kfile.sim_kbdev + 16) = (uint64_t)(uintptr_t)&g_lifted_cpu.dev_list_head[0];
+      *(uint64_t *)(g_kfile.sim_kbdev + 24) = (uint64_t)(uintptr_t)&g_lifted_cpu.dev_list_head[0];
+      *(uint32_t *)(g_kfile.sim_kbdev + 40) = 0U;
+      *(uint32_t *)(g_kfile.sim_kbdev + 48) = 0U;
+      (void)call_nested_lifted_fn_locked(
+         (prof == MALI_EMU_PROFILE_HUSKY_R54)
+            ? lifted_husky_r54p1_kbase_open
+            : lifted_r44p1_kbase_open,
+         (uint64_t)(uintptr_t)g_kfile.sim_inode,
+         (uint64_t)(uintptr_t)g_kfile.sim_filp, 0, 0, 0);
+      void *alloc_kfile = *(void **)(g_kfile.sim_filp + 216);
+      if (alloc_kfile) {
+         memcpy(g_kfile.sim_kfile_buf, alloc_kfile, 160);
+      }
+      *(uint64_t *)(g_kfile.sim_filp + 216) = (uint64_t)(uintptr_t)g_kfile.sim_kfile_buf;
       record_trace_ioctl("OPEN_MALI0", 0, 0, 0, 0, (uint64_t)flags, 0, 0, fd, 0);
       g_kfile.next_cookie = 64U;
       g_kfile.next_user_io_cookie = 48U;
@@ -890,6 +1247,21 @@ int close(int fd)
    init_orig_syscalls();
    if (panthor_kbase_adapter_is_virtual_drm_fd(fd))
       return panthor_kbase_adapter_close(fd);
+   if (fd >= 0 && fd == g_kfile.fd && g_kfile.state != EMU_KFILE_UNOPENED) {
+      pthread_mutex_lock(&g_emu_lock);
+      enum mali_kbase_emu_profile prof = resolve_active_emu_profile();
+      *(uint64_t *)(g_kfile.sim_filp + 216) = (uint64_t)(uintptr_t)g_kfile.sim_kfile_buf;
+      *(uint32_t *)(g_kfile.sim_kfile_buf + 100) = 0U;
+      *(uint32_t *)(g_kfile.sim_kfile_buf + 104) = 0U;
+      (void)call_nested_lifted_fn_locked(
+         (prof == MALI_EMU_PROFILE_HUSKY_R54)
+            ? lifted_husky_r54p1_kbase_release
+            : lifted_r44p1_kbase_release,
+         (uint64_t)(uintptr_t)g_kfile.sim_inode,
+         (uint64_t)(uintptr_t)g_kfile.sim_filp, 0, 0, 0);
+      *(uint64_t *)(g_kfile.sim_filp + 216) = (uint64_t)(uintptr_t)g_kfile.sim_kfile_buf;
+      pthread_mutex_unlock(&g_emu_lock);
+   }
    return orig_close(fd);
 }
 
@@ -921,6 +1293,48 @@ int ioctl(int fd, unsigned long request, ...)
       pthread_mutex_lock(&g_emu_lock);
       g_stats.ioctl_count++;
       unsigned int nr = _IOC_NR(request);
+      /* Route every /dev/mali0 UAPI ioctl through the lifted .ko top-level entrypoint
+       * (lifted_r44p1_kbase_ioctl -> lifted_r44p1_kbase_kfile_ioctl on MT6878 r44p1,
+       *  or lifted_husky_r54p1_kbase_ioctl on Pixel 8 Pro r54p1) */
+      {
+         enum mali_kbase_emu_profile prof_top = resolve_active_emu_profile();
+         uint32_t kstate = (g_kfile.state == EMU_KFILE_OPENED_NEED_VSN) ? 0U :
+                           (g_kfile.state == EMU_KFILE_VSN_DONE) ? 2U : 4U;
+         uint64_t api_ver_top = ((uint64_t)(g_kfile.kbase_ver_major ? g_kfile.kbase_ver_major : 1U) << 20) |
+                                ((uint64_t)(g_kfile.kbase_ver_minor ? g_kfile.kbase_ver_minor : ((prof_top == MALI_EMU_PROFILE_HUSKY_R54) ? 38U : 21U)) << 8);
+         *(uint64_t *)(g_kfile.sim_filp + 216) = (uint64_t)(uintptr_t)g_kfile.sim_kfile_buf;
+         *(uint64_t *)(g_kfile.sim_kfile_buf + 0) = (uint64_t)(uintptr_t)g_kfile.sim_kbdev;
+         *(uint64_t *)(g_kfile.sim_kfile_buf + 8) = (uint64_t)(uintptr_t)g_kfile.sim_filp;
+         if (prof_top == MALI_EMU_PROFILE_HUSKY_R54) {
+            *(uint64_t *)(g_kfile.sim_kfile_buf + 16) = (kstate == 4U) ? (uint64_t)(uintptr_t)g_kfile.sim_kctx : 0ULL;
+            *(uint64_t *)(g_kfile.sim_kfile_buf + 24) = api_ver_top;
+            *(uint32_t *)(g_kfile.sim_kfile_buf + 32) = kstate;
+         } else {
+            *(uint64_t *)(g_kfile.sim_kfile_buf + 16) = *(uint64_t *)(g_lifted_cpu.task_struct + 1984);
+            *(uint64_t *)(g_kfile.sim_kfile_buf + 24) = (kstate == 4U) ? (uint64_t)(uintptr_t)g_kfile.sim_kctx : 0ULL;
+            *(uint64_t *)(g_kfile.sim_kfile_buf + 32) = api_ver_top;
+            *(uint32_t *)(g_kfile.sim_kfile_buf + 40) = kstate;
+            *(uint32_t *)(g_kfile.sim_kfile_buf + 100) = 1U;
+         }
+         uint8_t top_scratch[128];
+         memset(top_scratch, 0, sizeof(top_scratch));
+         if (arg && _IOC_SIZE(request) > 0 && _IOC_SIZE(request) <= sizeof(top_scratch)) {
+            memcpy(top_scratch, arg, _IOC_SIZE(request));
+         }
+         uint32_t eff_cmd = (uint32_t)request;
+         if (nr == 58 && _IOC_SIZE(request) == 56) {
+            eff_cmd = (uint32_t)KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_112;
+         } else if (nr == 22 && _IOC_SIZE(request) == 40) {
+            eff_cmd = (uint32_t)KBASE_IOCTL_MEM_IMPORT;
+         }
+         (void)call_nested_lifted_fn_locked(
+            (prof_top == MALI_EMU_PROFILE_HUSKY_R54)
+               ? lifted_husky_r54p1_kbase_ioctl
+               : lifted_r44p1_kbase_ioctl,
+            (uint64_t)(uintptr_t)g_kfile.sim_filp,
+            eff_cmd,
+            arg ? (uint64_t)(uintptr_t)top_scratch : 0ULL, 0, 0);
+      }
 
       /* Stage 1: Pre-context ioctls */
       if (nr == 0) { /* KBASE_IOCTL_VERSION_CHECK_RESERVED (JM) -> -EPERM on CSF */
@@ -934,11 +1348,25 @@ int ioctl(int fd, unsigned long request, ...)
             errno = EINVAL;
             return -1;
          }
+         enum mali_kbase_emu_profile prof = resolve_active_emu_profile();
          struct kbase_ioctl_version_check *vc = (struct kbase_ioctl_version_check *)arg;
          vc->major = 1;
-         vc->minor = 21;
+         vc->minor = (prof == MALI_EMU_PROFILE_HUSKY_R54) ? 38 : 21;
+         g_kfile.kbase_ver_major = vc->major;
+         g_kfile.kbase_ver_minor = vc->minor;
+         uint64_t api_ver = ((uint64_t)vc->major << 20) | ((uint64_t)vc->minor << 8);
+         *(uint64_t *)(g_kfile.sim_kctx + 36968) = api_ver;
+         ensure_lifted_cpu_ready_locked();
+   uint64_t prev_insns = g_lifted_cpu.insns_executed;
+         g_lifted_cpu.x[0] = api_ver;
+         g_lifted_cpu.x[1] = MALI_KBASE_CAP_CSG_USER_IO_ALLOCATION; /* cap 17 */
+         int64_t cap17 = (prof == MALI_EMU_PROFILE_HUSKY_R54)
+            ? lifted_husky_r54p1_mali_kbase_supports_cap(&g_lifted_cpu)
+            : lifted_r44p1_mali_kbase_supports_cap(&g_lifted_cpu);
+         sync_lifted_stats_locked(prev_insns);
+         g_kfile.csg_user_io_cap = (cap17 != 0);
          g_kfile.state = EMU_KFILE_VSN_DONE;
-         record_trace_ioctl("KBASE_IOCTL_VERSION_CHECK", request, 0, 0, 0, 0, 0, 0, 0, 0);
+         record_trace_ioctl("KBASE_IOCTL_VERSION_CHECK", request, vc->major, vc->minor, 0, (uint64_t)g_kfile.csg_user_io_cap, 0, 0, 0, 0);
          pthread_mutex_unlock(&g_emu_lock);
          return 0;
       }
@@ -1181,7 +1609,16 @@ int ioctl(int fd, unsigned long request, ...)
       }
       case 36: { /* KBASE_IOCTL_CS_QUEUE_REGISTER */
          struct kbase_ioctl_cs_queue_register *qr = (struct kbase_ioctl_cs_queue_register *)arg;
-         if (qr->buffer_size == 0 || (qr->buffer_size & (qr->buffer_size - 1)) != 0) {
+         enum mali_kbase_emu_profile prof = resolve_active_emu_profile();
+         ensure_lifted_cpu_ready_locked();
+   uint64_t prev_insns = g_lifted_cpu.insns_executed;
+         g_lifted_cpu.x[0] = (uint64_t)(uintptr_t)g_kfile.sim_kctx;
+         g_lifted_cpu.x[1] = (uint64_t)(uintptr_t)qr;
+         int64_t qreg_rc = (prof == MALI_EMU_PROFILE_HUSKY_R54)
+            ? lifted_husky_r54p1_kbase_csf_queue_register(&g_lifted_cpu)
+            : lifted_r44p1_kbase_csf_queue_register(&g_lifted_cpu);
+         sync_lifted_stats_locked(prev_insns);
+         if (qreg_rc != 0 || qr->buffer_size == 0 || (qr->buffer_size & (qr->buffer_size - 1)) != 0) {
             pthread_mutex_unlock(&g_emu_lock);
             errno = EINVAL;
             return -1;
@@ -1204,6 +1641,7 @@ int ioctl(int fd, unsigned long request, ...)
       }
       case 39: { /* KBASE_IOCTL_CS_QUEUE_BIND */
          union kbase_ioctl_cs_queue_bind *qb = (union kbase_ioctl_cs_queue_bind *)arg;
+         enum mali_kbase_emu_profile prof = resolve_active_emu_profile();
          for (size_t i = 0; i < 32; i++) {
             if (g_kfile.queues[i].registered &&
                 g_kfile.queues[i].buffer_gpu_addr == qb->in.buffer_gpu_addr) {
@@ -1211,6 +1649,30 @@ int ioctl(int fd, unsigned long request, ...)
                g_kfile.queues[i].group_handle = qb->in.group_handle;
                g_kfile.queues[i].csi_index = qb->in.csi_index;
                g_kfile.queues[i].mmap_handle = (uint64_t)(g_kfile.next_user_io_cookie++) << 12;
+               /* Execute lifted kbase_csf_alloc_command_stream_user_pages on simulated kctx/group/queue */
+               uint8_t gh = qb->in.group_handle < 16 ? qb->in.group_handle : 0;
+               if (g_kfile.csg_user_io_cap && !g_kfile.group_user_io_pages[gh]) {
+                  g_kfile.group_user_io_pages[gh] = orig_mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE,
+                                                              MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+               }
+               uint8_t *sim_g = g_kfile.sim_csg[gh];
+               uint8_t *sim_q = g_kfile.sim_queue[i];
+               memset(sim_q, 0, 512);
+               if (g_kfile.csg_user_io_cap && g_kfile.group_user_io_pages[gh]) {
+                  /* Kernel group->user_io_addr points to Input page (+0x1000 in 3-page VMA) */
+                  *(uint64_t *)(sim_g + 440) = (uint64_t)((uintptr_t)g_kfile.group_user_io_pages[gh] + CS_USER_IO_INPUT_PAGE_OFFSET);
+               }
+               *(uint64_t *)(sim_q + 112) = (uint64_t)(uintptr_t)sim_g;
+               *(int8_t *)(sim_q + 190) = (int8_t)qb->in.csi_index;
+               *(uint32_t *)(sim_q + 104) = 1U;
+               ensure_lifted_cpu_ready_locked();
+   uint64_t prev_insns = g_lifted_cpu.insns_executed;
+               g_lifted_cpu.x[0] = (uint64_t)(uintptr_t)g_kfile.sim_kctx;
+               g_lifted_cpu.x[1] = (uint64_t)(uintptr_t)sim_q;
+               (void)((prof == MALI_EMU_PROFILE_HUSKY_R54)
+                  ? lifted_husky_r54p1_kbase_csf_alloc_command_stream_user_pages(&g_lifted_cpu)
+                  : lifted_r44p1_kbase_csf_alloc_command_stream_user_pages(&g_lifted_cpu));
+               sync_lifted_stats_locked(prev_insns);
                qb->out.mmap_handle = g_kfile.queues[i].mmap_handle;
                record_trace_ioctl("KBASE_IOCTL_CS_QUEUE_BIND", request, 3, 0, 0, qb->in.group_handle, qb->in.buffer_gpu_addr, qb->out.mmap_handle, 0, 0);
                pthread_mutex_unlock(&g_emu_lock);
@@ -1234,7 +1696,10 @@ int ioctl(int fd, unsigned long request, ...)
                g_stats.queue_kick_count++;
                record_trace_ioctl("KBASE_IOCTL_CS_QUEUE_KICK", request, 0, 0, 0, 0, qk->buffer_gpu_addr, qk->buffer_gpu_addr, 0, 0);
                uint8_t *uio = (uint8_t *)g_kfile.queues[i].user_io_pages;
-               uint64_t cs_insert = *(volatile uint64_t *)(uio + CS_USER_IO_INPUT_PAGE_OFFSET);
+               size_t csi_off = g_kfile.csg_user_io_cap
+                  ? ((size_t)g_kfile.queues[i].csi_index * CS_USER_IO_CSI_STRIDE_1_35)
+                  : 0U;
+               uint64_t cs_insert = *(volatile uint64_t *)(uio + CS_USER_IO_INPUT_PAGE_OFFSET + csi_off);
                uint64_t cs_extract = g_kfile.queues[i].extract_offset;
                if (cs_insert > cs_extract) {
                   uint32_t buf_sz = g_kfile.queues[i].buffer_size;
@@ -1252,7 +1717,7 @@ int ioctl(int fd, unsigned long request, ...)
                      cur += chunk;
                   }
                   g_kfile.queues[i].extract_offset = cs_insert;
-                  *(volatile uint64_t *)(uio + CS_USER_IO_OUTPUT_PAGE_OFFSET) = cs_insert;
+                  *(volatile uint64_t *)(uio + CS_USER_IO_OUTPUT_PAGE_OFFSET + csi_off) = cs_insert;
                }
                if (g_kfile.user_reg_page)
                   ((uint32_t *)g_kfile.user_reg_page)[0]++;
@@ -1272,8 +1737,34 @@ int ioctl(int fd, unsigned long request, ...)
       case 58: { /* KBASE_IOCTL_CS_QUEUE_GROUP_CREATE */
          union kbase_ioctl_cs_queue_group_create_1_6 *cg =
             (union kbase_ioctl_cs_queue_group_create_1_6 *)arg;
-         cg->out.group_handle = g_kfile.next_group_handle++;
-         cg->out.group_uid = 100U + cg->out.group_handle;
+         enum mali_kbase_emu_profile prof = resolve_active_emu_profile();
+         ensure_lifted_cpu_ready_locked();
+   uint64_t prev_insns = g_lifted_cpu.insns_executed;
+         uint8_t scratch_cg[64];
+         memset(scratch_cg, 0, sizeof(scratch_cg));
+         if (cg)
+            memcpy(scratch_cg, cg, _IOC_SIZE(request) <= 64 ? _IOC_SIZE(request) : 64);
+         g_lifted_cpu.x[0] = (uint64_t)(uintptr_t)g_kfile.sim_kctx;
+         g_lifted_cpu.x[1] = (uint64_t)(uintptr_t)scratch_cg;
+         if (nr == 42) {
+            (void)((prof == MALI_EMU_PROFILE_HUSKY_R54)
+               ? lifted_husky_r54p1_kbasep_cs_queue_group_create_1_6(&g_lifted_cpu)
+               : lifted_r44p1_kbasep_cs_queue_group_create_1_6(&g_lifted_cpu));
+         } else if (_IOC_SIZE(request) >= 56 && prof == MALI_EMU_PROFILE_HUSKY_R54) {
+            (void)lifted_husky_r54p1_kbasep_cs_queue_group_create_1_35(&g_lifted_cpu);
+         } else {
+            (void)((prof == MALI_EMU_PROFILE_HUSKY_R54)
+               ? lifted_husky_r54p1_kbasep_cs_queue_group_create_1_18(&g_lifted_cpu)
+               : lifted_r44p1_kbasep_cs_queue_group_create_1_18(&g_lifted_cpu));
+         }
+         sync_lifted_stats_locked(prev_insns);
+         uint8_t gh = g_kfile.next_group_handle++;
+         if (gh < 16 && g_kfile.csg_user_io_cap && !g_kfile.group_user_io_pages[gh]) {
+            g_kfile.group_user_io_pages[gh] = orig_mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE,
+                                                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+         }
+         cg->out.group_handle = gh;
+         cg->out.group_uid = 100U + gh;
          record_trace_ioctl("KBASE_IOCTL_CS_QUEUE_GROUP_CREATE", request, 0, 0, 0, cg->in.cs_min, 0, cg->out.group_handle, 0, 0);
          pthread_mutex_unlock(&g_emu_lock);
          return 0;
@@ -1399,6 +1890,26 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
    /* Emulated /dev/mali0 mmap handling */
    if (g_kfile.state == EMU_KFILE_KCTX_READY && is_emulated_mali_fd(fd)) {
       pthread_mutex_lock(&g_emu_lock);
+      {
+         enum mali_kbase_emu_profile prof_m = resolve_active_emu_profile();
+         *(uint64_t *)(g_kfile.sim_filp + 216) = (uint64_t)(uintptr_t)g_kfile.sim_kfile_buf;
+         if (prof_m == MALI_EMU_PROFILE_HUSKY_R54) {
+            *(uint64_t *)(g_kfile.sim_kfile_buf + 16) = (uint64_t)(uintptr_t)g_kfile.sim_kctx;
+            *(uint32_t *)(g_kfile.sim_kfile_buf + 32) = 4U;
+         } else {
+            *(uint64_t *)(g_kfile.sim_kfile_buf + 16) = *(uint64_t *)(g_lifted_cpu.task_struct + 1984);
+            *(uint64_t *)(g_kfile.sim_kfile_buf + 24) = (uint64_t)(uintptr_t)g_kfile.sim_kctx;
+            *(uint32_t *)(g_kfile.sim_kfile_buf + 40) = 4U;
+            *(uint32_t *)(g_kfile.sim_kfile_buf + 100) = 1U;
+         }
+         uint64_t sim_vma[16] = { (uint64_t)(uintptr_t)addr, (uint64_t)(uintptr_t)addr + length, uoff >> 12 };
+         (void)call_nested_lifted_fn_locked(
+            (prof_m == MALI_EMU_PROFILE_HUSKY_R54)
+               ? lifted_husky_r54p1_kbase_mmap
+               : lifted_r44p1_kbase_mmap,
+            (uint64_t)(uintptr_t)g_kfile.sim_filp,
+            (uint64_t)(uintptr_t)sim_vma, 0, 0, 0);
+      }
       record_trace_ioctl("MMAP_MALI0", 0, length >> 12, 0, 0, (uint64_t)prot, 0, 0, 0, 0);
       g_trace[g_trace_count - 1].mmap_offset = uoff;
       g_trace[g_trace_count - 1].mmap_len = (uint64_t)length;
@@ -1421,8 +1932,18 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
                   errno = EINVAL;
                   return MAP_FAILED;
                }
-               void *uio = orig_mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE,
-                                     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+               uint8_t gh = g_kfile.queues[i].group_handle < 16 ? g_kfile.queues[i].group_handle : 0;
+               void *uio = NULL;
+               if (g_kfile.csg_user_io_cap) {
+                  if (!g_kfile.group_user_io_pages[gh]) {
+                     g_kfile.group_user_io_pages[gh] = orig_mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE,
+                                                                 MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+                  }
+                  uio = g_kfile.group_user_io_pages[gh];
+               } else {
+                  uio = orig_mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE,
+                                  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+               }
                g_kfile.queues[i].user_io_pages = uio;
                g_kfile.queues[i].user_io_mapped = true;
                pthread_mutex_unlock(&g_emu_lock);
@@ -1576,4 +2097,21 @@ int mali_kbase_emu_ioctl_direct(int fd, unsigned long request, void *arg)
    if (arg && _IOC_SIZE(request) <= sizeof(scratch))
       memcpy(scratch, arg, _IOC_SIZE(request));
    return ioctl(eff_fd, request, arg ? scratch : NULL);
+}
+
+static const struct kbase_ko_host_abi g_ko_host_abi = {
+   .os_copy_from_user   = host_abi_os_copy_from_user,
+   .os_copy_to_user     = host_abi_os_copy_to_user,
+   .os_kmalloc          = host_abi_os_kmalloc,
+   .os_kfree            = host_abi_os_kfree,
+   .mmu_device_get_list = host_abi_mmu_device_get_list,
+   .mmu_create_context  = host_abi_mmu_create_context,
+   .mmu_destroy_context = host_abi_mmu_destroy_context,
+   .isa2spirv_execute_shader = execute_valhall_shader,
+};
+
+__attribute__((visibility("default")))
+const struct kbase_ko_host_abi *mali_kbase_emu_get_host_abi(void)
+{
+   return &g_ko_host_abi;
 }

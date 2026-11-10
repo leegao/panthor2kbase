@@ -103,7 +103,7 @@ case "$CMD" in
         python3 scripts/gen_bionic_glibc_stubs.py
         ;;
     --inspect-props)
-        SO_PATH="${1:-/working_dir/c_3106ac7496559798/user_uploaded_files/ttl=63d/user_uploaded/libGLES_mali.r44p1.so}"
+        SO_PATH="${1:-$ROOT_DIR/libGLES_mali.so}"
         python3 -c "
 import re, sys
 with open('$SO_PATH', 'rb') as f:

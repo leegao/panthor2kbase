@@ -708,6 +708,25 @@ panvk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
    return vk_outarray_status(&out);
 }
 
+static uint64_t
+panvk_read_proc_mem_available_bytes(void)
+{
+   FILE *fp = fopen("/proc/meminfo", "r");
+   if (!fp)
+      return 0;
+   char line[256];
+   uint64_t avail_kb = 0;
+   while (fgets(line, sizeof(line), fp)) {
+      unsigned long long val = 0;
+      if (sscanf(line, "MemAvailable: %llu kB", &val) == 1) {
+         avail_kb = (uint64_t)val;
+         break;
+      }
+   }
+   fclose(fp);
+   return avail_kb * 1024ULL;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 panvk_GetPhysicalDeviceMemoryProperties2(
    VkPhysicalDevice physicalDevice,
@@ -746,9 +765,25 @@ panvk_GetPhysicalDeviceMemoryProperties2(
           */
          p->heapUsage[0] = used;
 
-         /* Set the budget at 90% of available to avoid thrashing */
-         p->heapBudget[0] = vk_physical_device_heap_budget_from_system(
+         /* Set the budget at 90% of available to avoid thrashing, and honor
+          * PANVK_MEM_BUDGET_PRESSURE / PANVK_MEM_BUDGET_RESERVE_MB using live
+          * /proc/meminfo MemAvailable so DXVK compacts empty chunks before kswapd thrashing! */
+         uint64_t budget = vk_physical_device_heap_budget_from_system(
             &physical_device->vk, 0.9f, heap_size, used);
+         const char *pressure_env = getenv("PANVK_MEM_BUDGET_PRESSURE");
+         if (!pressure_env || !pressure_env[0] || atoi(pressure_env) != 0) {
+            uint64_t avail_b = panvk_read_proc_mem_available_bytes();
+            if (avail_b > 0) {
+               const char *res_env = getenv("PANVK_MEM_BUDGET_RESERVE_MB");
+               uint64_t reserve_mb = (res_env && res_env[0]) ? strtoull(res_env, NULL, 0) : 1024ULL;
+               uint64_t reserve_b = reserve_mb * 1024ULL * 1024ULL;
+               uint64_t headroom_b = (avail_b > reserve_b) ? (avail_b - reserve_b) : (64ULL << 20);
+               uint64_t dynamic_budget = used + headroom_b;
+               if (dynamic_budget < budget)
+                  budget = dynamic_budget;
+            }
+         }
+         p->heapBudget[0] = budget;
 
          /* From the Vulkan 1.3.278 spec:
           *

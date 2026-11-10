@@ -25,6 +25,7 @@
 #include <utility>
 #include <vector>
 
+#if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS) && __has_include("llvm/IR/IRBuilder.h")
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -49,6 +50,9 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
+#else
+#include "llvm_compat_standalone.hpp"
+#endif
 
 namespace ultrs::llvm_ir {
 

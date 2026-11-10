@@ -44,6 +44,8 @@ static void *(*real_mmap_fn)(void *, size_t, int, int, int, off_t) = NULL;
 static pthread_mutex_t g_trace_mtx = PTHREAD_MUTEX_INITIALIZER;
 static FILE *g_out_fp = NULL;
 static uint64_t g_seq = 0;
+static uint16_t g_kbase_ver_major = 1;
+static uint16_t g_kbase_ver_minor = 21;
 
 struct traced_queue {
    bool active;
@@ -233,7 +235,13 @@ int ioctl(int fd, unsigned long request, ...)
       pthread_mutex_lock(&g_trace_mtx);
       uint64_t out_va = 0, out_fl = 0;
       if (ret >= 0 && arg) {
-         if (nr == 5) {
+         if (nr == 0 || nr == 52) {
+            struct kbase_ioctl_version_check *vc = (struct kbase_ioctl_version_check *)arg;
+            if (vc->major != 0) {
+               g_kbase_ver_major = vc->major;
+               g_kbase_ver_minor = vc->minor;
+            }
+         } else if (nr == 5) {
             union kbase_ioctl_mem_alloc *ma = (union kbase_ioctl_mem_alloc *)arg;
             out_va = ma->out.gpu_va; out_fl = ma->out.flags;
          } else if (nr == 59) {
@@ -302,13 +310,23 @@ int ioctl(int fd, unsigned long request, ...)
                  (unsigned long long)in_buf_va,
                  (unsigned long long)out_va, ret);
 
-         /* On CS_QUEUE_KICK, dump emitted 64-bit CSF ring instructions */
+         /* On CS_QUEUE_KICK, dump emitted 64-bit CSF ring instructions.
+          * On kbase >= 1.35 (MALI_KBASE_CAP_CSG_USER_IO_ALLOCATION, e.g. Pixel 8 Pro husky 1.38),
+          * CS_INSERT and CS_EXTRACT are indexed by csi_index * 16 inside the CSG-shared USER_IO pages! */
          if (nr == 37 && ret == 0) {
             for (size_t i = 0; i < 32; i++) {
                if (g_queues[i].active && g_queues[i].ring_gpu_va == in_buf_va &&
                    g_queues[i].user_io_ptr && g_queues[i].ring_cpu_ptr) {
-                  uint64_t ins = *(volatile uint64_t *)((uint8_t *)g_queues[i].user_io_ptr + 0x1000);
+                  size_t csi_off = (g_kbase_ver_major > 1 || (g_kbase_ver_major == 1 && g_kbase_ver_minor >= 35))
+                                      ? ((size_t)g_queues[i].csi_index * 16U)
+                                      : 0U;
+                  uint64_t ins = *(volatile uint64_t *)((uint8_t *)g_queues[i].user_io_ptr + 0x1000 + csi_off);
+                  uint64_t ext = *(volatile uint64_t *)((uint8_t *)g_queues[i].user_io_ptr + 0x2000 + csi_off);
                   uint64_t prev = g_queues[i].last_insert;
+                  fprintf(g_out_fp, ",\"csi_index\":%u,\"cs_insert\":%llu,\"cs_extract\":%llu",
+                          (unsigned)g_queues[i].csi_index,
+                          (unsigned long long)ins,
+                          (unsigned long long)ext);
                   if (ins > prev && g_queues[i].ring_size > 0) {
                      uint32_t off = (uint32_t)(prev % g_queues[i].ring_size);
                      uint32_t qwords = (uint32_t)((ins - prev) / 8U);
@@ -316,8 +334,7 @@ int ioctl(int fd, unsigned long request, ...)
                         qwords = 32;
                      const uint64_t *ring_q =
                         (const uint64_t *)((const uint8_t *)g_queues[i].ring_cpu_ptr + off);
-                     fprintf(g_out_fp, ",\"cs_insert\":%llu,\"ring_qwords\":[",
-                             (unsigned long long)ins);
+                     fprintf(g_out_fp, ",\"ring_qwords\":[");
                      for (uint32_t q = 0; q < qwords; q++) {
                         fprintf(g_out_fp, "\"0x%016llx\"%s",
                                 (unsigned long long)ring_q[q],

@@ -213,9 +213,7 @@ def build_diff_report(winlator_summary):
     }
 
 def main():
-    default_log = "/working_dir/c_3106ac7496559798/user_uploaded_files/ttl=63d/user_uploaded/winlator_log.txt"
-    if not os.path.exists(default_log) and os.path.exists("winlator_log.txt"):
-        default_log = "winlator_log.txt"
+    default_log = "winlator_log.txt"
     log_path = sys.argv[1] if len(sys.argv) > 1 else default_log
 
     w_sum = parse_winlator_log(log_path)

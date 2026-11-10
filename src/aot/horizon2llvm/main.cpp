@@ -1,28 +1,85 @@
-// Scoped-Down AArch64 -> LLVM IR Static Lifter & Compiler CLI (src/aot/horizon2llvm/main.cpp)
+// Unified Horizon2LLVM AArch64 -> LLVM IR & Native Object Recompiler CLI (src/aot/horizon2llvm/main.cpp)
+//
+// Unifies AArch64 lifting and mode-parameterized pass-pipeline lowering across:
+//   1. User-space ELF64 ET_DYN shared libraries (`libGLES_mali.so` -> `LoweringMode::UserspaceBionicSo`)
+//   2. Linux kernel ELF64 ET_REL modules (`mali_kbase.ko` & `mali_kbase_husky.ko` -> `LoweringMode::KernelModuleKo`,
+//      lowering all 68 kernel functions directly to SSA LLVM IR `lifted_kbase_ko.ll` and compiling to `.o`)
+//   3. Standalone LLVM IR compilation (`--compile-ir`)
 //
 // Usage:
+//   horizon2llvm --lift-ko <r44_ko> <husky_ko> <out.h> <out_runtime.c> [--out-ir <out.ll>] [--out-obj-x86 <x86.o>] [--out-obj-arm64 <arm64.o>] [--full-indirect-dispatch]
+//   horizon2llvm --lift-ko-dual <r44_ko> <husky_ko> [<out.h> <out_runtime.c>] [--out-ir <out.ll>] [--out-obj-x86 <x86.o>] [--out-obj-arm64 <arm64.o>] [--full-indirect-dispatch]
+//   horizon2llvm --lift-so <libGLES_mali.so> <out_dir> [--hook-Vulkan-calls]
 //   horizon2llvm --compile-ir <in.ll> <out.o> [-O0|-O2] [--target-triple TRIPLE]
-//   horizon2llvm --lift-raw-bin <in.bin> <entry_pc_hex> <out.ll> [--emit-obj <out.o>]
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <set>
 #include <string>
 #include <vector>
 
-#include "aarch64/aarch64_lifter.hpp"
+#include "ko_lifter.hpp"
 #include "llvm_backend.hpp"
-#include "llvm_ir.hpp"
-#include "passes.hpp"
 
-namespace fs = std::filesystem;
 using namespace ultrs;
 
 int main(int argc, char** argv) {
+    if (argc >= 4 && (std::string(argv[1]) == "--lift-ko" || std::string(argv[1]) == "--lift-ko-dual")) {
+        std::string r44_ko = argv[2];
+        std::string husky_ko = argv[3];
+        std::string out_hdr = "src/emulator/lifted_kbase_ko.h";
+        std::string out_c = "src/emulator/lifted_kbase_ko.c";
+        std::string out_ll = "src/emulator/lifted_kbase_ko.ll";
+        std::string out_obj_x86 = "src/emulator/lifted_kbase_ko_x86_64.o";
+        std::string out_obj_arm64 = "src/emulator/lifted_kbase_ko_arm64.o";
+        bool full_indirect_dispatch = false;
+        if (const char* env_full = std::getenv("HORIZON2LLVM_FULL_INDIRECT_DISPATCH")) {
+            if (std::string(env_full) == "1" || std::string(env_full) == "true") {
+                full_indirect_dispatch = true;
+            }
+        }
+        int opt_start = 4;
+        if (argc >= 6 && argv[4][0] != '-' && argv[5][0] != '-') {
+            out_hdr = argv[4];
+            out_c = argv[5];
+            opt_start = 6;
+        }
+        for (int i = opt_start; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--out-ir" && i + 1 < argc) out_ll = argv[++i];
+            else if (a == "--out-c" && i + 1 < argc) out_c = argv[++i];
+            else if (a == "--out-hdr" && i + 1 < argc) out_hdr = argv[++i];
+            else if ((a == "--out-obj-x86" || a == "--out-obj") && i + 1 < argc) out_obj_x86 = argv[++i];
+            else if (a == "--out-obj-arm64" && i + 1 < argc) out_obj_arm64 = argv[++i];
+            else if (a == "--full-indirect-dispatch") full_indirect_dispatch = true;
+        }
+        std::string err;
+        if (!ko_lifter::lift_ko_modules_to_c_and_ir(
+                r44_ko, husky_ko, out_hdr, out_c, out_ll, err,
+                out_obj_x86, out_obj_arm64, full_indirect_dispatch)) {
+            std::fprintf(stderr, "[horizon2llvm --lift-ko] ERROR: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("[horizon2llvm --lift-ko] Successfully lowered %s and %s -> %s, %s, %s (objs: %s, %s, full_indirect_dispatch=%d)\n",
+                    r44_ko.c_str(), husky_ko.c_str(), out_hdr.c_str(), out_c.c_str(),
+                    out_ll.c_str(), out_obj_x86.c_str(), out_obj_arm64.c_str(),
+                    full_indirect_dispatch ? 1 : 0);
+        return 0;
+    }
+
+    if (argc >= 4 && std::string(argv[1]) == "--lift-so") {
+        std::string so_path = argv[2];
+        std::string out_dir = argv[3];
+        std::string cmd = "src/aot/bin/mali_llvm_pass_driver --lift-so \"" + so_path + "\" \"" + out_dir + "\"";
+        for (int i = 4; i < argc; ++i) {
+            cmd += " \"" + std::string(argv[i]) + "\"";
+        }
+        int rc = std::system(cmd.c_str());
+        return (rc == 0) ? 0 : 1;
+    }
+
     if (argc >= 4 && std::string(argv[1]) == "--compile-ir") {
         std::string in_ll = argv[2];
         std::string out_obj = argv[3];
@@ -49,75 +106,12 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    if (argc >= 5 && std::string(argv[1]) == "--lift-raw-bin") {
-        std::string in_bin = argv[2];
-        uint64_t entry_pc = std::stoull(argv[3], nullptr, 16);
-        std::string out_ll = argv[4];
-        std::string out_obj;
-        for (int i = 5; i < argc; ++i) {
-            std::string a = argv[i];
-            if (a == "--emit-obj" && i + 1 < argc) out_obj = argv[++i];
-        }
-        std::ifstream f(in_bin, std::ios::binary);
-        if (!f) {
-            std::fprintf(stderr, "error: cannot open %s\n", in_bin.c_str());
-            return 1;
-        }
-        std::vector<uint8_t> raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        size_t n_words = raw.size() / 4;
-        std::vector<uint32_t> words(n_words);
-        for (size_t i = 0; i < n_words; ++i) {
-            words[i] = static_cast<uint32_t>(raw[i * 4 + 0]) |
-                       (static_cast<uint32_t>(raw[i * 4 + 1]) << 8) |
-                       (static_cast<uint32_t>(raw[i * 4 + 2]) << 16) |
-                       (static_cast<uint32_t>(raw[i * 4 + 3]) << 24);
-        }
-        uint64_t end_pc = entry_pc + n_words * 4;
-        llvm_ir::Module mod("lifted_aarch64", llvm_backend::default_host_triple());
-        std::set<uint64_t> labels = {entry_pc};
-        for (size_t i = 0; i < n_words; ++i) {
-            uint64_t pc = entry_pc + i * 4;
-            uint32_t w = words[i];
-            if ((w & 0x7C000000u) == 0x14000000u) {
-                uint64_t t = static_cast<uint64_t>(static_cast<int64_t>(pc) + lifter::sext(w & 0x03FFFFFFu, 26) * 4);
-                if (t >= entry_pc && t < end_pc) labels.insert(t);
-                if ((w & 0x80000000u) == 0 && i + 1 < n_words) labels.insert(pc + 4);
-            } else if (((w >> 25) & 0x7Fu) == 0b0101010u || ((w >> 25) & 0x3Eu) == 0b011010u) {
-                uint64_t t = static_cast<uint64_t>(static_cast<int64_t>(pc) + lifter::sext((w >> 5) & 0x7FFFFu, 19) * 4);
-                if (t >= entry_pc && t < end_pc) labels.insert(t);
-                if (i + 1 < n_words) labels.insert(pc + 4);
-            }
-        }
-        auto* fn = mod.create_function(lifter::fn_symbol(entry_pc), entry_pc, end_pc);
-        fn->label_pcs = labels;
-        fn->raw_words = words;
-        lifter::FunctionLifter fl(*fn, entry_pc, words, entry_pc, end_pc, labels, {});
-        fl.lift();
-
-        passes::PassPipelineConfig cfg;
-        llvm_ir::ModulePassManager mpm;
-        passes::build_aarch64_lowering_pipeline(mpm, cfg);
-        mpm.run(mod);
-
-        std::string ir_text = mod.serialize();
-        {
-            std::ofstream out(out_ll, std::ios::binary);
-            out.write(ir_text.data(), static_cast<std::streamsize>(ir_text.size()));
-        }
-        if (!out_obj.empty()) {
-            auto res = llvm_backend::process_module(ir_text, mod.target_triple, true, "default<O2>", "", "", out_obj);
-            if (!res.ok) {
-                std::fprintf(stderr, "error emitting object: %s\n", res.error_message.c_str());
-                return 1;
-            }
-        }
-        return 0;
-    }
-
-    std::printf("horizon2llvm (scoped-down AArch64-to-LLVM-IR lifter for Mali/PanVK AOT)\n"
+    std::printf("horizon2llvm (unified AArch64-to-LLVM-IR & Native Object Lifter for libGLES_mali.so and mali_kbase*.ko)\n"
                 "Usage:\n"
-                "  %s --compile-ir <in.ll> <out.o> [-O0|-O2] [--target-triple TRIPLE]\n"
-                "  %s --lift-raw-bin <in.bin> <entry_pc_hex> <out.ll> [--emit-obj <out.o>]\n",
-                argv[0], argv[0]);
+                "  %s --lift-ko <r44_ko> <husky_ko> <out.h> <out_runtime.c> [--out-ir <out.ll>] [--out-obj-x86 <x86.o>] [--out-obj-arm64 <arm64.o>] [--full-indirect-dispatch]\n"
+                "  %s --lift-ko-dual <r44_ko> <husky_ko> [<out.h> <out_runtime.c>] [--out-ir <out.ll>] [--out-obj <x86.o>] [--full-indirect-dispatch]\n"
+                "  %s --lift-so <libGLES_mali.so> <out_dir> [--hook-Vulkan-calls]\n"
+                "  %s --compile-ir <in.ll> <out.o> [-O0|-O2] [--target-triple TRIPLE]\n",
+                argv[0], argv[0], argv[0], argv[0]);
     return 0;
 }

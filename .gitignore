@@ -95,3 +95,6 @@ panthor_vk_replayer
 !*/CMakeLists.txt
 *.txt
 patch.diff
+src/aot/bin/horizon2llvm
+src/aot/horizon2llvm/horizon2llvm
+src/emulator/lifted_kbase_ko.ll

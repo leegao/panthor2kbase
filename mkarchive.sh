@@ -48,7 +48,8 @@ elif command -v zip >/dev/null 2>&1; then
         -9 -y -r "$TARGET_FILE" .
         -x ".cache/*" "build*/*" "archives/*"
         "llvm.zip" "include.zip" "AGENTS.md" "CLAUDE.md" "External/*"
-        "kittytoy/*" "screenshots/*" "mesa/*" "archive.zip" "*.zip" "*.so" "*.o" "*.whl" "*.ko" "sandbox_bundles/*" "predownloaded/*"
+        "kittytoy/*" "screenshots/*" "mesa/*" "archive.zip" "*.zip" "*.so" "*.o" "*.whl" "*.ko"
+        "sandbox_bundles/*" "predownloaded/*" "src/aot/bin/*" "src/aot/horizon2llvm/horizon2llvm"
     )
     if $SLIM; then
         FLAGS+=(-x "*.ko")

@@ -3,6 +3,8 @@ set -euo pipefail
 
 export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$HOME/Android/Sdk/ndk/27.0.12077973}"
 export MESON_WORKING_DIR="$PWD"
+CMAKE_BIN_DIR="$(dirname "$("$MESON_WORKING_DIR/scripts/find_cmake.sh" 2>/dev/null || echo /usr/bin/cmake)")"
+export PATH="$CMAKE_BIN_DIR:$PATH"
 export PATH="$MESON_WORKING_DIR/build-x86-64/mesa/src/compiler/clc:$MESON_WORKING_DIR/build-x86-64/mesa/src/compiler/spirv:$MESON_WORKING_DIR/build-x86-64/mesa/src/panfrost/clc:$MESON_WORKING_DIR/build-host/src/compiler/clc:$MESON_WORKING_DIR/build-host/src/compiler/spirv:$MESON_WORKING_DIR/build-host/src/panfrost/clc:$PATH"
 
 # Fast checksum helper (uses POSIX `cksum` CRC-32 with `sha256sum` fallback).
@@ -31,7 +33,7 @@ elif [ -x "$NDK_BIN/aarch64-linux-android35-clang++" ]; then
 fi
 
 if [ -n "$NDK_CXX" ]; then
-   ADAPTER_SUM="$(cksum src/adapter/panthor_kbase_adapter.cpp src/adapter/panthor_drm_capture_replay.cpp src/adapter/log.cpp src/adapter/drm_mode_stubs.c include/panthor_kbase_adapter.h include/mali_kbase_uapi.h include/panthor_drm.h 2>/dev/null | cksum | awk '{print $1 "-" $2}')"
+   ADAPTER_SUM="$(cksum src/adapter/panthor_kbase_adapter.cpp src/adapter/mali_kbase_caps.cpp src/adapter/panthor_drm_capture_replay.cpp src/adapter/log.cpp src/adapter/drm_mode_stubs.c include/panthor_kbase_adapter.h include/mali_kbase_caps.h include/mali_kbase_uapi.h include/panthor_drm.h 2>/dev/null | cksum | awk '{print $1 "-" $2}')"
    PREV_ADAPTER_SUM=""
    if [ -f build-android/scratch/.libdrm_sources.sha256 ]; then
       PREV_ADAPTER_SUM="$(cat build-android/scratch/.libdrm_sources.sha256)"
@@ -39,29 +41,47 @@ if [ -n "$NDK_CXX" ]; then
    if [ ! -f shims/lib/libdrm.a ] || [ "$ADAPTER_SUM" != "$PREV_ADAPTER_SUM" ]; then
       echo "  [ndk] Rebuilding shims/lib/libdrm.a via CMake (digest changed: $ADAPTER_SUM)..."
       CMAKE_BIN="$("$MESON_WORKING_DIR/scripts/find_cmake.sh" 2>/dev/null || command -v cmake)"
-      if [ -n "$CMAKE_BIN" ] && [ -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" ]; then
-         "$CMAKE_BIN" -S "$MESON_WORKING_DIR" -B "$MESON_WORKING_DIR/build-android" \
-            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-30 \
-            -DPANTHOR_KBASE_BUILD_TESTS=OFF \
-            -DPANTHOR_KBASE_BUILD_AOT=OFF
+      if [ -n "$CMAKE_BIN" ]; then
+         if [ -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" ]; then
+            "$CMAKE_BIN" -S "$MESON_WORKING_DIR" -B "$MESON_WORKING_DIR/build-android" \
+               -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+               -DANDROID_ABI=arm64-v8a \
+               -DANDROID_PLATFORM=android-30 \
+               -DPANTHOR_KBASE_BUILD_TESTS=OFF \
+               -DPANTHOR_KBASE_BUILD_AOT=OFF
+         else
+            "$CMAKE_BIN" -S "$MESON_WORKING_DIR" -B "$MESON_WORKING_DIR/build-android" \
+               -DCMAKE_SYSTEM_NAME=Linux \
+               -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+               -DANDROID=ON \
+               -DANDROID_ABI=arm64-v8a \
+               -DANDROID_PLATFORM=android-30 \
+               -DCMAKE_C_COMPILER="$NDK_CC" \
+               -DCMAKE_CXX_COMPILER="$NDK_CXX" \
+               -DCMAKE_AR="$NDK_BIN/llvm-ar" \
+               -DCMAKE_RANLIB="$NDK_BIN/llvm-ranlib" \
+               -DPANTHOR_KBASE_BUILD_TESTS=OFF \
+               -DPANTHOR_KBASE_BUILD_AOT=OFF
+         fi
          "$CMAKE_BIN" --build "$MESON_WORKING_DIR/build-android" --target drm_shim panthor_kbase_adapter_static panthor_kbase_adapter mali_kbase_emu mali_kbase_emu_static -j"$(nproc)"
          cp -f "$MESON_WORKING_DIR/build-android/libdrm.a" shims/lib/libdrm.a
          cp -f "$MESON_WORKING_DIR/build-android/libdrm.a" shims/libdrm.a
          cp -f "$MESON_WORKING_DIR/build-android/libpanthor_kbase_adapter.a" shims/libpanthor_kbase_adapter.a
          cp -f "$MESON_WORKING_DIR/build-android/libpanthor_kbase_adapter.a" shims/lib/libpanthor_kbase_adapter.a
       else
-         "$NDK_CXX" -std=c++17 -O2 -fPIC -Wall -Wextra -Iinclude -Isrc/adapter \
+         "$NDK_CXX" -std=c++17 -O2 -fPIC -ffile-prefix-map="$MESON_WORKING_DIR"=. -Wall -Wextra -Iinclude -Isrc/adapter \
             -c src/adapter/panthor_kbase_adapter.cpp -o build-android/scratch/panthor_kbase_adapter.o
-         "$NDK_CXX" -std=c++17 -O2 -fPIC -Wall -Iinclude -Isrc/adapter -Isrc/emulator \
+         "$NDK_CXX" -std=c++17 -O2 -fPIC -ffile-prefix-map="$MESON_WORKING_DIR"=. -Wall -Wextra -Iinclude -Isrc/adapter \
+            -c src/adapter/mali_kbase_caps.cpp -o build-android/scratch/mali_kbase_caps.o
+         "$NDK_CXX" -std=c++17 -O2 -fPIC -ffile-prefix-map="$MESON_WORKING_DIR"=. -Wall -Iinclude -Isrc/adapter -Isrc/emulator \
             -c src/adapter/panthor_drm_capture_replay.cpp -o build-android/scratch/panthor_drm_capture_replay.o
-         "$NDK_CXX" -std=c++17 -O2 -fPIC -Wall -Wextra -Iinclude -Isrc/adapter \
+         "$NDK_CXX" -std=c++17 -O2 -fPIC -ffile-prefix-map="$MESON_WORKING_DIR"=. -Wall -Wextra -Iinclude -Isrc/adapter \
             -c src/adapter/log.cpp -o build-android/scratch/log.o
-         "$NDK_CC" -std=c11 -O2 -fPIC -Wall -Wextra -Iinclude -Isrc/adapter \
+         "$NDK_CC" -std=c11 -O2 -fPIC -ffile-prefix-map="$MESON_WORKING_DIR"=. -Wall -Wextra -Iinclude -Isrc/adapter \
             -c src/adapter/drm_mode_stubs.c -o build-android/scratch/drm_mode_stubs.o
          "$NDK_BIN/llvm-ar" rcs shims/lib/libdrm.a \
             build-android/scratch/panthor_kbase_adapter.o \
+            build-android/scratch/mali_kbase_caps.o \
             build-android/scratch/panthor_drm_capture_replay.o \
             build-android/scratch/log.o \
             build-android/scratch/drm_mode_stubs.o
@@ -80,9 +100,9 @@ if [ -f mesa_overlay/src/panfrost/genxml/cs_builder.h ]; then
 fi
 
 MESA_BUILD_TARGET=""
-if [ -d build-android/mesa ]; then
+if [ -f build-android/mesa/build.ninja ]; then
    MESA_BUILD_TARGET="build-android/mesa"
-elif [ -d build-android ]; then
+elif [ -f build-android/build.ninja ]; then
    MESA_BUILD_TARGET="build-android"
 fi
 

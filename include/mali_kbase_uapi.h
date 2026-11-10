@@ -101,12 +101,26 @@ extern "C" {
 #define CS_USER_IO_OUTPUT_PAGE_OFFSET          0x2000UL
 #define CS_USER_IO_MMAP_SIZE                   (3UL * 4096UL)
 
-/* Offsets within USER_IO Pages (mali_kbase_csf_registers.h) */
+/*
+ * Offsets within USER_IO Pages (mali_kbase_csf_registers.h & mali_kbase_husky.ko):
+ *  - On kbase < 1.35 (e.g. MT6878 r44p1 v1.21), each bound CSI queue has its own
+ *    dedicated 4 KiB Input page (+0x1000) and 4 KiB Output page (+0x2000), with
+ *    CS_INSERT / CS_EXTRACT at byte offset +0 of those pages.
+ *  - On kbase >= 1.35 (e.g. Pixel 8 Pro husky r54p1/r54p3 v1.38), capability 0x11
+ *    (MALI_KBASE_CAP_CSG_USER_IO_ALLOCATION = 17) is enabled in kbase_api_handshake
+ *    (0x04a8c): the kernel allocates 1 shared Input page (group->phys[0]) and 1 shared
+ *    Output page (group->phys[1]) per CSG, maps them into every bound queue's 3-page
+ *    USER_IO VMA, and indexes each queue's slot by `csi_index * 16` (`lsl #4`, verified
+ *    at kbase_csf_alloc_command_stream_user_pages+0xd4 [0x321c0], csg_reg_update_on_csis+0xd0
+ *    [0x3b8e8], and kbase_csf_mcu_shared_add_queue+0x3c [0x5527c]).
+ */
+#define MALI_KBASE_CAP_CSG_USER_IO_ALLOCATION  17U      /* 0x11: enabled when kbase_ver >= 1.35 */
+#define CS_USER_IO_CSI_STRIDE_1_35             16UL     /* 16B per csi_index (lsl #4) on kbase >= 1.35 */
 #define CS_USER_IO_DOORBELL_OFFSET             0x0000UL /* u32 write triggers doorbell */
-#define CS_USER_IO_CS_INSERT_OFFSET            0x1000UL /* u64 byte offset in ring */
-#define CS_USER_IO_CS_EXTRACT_INIT_OFFSET      0x1008UL /* u64 initial extract */
-#define CS_USER_IO_CS_EXTRACT_OFFSET           0x2000UL /* u64 current FW extract */
-#define CS_USER_IO_CS_ACTIVE_OFFSET            0x2008UL /* u32 active status */
+#define CS_USER_IO_CS_INSERT_OFFSET            0x1000UL /* u64 byte offset in ring (+ csi_index*16 on >=1.35) */
+#define CS_USER_IO_CS_EXTRACT_INIT_OFFSET      0x1008UL /* u64 initial extract (+ csi_index*16 on >=1.35) */
+#define CS_USER_IO_CS_EXTRACT_OFFSET           0x2000UL /* u64 current FW extract (+ csi_index*16 on >=1.35) */
+#define CS_USER_IO_CS_ACTIVE_OFFSET            0x2008UL /* u32 active status (+ csi_index*16 on >=1.35) */
 #define CS_USER_IO_CS_FAULT_OFFSET             0x2080UL /* u32 recoverable CS fault */
 #define CS_USER_IO_CS_FATAL_OFFSET             0x2084UL /* u32 fatal CS fault */
 #define CS_USER_IO_CS_FAULT_INFO_OFFSET        0x2088UL /* u64 fault info */

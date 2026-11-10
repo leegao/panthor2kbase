@@ -31,14 +31,11 @@ import build_sample_spirv  # noqa: E402
 SO_R26P0 = "/tmp/mali_work/libGLES_mali_64_v2.so"
 SO_R49_V4 = "/tmp/mali_work/libGLES_mali_v4.so"
 SO_R49_V5 = "/tmp/mali_work/libGLES_mali_v5.so"
+REPO_ROOT = os.path.abspath(os.path.join(ROOT_DIR, "..", ".."))
 SO_R54P3 = (
-    "/working_dir/c_24f54338d69d9705/user_uploaded_files/ttl=63d/user_uploaded/libGLES_mali.so"
-    if os.path.exists("/working_dir/c_24f54338d69d9705/user_uploaded_files/ttl=63d/user_uploaded/libGLES_mali.so")
-    else (
-        os.path.join(ROOT_DIR, "libGLES_mali.so")
-        if os.path.exists(os.path.join(ROOT_DIR, "libGLES_mali.so"))
-        else "/working_dir/c_a3c1acfa7b15211d/work/libGLES_mali.so"
-    )
+    os.path.join(ROOT_DIR, "libGLES_mali.so")
+    if os.path.exists(os.path.join(ROOT_DIR, "libGLES_mali.so"))
+    else os.path.join(REPO_ROOT, "libGLES_mali.so")
 )
 PASS_DRIVER = os.path.join(ROOT_DIR, "bin", "mali_llvm_pass_driver")
 
