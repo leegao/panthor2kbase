@@ -355,6 +355,71 @@ struct ModuleStringPool {
 //   dev_list_head[2]:    336
 //   insns_executed:      352
 //   calls_executed:      360
+
+enum LiftedKoProfileId : uint32_t {
+    KO_PROFILE_R44P1       = 0,
+    KO_PROFILE_HUSKY_R54P1 = 1,
+};
+
+enum LiftedKernelShimId : uint32_t {
+    KO_SHIM_UNKNOWN                         = 0,
+    KO_SHIM_INDIRECT_BLR                    = 1,
+    KO_SHIM_KMALLOC                         = 2,
+    KO_SHIM_KMALLOC_TRACE                   = 3,
+    KO_SHIM_KFREE                           = 4,
+    KO_SHIM_MEMSET                          = 5,
+    KO_SHIM_MEMCPY                          = 6,
+    KO_SHIM_COPY_FROM_USER                  = 7,
+    KO_SHIM_COPY_TO_USER                    = 8,
+    KO_SHIM_CHECK_OBJECT_SIZE               = 9,
+    KO_SHIM_SW_HWEIGHT64                    = 10,
+    KO_SHIM_KBASE_HAS_EXEC_VA_ZONE          = 11,
+    KO_SHIM_SCNPRINTF                       = 12,
+    KO_SHIM_KBASE_DEVICE_GET_LIST           = 13,
+    KO_SHIM_KBASE_CREATE_CONTEXT            = 14,
+    KO_SHIM_KBASE_DESTROY_CONTEXT           = 15,
+    KO_SHIM_KBASE_MEM_POOL_ALLOC_PAGES      = 16,
+    KO_SHIM_KERNEL_MAP_USER_IO_PAGES        = 17,
+    KO_SHIM_KBASE_MEM_ALLOC                 = 18,
+    KO_SHIM_KBASE_MEM_ALIAS                 = 19,
+    KO_SHIM_KBASE_CSF_FIRMWARE_GET_GLB_IFACE = 20,
+    KO_SHIM_CSF_QUEUE_REGISTER_INTERNAL     = 21,
+    KO_SHIM_CREATE_QUEUE_GROUP              = 22,
+    KO_SHIM_KBASE_CSF_TILER_HEAP_INIT       = 23,
+    KO_SHIM_NOOP_EXTERNAL                   = 24,
+};
+
+static uint32_t resolve_profile_id(const std::string& mod_label) {
+    return (mod_label == "husky_r54p1") ? KO_PROFILE_HUSKY_R54P1 : KO_PROFILE_R44P1;
+}
+
+static uint32_t resolve_shim_id(const std::string& callee) {
+    if (callee == "__indirect_blr") return KO_SHIM_INDIRECT_BLR;
+    if (callee == "__kmalloc" || callee == "vzalloc") return KO_SHIM_KMALLOC;
+    if (callee == "kmalloc_trace") return KO_SHIM_KMALLOC_TRACE;
+    if (callee == "kfree" || callee == "vfree") return KO_SHIM_KFREE;
+    if (callee == "memset") return KO_SHIM_MEMSET;
+    if (callee == "memcpy") return KO_SHIM_MEMCPY;
+    if (callee == "__arch_copy_from_user" || callee.rfind("_copy_from_user", 0) == 0) return KO_SHIM_COPY_FROM_USER;
+    if (callee == "__arch_copy_to_user" || callee.rfind("_copy_to_user", 0) == 0) return KO_SHIM_COPY_TO_USER;
+    if (callee == "__check_object_size") return KO_SHIM_CHECK_OBJECT_SIZE;
+    if (callee == "__sw_hweight64") return KO_SHIM_SW_HWEIGHT64;
+    if (callee == "kbase_has_exec_va_zone") return KO_SHIM_KBASE_HAS_EXEC_VA_ZONE;
+    if (callee == "scnprintf") return KO_SHIM_SCNPRINTF;
+    if (callee == "kbase_device_get_list") return KO_SHIM_KBASE_DEVICE_GET_LIST;
+    if (callee == "kbase_create_context") return KO_SHIM_KBASE_CREATE_CONTEXT;
+    if (callee == "kbase_destroy_context") return KO_SHIM_KBASE_DESTROY_CONTEXT;
+    if (callee == "kbase_mem_pool_alloc_pages") return KO_SHIM_KBASE_MEM_POOL_ALLOC_PAGES;
+    if (callee == "kernel_map_user_io_pages" || callee == "kernel_alloc_user_io_pages") return KO_SHIM_KERNEL_MAP_USER_IO_PAGES;
+    if (callee == "kbase_mem_alloc") return KO_SHIM_KBASE_MEM_ALLOC;
+    if (callee == "kbase_mem_alias") return KO_SHIM_KBASE_MEM_ALIAS;
+    if (callee == "kbase_csf_firmware_get_glb_iface") return KO_SHIM_KBASE_CSF_FIRMWARE_GET_GLB_IFACE;
+    if (callee == "csf_queue_register_internal") return KO_SHIM_CSF_QUEUE_REGISTER_INTERNAL;
+    if (callee == "create_queue_group" || callee == "kbase_csf_queue_group_create") return KO_SHIM_CREATE_QUEUE_GROUP;
+    if (callee == "kbase_csf_tiler_heap_init") return KO_SHIM_KBASE_CSF_TILER_HEAP_INIT;
+    return KO_SHIM_NOOP_EXTERNAL;
+}
+
 struct KoFunctionIRBuilder {
     const std::string& mod_label;
     const ParsedKoModule& mod;
@@ -364,17 +429,28 @@ struct KoFunctionIRBuilder {
     ultrs::llvm_ir::Function* ir_fn = nullptr;
     ultrs::llvm_ir::BasicBlock* cur_bb = nullptr;
     unsigned ssa_id = 1;
+    bool count_insns = true;
+    int64_t bb_pending_insns = 0;
 
     KoFunctionIRBuilder(const std::string& lbl,
                         const ParsedKoModule& m,
                         const std::set<uint64_t>& pcs,
                         const std::set<uint64_t>& leaders,
                         ModuleStringPool& sp,
-                        ultrs::llvm_ir::Function* f)
-        : mod_label(lbl), mod(m), valid_pcs(pcs), block_leaders(leaders), str_pool(sp), ir_fn(f) {}
+                        ultrs::llvm_ir::Function* f,
+                        bool cnt_insns = true)
+        : mod_label(lbl), mod(m), valid_pcs(pcs), block_leaders(leaders), str_pool(sp), ir_fn(f), count_insns(cnt_insns) {}
+
+    void flush_bb_insn_count() {
+        if (count_insns && bb_pending_insns > 0 && cur_bb != nullptr) {
+            add_cpu_i64_at(352, bb_pending_insns);
+            bb_pending_insns = 0;
+        }
+    }
 
     void emit_fallthrough(uint64_t next_pc, const std::string& next_lbl) {
         if (!valid_pcs.count(next_pc) || block_leaders.count(next_pc)) {
+            flush_bb_insn_count();
             emit_line(std::string("br label %") + next_lbl, ultrs::llvm_ir::OpTag::UncondBranch);
         }
     }
@@ -706,9 +782,10 @@ struct KoFunctionIRBuilder {
 
         if (cur_bb == nullptr || block_leaders.count(pc)) {
             cur_bb = ir_fn->create_block(bb_label(pc), pc);
+            bb_pending_insns = 0;
         }
         emit_line("; @pc " + hex6(pc) + " " + ins.raw_text, ultrs::llvm_ir::OpTag::Comment);
-        add_cpu_i64_at(352, 1); // cpu->insns_executed++
+        bb_pending_insns++;
 
         if (mnem == "dmb" || mnem == "dsb" || mnem == "isb") {
             emit_line("fence seq_cst", ultrs::llvm_ir::OpTag::MemBarrier);
@@ -720,6 +797,7 @@ struct KoFunctionIRBuilder {
             return;
         }
         if (mnem == "brk" || mnem == "ret") {
+            flush_bb_insn_count();
             emit_line("br label %exit_ret", ultrs::llvm_ir::OpTag::Return);
             return;
         }
@@ -781,10 +859,10 @@ struct KoFunctionIRBuilder {
                     uint64_t off_ro = static_cast<uint64_t>(static_cast<int64_t>(rel->sym_val) + rel->r_addend);
                     auto it = kRodataTableMap.find({mod_label, off_ro});
                     if (it != kRodataTableMap.end()) {
-                        std::string prof_str = str_pool.intern(mod_label);
+                        uint32_t prof_id = resolve_profile_id(mod_label);
                         std::string ro_p = next_reg("rop");
                         std::string ro_i = next_reg("roi");
-                        emit_line(ro_p + " = call ptr @lifted_ko_rodata_ptr(ptr %c, ptr " + prof_str +
+                        emit_line(ro_p + " = call ptr @lifted_ko_rodata_ptr_id(ptr %c, i32 " + std::to_string(prof_id) +
                                   ", i32 " + std::to_string(off_ro) + ", ptr @" + it->second.fallback_symbol + ")");
                         emit_line(ro_i + " = ptrtoint ptr " + ro_p + " to i64");
                         store_reg64(dst, ro_i);
@@ -1329,6 +1407,7 @@ struct KoFunctionIRBuilder {
             return;
         }
         if (mnem == "b") {
+            flush_bb_insn_count();
             int64_t off = parse_imm(ops[0]);
             uint64_t t_pc = static_cast<uint64_t>(static_cast<int64_t>(pc) + off);
             emit_line("br label %" + target_bb_or_exit(t_pc), ultrs::llvm_ir::OpTag::UncondBranch);
@@ -1339,6 +1418,7 @@ struct KoFunctionIRBuilder {
             int64_t off = parse_imm(ops[0]);
             uint64_t t_pc = static_cast<uint64_t>(static_cast<int64_t>(pc) + off);
             std::string cond_i1 = eval_cond_i1(cc);
+            flush_bb_insn_count();
             emit_line("br i1 " + cond_i1 + ", label %" + target_bb_or_exit(t_pc) + ", label %" + next_lbl,
                       ultrs::llvm_ir::OpTag::CondBranch);
             return;
@@ -1350,6 +1430,7 @@ struct KoFunctionIRBuilder {
             std::string v = load_reg64(r);
             std::string cond_i1 = next_reg("cb");
             emit_line(cond_i1 + " = icmp " + (mnem == "cbz" ? "eq" : "ne") + " i64 " + v + ", 0");
+            flush_bb_insn_count();
             emit_line("br i1 " + cond_i1 + ", label %" + target_bb_or_exit(t_pc) + ", label %" + next_lbl,
                       ultrs::llvm_ir::OpTag::CondBranch);
             return;
@@ -1366,6 +1447,7 @@ struct KoFunctionIRBuilder {
             std::string cond_i1 = next_reg("tbc");
             emit_line(b + " = and i64 " + sh + ", 1");
             emit_line(cond_i1 + " = icmp " + (mnem == "tbz" ? "eq" : "ne") + " i64 " + b + ", 0");
+            flush_bb_insn_count();
             emit_line("br i1 " + cond_i1 + ", label %" + target_bb_or_exit(t_pc) + ", label %" + next_lbl,
                       ultrs::llvm_ir::OpTag::CondBranch);
             return;
@@ -1374,15 +1456,18 @@ struct KoFunctionIRBuilder {
             std::string t = load_reg64(ops[0]);
             std::string m = next_reg("brm");
             emit_line(m + " = and i64 " + t + ", 4294967295");
+            flush_bb_insn_count();
             emit_line("store i64 " + m + ", ptr %ind_pc_slot, align 8");
             emit_line("br label %indirect_br_dispatch", ultrs::llvm_ir::OpTag::UncondBranch);
             return;
         }
         if (mnem == "blr") {
-            add_cpu_i64_at(360, 1); // cpu->calls_executed++
-            std::string prof_str = str_pool.intern(mod_label);
-            std::string cal_str = str_pool.intern("__indirect_blr");
-            emit_line("call void @lifted_kernel_shim_dispatch(ptr %c, ptr " + prof_str + ", ptr " + cal_str + ")",
+            flush_bb_insn_count();
+            if (count_insns) add_cpu_i64_at(360, 1); // cpu->calls_executed++
+            uint32_t prof_id = resolve_profile_id(mod_label);
+            uint32_t shim_id = KO_SHIM_INDIRECT_BLR;
+            emit_line("call void @lifted_kernel_shim_dispatch_id(ptr %c, i32 " + std::to_string(prof_id) +
+                      ", i32 " + std::to_string(shim_id) + ")",
                       ultrs::llvm_ir::OpTag::IndirectCall);
             emit_fallthrough(next_pc, next_lbl);
             return;
@@ -1413,15 +1498,17 @@ struct KoFunctionIRBuilder {
                     target = b;
                 }
             }
-            add_cpu_i64_at(360, 1); // cpu->calls_executed++
+            flush_bb_insn_count();
+            if (count_insns) add_cpu_i64_at(360, 1); // cpu->calls_executed++
             if (kDirectLiftedCallees.count(target) && mod.sym_by_name.count(target)) {
                 std::string cr = next_reg("call");
                 emit_line(cr + " = call i64 @lifted_" + mod_label + "_" + target + "(ptr %c)",
                           ultrs::llvm_ir::OpTag::DirectCall);
             } else {
-                std::string prof_str = str_pool.intern(mod_label);
-                std::string cal_str = str_pool.intern(target);
-                emit_line("call void @lifted_kernel_shim_dispatch(ptr %c, ptr " + prof_str + ", ptr " + cal_str + ")",
+                uint32_t prof_id = resolve_profile_id(mod_label);
+                uint32_t shim_id = resolve_shim_id(target);
+                emit_line("call void @lifted_kernel_shim_dispatch_id(ptr %c, i32 " + std::to_string(prof_id) +
+                          ", i32 " + std::to_string(shim_id) + ") ; " + target,
                           ultrs::llvm_ir::OpTag::DirectCall);
             }
             emit_fallthrough(next_pc, next_lbl);
@@ -1754,7 +1841,8 @@ bool lift_ko_modules_to_c_and_ir(
     std::string& err,
     const std::string& out_obj_x86_path,
     const std::string& out_obj_arm64_path,
-    bool full_indirect_dispatch) {
+    bool full_indirect_dispatch,
+    bool count_insns) {
     if (const char* env_full = std::getenv("HORIZON2LLVM_FULL_INDIRECT_DISPATCH")) {
         if (std::string(env_full) == "1" || std::string(env_full) == "true") {
             full_indirect_dispatch = true;
@@ -1781,23 +1869,58 @@ bool lift_ko_modules_to_c_and_ir(
        << "#define LIFTED_KBASE_KO_H\n\n"
        << "#include <stdbool.h>\n"
        << "#include <stdint.h>\n"
-       << "#include <stddef.h>\n\n"
+       << "#include <stddef.h>\n"
+       << "#include \"aarch64_common_cpu_prefix.h\"\n\n"
        << "#ifdef __cplusplus\n"
        << "extern \"C\" {\n"
        << "#endif\n\n"
        << "typedef struct LiftedKbaseCPU LiftedKbaseCPU;\n"
        << "typedef void (*LiftedKbaseShimHook)(LiftedKbaseCPU *cpu, const char *ko_profile, const char *callee);\n\n"
+       << "/* Target kernel module hardware/platform profile ID (per Doc 48 comment doco.Sqmp-w0Al4UvqeikyjWXcQ) */\n"
+       << "enum LiftedKoProfileId {\n"
+       << "    KO_PROFILE_R44P1       = 0, /* MediaTek MT6878 Mali-G615 r44p1/r49p1 (kbase v1.21) */\n"
+       << "    KO_PROFILE_HUSKY_R54P1 = 1, /* Google Pixel 8 Pro Tensor G3 Husky Mali-G715 r54p1 (kbase v1.38) */\n"
+       << "};\n\n"
+       << "/* Compile-time integer enum ID for external kernel shim callouts (per Doc 48 comment doco.fy1VMDUccXqURl_ae6DDiw) */\n"
+       << "enum LiftedKernelShimId {\n"
+       << "    KO_SHIM_UNKNOWN                          = 0,\n"
+       << "    KO_SHIM_INDIRECT_BLR                     = 1,\n"
+       << "    KO_SHIM_KMALLOC                          = 2,\n"
+       << "    KO_SHIM_KMALLOC_TRACE                    = 3,\n"
+       << "    KO_SHIM_KFREE                            = 4,\n"
+       << "    KO_SHIM_MEMSET                           = 5,\n"
+       << "    KO_SHIM_MEMCPY                           = 6,\n"
+       << "    KO_SHIM_COPY_FROM_USER                   = 7,\n"
+       << "    KO_SHIM_COPY_TO_USER                     = 8,\n"
+       << "    KO_SHIM_CHECK_OBJECT_SIZE                = 9,\n"
+       << "    KO_SHIM_SW_HWEIGHT64                     = 10,\n"
+       << "    KO_SHIM_KBASE_HAS_EXEC_VA_ZONE           = 11,\n"
+       << "    KO_SHIM_SCNPRINTF                        = 12,\n"
+       << "    KO_SHIM_KBASE_DEVICE_GET_LIST            = 13,\n"
+       << "    KO_SHIM_KBASE_CREATE_CONTEXT             = 14,\n"
+       << "    KO_SHIM_KBASE_DESTROY_CONTEXT            = 15,\n"
+       << "    KO_SHIM_KBASE_MEM_POOL_ALLOC_PAGES       = 16,\n"
+       << "    KO_SHIM_KERNEL_MAP_USER_IO_PAGES         = 17,\n"
+       << "    KO_SHIM_KBASE_MEM_ALLOC                  = 18,\n"
+       << "    KO_SHIM_KBASE_MEM_ALIAS                  = 19,\n"
+       << "    KO_SHIM_KBASE_CSF_FIRMWARE_GET_GLB_IFACE = 20,\n"
+       << "    KO_SHIM_CSF_QUEUE_REGISTER_INTERNAL      = 21,\n"
+       << "    KO_SHIM_CREATE_QUEUE_GROUP               = 22,\n"
+       << "    KO_SHIM_KBASE_CSF_TILER_HEAP_INIT        = 23,\n"
+       << "    KO_SHIM_NOOP_EXTERNAL                    = 24,\n"
+       << "};\n\n"
        << "/*\n"
        << " * Enclosing Kernel Heap Arena & Sanitizer State (`struct LiftedKoHeap`, per\n"
-       << " * doco.fye2LblI44z3tNk1mh5Euw & doco.mbTC_NolEN_X7AF0b4BFRQ).\n"
-       << " * Prepends a 16-byte `LiftedKoHeapBlockHdr` before every allocation, poisons\n"
-       << " * freed blocks with 0x6B (POISON_FREE), and catches both double-free\n"
-       << " * (`free-after-free`) and use-after-free (`UAF`) memory accesses.\n"
+       << " * doco.fye2LblI44z3tNk1mh5Euw, doco.mbTC_NolEN_X7AF0b4BFRQ & doco.AmlJA4WGBr86E_Cg1P7hMw).\n"
+       << " * Prepends a 16-byte `LiftedKoHeapBlockHdr` before every allocation, appends a\n"
+       << " * 16-byte `0xFE` redzone canary after every payload, poisons freed blocks with\n"
+       << " * `0x6B` (POISON_FREE), and prints a full guest + host stacktrace on any violation.\n"
        << " */\n"
        << "#define LIFTED_KO_HEAP_MAGIC        0x4B414C43U\n"
        << "#define LIFTED_KO_STATE_ALLOCATED   0xA110CA7EU\n"
        << "#define LIFTED_KO_STATE_FREED       0xF2EED00DU\n"
-       << "#define LIFTED_KO_POISON_FREE_BYTE  0x6BU\n\n"
+       << "#define LIFTED_KO_POISON_FREE_BYTE  0x6BU\n"
+       << "#define LIFTED_KO_REDZONE_BYTE      0xFEU\n\n"
        << "struct LiftedKoHeapBlockHdr {\n"
        << "    uint32_t magic;\n"
        << "    uint32_t state;\n"
@@ -1819,8 +1942,7 @@ bool lift_ko_modules_to_c_and_ir(
        << "    uint8_t arena[65536] __attribute__((aligned(16)));\n"
        << "};\n\n"
        << "struct LiftedKbaseCPU {\n"
-       << "    uint64_t x[31];\n"
-       << "    uint64_t sp;\n"
+       << "    AARCH64_COMMON_CPU_PREFIX_FIELDS\n"
        << "    uint64_t x18;\n"
        << "    uint8_t n, z, c, v;\n"
        << "    uint64_t sp_el0;\n"
@@ -1843,13 +1965,17 @@ bool lift_ko_modules_to_c_and_ir(
        << "    uint64_t cur_pc;\n"
        << "    const char *cur_fn;\n"
        << "};\n\n"
+       << "AARCH64_STATIC_ASSERT_CPU_PREFIX(struct LiftedKbaseCPU);\n\n"
        << "void lifted_kbase_cpu_init(LiftedKbaseCPU *cpu, void *user_ctx, LiftedKbaseShimHook shim_hook);\n"
        << "void *lifted_ko_heap_alloc(LiftedKbaseCPU *cpu, size_t sz);\n"
        << "int lifted_ko_heap_free(LiftedKbaseCPU *cpu, void *ptr);\n"
        << "bool lifted_ko_check_mem_access(LiftedKbaseCPU *cpu, const void *ptr, size_t sz, bool is_write);\n"
        << "void lifted_ko_print_stacktrace(LiftedKbaseCPU *cpu, const char *reason, const struct LiftedKoHeapBlockHdr *hdr);\n"
        << "const void *lifted_ko_rodata_ptr(LiftedKbaseCPU *cpu, const char *ko_profile, uint32_t rodata_offset, const void *fallback_slice);\n"
+       << "const void *lifted_ko_rodata_ptr_id(LiftedKbaseCPU *cpu, uint32_t profile_id, uint32_t rodata_offset, const void *fallback_slice);\n"
        << "bool lifted_ko_is_image_mapped(const char *ko_profile, size_t *out_rodata_size);\n"
+       << "const char *lifted_kernel_shim_id_name(uint32_t shim_id);\n"
+       << "void lifted_kernel_shim_dispatch_id(LiftedKbaseCPU *cpu, uint32_t profile_id, uint32_t shim_id);\n"
        << "void lifted_kernel_shim_dispatch(LiftedKbaseCPU *cpu, const char *ko_profile, const char *callee);\n\n";
 
     for (const ParsedKoModule* m : mods) {
@@ -1979,18 +2105,22 @@ bool lift_ko_modules_to_c_and_ir(
        << "    if (out_rodata_size) *out_rodata_size = img->valid ? img->rodata_size : 0;\n"
        << "    return img->valid;\n"
        << "}\n\n"
-       << "const void *lifted_ko_rodata_ptr(LiftedKbaseCPU *cpu, const char *ko_profile, uint32_t rodata_offset, const void *fallback_slice) {\n"
+       << "const void *lifted_ko_rodata_ptr_id(LiftedKbaseCPU *cpu, uint32_t profile_id, uint32_t rodata_offset, const void *fallback_slice) {\n"
        << "    (void)cpu;\n"
        << "    ensure_ko_images_mapped();\n"
-       << "    const struct MappedKoImage *img = (ko_profile && strcmp(ko_profile, \"husky_r54p1\") == 0)\n"
+       << "    const struct MappedKoImage *img = (profile_id == KO_PROFILE_HUSKY_R54P1)\n"
        << "        ? &g_mapped_husky_r54p1 : &g_mapped_r44p1;\n"
        << "    if (img->valid && (size_t)rodata_offset < img->rodata_size) {\n"
        << "        return img->rodata_base + rodata_offset;\n"
        << "    }\n"
        << "    return fallback_slice;\n"
        << "}\n\n"
+       << "const void *lifted_ko_rodata_ptr(LiftedKbaseCPU *cpu, const char *ko_profile, uint32_t rodata_offset, const void *fallback_slice) {\n"
+       << "    uint32_t prof_id = (ko_profile && strcmp(ko_profile, \"husky_r54p1\") == 0) ? KO_PROFILE_HUSKY_R54P1 : KO_PROFILE_R44P1;\n"
+       << "    return lifted_ko_rodata_ptr_id(cpu, prof_id, rodata_offset, fallback_slice);\n"
+       << "}\n\n"
        << "void lifted_ko_print_stacktrace(LiftedKbaseCPU *cpu, const char *reason, const struct LiftedKoHeapBlockHdr *hdr) {\n"
-       << "    fprintf(stderr, \"[lifted_ko_heap] %s\\n\", reason ? reason : \"memory error\");\n"
+       << "    fprintf(stderr, \"[lifted_ko_violation] %s\\n\", reason ? reason : \"runtime violation\");\n"
        << "    if (hdr) {\n"
        << "        fprintf(stderr, \"  block seq=%u size=%u state=0x%08x\\n\", hdr->alloc_seq, hdr->payload_size, hdr->state);\n"
        << "        fprintf(stderr, \"  allocated at guest fn=%s pc=0x%llx (host bt[0]=%p)\\n\",\n"
@@ -2021,10 +2151,21 @@ bool lift_ko_modules_to_c_and_ir(
        << "    }\n"
        << "#endif\n"
        << "}\n\n"
+       << "static bool check_redzone_intact(const struct LiftedKoHeapBlockHdr *hdr) {\n"
+       << "    size_t aligned_sz = ((size_t)hdr->payload_size + 15U) & ~15ULL;\n"
+       << "    const uint8_t *rz = (const uint8_t *)hdr + sizeof(struct LiftedKoHeapBlockHdr) + aligned_sz;\n"
+       << "    for (size_t i = 0; i < 16U; ++i) {\n"
+       << "        if (rz[i] != LIFTED_KO_REDZONE_BYTE) return false;\n"
+       << "    }\n"
+       << "    return true;\n"
+       << "}\n\n"
        << "void *lifted_ko_heap_alloc(LiftedKbaseCPU *cpu, size_t sz) {\n"
        << "    size_t aligned_sz = (sz + 15U) & ~15ULL;\n"
        << "    size_t total = sizeof(struct LiftedKoHeapBlockHdr) + aligned_sz + 16U;\n"
-       << "    if (!cpu || (size_t)cpu->heap.used + total > sizeof(cpu->heap.arena)) return NULL;\n"
+       << "    if (!cpu || (size_t)cpu->heap.used + total > sizeof(cpu->heap.arena)) {\n"
+       << "        if (cpu) lifted_ko_print_stacktrace(cpu, \"HEAP ARENA EXHAUSTION in lifted_ko_heap_alloc\", NULL);\n"
+       << "        return NULL;\n"
+       << "    }\n"
        << "    uint8_t *base = &cpu->heap.arena[cpu->heap.used];\n"
        << "    struct LiftedKoHeapBlockHdr *hdr = (struct LiftedKoHeapBlockHdr *)base;\n"
        << "    memset(hdr, 0, sizeof(*hdr));\n"
@@ -2040,7 +2181,7 @@ bool lift_ko_modules_to_c_and_ir(
        << "#endif\n"
        << "    void *payload = base + sizeof(struct LiftedKoHeapBlockHdr);\n"
        << "    memset(payload, 0, aligned_sz);\n"
-       << "    memset((uint8_t *)payload + aligned_sz, 0xFE, 16U);\n"
+       << "    memset((uint8_t *)payload + aligned_sz, LIFTED_KO_REDZONE_BYTE, 16U);\n"
        << "    cpu->heap.used += (uint32_t)total;\n"
        << "    return payload;\n"
        << "}\n\n"
@@ -2049,12 +2190,23 @@ bool lift_ko_modules_to_c_and_ir(
        << "    uintptr_t p = (uintptr_t)ptr;\n"
        << "    uintptr_t arena_lo = (uintptr_t)&cpu->heap.arena[0];\n"
        << "    uintptr_t arena_hi = arena_lo + sizeof(cpu->heap.arena);\n"
-       << "    if (p < arena_lo + sizeof(struct LiftedKoHeapBlockHdr) || p >= arena_hi) return -1;\n"
+       << "    if (p < arena_lo + sizeof(struct LiftedKoHeapBlockHdr) || p >= arena_hi) {\n"
+       << "        lifted_ko_print_stacktrace(cpu, \"OUT-OF-ARENA pointer passed to lifted_ko_heap_free\", NULL);\n"
+       << "        return -1;\n"
+       << "    }\n"
        << "    struct LiftedKoHeapBlockHdr *hdr = (struct LiftedKoHeapBlockHdr *)(p - sizeof(struct LiftedKoHeapBlockHdr));\n"
-       << "    if (hdr->magic != LIFTED_KO_HEAP_MAGIC) return -1;\n"
+       << "    if (hdr->magic != LIFTED_KO_HEAP_MAGIC) {\n"
+       << "        lifted_ko_print_stacktrace(cpu, \"HEAP HEADER MAGIC CORRUPTION detected in lifted_ko_heap_free\", hdr);\n"
+       << "        return -1;\n"
+       << "    }\n"
        << "    if (hdr->state == LIFTED_KO_STATE_FREED) {\n"
        << "        cpu->heap.double_free_errors++;\n"
        << "        lifted_ko_print_stacktrace(cpu, \"DOUBLE-FREE detected in lifted_ko_heap_free\", hdr);\n"
+       << "        return -1;\n"
+       << "    }\n"
+       << "    if (!check_redzone_intact(hdr)) {\n"
+       << "        cpu->heap.uaf_errors++;\n"
+       << "        lifted_ko_print_stacktrace(cpu, \"REDZONE CANARY CORRUPTION detected in lifted_ko_heap_free\", hdr);\n"
        << "        return -1;\n"
        << "    }\n"
        << "    hdr->state = LIFTED_KO_STATE_FREED;\n"
@@ -2079,14 +2231,17 @@ bool lift_ko_modules_to_c_and_ir(
        << "        size_t off = 0;\n"
        << "        while (off + sizeof(struct LiftedKoHeapBlockHdr) <= cpu->heap.used) {\n"
        << "            struct LiftedKoHeapBlockHdr *hdr = (struct LiftedKoHeapBlockHdr *)&cpu->heap.arena[off];\n"
-       << "            if (hdr->magic != LIFTED_KO_HEAP_MAGIC) break;\n"
+       << "            if (hdr->magic != LIFTED_KO_HEAP_MAGIC) {\n"
+       << "                lifted_ko_print_stacktrace(cpu, \"HEAP HEADER MAGIC CORRUPTION in lifted_ko_check_mem_access\", hdr);\n"
+       << "                break;\n"
+       << "            }\n"
        << "            size_t aligned_sz = ((size_t)hdr->payload_size + 15U) & ~15ULL;\n"
        << "            uintptr_t blk_lo = arena_lo + off + sizeof(struct LiftedKoHeapBlockHdr);\n"
        << "            uintptr_t blk_hi = blk_lo + aligned_sz;\n"
        << "            if (p >= blk_lo && p < blk_hi) {\n"
-       << "                if (hdr->state == LIFTED_KO_STATE_FREED || p + sz > blk_lo + hdr->payload_size) {\n"
+       << "                if (hdr->state == LIFTED_KO_STATE_FREED || p + sz > blk_lo + hdr->payload_size || !check_redzone_intact(hdr)) {\n"
        << "                    cpu->heap.uaf_errors++;\n"
-       << "                    lifted_ko_print_stacktrace(cpu, \"USE-AFTER-FREE / OOB detected in lifted_ko_check_mem_access\", hdr);\n"
+       << "                    lifted_ko_print_stacktrace(cpu, \"USE-AFTER-FREE / OOB / REDZONE VIOLATION detected in lifted_ko_check_mem_access\", hdr);\n"
        << "                    return false;\n"
        << "                }\n"
        << "                return true;\n"
@@ -2094,6 +2249,7 @@ bool lift_ko_modules_to_c_and_ir(
        << "            off += sizeof(struct LiftedKoHeapBlockHdr) + aligned_sz + 16U;\n"
        << "        }\n"
        << "        cpu->heap.uaf_errors++;\n"
+       << "        lifted_ko_print_stacktrace(cpu, \"UNALLOCATED / HEADER-ZONE ACCESS in lifted_ko_check_mem_access\", NULL);\n"
        << "        return false;\n"
        << "    }\n"
        << "    return true;\n"
@@ -2113,29 +2269,58 @@ bool lift_ko_modules_to_c_and_ir(
        << "    cpu->dev_list_head[1] = (uintptr_t)&cpu->dev_list_head[0];\n"
        << "    ensure_ko_images_mapped();\n"
        << "}\n\n"
-       << "void lifted_kernel_shim_dispatch(LiftedKbaseCPU *cpu, const char *ko_profile, const char *callee) {\n"
-       << "    if (strcmp(callee, \"__kmalloc\") == 0 || strcmp(callee, \"kmalloc_trace\") == 0 || strcmp(callee, \"vzalloc\") == 0) {\n"
-       << "        size_t sz = (size_t)cpu->x[0];\n"
-       << "        if (strcmp(callee, \"kmalloc_trace\") == 0) sz = (size_t)cpu->x[2];\n"
+       << "const char *lifted_kernel_shim_id_name(uint32_t shim_id) {\n"
+       << "    switch ((enum LiftedKernelShimId)shim_id) {\n"
+       << "    case KO_SHIM_INDIRECT_BLR:                    return \"__indirect_blr\";\n"
+       << "    case KO_SHIM_KMALLOC:                         return \"__kmalloc\";\n"
+       << "    case KO_SHIM_KMALLOC_TRACE:                   return \"kmalloc_trace\";\n"
+       << "    case KO_SHIM_KFREE:                           return \"kfree\";\n"
+       << "    case KO_SHIM_MEMSET:                          return \"memset\";\n"
+       << "    case KO_SHIM_MEMCPY:                          return \"memcpy\";\n"
+       << "    case KO_SHIM_COPY_FROM_USER:                  return \"_copy_from_user\";\n"
+       << "    case KO_SHIM_COPY_TO_USER:                    return \"_copy_to_user\";\n"
+       << "    case KO_SHIM_CHECK_OBJECT_SIZE:               return \"__check_object_size\";\n"
+       << "    case KO_SHIM_SW_HWEIGHT64:                    return \"__sw_hweight64\";\n"
+       << "    case KO_SHIM_KBASE_HAS_EXEC_VA_ZONE:          return \"kbase_has_exec_va_zone\";\n"
+       << "    case KO_SHIM_SCNPRINTF:                       return \"scnprintf\";\n"
+       << "    case KO_SHIM_KBASE_DEVICE_GET_LIST:           return \"kbase_device_get_list\";\n"
+       << "    case KO_SHIM_KBASE_CREATE_CONTEXT:            return \"kbase_create_context\";\n"
+       << "    case KO_SHIM_KBASE_DESTROY_CONTEXT:           return \"kbase_destroy_context\";\n"
+       << "    case KO_SHIM_KBASE_MEM_POOL_ALLOC_PAGES:      return \"kbase_mem_pool_alloc_pages\";\n"
+       << "    case KO_SHIM_KERNEL_MAP_USER_IO_PAGES:        return \"kernel_map_user_io_pages\";\n"
+       << "    case KO_SHIM_KBASE_MEM_ALLOC:                 return \"kbase_mem_alloc\";\n"
+       << "    case KO_SHIM_KBASE_MEM_ALIAS:                 return \"kbase_mem_alias\";\n"
+       << "    case KO_SHIM_KBASE_CSF_FIRMWARE_GET_GLB_IFACE: return \"kbase_csf_firmware_get_glb_iface\";\n"
+       << "    case KO_SHIM_CSF_QUEUE_REGISTER_INTERNAL:     return \"csf_queue_register_internal\";\n"
+       << "    case KO_SHIM_CREATE_QUEUE_GROUP:              return \"create_queue_group\";\n"
+       << "    case KO_SHIM_KBASE_CSF_TILER_HEAP_INIT:       return \"kbase_csf_tiler_heap_init\";\n"
+       << "    case KO_SHIM_NOOP_EXTERNAL:                   return \"__noop_external\";\n"
+       << "    default:                                      return \"unknown\";\n"
+       << "    }\n"
+       << "}\n\n"
+       << "void lifted_kernel_shim_dispatch_id(LiftedKbaseCPU *cpu, uint32_t profile_id, uint32_t shim_id) {\n"
+       << "    const char *ko_profile = (profile_id == KO_PROFILE_HUSKY_R54P1) ? \"husky_r54p1\" : \"r44p1\";\n"
+       << "    switch ((enum LiftedKernelShimId)shim_id) {\n"
+       << "    case KO_SHIM_KMALLOC:\n"
+       << "    case KO_SHIM_KMALLOC_TRACE: {\n"
+       << "        size_t sz = (shim_id == KO_SHIM_KMALLOC_TRACE) ? (size_t)cpu->x[2] : (size_t)cpu->x[0];\n"
        << "        if (sz == 0) sz = 64;\n"
        << "        void *ptr = lifted_ko_heap_alloc(cpu, sz);\n"
        << "        cpu->x[0] = (uintptr_t)ptr;\n"
        << "        return;\n"
        << "    }\n"
-       << "    if (strcmp(callee, \"kfree\") == 0 || strcmp(callee, \"vfree\") == 0) {\n"
+       << "    case KO_SHIM_KFREE:\n"
        << "        (void)lifted_ko_heap_free(cpu, (void *)(uintptr_t)cpu->x[0]);\n"
        << "        cpu->x[0] = 0;\n"
        << "        return;\n"
-       << "    }\n"
-       << "    if (strcmp(callee, \"memset\") == 0) {\n"
+       << "    case KO_SHIM_MEMSET:\n"
        << "        if (cpu->x[0] && cpu->x[2]) memset((void *)(uintptr_t)cpu->x[0], (int)(cpu->x[1] & 0xFF), (size_t)cpu->x[2]);\n"
        << "        return;\n"
-       << "    }\n"
-       << "    if (strcmp(callee, \"memcpy\") == 0) {\n"
+       << "    case KO_SHIM_MEMCPY:\n"
        << "        if (cpu->x[0] && cpu->x[1] && cpu->x[2]) memcpy((void *)(uintptr_t)cpu->x[0], (const void *)(uintptr_t)cpu->x[1], (size_t)cpu->x[2]);\n"
        << "        return;\n"
-       << "    }\n"
-       << "    if (strcmp(callee, \"__arch_copy_from_user\") == 0 || strncmp(callee, \"_copy_from_user\", 15) == 0) {\n"
+       << "    case KO_SHIM_COPY_FROM_USER:\n"
+       << "    case KO_SHIM_COPY_TO_USER:\n"
        << "        if (cpu->x[0] && cpu->x[1] && cpu->x[2]) {\n"
        << "            memcpy((void *)(uintptr_t)cpu->x[0], (const void *)(uintptr_t)cpu->x[1], (size_t)cpu->x[2]);\n"
        << "            cpu->x[0] = 0;\n"
@@ -2143,37 +2328,47 @@ bool lift_ko_modules_to_c_and_ir(
        << "            cpu->x[0] = cpu->x[2];\n"
        << "        }\n"
        << "        return;\n"
-       << "    }\n"
-       << "    if (strcmp(callee, \"__arch_copy_to_user\") == 0 || strncmp(callee, \"_copy_to_user\", 13) == 0) {\n"
-       << "        if (cpu->x[0] && cpu->x[1] && cpu->x[2]) {\n"
-       << "            memcpy((void *)(uintptr_t)cpu->x[0], (const void *)(uintptr_t)cpu->x[1], (size_t)cpu->x[2]);\n"
-       << "            cpu->x[0] = 0;\n"
-       << "        } else {\n"
-       << "            cpu->x[0] = cpu->x[2];\n"
-       << "        }\n"
-       << "        return;\n"
-       << "    }\n"
-       << "    if (strcmp(callee, \"__check_object_size\") == 0) {\n"
+       << "    case KO_SHIM_CHECK_OBJECT_SIZE:\n"
        << "        cpu->x[0] = 0;\n"
        << "        return;\n"
-       << "    }\n"
-       << "    if (strcmp(callee, \"__sw_hweight64\") == 0) {\n"
+       << "    case KO_SHIM_SW_HWEIGHT64:\n"
        << "        cpu->x[0] = (uint64_t)__builtin_popcountll(cpu->x[0]);\n"
        << "        return;\n"
-       << "    }\n"
-       << "    if (strcmp(callee, \"kbase_has_exec_va_zone\") == 0) {\n"
+       << "    case KO_SHIM_KBASE_HAS_EXEC_VA_ZONE: {\n"
        << "        uint64_t v = *(uint64_t *)((uintptr_t)cpu->x[0] + 37072 + 192);\n"
        << "        cpu->x[0] = (v != ~0ULL && v != 0ULL) ? 1ULL : 0ULL;\n"
        << "        return;\n"
        << "    }\n"
-       << "    if (strcmp(callee, \"scnprintf\") == 0) {\n"
+       << "    case KO_SHIM_SCNPRINTF:\n"
        << "        cpu->x[0] = 16ULL;\n"
        << "        return;\n"
-       << "    }\n"
-       << "    if (cpu->shim_hook) {\n"
-       << "        cpu->shim_hook(cpu, ko_profile, callee);\n"
+       << "    case KO_SHIM_NOOP_EXTERNAL:\n"
+       << "        cpu->x[0] = 0;\n"
+       << "        return;\n"
+       << "    default:\n"
+       << "        if (cpu->shim_hook) {\n"
+       << "            cpu->shim_hook(cpu, ko_profile, lifted_kernel_shim_id_name(shim_id));\n"
+       << "            return;\n"
+       << "        }\n"
+       << "        cpu->x[0] = 0;\n"
        << "        return;\n"
        << "    }\n"
+       << "}\n\n"
+       << "void lifted_kernel_shim_dispatch(LiftedKbaseCPU *cpu, const char *ko_profile, const char *callee) {\n"
+       << "    uint32_t prof_id = (ko_profile && strcmp(ko_profile, \"husky_r54p1\") == 0) ? KO_PROFILE_HUSKY_R54P1 : KO_PROFILE_R44P1;\n"
+       << "    if (!callee) { cpu->x[0] = 0; return; }\n"
+       << "    if (strcmp(callee, \"__kmalloc\") == 0 || strcmp(callee, \"vzalloc\") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_KMALLOC); return; }\n"
+       << "    if (strcmp(callee, \"kmalloc_trace\") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_KMALLOC_TRACE); return; }\n"
+       << "    if (strcmp(callee, \"kfree\") == 0 || strcmp(callee, \"vfree\") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_KFREE); return; }\n"
+       << "    if (strcmp(callee, \"memset\") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_MEMSET); return; }\n"
+       << "    if (strcmp(callee, \"memcpy\") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_MEMCPY); return; }\n"
+       << "    if (strcmp(callee, \"__arch_copy_from_user\") == 0 || strncmp(callee, \"_copy_from_user\", 15) == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_COPY_FROM_USER); return; }\n"
+       << "    if (strcmp(callee, \"__arch_copy_to_user\") == 0 || strncmp(callee, \"_copy_to_user\", 13) == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_COPY_TO_USER); return; }\n"
+       << "    if (strcmp(callee, \"__check_object_size\") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_CHECK_OBJECT_SIZE); return; }\n"
+       << "    if (strcmp(callee, \"__sw_hweight64\") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_SW_HWEIGHT64); return; }\n"
+       << "    if (strcmp(callee, \"kbase_has_exec_va_zone\") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_KBASE_HAS_EXEC_VA_ZONE); return; }\n"
+       << "    if (strcmp(callee, \"scnprintf\") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_SCNPRINTF); return; }\n"
+       << "    if (cpu->shim_hook) { cpu->shim_hook(cpu, ko_profile, callee); return; }\n"
        << "    cpu->x[0] = 0;\n"
        << "}\n";
 
@@ -2334,10 +2529,11 @@ bool lift_ko_modules_to_c_and_ir(
                 entry_bb->insts.push_back(std::move(i1));
             }
 
-            KoFunctionIRBuilder fb(m->label, *m, valid_pcs, block_leaders, str_pool, ir_fn);
+            KoFunctionIRBuilder fb(m->label, *m, valid_pcs, block_leaders, str_pool, ir_fn, count_insns);
             for (const DisasmInsn& ins : insns) {
                 fb.lift_insn_to_bb(ins);
             }
+            fb.flush_bb_insn_count();
 
             // Emit `indirect_br_dispatch` ONLY when the function has an indirect branch (or `--full-indirect-dispatch` is set)
             if (has_indirect_br || full_indirect_dispatch) {
@@ -2388,8 +2584,8 @@ bool lift_ko_modules_to_c_and_ir(
     std::ostringstream ll_ss;
     ll_ss << "; ModuleID = 'unified_horizon2llvm_kbase_ko'\n"
           << "source_filename = \"unified_horizon2llvm_kbase_ko.ll\"\n\n"
-          << "declare dso_local ptr @lifted_ko_rodata_ptr(ptr, ptr, i32, ptr) nounwind\n"
-          << "declare dso_local void @lifted_kernel_shim_dispatch(ptr, ptr, ptr) nounwind\n\n";
+          << "declare dso_local ptr @lifted_ko_rodata_ptr_id(ptr, i32, i32, ptr) nounwind\n"
+          << "declare dso_local void @lifted_kernel_shim_dispatch_id(ptr, i32, i32) nounwind\n\n";
 
     for (const auto& kv : kRodataTableMap) {
         ll_ss << "@" << kv.second.fallback_symbol << " = external hidden constant ["
@@ -2445,7 +2641,7 @@ bool lift_ko_modules_to_c_and_ir(
     // 5. Compile `lifted_kbase_ko.ll` directly to native ELF64 PIC object code (.o) via libLLVM
     if (!out_obj_x86_path.empty()) {
         auto res = ultrs::llvm_backend::process_module(
-            final_ir, "x86_64-pc-linux-gnu", true, "default<O1>", "", "", out_obj_x86_path);
+            final_ir, "x86_64-pc-linux-gnu", true, "default<O2>", "", "", out_obj_x86_path);
         if (!res.ok) {
             err = "x86_64 LLVM IR compilation failed: " + res.error_message;
             return false;
@@ -2453,7 +2649,7 @@ bool lift_ko_modules_to_c_and_ir(
     }
     if (!out_obj_arm64_path.empty()) {
         auto res = ultrs::llvm_backend::process_module(
-            final_ir, "aarch64-unknown-linux-gnu", true, "default<O1>", "", "", out_obj_arm64_path);
+            final_ir, "aarch64-unknown-linux-gnu", true, "default<O2>", "", "", out_obj_arm64_path);
         if (!res.ok) {
             err = "aarch64 LLVM IR compilation failed: " + res.error_message;
             return false;

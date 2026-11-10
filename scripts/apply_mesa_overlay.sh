@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # scripts/apply_mesa_overlay.sh
-# Idempotently syncs all modified Mesa files from mesa_overlay/, include/,
-# src/adapter/, and mesa_subproject/ into mesa/ (and shims/include) without
-# modifying destination timestamps when contents are unchanged.
+# Idempotently performs 2-way synchronization between mesa_overlay/ and mesa/
+# (via scripts/sync_mesa_overlay.py) and syncs include/, src/adapter/, and
+# mesa_subproject/ into mesa/ (and shims/include) without modifying destination
+# timestamps when contents are unchanged.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,8 +38,11 @@ mkdir -p "${ROOT_DIR}/shims/include"
 sync_tree_if_changed "${ROOT_DIR}/src/mesa_shims" "${ROOT_DIR}/shims/include"
 sync_tree_if_changed "${ROOT_DIR}/include" "${ROOT_DIR}/shims/include"
 
-# 2. Sync mesa overlay and subprojects into mesa/ (if mesa directory exists)
+# 2. 2-way sync mesa_overlay/ <-> mesa/ and apply subprojects into mesa/
 if [ -d "${MESA_DIR}" ]; then
+   if [ -f "${SCRIPT_DIR}/sync_mesa_overlay.py" ] && command -v python3 >/dev/null 2>&1; then
+      python3 "${SCRIPT_DIR}/sync_mesa_overlay.py" --mesa-dir "${MESA_DIR}" --overlay-dir "${ROOT_DIR}/mesa_overlay" --mode auto --quiet
+   fi
    sync_tree_if_changed "${ROOT_DIR}/mesa_overlay" "${MESA_DIR}"
 
    mkdir -p "${MESA_DIR}/src/panfrost/uapi_adapter" \

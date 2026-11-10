@@ -148,10 +148,89 @@ add_custom_command(TARGET drm_shim POST_BUILD
 # -----------------------------------------------------------------------------
 # 3. User-Space /dev/mali0 Kbase CSF & Valhall ISA Emulator (Shared & Static)
 # -----------------------------------------------------------------------------
+add_custom_command(
+   OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.ll"
+          "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.c"
+   COMMAND $<TARGET_FILE:horizon2llvm> --lift-ko-dual
+           "${CMAKE_CURRENT_SOURCE_DIR}/kernel/mali_kbase_mt6878_r44p1.ko"
+           "${CMAKE_CURRENT_SOURCE_DIR}/kernel/mali_kbase_husky_r54p1.ko"
+           "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.h"
+           "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.c"
+           --out-ir "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.ll"
+           --out-obj-x86 "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko_x86_64.o"
+           --out-obj-arm64 ""
+   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+   DEPENDS horizon2llvm
+           "${CMAKE_CURRENT_SOURCE_DIR}/kernel/mali_kbase_mt6878_r44p1.ko"
+           "${CMAKE_CURRENT_SOURCE_DIR}/kernel/mali_kbase_husky_r54p1.ko"
+   COMMENT "Lifting kernel modules -> lifted_kbase_ko.ll via horizon2llvm"
+)
+
+if(NOT ANDROID)
+   file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/bin")
+   add_executable(horizon2llvm
+      src/aot/horizon2llvm/main.cpp
+      src/aot/horizon2llvm/ko_lifter.cpp
+      src/aot/horizon2llvm/llvm_backend.cpp
+      src/aot/horizon2llvm/passes.cpp
+      src/aot/horizon2llvm/aarch64/aarch64_lifter.cpp
+      src/aot/horizon2llvm/lowering/pass_aapcs64_abi_contract.cpp
+      src/aot/horizon2llvm/lowering/pass_aarch64_idiom_deconstruct.cpp
+      src/aot/horizon2llvm/lowering/pass_cpu_state_promotion.cpp
+      src/aot/horizon2llvm/lowering/pass_fcmp_predicate_fusion.cpp
+      src/aot/horizon2llvm/lowering/pass_guest_stack_alignment.cpp
+      src/aot/horizon2llvm/lowering/pass_jump_table_lowering.cpp
+      src/aot/horizon2llvm/lowering/pass_link_register_elision.cpp
+      src/aot/horizon2llvm/lowering/pass_nzcv_dead_flag_elim.cpp
+      src/aot/horizon2llvm/lowering/pass_nzcv_predicate_fusion.cpp
+      src/aot/horizon2llvm/lowering/pass_tail_call_devirt.cpp
+   )
+   target_include_directories(horizon2llvm PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/horizon2llvm")
+   set_target_properties(horizon2llvm PROPERTIES
+      CXX_STANDARD 20
+      RUNTIME_OUTPUT_DIRECTORY "${AOT_DIR}"
+   )
+   option(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS "Compile horizon2llvm against system C++ LLVM headers instead of self-contained llvm_compat_standalone.hpp" OFF)
+   if(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS)
+      target_compile_definitions(horizon2llvm PRIVATE HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS=1)
+      find_library(SYSTEM_LLVM_SHARED_LIB NAMES LLVM LLVM-18 LLVM-17 LLVM-16 LLVM-15)
+      if(SYSTEM_LLVM_SHARED_LIB)
+         target_link_libraries(horizon2llvm PRIVATE "${SYSTEM_LLVM_SHARED_LIB}")
+      endif()
+   endif()
+   target_link_libraries(horizon2llvm PRIVATE dl ${PLATFORM_LIBS})
+   target_copy_to_source_tree(horizon2llvm "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/bin/horizon2llvm")
+endif()
+
 if(ANDROID)
-   set(LIFTED_KBASE_KO_LL_OBJ "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko_arm64.o")
+   set(LIFTED_KBASE_KO_LL_OBJ "${EMULATOR_DIR}/lifted_kbase_ko_arm64.o")
+   set(LIFTED_KBASE_KO_SRC_OBJ "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko_arm64.o")
+   add_custom_command(
+      OUTPUT "${LIFTED_KBASE_KO_LL_OBJ}"
+      COMMAND "${CMAKE_C_COMPILER}" --target=aarch64-linux-android30 -O2 -fPIC -Wno-override-module -c
+              "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.ll"
+              -o "${LIFTED_KBASE_KO_LL_OBJ}"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${LIFTED_KBASE_KO_LL_OBJ}"
+              "${LIFTED_KBASE_KO_SRC_OBJ}"
+      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.ll"
+      COMMENT "Compiling lifted_kbase_ko.ll -> ${LIFTED_KBASE_KO_LL_OBJ} (Android arm64 -O2)"
+   )
 else()
-   set(LIFTED_KBASE_KO_LL_OBJ "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko_x86_64.o")
+   set(LIFTED_KBASE_KO_LL_OBJ "${EMULATOR_DIR}/lifted_kbase_ko_x86_64.o")
+   set(LIFTED_KBASE_KO_SRC_OBJ "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko_x86_64.o")
+   add_custom_command(
+      OUTPUT "${LIFTED_KBASE_KO_LL_OBJ}"
+      COMMAND $<TARGET_FILE:horizon2llvm> --compile-ir
+              "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.ll"
+              "${LIFTED_KBASE_KO_LL_OBJ}" -O2 --target-triple x86_64-pc-linux-gnu
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${LIFTED_KBASE_KO_LL_OBJ}"
+              "${LIFTED_KBASE_KO_SRC_OBJ}"
+      DEPENDS horizon2llvm "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.ll"
+      COMMENT "Compiling lifted_kbase_ko.ll -> ${LIFTED_KBASE_KO_LL_OBJ} (Host x86-64 -O2 via horizon2llvm)"
+   )
 endif()
 set_source_files_properties(${LIFTED_KBASE_KO_LL_OBJ} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 
@@ -323,39 +402,6 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
       LIBRARY_OUTPUT_DIRECTORY "${AOT_DIR}"
    )
 
-   add_executable(horizon2llvm
-      src/aot/horizon2llvm/main.cpp
-      src/aot/horizon2llvm/ko_lifter.cpp
-      src/aot/horizon2llvm/llvm_backend.cpp
-      src/aot/horizon2llvm/passes.cpp
-      src/aot/horizon2llvm/aarch64/aarch64_lifter.cpp
-      src/aot/horizon2llvm/lowering/pass_aapcs64_abi_contract.cpp
-      src/aot/horizon2llvm/lowering/pass_aarch64_idiom_deconstruct.cpp
-      src/aot/horizon2llvm/lowering/pass_cpu_state_promotion.cpp
-      src/aot/horizon2llvm/lowering/pass_fcmp_predicate_fusion.cpp
-      src/aot/horizon2llvm/lowering/pass_guest_stack_alignment.cpp
-      src/aot/horizon2llvm/lowering/pass_jump_table_lowering.cpp
-      src/aot/horizon2llvm/lowering/pass_link_register_elision.cpp
-      src/aot/horizon2llvm/lowering/pass_nzcv_dead_flag_elim.cpp
-      src/aot/horizon2llvm/lowering/pass_nzcv_predicate_fusion.cpp
-      src/aot/horizon2llvm/lowering/pass_tail_call_devirt.cpp
-   )
-   target_include_directories(horizon2llvm PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/horizon2llvm")
-   set_target_properties(horizon2llvm PROPERTIES
-      CXX_STANDARD 20
-      RUNTIME_OUTPUT_DIRECTORY "${AOT_DIR}"
-   )
-   option(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS "Compile horizon2llvm against system C++ LLVM headers instead of self-contained llvm_compat_standalone.hpp" OFF)
-   if(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS)
-      target_compile_definitions(horizon2llvm PRIVATE HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS=1)
-      find_library(SYSTEM_LLVM_SHARED_LIB NAMES LLVM LLVM-18 LLVM-17 LLVM-16 LLVM-15)
-      if(SYSTEM_LLVM_SHARED_LIB)
-         target_link_libraries(horizon2llvm PRIVATE "${SYSTEM_LLVM_SHARED_LIB}")
-      endif()
-   endif()
-   target_link_libraries(horizon2llvm PRIVATE dl ${PLATFORM_LIBS})
-   target_copy_to_source_tree(horizon2llvm "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/bin/horizon2llvm")
-
    add_executable(mali_llvm_pass_driver
       src/aot/src/mali_llvm_passes.cpp
    )
@@ -365,11 +411,35 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
    )
 
    # AOT Lifter target
-   add_custom_target(aot_targets ALL
+   # add_custom_target(aot_targets ALL
+   #    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/translate.sh" libGLES_mali.so "${CMAKE_BINARY_DIR}"
+   #    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+   #    DEPENDS mali_kbase_emu_static panthor_kbase_adapter_static mali_llvm_pass_driver horizon2llvm
+   #    COMMENT "Running 64-bit Mali AOT translation pipeline (translate.sh)"
+   # )
+   set(AOT_ICD_SO "${CMAKE_BINARY_DIR}/libvulkan_mali_aot_icd.so")
+   set(AOT_RUNNER "${CMAKE_BINARY_DIR}/mali_aot_runner")
+   set(AOT_JSON   "${CMAKE_BINARY_DIR}/mali_aot_icd.x86_64.json")
+
+   add_custom_command(
+      OUTPUT "${AOT_ICD_SO}" "${AOT_RUNNER}" "${AOT_JSON}"
       COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/translate.sh" libGLES_mali.so "${CMAKE_BINARY_DIR}"
       WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-      DEPENDS mali_kbase_emu_static panthor_kbase_adapter_static mali_llvm_pass_driver horizon2llvm
+      DEPENDS mali_kbase_emu_static
+              panthor_kbase_adapter_static
+              mali_llvm_pass_driver
+              horizon2llvm
+              "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/src/mali_vulkan_icd.cpp"
+              "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/src/mali_aot_runner.cpp"
+              "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/src/mali_icd_internal.h"
+              "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/src/mali_icd_wsi.cpp"
+              "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/src/mali_icd_physdev.cpp"
+              "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/include/mali0_emu_lvp.hpp"
       COMMENT "Running 64-bit Mali AOT translation pipeline (translate.sh)"
+   )
+
+   add_custom_target(aot_targets ALL
+      DEPENDS "${AOT_ICD_SO}"
    )
 endif()
 

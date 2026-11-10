@@ -131,8 +131,10 @@ for p in props:
         export MALI_AOT_ICD_LOG="${MALI_AOT_ICD_LOG:-1}"
         export NODEVICE_SELECT="${NODEVICE_SELECT:-1}"
         export VK_LOADER_LAYERS_DISABLE="${VK_LOADER_LAYERS_DISABLE:-~implicit~}"
-        VKCUBE_BIN="./src/aot/bin/vkcube_khronos"
-        if [ ! -x "$VKCUBE_BIN" ] && command -v vkcube >/dev/null 2>&1; then
+        VKCUBE_BIN="$ROOT_DIR/build-x86-64/aot/aot_vkcube"
+        if [ ! -x "$VKCUBE_BIN" ] && [ -x "$ROOT_DIR/src/aot/bin/vkcube" ]; then
+            VKCUBE_BIN="$ROOT_DIR/src/aot/bin/vkcube"
+        elif [ ! -x "$VKCUBE_BIN" ] && command -v vkcube >/dev/null 2>&1; then
             VKCUBE_BIN="$(command -v vkcube)"
         fi
         if [ -n "${DISPLAY:-}" ]; then
@@ -146,7 +148,7 @@ for p in props:
                 LD_LIBRARY_PATH="$ICD_DIR:$ROOT_DIR:${LD_LIBRARY_PATH:-}" \
                 VK_DRIVER_FILES="$ICD_JSON" \
                 VK_ICD_FILENAMES="$ICD_JSON" \
-                ./src/aot/bin/vkcube_khronos --wsi display --c "${1:-10}"
+                $VKCUBE_BIN --wsi display --c "${1:-10}"
         fi
         ;;
     --run-vkcube-wayland)
@@ -156,8 +158,10 @@ for p in props:
         export MALI_AOT_ICD_LOG="${MALI_AOT_ICD_LOG:-1}"
         export NODEVICE_SELECT="${NODEVICE_SELECT:-1}"
         export VK_LOADER_LAYERS_DISABLE="${VK_LOADER_LAYERS_DISABLE:-~implicit~}"
-        VKCUBE_BIN="./src/aot/bin/vkcube_khronos"
-        if [ ! -x "$VKCUBE_BIN" ] && command -v vkcube >/dev/null 2>&1; then
+        VKCUBE_BIN="$ROOT_DIR/build-x86-64/aot/aot_vkcube"
+        if [ ! -x "$VKCUBE_BIN" ] && [ -x "$ROOT_DIR/src/aot/bin/vkcube" ]; then
+            VKCUBE_BIN="$ROOT_DIR/src/aot/bin/vkcube"
+        elif [ ! -x "$VKCUBE_BIN" ] && command -v vkcube >/dev/null 2>&1; then
             VKCUBE_BIN="$(command -v vkcube)"
         fi
         if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -x "$VKCUBE_BIN" ]; then
@@ -167,12 +171,12 @@ for p in props:
                 VK_ICD_FILENAMES="$ICD_JSON" \
                 "$VKCUBE_BIN" --wsi wayland --c "${1:-10}"
         else
-            echo "[AOT Runner] WAYLAND_DISPLAY is unset; running built-in Wayland compositor + vkcube WSI test (./tests/test_wayland_and_vkgears_e2e)..." >&2
+            echo "[AOT Runner] WAYLAND_DISPLAY is unset; running built-in Wayland compositor + vkcube WSI test (${BUILD_DIR:-$ROOT_DIR/build-x86-64}/tests/test_wayland_and_vkgears_e2e)..." >&2
             env -u MALI_AOT_DISABLE_WAYLAND_EXT \
                 LD_LIBRARY_PATH="$ICD_DIR:$ROOT_DIR:${LD_LIBRARY_PATH:-}" \
                 VK_DRIVER_FILES="$ICD_JSON" \
                 VK_ICD_FILENAMES="$ICD_JSON" \
-                ./tests/test_wayland_and_vkgears_e2e
+                ${BUILD_DIR:-$ROOT_DIR/build-x86-64}/tests/test_wayland_and_vkgears_e2e
         fi
         ;;
     --run-app)
@@ -218,6 +222,16 @@ for p in props:
         export VK_LOADER_DRIVERS_SELECT="*mali_aot*"
         export VK_LOADER_DRIVERS_DISABLE="*radeon*,*radv*,*lvp*,*intel*,*anv*,*nouveau*,*nvk*,*nvidia*"
 
+        if ! command -v "$1" >/dev/null 2>&1; then
+            if [ "$1" = "vkcube" ] && [ -x "$ROOT_DIR/build-x86-64/aot/aot_vkcube" ]; then
+                shift
+                set -- "$ROOT_DIR/build-x86-64/aot/aot_vkcube" "$@"
+            elif [ -x "$ROOT_DIR/build-x86-64/aot/$1" ]; then
+                _app="$ROOT_DIR/build-x86-64/aot/$1"; shift; set -- "$_app" "$@"
+            elif [ -x "$ROOT_DIR/src/aot/bin/$1" ]; then
+                _app="$ROOT_DIR/src/aot/bin/$1"; shift; set -- "$_app" "$@"
+            fi
+        fi
         APP_BIN="$(command -v "$1" 2>/dev/null || echo "$1")"
         echo "================================================================================" >&2
         echo " [AOT Runner] Launching Generic x86-64 Vulkan Application" >&2

@@ -16,10 +16,39 @@
 #include <cstring>
 #include <algorithm>
 
+#include <unistd.h>
 extern "C" {
+    typedef void (*mali_kbase_emu_csf_job_hook_fn)(uint8_t cs_opcode, uint64_t insn, const uint64_t *cs_regs, void *user_data);
+    __attribute__((weak)) void mali_kbase_emu_register_csf_job_hook(mali_kbase_emu_csf_job_hook_fn fn, void *user_data);
+    struct kbase_emu_stats {
+        uint32_t ioctl_count;
+        uint32_t mem_alloc_count;
+        uint32_t queue_kick_count;
+        uint32_t csf_instructions_executed;
+        uint32_t csf_calls_followed;
+        uint32_t valhall_shaders_executed;
+        uint32_t valhall_instructions_executed;
+        uint32_t compute_jobs_run;
+        uint32_t idvs_jobs_run;
+        uint32_t fragment_jobs_run;
+        uint32_t lvp_bridges_run;
+        uint32_t csg_scope_warnings;
+        uint32_t oom_heap_stat_errors;
+        uint32_t same_va_munmap_destroys;
+        uint32_t unwaited_deferred_sync_errors;
+        uint32_t csf_jumps_followed;
+        uint32_t lifted_ko_calls_executed;
+        uint64_t lifted_ko_insns_executed;
+        uint32_t active_profile;
+        uint16_t kbase_ver_major;
+        uint16_t kbase_ver_minor;
+    };
+    __attribute__((weak)) void mali_kbase_emu_get_stats(struct kbase_emu_stats *out);
     __attribute__((weak)) int mali_kbase_emu_open_direct(const char *pathname, int flags);
     __attribute__((weak)) int mali_kbase_emu_close_direct(int fd);
     __attribute__((weak)) int mali_kbase_emu_ioctl_direct(int fd, unsigned long request, void *arg);
+    __attribute__((weak)) void *mali_kbase_emu_mmap_direct(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
+    __attribute__((weak)) int mali_kbase_emu_munmap_direct(void *addr, size_t length);
 }
 
 struct KbaseBufferObject {
@@ -118,6 +147,96 @@ public:
     std::vector<VkCubeFrameStats>         executed_vkcube_frames;
     std::vector<BaseJdEventV2>            jm_event_queue;
     HostLvpipeVulkanExecutor              lvp_executor;
+
+    void ensureLiftedKernelBound() {
+        if (mali_kbase_emu_register_csf_job_hook) {
+            mali_kbase_emu_register_csf_job_hook(&MaliKbaseCsfKernelEmulator::onLiftedCsfJobCallback, this);
+        }
+    }
+
+    static void onLiftedCsfJobCallback(uint8_t cs_opcode, uint64_t insn, const uint64_t *cs_regs, void *user_data) {
+        if (!user_data || !cs_regs) return;
+        static_cast<MaliKbaseCsfKernelEmulator*>(user_data)->dispatchCsfJobFromRegs(cs_opcode, insn, cs_regs);
+    }
+
+    void dispatchCsfJobFromRegs(uint8_t opc, uint64_t insn, const uint64_t *cs_regs64) {
+        auto getReg64 = [&](unsigned d_idx) -> uint64_t {
+            if (d_idx + 1 >= 96) return 0;
+            return (cs_regs64[d_idx] & 0xFFFFFFFFULL) | ((cs_regs64[d_idx + 1] & 0xFFFFFFFFULL) << 32);
+        };
+        uint8_t srt_sel = static_cast<uint8_t>((insn >> 40) & 0x3U);
+        uint8_t spd_sel = static_cast<uint8_t>((insn >> 42) & 0x3U);
+        uint8_t tsd_sel = static_cast<uint8_t>((insn >> 44) & 0x3U);
+        uint8_t fau_sel = static_cast<uint8_t>((insn >> 46) & 0x3U);
+
+        KbaseCsfExecutedJob job;
+        job.cs_opcode  = opc;
+        job.srt_gpu_va = getReg64(srt_sel * 2);
+        job.spd_gpu_va = getReg64(8 + spd_sel * 2);
+        job.tsd_gpu_va = getReg64(16 + tsd_sel * 2);
+        job.fau_gpu_va = getReg64(24 + fau_sel * 2);
+        job.wg_x       = std::max<uint32_t>(1U, static_cast<uint32_t>(cs_regs64[32]));
+        job.wg_y       = std::max<uint32_t>(1U, static_cast<uint32_t>(cs_regs64[33]));
+        job.wg_z       = std::max<uint32_t>(1U, static_cast<uint32_t>(cs_regs64[34]));
+
+        if (job.spd_gpu_va >= 0x10000ULL) {
+            const uint64_t* spd = reinterpret_cast<const uint64_t*>(job.spd_gpu_va);
+            job.shader_objc_va    = spd[0];
+            job.shader_objc_bytes = static_cast<uint32_t>(spd[1] & 0xFFFFFFFFULL);
+        }
+
+        const MaliIdvsDrawPacket* draw_pkt = nullptr;
+        if (job.tsd_gpu_va >= 0x10000ULL && *reinterpret_cast<const uint32_t*>(job.tsd_gpu_va) == MALI_IDVS_MAGIC) {
+            draw_pkt = reinterpret_cast<const MaliIdvsDrawPacket*>(job.tsd_gpu_va);
+        } else if (job.srt_gpu_va >= 0x10000ULL && *reinterpret_cast<const uint32_t*>(job.srt_gpu_va) == MALI_IDVS_MAGIC) {
+            draw_pkt = reinterpret_cast<const MaliIdvsDrawPacket*>(job.srt_gpu_va);
+        }
+
+        if (draw_pkt && draw_pkt->mfbd_gpu_va) {
+            job.is_vkcube_graphics_job = true;
+            if (job.shader_objc_va >= 0x10000ULL && job.shader_objc_bytes >= 8 && job.shader_objc_bytes <= 65536) {
+                const uint64_t* objc_words = reinterpret_cast<const uint64_t*>(job.shader_objc_va);
+                size_t num_words = job.shader_objc_bytes / 8;
+                job.disasm = ValhallISAToSpirvTranslator::disassembleObjc(objc_words, num_words);
+            }
+            if (opc == MALI_CS_OPCODE_RUN_IDVS) {
+                job.lifted_spirv = MaliVkCubeIsaPipelineTranslator::liftVertexObjcToSpirv(
+                    (job.shader_objc_va >= 0x10000ULL) ? reinterpret_cast<const uint64_t*>(job.shader_objc_va) : nullptr,
+                    (job.shader_objc_va >= 0x10000ULL) ? (job.shader_objc_bytes / 8) : 0, false);
+                job.executed_on_lvp = lvp_executor.validateShaderModuleOnLvpipe(job.lifted_spirv);
+            } else if (opc == MALI_CS_OPCODE_RUN_FRAGMENT) {
+                job.lifted_spirv = MaliVkCubeIsaPipelineTranslator::liftFragmentObjcToSpirv(
+                    (job.shader_objc_va >= 0x10000ULL) ? reinterpret_cast<const uint64_t*>(job.shader_objc_va) : nullptr,
+                    (job.shader_objc_va >= 0x10000ULL) ? (job.shader_objc_bytes / 8) : 0, false);
+                auto vs_spv = MaliVkCubeIsaPipelineTranslator::liftVertexObjcToSpirv(nullptr, 0, false);
+                auto* mfbd  = reinterpret_cast<MaliMfbdDescriptor*>(draw_pkt->mfbd_gpu_va);
+                VkCubeFrameStats fstats{};
+                job.executed_on_lvp = lvp_executor.executeVkCubeGraphicsPass(
+                    *draw_pkt, *mfbd, vs_spv, job.lifted_spirv, &fstats);
+                executed_vkcube_frames.push_back(fstats);
+            }
+        } else if (job.shader_objc_va >= 0x10000ULL && job.shader_objc_bytes >= 8 && job.shader_objc_bytes <= 65536) {
+            const uint64_t* objc_words = reinterpret_cast<const uint64_t*>(job.shader_objc_va);
+            size_t num_words = job.shader_objc_bytes / 8;
+            job.lifted_spirv = ValhallISAToSpirvTranslator::translateObjcToSpirv(
+                objc_words, num_words, &job.disasm);
+
+            const void* in_ptr = nullptr;
+            void* out_ptr = nullptr;
+            size_t copy_bytes = 64;
+            if (job.srt_gpu_va >= 0x10000ULL) {
+                const uint64_t* srt = reinterpret_cast<const uint64_t*>(job.srt_gpu_va);
+                in_ptr  = reinterpret_cast<const void*>(srt[0]);
+                out_ptr = reinterpret_cast<void*>(srt[1]);
+                if (srt[2] >= 64 && srt[2] <= 65536) {
+                    copy_bytes = static_cast<size_t>(srt[2]);
+                }
+            }
+            job.executed_on_lvp = lvp_executor.executeLiftedSpirv(
+                job.lifted_spirv, in_ptr, out_ptr, copy_bytes, job.wg_x, job.wg_y, job.wg_z);
+        }
+        executed_jobs.push_back(std::move(job));
+    }
 
     void setGpuProfile(MaliGpuProfileId prof) {
         gpu_product_id = static_cast<uint32_t>(prof);
@@ -236,6 +355,8 @@ public:
             return static_cast<uint64_t>(dma_heap_fd);
         }
         if (std::strstr(path, "mali") != nullptr) {
+            fprintf(stderr, "MALI!!!!\n");
+            ensureLiftedKernelBound();
             if (mali_kbase_emu_open_direct) {
                 (void)mali_kbase_emu_open_direct(path, 0);
             }
@@ -245,16 +366,34 @@ public:
         return static_cast<uint64_t>(-1LL);
     }
 
-    uint64_t handleClose(uint64_t /*fd*/) {
+    uint64_t handleClose(uint64_t fd) {
+        if (mali_kbase_emu_close_direct && static_cast<int>(fd) == virtual_fd) {
+            (void)mali_kbase_emu_close_direct(static_cast<int>(fd));
+        }
         return 0;
     }
 
-    uint64_t handleMmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t /*flags*/, uint64_t fd, uint64_t offset) {
+    uint64_t handleMmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset) {
+        ensureLiftedKernelBound();
         int ifd = static_cast<int>(fd);
         if (dmabuf_table.count(ifd)) {
             void* p = dmabuf_table[ifd].host_mapping;
             ioctl_trace.push_back("mmap(dmabuf_fd=" + std::to_string(ifd) + ")");
             return reinterpret_cast<uint64_t>(p);
+        }
+        if (mali_kbase_emu_mmap_direct && (ifd == virtual_fd || ifd == -1) &&
+            !bos_by_cookie.count(offset) && !mmap_handle_to_queue_va.count(offset)) {
+            void* p = mali_kbase_emu_mmap_direct(
+                reinterpret_cast<void*>(addr),
+                std::max<size_t>(length, KBASE_PAGE_SIZE),
+                static_cast<int>(prot) | PROT_READ | PROT_WRITE,
+                static_cast<int>(flags ? flags : MAP_SHARED),
+                ifd,
+                static_cast<off_t>(offset));
+            if (p && p != MAP_FAILED) {
+                ioctl_trace.push_back("mmap(lifted_kbase_ko offset=0x" + std::to_string(offset) + ")");
+                return reinterpret_cast<uint64_t>(p);
+            }
         }
         if (ifd != virtual_fd && ifd != -1) {
             void* p = mmap(reinterpret_cast<void*>(addr), length, static_cast<int>(prot) | PROT_READ | PROT_WRITE,
@@ -689,10 +828,26 @@ public:
     }
 
     uint64_t handleIoctl(uint64_t fd, uint64_t cmd, uint64_t arg_addr) {
-        if (mali_kbase_emu_ioctl_direct && ((cmd >> 8) & 0xFFU) == 0x80U) {
-            (void)mali_kbase_emu_ioctl_direct(static_cast<int>(fd), static_cast<unsigned long>(cmd), reinterpret_cast<void*>(arg_addr));
-        }
+        ensureLiftedKernelBound();
         uint32_t ucmd = static_cast<uint32_t>(cmd);
+        if (mali_kbase_emu_ioctl_direct && ((ucmd >> 8) & 0xFFU) == 0x80U) {
+            unsigned int nr = ucmd & 0xFFU;
+            // Track jit_va_pages and exec_va_pages for runner telemetry assertions
+            if (ucmd == 0x4018800eU && arg_addr) jit_va_pages = *reinterpret_cast<uint64_t*>(arg_addr);
+            if (ucmd == 0x40088026U && arg_addr) exec_va_pages = *reinterpret_cast<uint64_t*>(arg_addr);
+            if (ucmd == 0xc0048034U) csf_mode_active = true;
+            // Route CSF kernel UAPI ioctls (MEM_ALLOC/EX/QUERY/FREE/COMMIT/ALIAS/SYNC/FLAGS,
+            // CS_QUEUE_REGISTER/BIND/KICK/TERMINATE, CS_QUEUE_GROUP_CREATE/TERMINATE,
+            // CS_TILER_HEAP_INIT/TERM, KCPU_QUEUE_CREATE/DELETE/ENQUEUE, SET_FLAGS, VERSION_CHECK_CSF)
+            // directly into our lifted /dev/mali0 kernel emulator (mali_kbase_emu.c + lifted_kbase_ko.ll + lifted_csffw.c)!
+            // Keep GET_GPUPROPS (nr=3), CS_GET_GLB_IFACE (nr=51), JM JOB_SUBMIT (nr=2), and UMM MEM_IMPORT (nr=22)
+            // augmented with the runner's 85-property TLV / 64-stream / virtual-dmabuf tables after running lifted_kbase_ko!
+            if (nr != 0 && nr != 2 && nr != 3 && nr != 22 && nr != 28 && ucmd != 0xc0048036U && ucmd != 0xc0018036U) {
+                int krc = mali_kbase_emu_ioctl_direct(static_cast<int>(fd), static_cast<unsigned long>(ucmd), reinterpret_cast<void*>(arg_addr));
+                ioctl_trace.push_back("lifted_kbase_ko_ioctl(cmd=0x" + std::to_string(ucmd) + ")");
+                return (krc == 0) ? 0ULL : static_cast<uint64_t>(static_cast<int64_t>(krc));
+            }
+        }
 
         switch (ucmd) {
             // 0. DMA_HEAP_IOCTL_ALLOC (0xc0184800) on /dev/dma_heap/system

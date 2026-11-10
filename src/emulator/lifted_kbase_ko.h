@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include "aarch64_common_cpu_prefix.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -13,17 +14,53 @@ extern "C" {
 typedef struct LiftedKbaseCPU LiftedKbaseCPU;
 typedef void (*LiftedKbaseShimHook)(LiftedKbaseCPU *cpu, const char *ko_profile, const char *callee);
 
+/* Target kernel module hardware/platform profile ID (per Doc 48 comment doco.Sqmp-w0Al4UvqeikyjWXcQ) */
+enum LiftedKoProfileId {
+    KO_PROFILE_R44P1       = 0, /* MediaTek MT6878 Mali-G615 r44p1/r49p1 (kbase v1.21) */
+    KO_PROFILE_HUSKY_R54P1 = 1, /* Google Pixel 8 Pro Tensor G3 Husky Mali-G715 r54p1 (kbase v1.38) */
+};
+
+/* Compile-time integer enum ID for external kernel shim callouts (per Doc 48 comment doco.fy1VMDUccXqURl_ae6DDiw) */
+enum LiftedKernelShimId {
+    KO_SHIM_UNKNOWN                          = 0,
+    KO_SHIM_INDIRECT_BLR                     = 1,
+    KO_SHIM_KMALLOC                          = 2,
+    KO_SHIM_KMALLOC_TRACE                    = 3,
+    KO_SHIM_KFREE                            = 4,
+    KO_SHIM_MEMSET                           = 5,
+    KO_SHIM_MEMCPY                           = 6,
+    KO_SHIM_COPY_FROM_USER                   = 7,
+    KO_SHIM_COPY_TO_USER                     = 8,
+    KO_SHIM_CHECK_OBJECT_SIZE                = 9,
+    KO_SHIM_SW_HWEIGHT64                     = 10,
+    KO_SHIM_KBASE_HAS_EXEC_VA_ZONE           = 11,
+    KO_SHIM_SCNPRINTF                        = 12,
+    KO_SHIM_KBASE_DEVICE_GET_LIST            = 13,
+    KO_SHIM_KBASE_CREATE_CONTEXT             = 14,
+    KO_SHIM_KBASE_DESTROY_CONTEXT            = 15,
+    KO_SHIM_KBASE_MEM_POOL_ALLOC_PAGES       = 16,
+    KO_SHIM_KERNEL_MAP_USER_IO_PAGES         = 17,
+    KO_SHIM_KBASE_MEM_ALLOC                  = 18,
+    KO_SHIM_KBASE_MEM_ALIAS                  = 19,
+    KO_SHIM_KBASE_CSF_FIRMWARE_GET_GLB_IFACE = 20,
+    KO_SHIM_CSF_QUEUE_REGISTER_INTERNAL      = 21,
+    KO_SHIM_CREATE_QUEUE_GROUP               = 22,
+    KO_SHIM_KBASE_CSF_TILER_HEAP_INIT        = 23,
+    KO_SHIM_NOOP_EXTERNAL                    = 24,
+};
+
 /*
  * Enclosing Kernel Heap Arena & Sanitizer State (`struct LiftedKoHeap`, per
- * doco.fye2LblI44z3tNk1mh5Euw & doco.mbTC_NolEN_X7AF0b4BFRQ).
- * Prepends a 16-byte `LiftedKoHeapBlockHdr` before every allocation, poisons
- * freed blocks with 0x6B (POISON_FREE), and catches both double-free
- * (`free-after-free`) and use-after-free (`UAF`) memory accesses.
+ * doco.fye2LblI44z3tNk1mh5Euw, doco.mbTC_NolEN_X7AF0b4BFRQ & doco.AmlJA4WGBr86E_Cg1P7hMw).
+ * Prepends a 16-byte `LiftedKoHeapBlockHdr` before every allocation, appends a
+ * 16-byte `0xFE` redzone canary after every payload, poisons freed blocks with
+ * `0x6B` (POISON_FREE), and prints a full guest + host stacktrace on any violation.
  */
 #define LIFTED_KO_HEAP_MAGIC        0x4B414C43U
 #define LIFTED_KO_STATE_ALLOCATED   0xA110CA7EU
 #define LIFTED_KO_STATE_FREED       0xF2EED00DU
 #define LIFTED_KO_POISON_FREE_BYTE  0x6BU
+#define LIFTED_KO_REDZONE_BYTE      0xFEU
 
 struct LiftedKoHeapBlockHdr {
     uint32_t magic;
@@ -48,8 +85,7 @@ struct LiftedKoHeap {
 };
 
 struct LiftedKbaseCPU {
-    uint64_t x[31];
-    uint64_t sp;
+    AARCH64_COMMON_CPU_PREFIX_FIELDS
     uint64_t x18;
     uint8_t n, z, c, v;
     uint64_t sp_el0;
@@ -73,13 +109,18 @@ struct LiftedKbaseCPU {
     const char *cur_fn;
 };
 
+AARCH64_STATIC_ASSERT_CPU_PREFIX(struct LiftedKbaseCPU);
+
 void lifted_kbase_cpu_init(LiftedKbaseCPU *cpu, void *user_ctx, LiftedKbaseShimHook shim_hook);
 void *lifted_ko_heap_alloc(LiftedKbaseCPU *cpu, size_t sz);
 int lifted_ko_heap_free(LiftedKbaseCPU *cpu, void *ptr);
 bool lifted_ko_check_mem_access(LiftedKbaseCPU *cpu, const void *ptr, size_t sz, bool is_write);
 void lifted_ko_print_stacktrace(LiftedKbaseCPU *cpu, const char *reason, const struct LiftedKoHeapBlockHdr *hdr);
 const void *lifted_ko_rodata_ptr(LiftedKbaseCPU *cpu, const char *ko_profile, uint32_t rodata_offset, const void *fallback_slice);
+const void *lifted_ko_rodata_ptr_id(LiftedKbaseCPU *cpu, uint32_t profile_id, uint32_t rodata_offset, const void *fallback_slice);
 bool lifted_ko_is_image_mapped(const char *ko_profile, size_t *out_rodata_size);
+const char *lifted_kernel_shim_id_name(uint32_t shim_id);
+void lifted_kernel_shim_dispatch_id(LiftedKbaseCPU *cpu, uint32_t profile_id, uint32_t shim_id);
 void lifted_kernel_shim_dispatch(LiftedKbaseCPU *cpu, const char *ko_profile, const char *callee);
 
 int64_t lifted_r44p1_kbase_check_flags(LiftedKbaseCPU *cpu);

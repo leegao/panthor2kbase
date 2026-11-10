@@ -1159,9 +1159,9 @@ static uint64_t icdAllocKbaseBo(MaliIcdDevice* dev, uint64_t pages, uint64_t fla
         cpu.x[1] = pages;
         cpu.x[2] = pages;
         cpu.x[3] = 0;
-        cpu.x[4] = reinterpret_cast<uint64_t>(&out_flags);
+        cpu.x[4] = flags;
         cpu.x[5] = reinterpret_cast<uint64_t>(&out_gpu_va);
-        cpu.x[6] = flags;
+        cpu.x[6] = reinterpret_cast<uint64_t>(&out_flags);
         cpu.x[7] = 0;
         aot_kbase_mem_alloc(&cpu);
         if (cpu.x[0] == 0 && out_gpu_va != 0) return out_gpu_va;

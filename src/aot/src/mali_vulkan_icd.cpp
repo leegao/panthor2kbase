@@ -121,6 +121,20 @@ int32_t vkCreateDevice(void* physicalDevice, const void* /*pCreateInfo*/, const 
 
 __attribute__((visibility("default")))
 void vkDestroyDevice(void* device, const void* /*pAllocator*/) {
+    const char* log_env = std::getenv("MALI_AOT_ICD_LOG");
+    if (log_env && log_env[0] != '0' && mali_kbase_emu_get_stats) {
+        struct kbase_emu_stats kst{};
+        mali_kbase_emu_get_stats(&kst);
+        std::fprintf(stderr,
+               "[MALI_AOT_ICD] vkDestroyDevice -> Lifted /dev/mali0 Kernel E2E Stats (libmali_kbase_emu: lifted_kbase_ko.ll + lifted_csffw.c): "
+               "ioctls=%llu, mem_allocs=%llu, queue_kicks=%llu, csf_insns=%llu, lifted_ko_calls=%llu, lifted_ko_insns=%llu\n",
+               (unsigned long long)kst.ioctl_count,
+               (unsigned long long)kst.mem_alloc_count,
+               (unsigned long long)kst.queue_kick_count,
+               (unsigned long long)kst.csf_instructions_executed,
+               (unsigned long long)kst.lifted_ko_calls_executed,
+               (unsigned long long)kst.lifted_ko_insns_executed);
+    }
     delete static_cast<MaliIcdDevice*>(device);
 }
 
@@ -238,7 +252,7 @@ int32_t vkCreateShaderModule(void* device, const void* pCreateInfo, const void* 
         cpu.x[2] = 0; // use device allocator
         cpu.x[3] = reinterpret_cast<uint64_t>(&aot_sm_handle);
         aot_vkCreateShaderModule(&cpu);
-        if (cpu.x[0] == 0 && aot_sm_handle != 0) {
+        if (cpu.x[0] == 0 && aot_sm_handle >= 0x10000ULL) {
             mod->aot_shader_module_handle = aot_sm_handle;
             // Extract 20-byte SHA-1 digest from AOT shader_module struct
             std::memcpy(mod->sha1_digest, reinterpret_cast<const void*>(aot_sm_handle + 0x18), 20);
@@ -1066,10 +1080,9 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
                         g_aot_rt.cpu.x[0] = reinterpret_cast<uint64_t>(dev->csi_queue_struct.data());
                         g_aot_rt.cpu.x[1] = 1;
                         aot_kbase_cs_queue_kick(&g_aot_rt.cpu);
-                    } else {
-                        KbaseIoctlCsQueueKick kick{dev->ring_bo_va};
-                        bionic_mali_kbase_ioctl_stub(100, 0x40088025U, reinterpret_cast<uint64_t>(&kick));
                     }
+                    KbaseIoctlCsQueueKick kick{dev->ring_bo_va};
+                    bionic_mali_kbase_ioctl_stub(100, 0x40088025U, reinterpret_cast<uint64_t>(&kick));
                 } else if (cmd.type == MaliIcdRecordedCmd::CMD_COPY_BUFFER) {
                     if (cmd.src_va && cmd.dst_va && cmd.copy_bytes) {
                         std::memcpy(reinterpret_cast<void*>(cmd.dst_va), reinterpret_cast<const void*>(cmd.src_va), cmd.copy_bytes);

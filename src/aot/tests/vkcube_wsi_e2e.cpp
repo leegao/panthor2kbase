@@ -23,8 +23,19 @@ typedef PFN_vkVoidFunction (*PFN_vkGetInstanceProcAddr)(void*, const char*);
 
 int main(int argc, char** argv) {
     std::string icd_path;
-    const char* arg_icd = (argc > 1) ? argv[1] : nullptr;
-    const char* arg_so  = (argc > 2) ? argv[2] : nullptr;
+    const char* arg_icd = nullptr;
+    const char* arg_so  = nullptr;
+    uint32_t num_frames = 4;
+    for (int ai = 1; ai < argc; ++ai) {
+        if ((std::strcmp(argv[ai], "--c") == 0 || std::strcmp(argv[ai], "-c") == 0) && ai + 1 < argc) {
+            num_frames = static_cast<uint32_t>(std::max(1, std::atoi(argv[++ai])));
+        } else if (std::strcmp(argv[ai], "--wsi") == 0 && ai + 1 < argc) {
+            ++ai;
+        } else if (argv[ai][0] != '-') {
+            if (!arg_icd) arg_icd = argv[ai];
+            else if (!arg_so) arg_so = argv[ai];
+        }
+    }
 
     std::string exe_dir = ".";
     {
@@ -290,7 +301,7 @@ int main(int argc, char** argv) {
     typedef int32_t (*PFN_vkQueuePresentKHR)(void*, const void*);
 
     std::vector<uint32_t> frame_crcs;
-    for (uint32_t frame = 0; frame < 4; ++frame) {
+    for (uint32_t frame = 0; frame < num_frames; ++frame) {
         uint32_t img_idx = 0;
         rc = reinterpret_cast<PFN_vkAcquireNextImageKHR>(gipa(instance, "vkAcquireNextImageKHR"))(
             device, swapchain, ~0ULL, 0, 0, &img_idx);
@@ -345,7 +356,7 @@ int main(int argc, char** argv) {
         assert(shaded > 1000U);
     }
 
-    assert(frame_crcs[0] != frame_crcs[1] && frame_crcs[1] != frame_crcs[2]);
+    if (frame_crcs.size() >= 3) assert(frame_crcs[0] != frame_crcs[1] && frame_crcs[1] != frame_crcs[2]);
 
     typedef void (*PFN_vkDestroyObj)(void*, uint64_t, const void*);
     reinterpret_cast<PFN_vkDestroyObj>(gipa(instance, "vkDestroySwapchainKHR"))(device, swapchain, nullptr);

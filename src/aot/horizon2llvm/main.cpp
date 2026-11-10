@@ -3,12 +3,12 @@
 // Unifies AArch64 lifting and mode-parameterized pass-pipeline lowering across:
 //   1. User-space ELF64 ET_DYN shared libraries (`libGLES_mali.so` -> `LoweringMode::UserspaceBionicSo`)
 //   2. Linux kernel ELF64 ET_REL modules (`mali_kbase.ko` & `mali_kbase_husky.ko` -> `LoweringMode::KernelModuleKo`,
-//      lowering all 68 kernel functions directly to SSA LLVM IR `lifted_kbase_ko.ll` and compiling to `.o`)
+//      lowering all 68 kernel functions directly to SSA LLVM IR `lifted_kbase_ko.ll` and compiling to `.o` at `-O2`)
 //   3. Standalone LLVM IR compilation (`--compile-ir`)
 //
 // Usage:
-//   horizon2llvm --lift-ko <r44_ko> <husky_ko> <out.h> <out_runtime.c> [--out-ir <out.ll>] [--out-obj-x86 <x86.o>] [--out-obj-arm64 <arm64.o>] [--full-indirect-dispatch]
-//   horizon2llvm --lift-ko-dual <r44_ko> <husky_ko> [<out.h> <out_runtime.c>] [--out-ir <out.ll>] [--out-obj-x86 <x86.o>] [--out-obj-arm64 <arm64.o>] [--full-indirect-dispatch]
+//   horizon2llvm --lift-ko <r44_ko> <husky_ko> <out.h> <out_runtime.c> [--out-ir <out.ll>] [--out-obj-x86 <x86.o>] [--out-obj-arm64 <arm64.o>] [--full-indirect-dispatch] [--count-insns|--no-count-insns]
+//   horizon2llvm --lift-ko-dual <r44_ko> <husky_ko> [<out.h> <out_runtime.c>] [--out-ir <out.ll>] [--out-obj-x86 <x86.o>] [--out-obj-arm64 <arm64.o>] [--full-indirect-dispatch] [--count-insns|--no-count-insns]
 //   horizon2llvm --lift-so <libGLES_mali.so> <out_dir> [--hook-Vulkan-calls]
 //   horizon2llvm --compile-ir <in.ll> <out.o> [-O0|-O2] [--target-triple TRIPLE]
 
@@ -35,9 +35,17 @@ int main(int argc, char** argv) {
         std::string out_obj_x86 = "src/emulator/lifted_kbase_ko_x86_64.o";
         std::string out_obj_arm64 = "src/emulator/lifted_kbase_ko_arm64.o";
         bool full_indirect_dispatch = false;
+        bool count_insns = true;
         if (const char* env_full = std::getenv("HORIZON2LLVM_FULL_INDIRECT_DISPATCH")) {
             if (std::string(env_full) == "1" || std::string(env_full) == "true") {
                 full_indirect_dispatch = true;
+            }
+        }
+        if (const char* env_cnt = std::getenv("HORIZON2LLVM_COUNT_INSNS")) {
+            if (std::string(env_cnt) == "0" || std::string(env_cnt) == "false") {
+                count_insns = false;
+            } else if (std::string(env_cnt) == "1" || std::string(env_cnt) == "true") {
+                count_insns = true;
             }
         }
         int opt_start = 4;
@@ -54,18 +62,20 @@ int main(int argc, char** argv) {
             else if ((a == "--out-obj-x86" || a == "--out-obj") && i + 1 < argc) out_obj_x86 = argv[++i];
             else if (a == "--out-obj-arm64" && i + 1 < argc) out_obj_arm64 = argv[++i];
             else if (a == "--full-indirect-dispatch") full_indirect_dispatch = true;
+            else if (a == "--count-insns") count_insns = true;
+            else if (a == "--no-count-insns") count_insns = false;
         }
         std::string err;
         if (!ko_lifter::lift_ko_modules_to_c_and_ir(
                 r44_ko, husky_ko, out_hdr, out_c, out_ll, err,
-                out_obj_x86, out_obj_arm64, full_indirect_dispatch)) {
+                out_obj_x86, out_obj_arm64, full_indirect_dispatch, count_insns)) {
             std::fprintf(stderr, "[horizon2llvm --lift-ko] ERROR: %s\n", err.c_str());
             return 1;
         }
-        std::printf("[horizon2llvm --lift-ko] Successfully lowered %s and %s -> %s, %s, %s (objs: %s, %s, full_indirect_dispatch=%d)\n",
+        std::printf("[horizon2llvm --lift-ko] Successfully lowered %s and %s -> %s, %s, %s (objs: %s, %s, full_indirect_dispatch=%d, count_insns=%d)\n",
                     r44_ko.c_str(), husky_ko.c_str(), out_hdr.c_str(), out_c.c_str(),
                     out_ll.c_str(), out_obj_x86.c_str(), out_obj_arm64.c_str(),
-                    full_indirect_dispatch ? 1 : 0);
+                    full_indirect_dispatch ? 1 : 0, count_insns ? 1 : 0);
         return 0;
     }
 
@@ -98,7 +108,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::string ir_text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        auto res = llvm_backend::process_module(ir_text, triple, false, opt_pipe, "", "", out_obj);
+        auto res = llvm_backend::process_module(ir_text, triple, true, opt_pipe, "", "", out_obj);
         if (!res.ok) {
             std::fprintf(stderr, "error compiling %s: %s\n", in_ll.c_str(), res.error_message.c_str());
             return 1;
@@ -108,8 +118,8 @@ int main(int argc, char** argv) {
 
     std::printf("horizon2llvm (unified AArch64-to-LLVM-IR & Native Object Lifter for libGLES_mali.so and mali_kbase*.ko)\n"
                 "Usage:\n"
-                "  %s --lift-ko <r44_ko> <husky_ko> <out.h> <out_runtime.c> [--out-ir <out.ll>] [--out-obj-x86 <x86.o>] [--out-obj-arm64 <arm64.o>] [--full-indirect-dispatch]\n"
-                "  %s --lift-ko-dual <r44_ko> <husky_ko> [<out.h> <out_runtime.c>] [--out-ir <out.ll>] [--out-obj <x86.o>] [--full-indirect-dispatch]\n"
+                "  %s --lift-ko <r44_ko> <husky_ko> <out.h> <out_runtime.c> [--out-ir <out.ll>] [--out-obj-x86 <x86.o>] [--out-obj-arm64 <arm64.o>] [--full-indirect-dispatch] [--count-insns|--no-count-insns]\n"
+                "  %s --lift-ko-dual <r44_ko> <husky_ko> [<out.h> <out_runtime.c>] [--out-ir <out.ll>] [--out-obj <x86.o>] [--full-indirect-dispatch] [--count-insns|--no-count-insns]\n"
                 "  %s --lift-so <libGLES_mali.so> <out_dir> [--hook-Vulkan-calls]\n"
                 "  %s --compile-ir <in.ll> <out.o> [-O0|-O2] [--target-triple TRIPLE]\n",
                 argv[0], argv[0], argv[0], argv[0]);

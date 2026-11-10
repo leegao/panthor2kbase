@@ -103,10 +103,10 @@ bool lifted_ko_is_image_mapped(const char *ko_profile, size_t *out_rodata_size) 
     return img->valid;
 }
 
-const void *lifted_ko_rodata_ptr(LiftedKbaseCPU *cpu, const char *ko_profile, uint32_t rodata_offset, const void *fallback_slice) {
+const void *lifted_ko_rodata_ptr_id(LiftedKbaseCPU *cpu, uint32_t profile_id, uint32_t rodata_offset, const void *fallback_slice) {
     (void)cpu;
     ensure_ko_images_mapped();
-    const struct MappedKoImage *img = (ko_profile && strcmp(ko_profile, "husky_r54p1") == 0)
+    const struct MappedKoImage *img = (profile_id == KO_PROFILE_HUSKY_R54P1)
         ? &g_mapped_husky_r54p1 : &g_mapped_r44p1;
     if (img->valid && (size_t)rodata_offset < img->rodata_size) {
         return img->rodata_base + rodata_offset;
@@ -114,8 +114,13 @@ const void *lifted_ko_rodata_ptr(LiftedKbaseCPU *cpu, const char *ko_profile, ui
     return fallback_slice;
 }
 
+const void *lifted_ko_rodata_ptr(LiftedKbaseCPU *cpu, const char *ko_profile, uint32_t rodata_offset, const void *fallback_slice) {
+    uint32_t prof_id = (ko_profile && strcmp(ko_profile, "husky_r54p1") == 0) ? KO_PROFILE_HUSKY_R54P1 : KO_PROFILE_R44P1;
+    return lifted_ko_rodata_ptr_id(cpu, prof_id, rodata_offset, fallback_slice);
+}
+
 void lifted_ko_print_stacktrace(LiftedKbaseCPU *cpu, const char *reason, const struct LiftedKoHeapBlockHdr *hdr) {
-    fprintf(stderr, "[lifted_ko_heap] %s\n", reason ? reason : "memory error");
+    fprintf(stderr, "[lifted_ko_violation] %s\n", reason ? reason : "runtime violation");
     if (hdr) {
         fprintf(stderr, "  block seq=%u size=%u state=0x%08x\n", hdr->alloc_seq, hdr->payload_size, hdr->state);
         fprintf(stderr, "  allocated at guest fn=%s pc=0x%llx (host bt[0]=%p)\n",
@@ -147,10 +152,22 @@ void lifted_ko_print_stacktrace(LiftedKbaseCPU *cpu, const char *reason, const s
 #endif
 }
 
+static bool check_redzone_intact(const struct LiftedKoHeapBlockHdr *hdr) {
+    size_t aligned_sz = ((size_t)hdr->payload_size + 15U) & ~15ULL;
+    const uint8_t *rz = (const uint8_t *)hdr + sizeof(struct LiftedKoHeapBlockHdr) + aligned_sz;
+    for (size_t i = 0; i < 16U; ++i) {
+        if (rz[i] != LIFTED_KO_REDZONE_BYTE) return false;
+    }
+    return true;
+}
+
 void *lifted_ko_heap_alloc(LiftedKbaseCPU *cpu, size_t sz) {
     size_t aligned_sz = (sz + 15U) & ~15ULL;
     size_t total = sizeof(struct LiftedKoHeapBlockHdr) + aligned_sz + 16U;
-    if (!cpu || (size_t)cpu->heap.used + total > sizeof(cpu->heap.arena)) return NULL;
+    if (!cpu || (size_t)cpu->heap.used + total > sizeof(cpu->heap.arena)) {
+        if (cpu) lifted_ko_print_stacktrace(cpu, "HEAP ARENA EXHAUSTION in lifted_ko_heap_alloc", NULL);
+        return NULL;
+    }
     uint8_t *base = &cpu->heap.arena[cpu->heap.used];
     struct LiftedKoHeapBlockHdr *hdr = (struct LiftedKoHeapBlockHdr *)base;
     memset(hdr, 0, sizeof(*hdr));
@@ -166,7 +183,7 @@ void *lifted_ko_heap_alloc(LiftedKbaseCPU *cpu, size_t sz) {
 #endif
     void *payload = base + sizeof(struct LiftedKoHeapBlockHdr);
     memset(payload, 0, aligned_sz);
-    memset((uint8_t *)payload + aligned_sz, 0xFE, 16U);
+    memset((uint8_t *)payload + aligned_sz, LIFTED_KO_REDZONE_BYTE, 16U);
     cpu->heap.used += (uint32_t)total;
     return payload;
 }
@@ -176,12 +193,23 @@ int lifted_ko_heap_free(LiftedKbaseCPU *cpu, void *ptr) {
     uintptr_t p = (uintptr_t)ptr;
     uintptr_t arena_lo = (uintptr_t)&cpu->heap.arena[0];
     uintptr_t arena_hi = arena_lo + sizeof(cpu->heap.arena);
-    if (p < arena_lo + sizeof(struct LiftedKoHeapBlockHdr) || p >= arena_hi) return -1;
+    if (p < arena_lo + sizeof(struct LiftedKoHeapBlockHdr) || p >= arena_hi) {
+        lifted_ko_print_stacktrace(cpu, "OUT-OF-ARENA pointer passed to lifted_ko_heap_free", NULL);
+        return -1;
+    }
     struct LiftedKoHeapBlockHdr *hdr = (struct LiftedKoHeapBlockHdr *)(p - sizeof(struct LiftedKoHeapBlockHdr));
-    if (hdr->magic != LIFTED_KO_HEAP_MAGIC) return -1;
+    if (hdr->magic != LIFTED_KO_HEAP_MAGIC) {
+        lifted_ko_print_stacktrace(cpu, "HEAP HEADER MAGIC CORRUPTION detected in lifted_ko_heap_free", hdr);
+        return -1;
+    }
     if (hdr->state == LIFTED_KO_STATE_FREED) {
         cpu->heap.double_free_errors++;
         lifted_ko_print_stacktrace(cpu, "DOUBLE-FREE detected in lifted_ko_heap_free", hdr);
+        return -1;
+    }
+    if (!check_redzone_intact(hdr)) {
+        cpu->heap.uaf_errors++;
+        lifted_ko_print_stacktrace(cpu, "REDZONE CANARY CORRUPTION detected in lifted_ko_heap_free", hdr);
         return -1;
     }
     hdr->state = LIFTED_KO_STATE_FREED;
@@ -207,14 +235,17 @@ bool lifted_ko_check_mem_access(LiftedKbaseCPU *cpu, const void *ptr, size_t sz,
         size_t off = 0;
         while (off + sizeof(struct LiftedKoHeapBlockHdr) <= cpu->heap.used) {
             struct LiftedKoHeapBlockHdr *hdr = (struct LiftedKoHeapBlockHdr *)&cpu->heap.arena[off];
-            if (hdr->magic != LIFTED_KO_HEAP_MAGIC) break;
+            if (hdr->magic != LIFTED_KO_HEAP_MAGIC) {
+                lifted_ko_print_stacktrace(cpu, "HEAP HEADER MAGIC CORRUPTION in lifted_ko_check_mem_access", hdr);
+                break;
+            }
             size_t aligned_sz = ((size_t)hdr->payload_size + 15U) & ~15ULL;
             uintptr_t blk_lo = arena_lo + off + sizeof(struct LiftedKoHeapBlockHdr);
             uintptr_t blk_hi = blk_lo + aligned_sz;
             if (p >= blk_lo && p < blk_hi) {
-                if (hdr->state == LIFTED_KO_STATE_FREED || p + sz > blk_lo + hdr->payload_size) {
+                if (hdr->state == LIFTED_KO_STATE_FREED || p + sz > blk_lo + hdr->payload_size || !check_redzone_intact(hdr)) {
                     cpu->heap.uaf_errors++;
-                    lifted_ko_print_stacktrace(cpu, "USE-AFTER-FREE / OOB detected in lifted_ko_check_mem_access", hdr);
+                    lifted_ko_print_stacktrace(cpu, "USE-AFTER-FREE / OOB / REDZONE VIOLATION detected in lifted_ko_check_mem_access", hdr);
                     return false;
                 }
                 return true;
@@ -222,6 +253,7 @@ bool lifted_ko_check_mem_access(LiftedKbaseCPU *cpu, const void *ptr, size_t sz,
             off += sizeof(struct LiftedKoHeapBlockHdr) + aligned_sz + 16U;
         }
         cpu->heap.uaf_errors++;
+        lifted_ko_print_stacktrace(cpu, "UNALLOCATED / HEADER-ZONE ACCESS in lifted_ko_check_mem_access", NULL);
         return false;
     }
     return true;
@@ -243,29 +275,59 @@ void lifted_kbase_cpu_init(LiftedKbaseCPU *cpu, void *user_ctx, LiftedKbaseShimH
     ensure_ko_images_mapped();
 }
 
-void lifted_kernel_shim_dispatch(LiftedKbaseCPU *cpu, const char *ko_profile, const char *callee) {
-    if (strcmp(callee, "__kmalloc") == 0 || strcmp(callee, "kmalloc_trace") == 0 || strcmp(callee, "vzalloc") == 0) {
-        size_t sz = (size_t)cpu->x[0];
-        if (strcmp(callee, "kmalloc_trace") == 0) sz = (size_t)cpu->x[2];
+const char *lifted_kernel_shim_id_name(uint32_t shim_id) {
+    switch ((enum LiftedKernelShimId)shim_id) {
+    case KO_SHIM_INDIRECT_BLR:                    return "__indirect_blr";
+    case KO_SHIM_KMALLOC:                         return "__kmalloc";
+    case KO_SHIM_KMALLOC_TRACE:                   return "kmalloc_trace";
+    case KO_SHIM_KFREE:                           return "kfree";
+    case KO_SHIM_MEMSET:                          return "memset";
+    case KO_SHIM_MEMCPY:                          return "memcpy";
+    case KO_SHIM_COPY_FROM_USER:                  return "_copy_from_user";
+    case KO_SHIM_COPY_TO_USER:                    return "_copy_to_user";
+    case KO_SHIM_CHECK_OBJECT_SIZE:               return "__check_object_size";
+    case KO_SHIM_SW_HWEIGHT64:                    return "__sw_hweight64";
+    case KO_SHIM_KBASE_HAS_EXEC_VA_ZONE:          return "kbase_has_exec_va_zone";
+    case KO_SHIM_SCNPRINTF:                       return "scnprintf";
+    case KO_SHIM_KBASE_DEVICE_GET_LIST:           return "kbase_device_get_list";
+    case KO_SHIM_KBASE_CREATE_CONTEXT:            return "kbase_create_context";
+    case KO_SHIM_KBASE_DESTROY_CONTEXT:           return "kbase_destroy_context";
+    case KO_SHIM_KBASE_MEM_POOL_ALLOC_PAGES:      return "kbase_mem_pool_alloc_pages";
+    case KO_SHIM_KERNEL_MAP_USER_IO_PAGES:        return "kernel_map_user_io_pages";
+    case KO_SHIM_KBASE_MEM_ALLOC:                 return "kbase_mem_alloc";
+    case KO_SHIM_KBASE_MEM_ALIAS:                 return "kbase_mem_alias";
+    case KO_SHIM_KBASE_CSF_FIRMWARE_GET_GLB_IFACE: return "kbase_csf_firmware_get_glb_iface";
+    case KO_SHIM_CSF_QUEUE_REGISTER_INTERNAL:     return "csf_queue_register_internal";
+    case KO_SHIM_CREATE_QUEUE_GROUP:              return "create_queue_group";
+    case KO_SHIM_KBASE_CSF_TILER_HEAP_INIT:       return "kbase_csf_tiler_heap_init";
+    case KO_SHIM_NOOP_EXTERNAL:                   return "__noop_external";
+    default:                                      return "unknown";
+    }
+}
+
+void lifted_kernel_shim_dispatch_id(LiftedKbaseCPU *cpu, uint32_t profile_id, uint32_t shim_id) {
+    const char *ko_profile = (profile_id == KO_PROFILE_HUSKY_R54P1) ? "husky_r54p1" : "r44p1";
+    switch ((enum LiftedKernelShimId)shim_id) {
+    case KO_SHIM_KMALLOC:
+    case KO_SHIM_KMALLOC_TRACE: {
+        size_t sz = (shim_id == KO_SHIM_KMALLOC_TRACE) ? (size_t)cpu->x[2] : (size_t)cpu->x[0];
         if (sz == 0) sz = 64;
         void *ptr = lifted_ko_heap_alloc(cpu, sz);
         cpu->x[0] = (uintptr_t)ptr;
         return;
     }
-    if (strcmp(callee, "kfree") == 0 || strcmp(callee, "vfree") == 0) {
+    case KO_SHIM_KFREE:
         (void)lifted_ko_heap_free(cpu, (void *)(uintptr_t)cpu->x[0]);
         cpu->x[0] = 0;
         return;
-    }
-    if (strcmp(callee, "memset") == 0) {
+    case KO_SHIM_MEMSET:
         if (cpu->x[0] && cpu->x[2]) memset((void *)(uintptr_t)cpu->x[0], (int)(cpu->x[1] & 0xFF), (size_t)cpu->x[2]);
         return;
-    }
-    if (strcmp(callee, "memcpy") == 0) {
+    case KO_SHIM_MEMCPY:
         if (cpu->x[0] && cpu->x[1] && cpu->x[2]) memcpy((void *)(uintptr_t)cpu->x[0], (const void *)(uintptr_t)cpu->x[1], (size_t)cpu->x[2]);
         return;
-    }
-    if (strcmp(callee, "__arch_copy_from_user") == 0 || strncmp(callee, "_copy_from_user", 15) == 0) {
+    case KO_SHIM_COPY_FROM_USER:
+    case KO_SHIM_COPY_TO_USER:
         if (cpu->x[0] && cpu->x[1] && cpu->x[2]) {
             memcpy((void *)(uintptr_t)cpu->x[0], (const void *)(uintptr_t)cpu->x[1], (size_t)cpu->x[2]);
             cpu->x[0] = 0;
@@ -273,37 +335,48 @@ void lifted_kernel_shim_dispatch(LiftedKbaseCPU *cpu, const char *ko_profile, co
             cpu->x[0] = cpu->x[2];
         }
         return;
-    }
-    if (strcmp(callee, "__arch_copy_to_user") == 0 || strncmp(callee, "_copy_to_user", 13) == 0) {
-        if (cpu->x[0] && cpu->x[1] && cpu->x[2]) {
-            memcpy((void *)(uintptr_t)cpu->x[0], (const void *)(uintptr_t)cpu->x[1], (size_t)cpu->x[2]);
-            cpu->x[0] = 0;
-        } else {
-            cpu->x[0] = cpu->x[2];
-        }
-        return;
-    }
-    if (strcmp(callee, "__check_object_size") == 0) {
+    case KO_SHIM_CHECK_OBJECT_SIZE:
         cpu->x[0] = 0;
         return;
-    }
-    if (strcmp(callee, "__sw_hweight64") == 0) {
+    case KO_SHIM_SW_HWEIGHT64:
         cpu->x[0] = (uint64_t)__builtin_popcountll(cpu->x[0]);
         return;
-    }
-    if (strcmp(callee, "kbase_has_exec_va_zone") == 0) {
+    case KO_SHIM_KBASE_HAS_EXEC_VA_ZONE: {
         uint64_t v = *(uint64_t *)((uintptr_t)cpu->x[0] + 37072 + 192);
         cpu->x[0] = (v != ~0ULL && v != 0ULL) ? 1ULL : 0ULL;
         return;
     }
-    if (strcmp(callee, "scnprintf") == 0) {
+    case KO_SHIM_SCNPRINTF:
         cpu->x[0] = 16ULL;
         return;
-    }
-    if (cpu->shim_hook) {
-        cpu->shim_hook(cpu, ko_profile, callee);
+    case KO_SHIM_NOOP_EXTERNAL:
+        cpu->x[0] = 0;
+        return;
+    default:
+        if (cpu->shim_hook) {
+            cpu->shim_hook(cpu, ko_profile, lifted_kernel_shim_id_name(shim_id));
+            return;
+        }
+        cpu->x[0] = 0;
         return;
     }
+}
+
+void lifted_kernel_shim_dispatch(LiftedKbaseCPU *cpu, const char *ko_profile, const char *callee) {
+    uint32_t prof_id = (ko_profile && strcmp(ko_profile, "husky_r54p1") == 0) ? KO_PROFILE_HUSKY_R54P1 : KO_PROFILE_R44P1;
+    if (!callee) { cpu->x[0] = 0; return; }
+    if (strcmp(callee, "__kmalloc") == 0 || strcmp(callee, "vzalloc") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_KMALLOC); return; }
+    if (strcmp(callee, "kmalloc_trace") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_KMALLOC_TRACE); return; }
+    if (strcmp(callee, "kfree") == 0 || strcmp(callee, "vfree") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_KFREE); return; }
+    if (strcmp(callee, "memset") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_MEMSET); return; }
+    if (strcmp(callee, "memcpy") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_MEMCPY); return; }
+    if (strcmp(callee, "__arch_copy_from_user") == 0 || strncmp(callee, "_copy_from_user", 15) == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_COPY_FROM_USER); return; }
+    if (strcmp(callee, "__arch_copy_to_user") == 0 || strncmp(callee, "_copy_to_user", 13) == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_COPY_TO_USER); return; }
+    if (strcmp(callee, "__check_object_size") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_CHECK_OBJECT_SIZE); return; }
+    if (strcmp(callee, "__sw_hweight64") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_SW_HWEIGHT64); return; }
+    if (strcmp(callee, "kbase_has_exec_va_zone") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_KBASE_HAS_EXEC_VA_ZONE); return; }
+    if (strcmp(callee, "scnprintf") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_SCNPRINTF); return; }
+    if (cpu->shim_hook) { cpu->shim_hook(cpu, ko_profile, callee); return; }
     cpu->x[0] = 0;
 }
 

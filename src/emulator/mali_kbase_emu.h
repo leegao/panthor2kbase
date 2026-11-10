@@ -6,7 +6,7 @@
  * Emulates ARM's mali_kbase kernel driver (/dev/mali0) on x86_64 / arm64:
  *  1. Routes every /dev/mali0 file_operations UAPI (open, release/close, ioctl,
  *     mmap, poll) straight into the statically lifted AArch64 kernel module binary
- *     (`mali_kbase.ko` r44p1 or `mali_kbase_husky.ko` r54p1) in `lifted_kbase_ko.c`.
+ *     (`mali_kbase.ko` r44p1 or `mali_kbase_husky.ko` r54p1) in `lifted_kbase_ko.ll`.
  *  2. Redirects only lower-level OS kernel primitives, GPU VM/MMU backing, CSF
  *     hardware doorbell/ringbuffer execution, and Valhall 64-bit ISA-to-SPIR-V /
  *     Lavapipe Vulkan pipeline execution through `struct kbase_ko_host_abi`.
@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <sys/types.h>
 #include "mali_kbase_uapi.h"
 #include "lifted_kbase_ko.h"
 
@@ -162,6 +163,16 @@ void mali_kbase_emu_reset_stats(void);
 bool mali_kbase_emu_init_lavapipe_bridge(void);
 void mali_kbase_emu_set_profile(enum mali_kbase_emu_profile profile);
 enum mali_kbase_emu_profile mali_kbase_emu_get_profile(void);
+
+/* Direct C API for AOT-translated libGLES_mali.so, libvulkan_mali_aot_icd.so, and r54p3_vulkan_icd */
+typedef void (*mali_kbase_emu_csf_job_hook_fn)(uint8_t cs_opcode, uint64_t insn, const uint64_t *cs_regs, void *user_data);
+void mali_kbase_emu_register_csf_job_hook(mali_kbase_emu_csf_job_hook_fn fn, void *user_data);
+
+int mali_kbase_emu_open_direct(const char *pathname, int flags);
+int mali_kbase_emu_close_direct(int fd);
+int mali_kbase_emu_ioctl_direct(int fd, unsigned long request, void *arg);
+void *mali_kbase_emu_mmap_direct(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
+int mali_kbase_emu_munmap_direct(void *addr, size_t length);
 
 #ifdef __cplusplus
 }

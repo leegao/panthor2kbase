@@ -141,23 +141,23 @@ fi
 BUILD_HOST_DIR="${2:-${BUILD_DIR:-$REPO_ROOT/build-x86-64}}"
 
 # Ensure static adapter and emulator archives are compiled in $BUILD_HOST_DIR
-if [ ! -f "$BUILD_HOST_DIR/libmali_kbase_emu.a" ] || [ ! -f "$BUILD_HOST_DIR/libpanthor_kbase_adapter.a" ]; then
+if [ ! -f "$BUILD_HOST_DIR/emulator/libmali_kbase_emu.a" ] || [ ! -f "$BUILD_HOST_DIR/adapter/libpanthor_kbase_adapter.a" ]; then
     CMAKE_BIN="$("${REPO_ROOT}/scripts/find_cmake.sh")"
     "$CMAKE_BIN" -S "$REPO_ROOT" -B "$BUILD_HOST_DIR" -DCMAKE_BUILD_TYPE=Release
     "$CMAKE_BIN" --build "$BUILD_HOST_DIR" --target mali_kbase_emu_static panthor_kbase_adapter_static
 fi
 
-STATIC_EMU="-Wl,--whole-archive $BUILD_HOST_DIR/libmali_kbase_emu.a $BUILD_HOST_DIR/libpanthor_kbase_adapter.a -Wl,--no-whole-archive"
+STATIC_EMU="-Wl,--whole-archive $BUILD_HOST_DIR/emulator/libmali_kbase_emu.a $BUILD_HOST_DIR/adapter/libpanthor_kbase_adapter.a -Wl,--no-whole-archive"
 
 echo "[Link] Statically linking mali_kbase_emu + panthor_kbase_adapter into runner and ICD..."
-g++ -O3 -fno-strict-aliasing -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
+g++ -O2 -fno-strict-aliasing -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
     -I"$REPO_ROOT/include" -I"$REPO_ROOT/src/adapter" -I"$REPO_ROOT/src/emulator" \
     "$ROOT_DIR/src/mali_aot_runner.cpp" "$OUT_DIR/mali_mbs2_aot.o" "${EXTRA_AOT_OBJS[@]}" \
     $STATIC_EMU -ldl -lpthread \
     -Wl,-rpath,'$ORIGIN' \
     -o "$OUT_DIR/mali_aot_runner"
 
-g++ -O3 -std=c++17 -fno-strict-aliasing -shared -fPIC \
+g++ -O2 -std=c++17 -fno-strict-aliasing -shared -fPIC \
     -Wl,-Bsymbolic -Wl,-Bsymbolic-functions \
     -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
     -I"$REPO_ROOT/include" -I"$REPO_ROOT/src/adapter" -I"$REPO_ROOT/src/emulator" \

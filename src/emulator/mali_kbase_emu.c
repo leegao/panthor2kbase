@@ -204,7 +204,7 @@ struct emu_kfile {
    uint32_t next_user_io_cookie;
    uint8_t next_group_handle;
    uint8_t next_kcpu_id;
-   struct emu_mem_region regions[512];
+   struct emu_mem_region regions[2048];
    struct emu_cs_queue queues[32];
    struct emu_tiler_heap heaps[16];
    uint8_t sim_kctx[65536] __attribute__((aligned(16)));
@@ -225,6 +225,16 @@ struct emu_kfile {
 static struct emu_kfile g_kfile;
 static int g_emu_profile_override = -1;
 static LiftedKbaseCPU g_lifted_cpu;
+static struct csffw_emu_state g_csffw_state;
+static mali_kbase_emu_csf_job_hook_fn g_csf_job_hook = NULL;
+static void *g_csf_job_hook_user_data = NULL;
+
+__attribute__((visibility("default")))
+void mali_kbase_emu_register_csf_job_hook(mali_kbase_emu_csf_job_hook_fn fn, void *user_data)
+{
+   g_csf_job_hook = fn;
+   g_csf_job_hook_user_data = user_data;
+}
 
 static enum mali_kbase_emu_profile resolve_active_emu_profile(void)
 {
@@ -316,6 +326,10 @@ static void host_abi_mmu_destroy_context(LiftedKbaseCPU *cpu, void *kctx)
 
 static void lifted_emu_shim_hook(LiftedKbaseCPU *cpu, const char *ko_prof, const char *callee)
 {
+    if (emu_log_enabled()) {
+        fprintf(stderr, "[lifted_emu_shim_hook] [%s] calling foreign host hook: %s (x0=0x%llx, x1=0x%llx)\n",
+                ko_prof, callee, (unsigned long long)cpu->x[0], (unsigned long long)cpu->x[1]);
+    }
    (void)ko_prof;
    if (strcmp(callee, "kbase_device_get_list") == 0) {
       cpu->x[0] = (uint64_t)(uintptr_t)host_abi_mmu_device_get_list(cpu);
@@ -655,13 +669,16 @@ static void execute_valhall_shader(const struct valhall_shader_desc *spd)
       return;
 
    /* Verify shader resides in an active, non-munmapped region */
-   for (size_t i = 0; i < 512; i++) {
-      if (g_kfile.regions[i].freed_by_munmap &&
+   bool found_active = false;
+   for (size_t i = 0; i < 2048; i++) {
+      if (g_kfile.regions[i].active && !g_kfile.regions[i].freed_by_munmap &&
           spd->shader_va >= g_kfile.regions[i].gpu_va &&
-          spd->shader_va < g_kfile.regions[i].gpu_va + g_kfile.regions[i].size) {
-         return;
+          spd->shader_va + spd->shader_size <= g_kfile.regions[i].gpu_va + g_kfile.regions[i].size) {
+         found_active = true;
+         break;
       }
    }
+   if (!found_active) return;
 
    g_stats.valhall_shaders_executed++;
    if (mali_kbase_emu_init_lavapipe_bridge())
@@ -760,6 +777,12 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
       uint64_t insn = stream[i];
       uint64_t opcode = (insn >> 56) & 0xffULL;
       g_stats.csf_instructions_executed++;
+      if (opcode >= 0x20ULL && opcode <= 0x80ULL && opcode != CSF_OP_CALL && opcode != 33ULL &&
+          opcode != 49ULL && opcode != CSF_OP_HEAP_OPERATION) {
+         (void)lifted_csffw_dispatch_opcode(&g_csffw_state, 0,
+                                            (uint32_t)(insn & 0xffffffffULL),
+                                            (uint32_t)(insn >> 32));
+      }
 
       switch (opcode) {
       case CSF_OP_NOP:
@@ -776,7 +799,7 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
       case CSF_OP_WAIT:
       case CSF_OP_FLUSH_CACHE2:
       case 36: /* HW_CSF_OP_FLUSH_CACHE2 (0x24) when bits [11:0] != 0 */ {
-         if (opcode == 4 && ((insn >> 40) & 0xffULL) != 0ULL) {
+         if (opcode == 4) {
             goto handle_run_compute;
          }
          if (opcode == 36 && (insn & 0xfffULL) == 0ULL && ((insn >> 32) & 0xffffULL) == 0ULL) {
@@ -823,6 +846,28 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
          uint32_t imm32 = (uint32_t)(insn & 0xffffffffULL);
          if (reg < 96)
             cs_regs[reg] = imm32;
+         break;
+      }
+
+      case 16: /* MALI_CS_OPCODE_ADD_IMMEDIATE32 (0x10) */ {
+         uint8_t dst = (insn >> 48) & 0xffU;
+         uint8_t src = (insn >> 40) & 0xffU;
+         uint32_t imm = (uint32_t)(insn & 0xffffffffULL);
+         if (dst < 96 && src < 96)
+            cs_regs[dst] = (uint32_t)cs_regs[src] + imm;
+         break;
+      }
+
+      case 17: /* MALI_CS_OPCODE_ADD_IMMEDIATE64 (0x11) */ {
+         uint8_t dst = (insn >> 48) & 0xffU;
+         uint8_t src = (insn >> 40) & 0xffU;
+         int64_t imm = (int32_t)(insn & 0xffffffffULL);
+         if (dst < 95 && src < 95) {
+            uint64_t sv = (cs_regs[src + 1] << 32) | (cs_regs[src] & 0xffffffffULL);
+            uint64_t dv = (uint64_t)((int64_t)sv + imm);
+            cs_regs[dst] = dv & 0xffffffffULL;
+            cs_regs[dst + 1] = dv >> 32;
+         }
          break;
       }
 
@@ -989,17 +1034,24 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
       handle_run_compute: {
          if (opcode == CSF_OP_RUN_COMPUTE || opcode == 4)
             g_stats.compute_jobs_run++;
-         else if (opcode == CSF_OP_RUN_IDVS)
+         else if (opcode == CSF_OP_RUN_IDVS || opcode == 6)
             g_stats.idvs_jobs_run++;
          else
             g_stats.fragment_jobs_run++;
 
+         if (g_csf_job_hook) {
+            g_csf_job_hook((uint8_t)opcode, insn, cs_regs, g_csf_job_hook_user_data);
+         }
+
          uint8_t spd_reg = (insn >> 40) & 0xffU;
+         if (spd_reg == 0 && (opcode == 6 || opcode == 7 || opcode == CSF_OP_RUN_IDVS || opcode == CSF_OP_RUN_FRAGMENT)) {
+            spd_reg = 8;
+         }
          if (spd_reg < 95) {
             uint64_t spd_va = (cs_regs[spd_reg + 1] << 32) | cs_regs[spd_reg];
-            if (spd_va >= 0x10000ULL && (spd_va & 0x7ULL) == 0) {
+            if (spd_va >= 0x10000ULL && (spd_va & 0x7ULL) == 0 && *(const uint32_t*)(uintptr_t)spd_va != 0x4D494456U) {
                /* Only execute synthetic Valhall shader descriptors when marked with valid shader_va */
-               for (size_t r = 0; r < 512; r++) {
+               for (size_t r = 0; r < 2048; r++) {
                   if (g_kfile.regions[r].active &&
                       spd_va >= g_kfile.regions[r].gpu_va &&
                       spd_va + sizeof(struct valhall_shader_desc) <= g_kfile.regions[r].gpu_va + g_kfile.regions[r].size) {
@@ -1097,7 +1149,7 @@ static int emu_handle_mem_alloc(uint64_t va_pages, uint64_t commit_pages,
    }
 
    size_t sz = (size_t)va_pages * 4096U;
-   for (size_t i = 0; i < 512; i++) {
+   for (size_t i = 0; i < 2048; i++) {
       if (!g_kfile.regions[i].active) {
          struct emu_mem_region *reg = &g_kfile.regions[i];
          memset(reg, 0, sizeof(*reg));
@@ -1225,6 +1277,7 @@ int open(const char *pathname, int flags, ...)
       }
       *(uint64_t *)(g_kfile.sim_filp + 216) = (uint64_t)(uintptr_t)g_kfile.sim_kfile_buf;
       record_trace_ioctl("OPEN_MALI0", 0, 0, 0, 0, (uint64_t)flags, 0, 0, fd, 0);
+      csffw_emu_state_init(&g_csffw_state);
       g_kfile.next_cookie = 64U;
       g_kfile.next_user_io_cookie = 48U;
       g_kfile.next_group_handle = 1U;
@@ -1407,6 +1460,7 @@ int ioctl(int fd, unsigned long request, ...)
          return 0;
       case 38: /* KBASE_IOCTL_MEM_EXEC_INIT */
          g_kfile.exec_va_initialized = true;
+         *(uint64_t *)(g_kfile.sim_kctx + 37072 + 192) = 1ULL;
          if (arg) { struct kbase_ioctl_mem_exec_init *ei = (struct kbase_ioctl_mem_exec_init *)arg; record_trace_ioctl("KBASE_IOCTL_MEM_EXEC_INIT", request, ei->va_pages, 0, 0, 0, 0, 0, 0, 0); }
          pthread_mutex_unlock(&g_emu_lock);
          return 0;
@@ -1440,7 +1494,7 @@ int ioctl(int fd, unsigned long request, ...)
          union kbase_ioctl_mem_query *mq = (union kbase_ioctl_mem_query *)arg;
          uint64_t addr = mq->in.gpu_addr;
          uint64_t qtype = mq->in.query;
-         for (size_t i = 0; i < 512; i++) {
+         for (size_t i = 0; i < 2048; i++) {
             if (g_kfile.regions[i].active &&
                 (g_kfile.regions[i].gpu_va == addr || g_kfile.regions[i].cookie_or_va == addr)) {
                if (qtype == KBASE_MEM_QUERY_COMMIT_SIZE)
@@ -1459,7 +1513,7 @@ int ioctl(int fd, unsigned long request, ...)
       }
       case 7: { /* KBASE_IOCTL_MEM_FREE */
          struct kbase_ioctl_mem_free *mf = (struct kbase_ioctl_mem_free *)arg;
-         for (size_t i = 0; i < 512; i++) {
+         for (size_t i = 0; i < 2048; i++) {
             if (g_kfile.regions[i].active &&
                 (g_kfile.regions[i].gpu_va == mf->gpu_addr ||
                  g_kfile.regions[i].cookie_or_va == mf->gpu_addr)) {
@@ -1482,7 +1536,7 @@ int ioctl(int fd, unsigned long request, ...)
             errno = EINVAL;
             return -1;
          }
-         for (size_t i = 0; i < 512; i++) {
+         for (size_t i = 0; i < 2048; i++) {
             struct emu_mem_region *reg = &g_kfile.regions[i];
             if (reg->active &&
                 (reg->gpu_va == mc->gpu_addr || reg->cookie_or_va == mc->gpu_addr)) {
@@ -1522,7 +1576,7 @@ int ioctl(int fd, unsigned long request, ...)
                (const struct base_mem_aliasing_info *)(uintptr_t)al->in.aliasing_info;
             for (uint64_t k = 0; k < al->in.nents; k++) {
                struct emu_mem_region *treg = NULL;
-               for (size_t r = 0; r < 512; r++) {
+               for (size_t r = 0; r < 2048; r++) {
                   if (g_kfile.regions[r].active &&
                       (g_kfile.regions[r].gpu_va == ai[k].handle ||
                        g_kfile.regions[r].cookie_or_va == ai[k].handle)) {
@@ -1542,7 +1596,7 @@ int ioctl(int fd, unsigned long request, ...)
             }
          }
          uint64_t total_pages = al->in.stride * al->in.nents;
-         for (size_t i = 0; i < 512; i++) {
+         for (size_t i = 0; i < 2048; i++) {
             if (!g_kfile.regions[i].active) {
                struct emu_mem_region *reg = &g_kfile.regions[i];
                memset(reg, 0, sizeof(*reg));
@@ -1583,7 +1637,7 @@ int ioctl(int fd, unsigned long request, ...)
             errno = EINVAL;
             return -1;
          }
-         for (size_t i = 0; i < 512; i++) {
+         for (size_t i = 0; i < 2048; i++) {
             if (!g_kfile.regions[i].active) {
                g_kfile.regions[i].active = true;
                g_kfile.regions[i].cpu_ptr = ptr;
@@ -1607,7 +1661,8 @@ int ioctl(int fd, unsigned long request, ...)
          pthread_mutex_unlock(&g_emu_lock);
          return sfd;
       }
-      case 36: { /* KBASE_IOCTL_CS_QUEUE_REGISTER */
+      case 36: /* KBASE_IOCTL_CS_QUEUE_REGISTER */
+      case 40: { /* KBASE_IOCTL_CS_QUEUE_REGISTER_EX */
          struct kbase_ioctl_cs_queue_register *qr = (struct kbase_ioctl_cs_queue_register *)arg;
          enum mali_kbase_emu_profile prof = resolve_active_emu_profile();
          ensure_lifted_cpu_ready_locked();
@@ -1624,10 +1679,11 @@ int ioctl(int fd, unsigned long request, ...)
             return -1;
          }
          for (size_t i = 0; i < 32; i++) {
-            if (!g_kfile.queues[i].registered) {
+            if (!g_kfile.queues[i].registered || g_kfile.queues[i].buffer_gpu_addr == qr->buffer_gpu_addr) {
                g_kfile.queues[i].registered = true;
                g_kfile.queues[i].buffer_gpu_addr = qr->buffer_gpu_addr;
                g_kfile.queues[i].buffer_size = qr->buffer_size;
+               g_kfile.queues[i].extract_offset = 0ULL;
                record_trace_ioctl("KBASE_IOCTL_CS_QUEUE_REGISTER", request, qr->buffer_size >> 12, 0, 0, qr->priority, qr->buffer_gpu_addr, qr->buffer_gpu_addr, 0, 0);
                g_trace[g_trace_count - 1].buffer_size = qr->buffer_size;
                g_trace[g_trace_count - 1].buffer_gpu_addr = qr->buffer_gpu_addr;
@@ -1648,7 +1704,7 @@ int ioctl(int fd, unsigned long request, ...)
                g_kfile.queues[i].bound = true;
                g_kfile.queues[i].group_handle = qb->in.group_handle;
                g_kfile.queues[i].csi_index = qb->in.csi_index;
-               g_kfile.queues[i].mmap_handle = (uint64_t)(g_kfile.next_user_io_cookie++) << 12;
+               g_kfile.queues[i].mmap_handle = (uint64_t)(48U + ((g_kfile.next_user_io_cookie++ - 48U) % 16U)) << 12;
                /* Execute lifted kbase_csf_alloc_command_stream_user_pages on simulated kctx/group/queue */
                uint8_t gh = qb->in.group_handle < 16 ? qb->in.group_handle : 0;
                if (g_kfile.csg_user_io_cap && !g_kfile.group_user_io_pages[gh]) {
@@ -1779,9 +1835,27 @@ int ioctl(int fd, unsigned long request, ...)
          return 0;
       }
       case 46: /* KBASE_IOCTL_KCPU_QUEUE_DELETE */
-      case 47: /* KBASE_IOCTL_KCPU_QUEUE_ENQUEUE */
          pthread_mutex_unlock(&g_emu_lock);
          return 0;
+      case 47: { /* KBASE_IOCTL_KCPU_QUEUE_ENQUEUE */
+         const struct kbase_ioctl_kcpu_queue_enqueue *enq =
+            (const struct kbase_ioctl_kcpu_queue_enqueue *)arg;
+         if (enq && enq->addr >= 0x10000ULL && enq->nr_commands > 0 && enq->nr_commands <= 16) {
+            const uint8_t *cmdp = (const uint8_t *)(uintptr_t)enq->addr;
+            if (cmdp[0] == 5U /* BASE_KCPU_COMMAND_TYPE_CQS_SET_OPERATION */) {
+               uint64_t objs_va = *(const uint64_t *)(cmdp + 8);
+               uint32_t nr_objs = *(const uint32_t *)(cmdp + 16);
+               if (objs_va >= 0x10000ULL && nr_objs > 0 && nr_objs <= 16) {
+                  uint64_t cqs_addr = *(const uint64_t *)(uintptr_t)objs_va;
+                  uint64_t cqs_val  = *(const uint64_t *)((uintptr_t)objs_va + 8);
+                  if (cqs_addr >= 0x10000ULL)
+                     *(uint64_t *)(uintptr_t)cqs_addr = cqs_val;
+               }
+            }
+         }
+         pthread_mutex_unlock(&g_emu_lock);
+         return 0;
+      }
       case 48: { /* KBASE_IOCTL_CS_TILER_HEAP_INIT / _1_13 */
          union kbase_ioctl_cs_tiler_heap_init_1_13 *hi =
             (union kbase_ioctl_cs_tiler_heap_init_1_13 *)arg;
@@ -1913,7 +1987,7 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
       record_trace_ioctl("MMAP_MALI0", 0, length >> 12, 0, 0, (uint64_t)prot, 0, 0, 0, 0);
       g_trace[g_trace_count - 1].mmap_offset = uoff;
       g_trace[g_trace_count - 1].mmap_len = (uint64_t)length;
-      if (uoff == BASE_MEM_MAP_TRACKING_HANDLE) {
+      if (uoff == BASE_MEM_MAP_TRACKING_HANDLE || uoff == 0x2000ULL || uoff == 0x4000ULL) {
          void *p = g_kfile.tracking_page;
          pthread_mutex_unlock(&g_emu_lock);
          return p;
@@ -1955,7 +2029,7 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
          return MAP_FAILED;
       }
       /* SAME_VA or EXEC_VA BO cookie/VA */
-      for (size_t i = 0; i < 512; i++) {
+      for (size_t i = 0; i < 2048; i++) {
          if (g_kfile.regions[i].active &&
              (g_kfile.regions[i].cookie_or_va == uoff || g_kfile.regions[i].gpu_va == uoff)) {
             if (g_kfile.regions[i].cpu_ptr) {
@@ -2080,23 +2154,68 @@ int mali_kbase_emu_ioctl_direct(int fd, unsigned long request, void *arg)
       (void)mali_kbase_emu_open_direct("/dev/mali0", O_RDWR | O_CLOEXEC);
       pthread_mutex_lock(&g_emu_lock);
    }
-   int eff_fd = (fd == 100 || fd <= 0) ? g_kfile.fd : fd;
+   int eff_fd = g_kfile.fd;
+   (void)fd;
+   uint16_t req_ver_minor = 0;
    if (_IOC_TYPE(request) == KBASE_IOCTL_TYPE) {
       unsigned int nr = _IOC_NR(request);
-      if (nr == 1 && g_kfile.state == EMU_KFILE_OPENED_NEED_VSN) {
+      if (nr == 52) {
+         if (arg) {
+            const struct kbase_ioctl_version_check *vc_in = (const struct kbase_ioctl_version_check *)arg;
+            req_ver_minor = vc_in->minor;
+         }
+         g_kfile.state = EMU_KFILE_OPENED_NEED_VSN;
+      } else if (nr == 1) {
          g_kfile.state = EMU_KFILE_VSN_DONE;
-      } else if (nr != 0 && nr != 52 && nr != 1 && nr != 3 && g_kfile.state != EMU_KFILE_KCTX_READY) {
+      } else if (nr != 0 && nr != 3) {
          g_kfile.state = EMU_KFILE_KCTX_READY;
          g_kfile.exec_va_initialized = true;
          g_kfile.jit_initialized = true;
+         *(uint64_t *)(g_kfile.sim_kctx + 37072 + 192) = 1ULL;
       }
    }
    pthread_mutex_unlock(&g_emu_lock);
-   uint8_t scratch[256];
-   memset(scratch, 0, sizeof(scratch));
-   if (arg && _IOC_SIZE(request) <= sizeof(scratch))
-      memcpy(scratch, arg, _IOC_SIZE(request));
-   return ioctl(eff_fd, request, arg ? scratch : NULL);
+
+   int rc = ioctl(eff_fd, request, arg);
+   if (rc == 0 && arg && _IOC_TYPE(request) == KBASE_IOCTL_TYPE) {
+      unsigned int nr = _IOC_NR(request);
+      if (nr == 52) {
+         struct kbase_ioctl_version_check *vc_out = (struct kbase_ioctl_version_check *)arg;
+         vc_out->major = 1;
+         vc_out->minor = (req_ver_minor != 0) ? req_ver_minor : 36;
+      } else if (nr == 5 || nr == 59 || nr == 21 || nr == 22) {
+         /* Mark BASE_MEM_NEED_MMAP (1ULL << 31) on SAME_VA cookie allocations for AOT libGLES_mali.so */
+         uint64_t *out_flags = (uint64_t *)arg;
+         if ((*out_flags & BASE_MEM_SAME_VA) && !(*out_flags & BASE_MEM_PROT_GPU_EX)) {
+            *out_flags |= BASE_MEM_NEED_MMAP;
+         }
+      }
+   }
+   return rc;
+}
+
+__attribute__((visibility("default")))
+void *mali_kbase_emu_mmap_direct(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+{
+   pthread_mutex_lock(&g_emu_lock);
+   if (g_kfile.state == EMU_KFILE_UNOPENED) {
+      pthread_mutex_unlock(&g_emu_lock);
+      (void)mali_kbase_emu_open_direct("/dev/mali0", O_RDWR | O_CLOEXEC);
+      pthread_mutex_lock(&g_emu_lock);
+   }
+   g_kfile.state = EMU_KFILE_KCTX_READY;
+   g_kfile.exec_va_initialized = true;
+   g_kfile.jit_initialized = true;
+   int eff_fd = g_kfile.fd;
+   (void)fd;
+   pthread_mutex_unlock(&g_emu_lock);
+   return mmap(addr, length, prot, flags, eff_fd, offset);
+}
+
+__attribute__((visibility("default")))
+int mali_kbase_emu_munmap_direct(void *addr, size_t length)
+{
+   return munmap(addr, length);
 }
 
 static const struct kbase_ko_host_abi g_ko_host_abi = {

@@ -28,7 +28,7 @@ NDK_TOOLCHAIN=""
 for cand in \
     "${ANDROID_NDK_HOME:-}/build/cmake/android.toolchain.cmake" \
     "$HOME/Android/Sdk/ndk/27.0.12077973/build/cmake/android.toolchain.cmake" \
-    "/working_dir/c_3106ac7496559798/work/ndk/android-ndk-r27d/build/cmake/android.toolchain.cmake"; do
+    "$ROOT_DIR/../ndk/android-ndk-r27d/build/cmake/android.toolchain.cmake"; do
     if [ -f "$cand" ]; then
         NDK_TOOLCHAIN="$cand"
         break
@@ -49,7 +49,7 @@ else
     echo "  -> Android NDK toolchain not found, skipping Android CMake build."
 fi
 
-if [ -d mesa ] && ([ -d build-android/mesa ] || [ -d build-android ]); then
+if [ -d mesa ] && ([ -f build-android/mesa/build.ninja ] || [ -f build-android/build.ninja ]); then
     echo "================================================================================"
     echo " [3/3] Running ./compile.sh for Android aarch64 NDK Mesa PanVK Build           "
     echo "================================================================================"

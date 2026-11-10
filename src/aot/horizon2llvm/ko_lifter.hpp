@@ -60,6 +60,7 @@ bool lift_ko_modules_to_c_and_ir(
     std::string& err,
     const std::string& out_obj_x86_path = "",
     const std::string& out_obj_arm64_path = "",
-    bool full_indirect_dispatch = false);
+    bool full_indirect_dispatch = false,
+    bool count_insns = true);
 
 } // namespace ultrs::ko_lifter
