@@ -45,7 +45,7 @@ RET_ENOMEM = -12
 RET_EINVAL = -22
 RET_EOVERFLOW = -75
 
-DEFAULT_BINARY_PATH = os.environ.get("KBASE_KERNEL_BINARY", "mali_kbase.ko")
+DEFAULT_BINARY_PATH = os.environ.get("KBASE_KERNEL_BINARY", "kernel/mali_kbase_gs201_r47p0_csf_5_10_189.ko")
 DEFAULT_HOST_TRACE_PATH = os.environ.get(
     "PANVK_HOST_TRACE_PATH", "artifacts/panvk_host_kbase_trace.json"
 )

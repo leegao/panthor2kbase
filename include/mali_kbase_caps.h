@@ -8,7 +8,7 @@
  *   drivers/gpu/arm/midgard/mali_kbase_caps.h
  *   drivers/gpu/arm/midgard/mali_kbase_caps.c (`.rodata` `kbase_caps_table`)
  * and verified against both:
- *   - MT6878 r44p1 `mali_kbase.ko` (`.rodata` offset 67800, 8 x uint16_t)
+ *   - MT6878 r44p1 `kernel/mali_kbase_gs201_r47p0_csf_5_10_189.ko` (`.rodata` offset 67800, 8 x uint16_t)
  *   - Pixel 8 Pro Tensor G3 r54p1 `mali_kbase_husky.ko` (`.rodata` offset 89160, 36 x uint16_t)
  */
 
@@ -103,7 +103,7 @@ struct mali_kbase_cap_descriptor {
 
 /**
  * Authoritative capability check matching `mali_kbase_supports_cap(api_version, cap)`
- * in `mali_kbase.ko` / `mali_kbase_husky.ko`.
+ * in `kernel/mali_kbase_gs201_r47p0_csf_5_10_189.ko` / `mali_kbase_husky.ko`.
  */
 bool mali_kbase_supports_cap_query(uint64_t api_version, enum mali_kbase_cap cap);
 

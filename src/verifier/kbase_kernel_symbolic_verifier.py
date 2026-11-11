@@ -535,7 +535,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--kernel-binary",
         "-b",
-        default=os.environ.get("KBASE_KERNEL_BINARY", "mali_kbase.ko" if os.path.exists("mali_kbase.ko") else None),
+        default=os.environ.get("KBASE_KERNEL_BINARY", "kernel/mali_kbase_gs201_r47p0_csf_5_10_189.ko" if os.path.exists("kernel/mali_kbase_gs201_r47p0_csf_5_10_189.ko") else None),
         help="Path to the mali_kbase.ko AArch64 kernel module binary. "
              "When provided, AArch64 machine instructions are lifted directly via LLVM MC.",
     )

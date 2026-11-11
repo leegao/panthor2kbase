@@ -69,8 +69,8 @@ echo " [Suite 7/8] OR-Tools CP-SAT & Z3 Symbolic Equivalence Verifiers          
 echo "================================================================================"
 python3 src/verifier/ortools_uapi_verifier.py
 python3 src/verifier/kbase_kernel_symbolic_verifier.py
-if [ -f mali_kbase.ko ]; then
-    python3 src/verifier/aarch64_mc_lifter.py mali_kbase.ko
+if [ -f kernel/mali_kbase_gs201_r47p0_csf_5_10_189.ko ]; then
+    python3 src/verifier/aarch64_mc_lifter.py kernel/mali_kbase_gs201_r47p0_csf_5_10_189.ko
 fi
 
 echo "================================================================================"
