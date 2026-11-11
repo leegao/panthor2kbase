@@ -6,3 +6,7 @@
 	path = third_party/bcn_layer
 	url = git@github.com:leegao/bcn_layer.git
 	branch = panthor2kbase-br
+[submodule "third_party/vulkan-wsi-layer"]
+	path = third_party/vulkan-wsi-layer
+	url = git@github.com:leegao/vulkan-wsi-layer.git
+	branch = panthor2kbase-br

@@ -177,6 +177,9 @@ JSON_EOF
         export VK_LOADER_LAYERS_DISABLE="${VK_LOADER_LAYERS_DISABLE:-~implicit~}"
         export VK_LAYER_PATH="$LAYER_DIR${VK_LAYER_PATH:+:$VK_LAYER_PATH}"
         export VK_ADD_LAYER_PATH="$LAYER_DIR${VK_ADD_LAYER_PATH:+:$VK_ADD_LAYER_PATH}"
+        export VK_LAYER_PATH="$ROOT_DIR/third_party/prebuilts/bcn_layer/x86-64:$ROOT_DIR/third_party/prebuilts/compat_layer/x86-64:$ROOT_DIR/third_party/prebuilts/vulkan_wsi_layer/x86-64:$VK_LAYER_PATH"
+        export VK_INSTANCE_LAYERS="VK_LAYER_window_system_integration"
+
         # export VK_INSTANCE_LAYERS="${VK_INSTANCE_LAYERS:-VK_LAYER_WSI_PanthorWsiLayer}"
         export LD_LIBRARY_PATH="$LAYER_DIR:$ICD_DIR:$ROOT_DIR:${LD_LIBRARY_PATH:-}"
         export VK_DRIVER_FILES="$ICD_JSON"

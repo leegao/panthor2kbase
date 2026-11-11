@@ -89,6 +89,38 @@ if [ -d $ROOT_DIR/third_party/bcn_layer ] && ([ -f $ROOT_DIR/third_party/bcn_lay
 EOF
 fi
 
+WSI_LAYER_DIR=""
+if [ -d "$ROOT_DIR/third_party/vulkan-wsi-layer" ] && [ -f "$ROOT_DIR/third_party/vulkan-wsi-layer/CMakeLists.txt" ]; then
+    WSI_LAYER_DIR="$ROOT_DIR/third_party/vulkan-wsi-layer"
+fi
+
+PREBUILT_WSI_DIR="$ROOT_DIR/third_party/prebuilts/vulkan_wsi_layer/x86-64"
+
+if [ -n "$WSI_LAYER_DIR" ]; then
+    echo "  -> Building $WSI_LAYER_DIR"
+    "$CMAKE_BIN" -S "$WSI_LAYER_DIR" -B "$ROOT_DIR/build-x86-64/vulkan_wsi_layer" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_WARN_DEPRECATED=OFF \
+        -DVULKAN_CXX_INCLUDE="$ROOT_DIR/include" \
+        -DSELECT_EXTERNAL_ALLOCATOR=dma_buf_heaps \
+        -DWSIALLOC_MEMORY_HEAP_NAME=system-uncached
+
+    cmake --build "$ROOT_DIR/build-x86-64/vulkan_wsi_layer" -j"$(nproc 2>/dev/null || echo 4)"
+    echo "  -> Built libVkLayer_window_system_integration.so in build-x86-64/vulkan_wsi_layer"
+
+    cp "$ROOT_DIR/build-x86-64/vulkan_wsi_layer/libVkLayer_window_system_integration.so" "$ROOT_DIR/build-x86-64/"
+    cp "$ROOT_DIR/build-x86-64/vulkan_wsi_layer/VkLayer_window_system_integration.json" "$ROOT_DIR/build-x86-64/"
+
+    mkdir -p "$PREBUILT_WSI_DIR"
+    cp "$ROOT_DIR/build-x86-64/vulkan_wsi_layer/libVkLayer_window_system_integration.so" "$PREBUILT_WSI_DIR/"
+    cp "$ROOT_DIR/build-x86-64/vulkan_wsi_layer/VkLayer_window_system_integration.json" "$PREBUILT_WSI_DIR/"
+    echo "  -> Cached layer to $PREBUILT_WSI_DIR"
+elif [ -f "$PREBUILT_WSI_DIR/libVkLayer_window_system_integration.so" ]; then
+    echo "  -> Using prebuilt vulkan_wsi_layer from third_party/prebuilts"
+    cp "$PREBUILT_WSI_DIR/libVkLayer_window_system_integration.so" "$ROOT_DIR/build-x86-64/"
+    cp "$PREBUILT_WSI_DIR/VkLayer_window_system_integration.json" "$ROOT_DIR/build-x86-64/"
+fi
+
 echo "================================================================================"
 echo " [2/3] Building Android Panthor-to-Kbase Adapter, /dev/mali0 Emulator & Tracer  "
 echo "================================================================================"
