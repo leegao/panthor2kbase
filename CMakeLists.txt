@@ -597,7 +597,7 @@ if(PANTHOR_KBASE_BUILD_TESTS AND NOT ANDROID)
       )
       add_test(
          NAME aarch64_mc_lifter_verifier
-         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/src/verifier/aarch64_mc_lifter.py ${CMAKE_CURRENT_SOURCE_DIR}/mali_kbase.ko
+         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/src/verifier/aarch64_mc_lifter.py ${CMAKE_CURRENT_SOURCE_DIR}/kernel/mali_kbase_gs201_r47p0_csf_5_10_189.ko
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
       )
    add_test(NAME csffw_formal_semantics_verifier

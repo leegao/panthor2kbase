@@ -91,9 +91,9 @@ logcat.txt
 wrapper_log.txt
 panthor_drm_replayer
 panthor_vk_replayer
+*.txt
 !CMakeLists.txt
 !*/CMakeLists.txt
-*.txt
 patch.diff
 src/aot/bin/horizon2llvm
 src/aot/horizon2llvm/horizon2llvm
