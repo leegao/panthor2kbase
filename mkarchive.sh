@@ -63,6 +63,7 @@ elif command -v zip >/dev/null 2>&1; then
         FLAGS+=(-x ".git/*")
     fi
     zip "${FLAGS[@]}"
+    zip -9 -y -r "$TARGET_FILE" third_party/prebuilts/
 elif $SLIM; then
     python3 "$SCRIPT_DIR/tools/mkarchive.py" --slim "$TARGET_FILE"
 else

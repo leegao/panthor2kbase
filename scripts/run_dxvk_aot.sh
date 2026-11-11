@@ -57,7 +57,7 @@ JSON_EOF
 # Auto-extract prebuilt DXVK 1.10.3 DLLs (d3d9, d3d10, d3d10_1, d3d10core, d3d11, dxgi)
 # from third_party/dxvk-1.10.3/dxvk-1.10.3.tar.xz into active WINEPREFIX (system32 & syswow64)
 DXVK_TARBALL="$ROOT_DIR/third_party/dxvk-1.10.3/dxvk-1.10.3.tar.xz"
-DXVK_DIST_DIR="$ROOT_DIR/third_party/dxvk-1.10.3/dist"
+DXVK_DIST_DIR="$ROOT_DIR/third_party/prebuilts/dxvk-1.10.3"
 export WINEPREFIX="${WINEPREFIX:-$HOME/.wine}"
 export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-d3d11,dxgi,d3d10core,d3d10,d3d10_1,d3d9=n,b}"
 
