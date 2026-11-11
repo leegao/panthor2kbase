@@ -117,7 +117,7 @@ def should_exclude_file(rel_file: str, target_file: str, slim_mode: bool, full_p
             return True
         if any(rel_norm.startswith(pre) for pre in ("src/aot/bin/", "predownloaded/", "src/aot/r54p3_vulkan_icd/lib/", "sandbox_bundles/")):
             return True
-        if fname.endswith((".ko", ".so", ".o", ".a")):
+        if fname.endswith((".ko", ".so", ".o", ".a", ".dll", ".ll")):
             return True
         if full_path and is_elf_file(full_path) and not fname.endswith(".sh"):
             return True

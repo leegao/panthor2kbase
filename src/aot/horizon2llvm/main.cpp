@@ -2,14 +2,18 @@
 //
 // Unifies AArch64 lifting and mode-parameterized pass-pipeline lowering across:
 //   1. User-space ELF64 ET_DYN shared libraries (`libGLES_mali.so` -> `LoweringMode::UserspaceBionicSo`)
-//   2. Linux kernel ELF64 ET_REL modules (`mali_kbase.ko` & `mali_kbase_husky.ko` -> `LoweringMode::KernelModuleKo`,
-//      lowering all 68 kernel functions directly to SSA LLVM IR `lifted_kbase_ko.ll` and compiling to `.o` at `-O2`)
-//   3. Standalone LLVM IR compilation (`--compile-ir`)
+//   2. Linux kernel ELF64 ET_REL modules (`mali_kbase*.ko` -> `LoweringMode::KernelModuleKo`,
+//      generically recovering `.rodata` tables and jump tables from ELF relocations & symbol boundaries
+//      with zero hardcoded `kRodataTableMap` entries, and lowering all target kernel functions directly
+//      to SSA LLVM IR `lifted_kbase_ko.ll` and compiling to `.o` at `-O2`)
+//   3. Standalone single-`.ko` generic lifting (`--lift-ko-single`)
+//   4. Standalone LLVM IR compilation (`--compile-ir`)
 //
 // Usage:
-//   horizon2llvm --lift-ko <r44_ko> <husky_ko> <out.h> <out_runtime.c> [--out-ir <out.ll>] [--out-obj-x86 <x86.o>] [--out-obj-arm64 <arm64.o>] [--full-indirect-dispatch] [--count-insns|--no-count-insns]
-//   horizon2llvm --lift-ko-dual <r44_ko> <husky_ko> [<out.h> <out_runtime.c>] [--out-ir <out.ll>] [--out-obj-x86 <x86.o>] [--out-obj-arm64 <arm64.o>] [--full-indirect-dispatch] [--count-insns|--no-count-insns]
-//   horizon2llvm --lift-so <libGLES_mali.so> <out_dir> [--hook-Vulkan-calls]
+//   horizon2llvm --lift-ko <r44_ko> <husky_ko> <out.h> <out_runtime.c> [--out-ir <out.ll>] [--out-obj-x86 <x86.o>] [--out-obj-arm64 <arm64.o>] [--full-indirect-dispatch] [--count-insns|--no-count-insns] [--instrument-calls|--record-stackframes|--profile-functions|--no-instrument-calls]
+//   horizon2llvm --lift-ko-dual <r44_ko> <husky_ko> [<out.h> <out_runtime.c>] [--out-ir <out.ll>] [--out-obj-x86 <x86.o>] [--out-obj-arm64 <arm64.o>] [--full-indirect-dispatch] [--count-insns|--no-count-insns] [--instrument-calls|--record-stackframes|--profile-functions|--no-instrument-calls]
+//   horizon2llvm --lift-ko-single <ko_path> <label> <out.ll> [--out-obj <out.o>] [--full-indirect-dispatch] [--count-insns|--no-count-insns] [--instrument-calls|--no-instrument-calls]
+//   horizon2llvm --lift-so <libGLES_mali.so> <out_dir> [--hook-Vulkan-calls] [--instrument-calls|--record-stackframes|--profile-functions|--no-instrument-calls]
 //   horizon2llvm --compile-ir <in.ll> <out.o> [-O0|-O2] [--target-triple TRIPLE]
 
 #include <cstdint>
@@ -36,6 +40,7 @@ int main(int argc, char** argv) {
         std::string out_obj_arm64 = "src/emulator/lifted_kbase_ko_arm64.o";
         bool full_indirect_dispatch = false;
         bool count_insns = true;
+        bool instrument_calls = true;
         if (const char* env_full = std::getenv("HORIZON2LLVM_FULL_INDIRECT_DISPATCH")) {
             if (std::string(env_full) == "1" || std::string(env_full) == "true") {
                 full_indirect_dispatch = true;
@@ -46,6 +51,13 @@ int main(int argc, char** argv) {
                 count_insns = false;
             } else if (std::string(env_cnt) == "1" || std::string(env_cnt) == "true") {
                 count_insns = true;
+            }
+        }
+        if (const char* env_inst = std::getenv("HORIZON2LLVM_INSTRUMENT_CALLS")) {
+            if (std::string(env_inst) == "0" || std::string(env_inst) == "false") {
+                instrument_calls = false;
+            } else if (std::string(env_inst) == "1" || std::string(env_inst) == "true") {
+                instrument_calls = true;
             }
         }
         int opt_start = 4;
@@ -64,18 +76,53 @@ int main(int argc, char** argv) {
             else if (a == "--full-indirect-dispatch") full_indirect_dispatch = true;
             else if (a == "--count-insns") count_insns = true;
             else if (a == "--no-count-insns") count_insns = false;
+            else if (a == "--instrument-calls" || a == "--record-stackframes" ||
+                     a == "--profile-functions" || a == "--debug-trace") instrument_calls = true;
+            else if (a == "--no-instrument-calls" || a == "--no-record-stackframes" ||
+                     a == "--no-profile-functions") instrument_calls = false;
         }
         std::string err;
         if (!ko_lifter::lift_ko_modules_to_c_and_ir(
                 r44_ko, husky_ko, out_hdr, out_c, out_ll, err,
-                out_obj_x86, out_obj_arm64, full_indirect_dispatch, count_insns)) {
+                out_obj_x86, out_obj_arm64, full_indirect_dispatch, count_insns, instrument_calls)) {
             std::fprintf(stderr, "[horizon2llvm --lift-ko] ERROR: %s\n", err.c_str());
             return 1;
         }
-        std::printf("[horizon2llvm --lift-ko] Successfully lowered %s and %s -> %s, %s, %s (objs: %s, %s, full_indirect_dispatch=%d, count_insns=%d)\n",
+        std::printf("[horizon2llvm --lift-ko] Successfully lowered %s and %s (+ discovered kernel/*.ko variants) -> %s, %s, %s (objs: %s, %s, full_indirect_dispatch=%d, count_insns=%d, instrument_calls=%d)\n",
                     r44_ko.c_str(), husky_ko.c_str(), out_hdr.c_str(), out_c.c_str(),
                     out_ll.c_str(), out_obj_x86.c_str(), out_obj_arm64.c_str(),
-                    full_indirect_dispatch ? 1 : 0, count_insns ? 1 : 0);
+                    full_indirect_dispatch ? 1 : 0, count_insns ? 1 : 0, instrument_calls ? 1 : 0);
+        return 0;
+    }
+
+    if (argc >= 5 && std::string(argv[1]) == "--lift-ko-single") {
+        std::string ko_path = argv[2];
+        std::string label = argv[3];
+        std::string out_ll = argv[4];
+        std::string out_obj;
+        bool full_indirect_dispatch = false;
+        bool count_insns = true;
+        bool instrument_calls = true;
+        for (int i = 5; i < argc; ++i) {
+            std::string a = argv[i];
+            if ((a == "--out-obj" || a == "--out-obj-x86") && i + 1 < argc) out_obj = argv[++i];
+            else if (a == "--full-indirect-dispatch") full_indirect_dispatch = true;
+            else if (a == "--count-insns") count_insns = true;
+            else if (a == "--no-count-insns") count_insns = false;
+            else if (a == "--instrument-calls" || a == "--record-stackframes" ||
+                     a == "--profile-functions" || a == "--debug-trace") instrument_calls = true;
+            else if (a == "--no-instrument-calls") instrument_calls = false;
+        }
+        std::string err;
+        if (!ko_lifter::lift_single_ko_module_to_ir(
+                ko_path, label, out_ll, err, out_obj,
+                full_indirect_dispatch, count_insns, instrument_calls)) {
+            std::fprintf(stderr, "[horizon2llvm --lift-ko-single] ERROR: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("[horizon2llvm --lift-ko-single] Successfully lowered %s (label=%s) -> %s (obj=%s, instrument_calls=%d)\n",
+                    ko_path.c_str(), label.c_str(), out_ll.c_str(),
+                    out_obj.empty() ? "none" : out_obj.c_str(), instrument_calls ? 1 : 0);
         return 0;
     }
 
@@ -118,10 +165,11 @@ int main(int argc, char** argv) {
 
     std::printf("horizon2llvm (unified AArch64-to-LLVM-IR & Native Object Lifter for libGLES_mali.so and mali_kbase*.ko)\n"
                 "Usage:\n"
-                "  %s --lift-ko <r44_ko> <husky_ko> <out.h> <out_runtime.c> [--out-ir <out.ll>] [--out-obj-x86 <x86.o>] [--out-obj-arm64 <arm64.o>] [--full-indirect-dispatch] [--count-insns|--no-count-insns]\n"
-                "  %s --lift-ko-dual <r44_ko> <husky_ko> [<out.h> <out_runtime.c>] [--out-ir <out.ll>] [--out-obj <x86.o>] [--full-indirect-dispatch] [--count-insns|--no-count-insns]\n"
-                "  %s --lift-so <libGLES_mali.so> <out_dir> [--hook-Vulkan-calls]\n"
+                "  %s --lift-ko <r44_ko> <husky_ko> <out.h> <out_runtime.c> [--out-ir <out.ll>] [--out-obj-x86 <x86.o>] [--out-obj-arm64 <arm64.o>] [--full-indirect-dispatch] [--count-insns|--no-count-insns] [--instrument-calls|--no-instrument-calls]\n"
+                "  %s --lift-ko-dual <r44_ko> <husky_ko> [<out.h> <out_runtime.c>] [--out-ir <out.ll>] [--out-obj <x86.o>] [--full-indirect-dispatch] [--count-insns|--no-count-insns] [--instrument-calls|--no-instrument-calls]\n"
+                "  %s --lift-ko-single <ko_path> <label> <out.ll> [--out-obj <out.o>] [--full-indirect-dispatch] [--count-insns|--no-count-insns] [--instrument-calls|--no-instrument-calls]\n"
+                "  %s --lift-so <libGLES_mali.so> <out_dir> [--hook-Vulkan-calls] [--instrument-calls|--no-instrument-calls]\n"
                 "  %s --compile-ir <in.ll> <out.o> [-O0|-O2] [--target-triple TRIPLE]\n",
-                argv[0], argv[0], argv[0], argv[0]);
+                argv[0], argv[0], argv[0], argv[0], argv[0]);
     return 0;
 }

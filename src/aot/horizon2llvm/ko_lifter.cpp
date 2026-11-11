@@ -2,24 +2,22 @@
 // (src/aot/horizon2llvm/ko_lifter.cpp)
 //
 // Implements the KernelModuleKo mode of the unified C++ `horizon2llvm` AArch64-to-LLVM-IR
-// lifting, lowering, and native recompilation framework (per Doc 48 comment
-// doco.C5ZRkpgUyjGpcLnE-7ASWg / doco.TYY1k8IskfrqydKDlRIIvg and Doc 50):
+// lifting, lowering, and native recompilation framework:
 //   1. ELF64 ET_REL section/symbol/relocation loader (.symtab, .strtab, .text, .rodata, .rela.text)
-//   2. Dynamic libLLVM MC disassembler bridge (matching src/verifier/aarch64_mc_lifter.py)
-//   3. Reuses the unified `ultrs::llvm_ir::Module` and `ultrs::passes::ModulePassManager`
-//      lowering pipeline (`PassPipelineConfig::forKernelKo()`):
-//        - `AArch64SysBarrierLoweringPass(LoweringMode::KernelModuleKo)`
-//        - `GuestStackAndAlignmentPass`
-//        - `AArch64IdiomDeconstructPass`
-//        - `JumpTableLoweringPass`
-//        - `NZCVPredicateFusionPass`
-//        - `NZCVDeadFlagElimPass`
-//        - `TailCallDevirtualizationPass`
-//        - `AAPCS64ABIContractPass`
-//        - `CpuStatePromotionPass`
-//      while omitting Bionic-specific user-space TLS (`TPIDR_EL0` slot hooks) and PLT/GOT passes.
-//   4. Lowers all 68 target kernel functions across `mali_kbase.ko` (MT6878 r44p1) and
-//      `mali_kbase_husky.ko` (Pixel 8 Pro Tensor G3 r54p1/r54p3) directly into genuine SSA
+//   2. Generic ELF symbol & relocation boundary-driven `.rodata` table & jump-table recovery
+//      (zero hardcoded `kRodataTableMap` entries; automatically recovers `.rodata` slice sizes
+//      and 32-bit PIC relative jump-table targets for any `mali_kbase*.ko` binary)
+//   3. Dynamic libLLVM MC disassembler bridge (matching src/verifier/aarch64_mc_lifter.py)
+//   4. Reuses the unified `ultrs::llvm_ir::Module` and `ultrs::passes::ModulePassManager`
+//      lowering pipeline (`PassPipelineConfig::forKernelKo()`)
+//   5. Flag-toggled guest stackframe recording (`LIFTED_KO_DEBUG_RECORD_STACKFRAMES`) and
+//      per-function call profiling / tracing (`LIFTED_KO_DEBUG_TRACE_CALLS`,
+//      `LIFTED_KO_DEBUG_PROFILE_CALLS`) via `@lifted_ko_trace_fn_enter` / `@lifted_ko_trace_fn_exit`
+//   6. Lowers all target kernel functions across `mali_kbase_mt6878_r44p1.ko` /
+//      `mali_kbase_gs201_r47p0_csf_5_10_189.ko` (r44p1 / gs201_r47p0_189),
+//      `mali_kbase_husky_r54p1.ko` (husky_r54p1),
+//      `mali_kbase_gs201_r47p0_csf_5_10_198.ko` (gs201_r47p0), and
+//      `mali_kbase_gs101_r47p0_jm_5_10_198.ko` (gs101_r47p0_jm) directly into genuine SSA
 //      LLVM IR (`src/emulator/lifted_kbase_ko.ll`), with zero lifted `.ko` functions in C,
 //      and compiles `lifted_kbase_ko.ll` to native ELF64 PIC `.o` object files via `libLLVM`.
 
@@ -194,6 +192,8 @@ static const std::vector<std::string> kTargetFunctions = {
     "kbase_gpuprops_populate_user_buffer",
     "kbase_file_create_kctx",
     "kbase_file_delete",
+    "kbase_api_set_flags",
+    "kbase_api_mem_jit_init",
     "kbase_api_mem_alloc_ex",
     "kbase_api_mem_alloc",
     "kbase_api_mem_alias",
@@ -213,6 +213,8 @@ static const std::vector<std::string> kTargetFunctions = {
     "kbasep_cs_queue_group_create_1_35",
     "kbasep_cs_tiler_heap_init",
     "kbasep_cs_tiler_heap_init_1_13",
+    "kbase_jd_submit",
+    "jd_submit_atom",
     "kbase_open",
     "kbase_release",
     "kbase_mmap",
@@ -225,6 +227,8 @@ static const std::set<std::string> kDirectLiftedCallees = {
     "mali_kbase_supports_cap",
     "kbase_file_create_kctx",
     "kbase_file_delete",
+    "kbase_api_set_flags",
+    "kbase_api_mem_jit_init",
     "kbase_api_mem_alloc",
     "kbase_api_mem_alloc_ex",
     "kbase_api_mem_alias",
@@ -241,29 +245,9 @@ static const std::set<std::string> kDirectLiftedCallees = {
     "kbasep_cs_tiler_heap_init_1_13",
     "kbase_csf_queue_register",
     "kbase_csf_queue_register_ex",
+    "kbase_jd_submit",
+    "jd_submit_atom",
     "kbase_kfile_ioctl",
-};
-
-struct RodataTableDesc {
-    std::string fallback_symbol;
-    uint32_t offset;
-    uint32_t size;
-};
-
-static const std::map<std::pair<std::string, uint64_t>, RodataTableDesc> kRodataTableMap = {
-    {{"r44p1", 67800}, {"g_lifted_r44p1_kbase_caps_table", 67800, 16}},
-    {{"r44p1", 65408}, {"g_lifted_r44p1_gpu_property_mapping", 65408, 1992}},
-    {{"r44p1", 61524}, {"g_lifted_r44p1_gpuprops_jtab", 61524, 32}},
-    {{"r44p1", 62284}, {"g_lifted_r44p1_ioctl_jtab1", 62284, 168}},
-    {{"r44p1", 62112}, {"g_lifted_r44p1_ioctl_jtab2", 62112, 176}},
-    {{"r44p1", 61968}, {"g_lifted_r44p1_ioctl_jtab3", 61968, 148}},
-    {{"husky_r54p1", 89160}, {"g_lifted_husky_r54p1_kbase_caps_table", 89160, 72}},
-    {{"husky_r54p1", 78896}, {"g_lifted_husky_r54p1_gpu_property_mapping", 78896, 2040}},
-    {{"husky_r54p1", 78776}, {"g_lifted_husky_r54p1_gpuprops_jtab", 78776, 32}},
-    {{"husky_r54p1", 88900}, {"g_lifted_husky_r54p1_ioctl_jtab1", 88900, 200}},
-    {{"husky_r54p1", 88584}, {"g_lifted_husky_r54p1_ioctl_jtab2", 88584, 148}},
-    {{"husky_r54p1", 88728}, {"g_lifted_husky_r54p1_ioctl_jtab3", 88728, 176}},
-    {{"husky_r54p1", 88456}, {"g_lifted_husky_r54p1_ioctl_jtab4", 88456, 132}},
 };
 
 static std::string trim_str(std::string s) {
@@ -366,46 +350,53 @@ struct ModuleStringPool {
 //   calls_executed:      360
 
 enum LiftedKoProfileId : uint32_t {
-    KO_PROFILE_R44P1       = 0,
-    KO_PROFILE_HUSKY_R54P1 = 1,
+    KO_PROFILE_R44P1          = 0,
+    KO_PROFILE_HUSKY_R54P1    = 1,
+    KO_PROFILE_GS201_R47P0    = 2,
+    KO_PROFILE_GS101_R47P0_JM = 3,
 };
 
 enum LiftedKernelShimId : uint32_t {
-    KO_SHIM_UNKNOWN                         = 0,
-    KO_SHIM_INDIRECT_BLR                    = 1,
-    KO_SHIM_KMALLOC                         = 2,
-    KO_SHIM_KMALLOC_TRACE                   = 3,
-    KO_SHIM_KFREE                           = 4,
-    KO_SHIM_MEMSET                          = 5,
-    KO_SHIM_MEMCPY                          = 6,
-    KO_SHIM_COPY_FROM_USER                  = 7,
-    KO_SHIM_COPY_TO_USER                    = 8,
-    KO_SHIM_CHECK_OBJECT_SIZE               = 9,
-    KO_SHIM_SW_HWEIGHT64                    = 10,
-    KO_SHIM_KBASE_HAS_EXEC_VA_ZONE          = 11,
-    KO_SHIM_SCNPRINTF                       = 12,
-    KO_SHIM_KBASE_DEVICE_GET_LIST           = 13,
-    KO_SHIM_KBASE_CREATE_CONTEXT            = 14,
-    KO_SHIM_KBASE_DESTROY_CONTEXT           = 15,
-    KO_SHIM_KBASE_MEM_POOL_ALLOC_PAGES      = 16,
-    KO_SHIM_KERNEL_MAP_USER_IO_PAGES        = 17,
-    KO_SHIM_KBASE_MEM_ALLOC                 = 18,
-    KO_SHIM_KBASE_MEM_ALIAS                 = 19,
+    KO_SHIM_UNKNOWN                          = 0,
+    KO_SHIM_INDIRECT_BLR                     = 1,
+    KO_SHIM_KMALLOC                          = 2,
+    KO_SHIM_KMALLOC_TRACE                    = 3,
+    KO_SHIM_KFREE                            = 4,
+    KO_SHIM_MEMSET                           = 5,
+    KO_SHIM_MEMCPY                           = 6,
+    KO_SHIM_COPY_FROM_USER                   = 7,
+    KO_SHIM_COPY_TO_USER                     = 8,
+    KO_SHIM_CHECK_OBJECT_SIZE                = 9,
+    KO_SHIM_SW_HWEIGHT64                     = 10,
+    KO_SHIM_KBASE_HAS_EXEC_VA_ZONE           = 11,
+    KO_SHIM_SCNPRINTF                        = 12,
+    KO_SHIM_KBASE_DEVICE_GET_LIST            = 13,
+    KO_SHIM_KBASE_CREATE_CONTEXT             = 14,
+    KO_SHIM_KBASE_DESTROY_CONTEXT            = 15,
+    KO_SHIM_KBASE_MEM_POOL_ALLOC_PAGES       = 16,
+    KO_SHIM_KERNEL_MAP_USER_IO_PAGES         = 17,
+    KO_SHIM_KBASE_MEM_ALLOC                  = 18,
+    KO_SHIM_KBASE_MEM_ALIAS                  = 19,
     KO_SHIM_KBASE_CSF_FIRMWARE_GET_GLB_IFACE = 20,
-    KO_SHIM_CSF_QUEUE_REGISTER_INTERNAL     = 21,
-    KO_SHIM_CREATE_QUEUE_GROUP              = 22,
-    KO_SHIM_KBASE_CSF_TILER_HEAP_INIT       = 23,
-    KO_SHIM_NOOP_EXTERNAL                   = 24,
+    KO_SHIM_CSF_QUEUE_REGISTER_INTERNAL      = 21,
+    KO_SHIM_CREATE_QUEUE_GROUP               = 22,
+    KO_SHIM_KBASE_CSF_TILER_HEAP_INIT        = 23,
+    KO_SHIM_NOOP_EXTERNAL                    = 24,
+    KO_SHIM_JD_SUBMIT_ATOM                   = 25,
+    KO_SHIM_JD_RUN_ATOM                      = 26,
 };
 
 static uint32_t resolve_profile_id(const std::string& mod_label) {
-    return (mod_label == "husky_r54p1") ? KO_PROFILE_HUSKY_R54P1 : KO_PROFILE_R44P1;
+    if (mod_label == "husky_r54p1") return KO_PROFILE_HUSKY_R54P1;
+    if (mod_label == "gs201_r47p0") return KO_PROFILE_GS201_R47P0;
+    if (mod_label == "gs101_r47p0_jm") return KO_PROFILE_GS101_R47P0_JM;
+    return KO_PROFILE_R44P1;
 }
 
 static uint32_t resolve_shim_id(const std::string& callee) {
     if (callee == "__indirect_blr") return KO_SHIM_INDIRECT_BLR;
     if (callee == "__kmalloc" || callee == "vzalloc") return KO_SHIM_KMALLOC;
-    if (callee == "kmalloc_trace") return KO_SHIM_KMALLOC_TRACE;
+    if (callee == "kmalloc_trace" || callee == "kmem_cache_alloc_trace") return KO_SHIM_KMALLOC_TRACE;
     if (callee == "kfree" || callee == "vfree") return KO_SHIM_KFREE;
     if (callee == "memset") return KO_SHIM_MEMSET;
     if (callee == "memcpy") return KO_SHIM_MEMCPY;
@@ -426,7 +417,35 @@ static uint32_t resolve_shim_id(const std::string& callee) {
     if (callee == "csf_queue_register_internal") return KO_SHIM_CSF_QUEUE_REGISTER_INTERNAL;
     if (callee == "create_queue_group" || callee == "kbase_csf_queue_group_create") return KO_SHIM_CREATE_QUEUE_GROUP;
     if (callee == "kbase_csf_tiler_heap_init") return KO_SHIM_KBASE_CSF_TILER_HEAP_INIT;
+    if (callee == "jd_submit_atom") return KO_SHIM_JD_SUBMIT_ATOM;
+    if (callee == "jd_run_atom") return KO_SHIM_JD_RUN_ATOM;
     return KO_SHIM_NOOP_EXTERNAL;
+}
+
+static void discover_module_rodata_tables(ParsedKoModule& m, LLVMDisasmDynamic& dis) {
+    m.ro_tables.clear();
+    for (const std::string& fn : kTargetFunctions) {
+        auto it = m.sym_by_name.find(fn);
+        if (it == m.sym_by_name.end()) continue;
+        auto insns = dis.disasm_range(m.text, it->second.st_value, it->second.st_value + it->second.st_size);
+        for (const auto& ins : insns) {
+            if (ins.mnemonic == "adrp") {
+                auto r_it = m.relas.find(ins.addr);
+                if (r_it != m.relas.end() && r_it->second.sym_shndx == m.ro_idx) {
+                    int64_t raw_off = static_cast<int64_t>(r_it->second.sym_val) + r_it->second.r_addend;
+                    if (raw_off < 0 || static_cast<uint64_t>(raw_off) >= m.rodata.size()) continue;
+                    uint64_t off_ro = static_cast<uint64_t>(raw_off);
+                    if (m.ro_tables.count(off_ro)) continue;
+                    uint32_t sz = infer_rodata_slice_size(m, off_ro);
+                    RodataTableDesc desc;
+                    desc.offset = static_cast<uint32_t>(off_ro);
+                    desc.size = sz;
+                    desc.fallback_symbol = "g_lifted_" + m.label + "_rodata_" + std::to_string(off_ro);
+                    m.ro_tables[off_ro] = std::move(desc);
+                }
+            }
+        }
+    }
 }
 
 struct KoFunctionIRBuilder {
@@ -496,7 +515,6 @@ struct KoFunctionIRBuilder {
         return -1;
     }
 
-    // Returns an i64 SSA value (or "0")
     std::string load_reg64(std::string r) {
         r = trim_str(r);
         int off = reg_cpu_byte_offset(r);
@@ -513,7 +531,6 @@ struct KoFunctionIRBuilder {
         return v;
     }
 
-    // Returns an i32 SSA value (or "0")
     std::string load_reg32(std::string r) {
         r = trim_str(r);
         if (r == "xzr" || r == "wzr") return "0";
@@ -565,7 +582,6 @@ struct KoFunctionIRBuilder {
         emit_line("store i64 " + n + ", ptr " + p + ", align 8");
     }
 
-    // Evaluates shifted immediate or register operand as an i64 SSA string
     std::string eval_shifted_op64(const std::vector<std::string>& tokens, bool is_64) {
         std::string base_t = trim_str(tokens[0]);
         if (!base_t.empty() && base_t[0] == '#') {
@@ -579,8 +595,6 @@ struct KoFunctionIRBuilder {
             }
             if (is_64) {
                 uint64_t uval = static_cast<uint64_t>(val);
-                // Pass 2 (KernelSysRegAndTaskStructPass): Widen 39-bit Android kernel TASK_SIZE_64
-                // (1ULL << 39 = 0x8000000000) access_ok() bounds to 48-bit host VA space.
                 if (uval >= 0x7FFFFF0000ULL && uval <= 0x8000000000ULL) {
                     uval = (1ULL << 48) - (0x8000000000ULL - uval);
                 }
@@ -732,7 +746,6 @@ struct KoFunctionIRBuilder {
     MemAddrIR emit_mem_addr(std::string mem_str) {
         mem_str = trim_str(mem_str);
         if (!mem_str.empty() && mem_str.back() == '!') {
-            // Pre-indexed: [base, #off]!
             std::string inner = trim_str(mem_str.substr(1, mem_str.size() - 3));
             auto parts = split_operands(inner);
             std::string base_r = parts[0];
@@ -745,7 +758,6 @@ struct KoFunctionIRBuilder {
         }
         auto close_pos = mem_str.find("],");
         if (close_pos != std::string::npos) {
-            // Post-indexed: [base], #off
             std::string base_r = trim_str(mem_str.substr(1, close_pos - 1));
             int64_t off = parse_imm(mem_str.substr(close_pos + 2));
             std::string b64 = load_reg64(base_r);
@@ -812,40 +824,67 @@ struct KoFunctionIRBuilder {
         }
         if (mnem == ".word") {
             uint32_t w = ins.word;
-            if (w == 0xB82A013FU) { // stadd w10, [x9]
-                std::string a = load_reg64("x9");
-                std::string v = load_reg32("w10");
+            // Generic ARMv8.1-A LSE atomic bitfield decoding:
+            //   1. STADD / STCLR / STEOR / STSET (LD<op> with Rt == XZR/WZR): (w & 0xBF200C1F) == 0xB820001F
+            //   2. CAS / CASA / CASL / CASAL (32/64-bit):                     (w & 0xBF207C00) == 0x88207C00
+            if ((w & 0xBF200C1FU) == 0xB820001FU) {
+                bool is64 = ((w >> 30) & 1U) != 0;
+                unsigned rs = (w >> 16) & 0x1FU;
+                unsigned opc = (w >> 12) & 0x7U;
+                unsigned rn = (w >> 5) & 0x1FU;
+                std::string rn_str = (rn == 31) ? "sp" : ("x" + std::to_string(rn));
+                std::string rs_str = (rs == 31) ? (is64 ? "xzr" : "wzr") : ((is64 ? "x" : "w") + std::to_string(rs));
+                std::string a = load_reg64(rn_str);
                 std::string p = next_reg("atp");
                 std::string old = next_reg("ato");
                 emit_line(p + " = inttoptr i64 " + a + " to ptr");
-                emit_line(old + " = atomicrmw add ptr " + p + ", i32 " + v + " seq_cst, align 4");
-            } else if (w == 0xF829011FU) { // stadd x9, [x8]
-                std::string a = load_reg64("x8");
-                std::string v = load_reg64("x9");
-                std::string p = next_reg("atp");
-                std::string old = next_reg("ato");
-                emit_line(p + " = inttoptr i64 " + a + " to ptr");
-                emit_line(old + " = atomicrmw add ptr " + p + ", i64 " + v + " seq_cst, align 8");
-            } else if (w == 0xB829311FU) { // stset w9, [x8]
-                std::string a = load_reg64("x8");
-                std::string v = load_reg32("w9");
-                std::string p = next_reg("atp");
-                std::string old = next_reg("ato");
-                emit_line(p + " = inttoptr i64 " + a + " to ptr");
-                emit_line(old + " = atomicrmw or ptr " + p + ", i32 " + v + " seq_cst, align 4");
-            } else if (w == 0x88AA7D02U || w == 0x88A97EA2U || w == 0x88E8FC02U || w == 0x88E9FC02U) {
-                const char* addr_r = (w == 0x88AA7D02U) ? "x8" : (w == 0x88A97EA2U) ? "x21" : "x0";
-                const char* exp_r  = (w == 0x88AA7D02U) ? "w10" : (w == 0x88E8FC02U) ? "w8" : "w9";
+                if (is64) {
+                    std::string v = load_reg64(rs_str);
+                    if (opc == 1) { // STCLR -> atomicrmw and ~v
+                        std::string nv = next_reg("atn");
+                        emit_line(nv + " = xor i64 " + v + ", -1");
+                        emit_line(old + " = atomicrmw and ptr " + p + ", i64 " + nv + " seq_cst, align 8");
+                    } else {
+                        const char* rmw_op = (opc == 0) ? "add" : (opc == 2 ? "xor" : "or");
+                        emit_line(old + " = atomicrmw " + rmw_op + " ptr " + p + ", i64 " + v + " seq_cst, align 8");
+                    }
+                } else {
+                    std::string v = load_reg32(rs_str);
+                    if (opc == 1) { // STCLR -> atomicrmw and ~v
+                        std::string nv = next_reg("atn");
+                        emit_line(nv + " = xor i32 " + v + ", -1");
+                        emit_line(old + " = atomicrmw and ptr " + p + ", i32 " + nv + " seq_cst, align 4");
+                    } else {
+                        const char* rmw_op = (opc == 0) ? "add" : (opc == 2 ? "xor" : "or");
+                        emit_line(old + " = atomicrmw " + rmw_op + " ptr " + p + ", i32 " + v + " seq_cst, align 4");
+                    }
+                }
+            } else if ((w & 0xBF207C00U) == 0x88207C00U) {
+                bool is64 = ((w >> 30) & 1U) != 0;
+                unsigned rs = (w >> 16) & 0x1FU;
+                unsigned rn = (w >> 5) & 0x1FU;
+                unsigned rt = w & 0x1FU;
+                std::string addr_r = (rn == 31) ? "sp" : ("x" + std::to_string(rn));
+                std::string exp_r  = (rs == 31) ? (is64 ? "xzr" : "wzr") : ((is64 ? "x" : "w") + std::to_string(rs));
+                std::string new_r  = (rt == 31) ? (is64 ? "xzr" : "wzr") : ((is64 ? "x" : "w") + std::to_string(rt));
                 std::string a = load_reg64(addr_r);
-                std::string e = load_reg32(exp_r);
-                std::string n = load_reg32("w2");
                 std::string p = next_reg("cxp");
                 std::string cx = next_reg("cxv");
                 std::string old = next_reg("cxo");
                 emit_line(p + " = inttoptr i64 " + a + " to ptr");
-                emit_line(cx + " = cmpxchg ptr " + p + ", i32 " + e + ", i32 " + n + " seq_cst seq_cst, align 4");
-                emit_line(old + " = extractvalue { i32, i1 } " + cx + ", 0");
-                store_reg32(exp_r, old);
+                if (is64) {
+                    std::string e = load_reg64(exp_r);
+                    std::string n = load_reg64(new_r);
+                    emit_line(cx + " = cmpxchg ptr " + p + ", i64 " + e + ", i64 " + n + " seq_cst seq_cst, align 8");
+                    emit_line(old + " = extractvalue { i64, i1 } " + cx + ", 0");
+                    store_reg64(exp_r, old);
+                } else {
+                    std::string e = load_reg32(exp_r);
+                    std::string n = load_reg32(new_r);
+                    emit_line(cx + " = cmpxchg ptr " + p + ", i32 " + e + ", i32 " + n + " seq_cst seq_cst, align 4");
+                    emit_line(old + " = extractvalue { i32, i1 } " + cx + ", 0");
+                    store_reg32(exp_r, old);
+                }
             }
             emit_fallthrough(next_pc, next_lbl);
             return;
@@ -866,9 +905,9 @@ struct KoFunctionIRBuilder {
             if (rel) {
                 if (rel->sym_shndx == mod.ro_idx) {
                     uint64_t off_ro = static_cast<uint64_t>(static_cast<int64_t>(rel->sym_val) + rel->r_addend);
-                    auto it = kRodataTableMap.find({mod_label, off_ro});
-                    if (it != kRodataTableMap.end()) {
-                        uint32_t prof_id = resolve_profile_id(mod_label);
+                    auto it = mod.ro_tables.find(off_ro);
+                    if (it != mod.ro_tables.end()) {
+                        uint32_t prof_id = mod.profile_id;
                         std::string ro_p = next_reg("rop");
                         std::string ro_i = next_reg("roi");
                         emit_line(ro_p + " = call ptr @lifted_ko_rodata_ptr_id(ptr %c, i32 " + std::to_string(prof_id) +
@@ -883,7 +922,15 @@ struct KoFunctionIRBuilder {
                 if (rel->sym_name == "_totalram_pages") field_off = 304;
                 else if (rel->sym_name == "kmalloc_caches") field_off = 312;
                 else if (rel->sym_name == "cpu_hwcaps") field_off = 320;
-                else if (mod_label == "r44p1" && (static_cast<int64_t>(rel->sym_val) + rel->r_addend) == 0xBCA0) field_off = 336;
+                else {
+                    auto dl_it = mod.sym_by_name.find("kbase_dev_list");
+                    uint64_t target_off = static_cast<uint64_t>(static_cast<int64_t>(rel->sym_val) + rel->r_addend);
+                    if (dl_it != mod.sym_by_name.end() &&
+                        rel->sym_shndx == dl_it->second.st_shndx &&
+                        target_off == dl_it->second.st_value) {
+                        field_off = 336; // cpu->dev_list_head
+                    }
+                }
                 std::string gp = next_reg("gp");
                 std::string gi = next_reg("gi");
                 emit_line(gp + " = getelementptr inbounds i8, ptr %c, i64 " + std::to_string(field_off));
@@ -1254,7 +1301,7 @@ struct KoFunctionIRBuilder {
             return;
         }
         if (mnem == "ldr" || mnem == "ldur" || mnem == "ldar" || mnem == "ldxr" ||
-            mnem == "ldrb" || mnem == "ldrh" || mnem == "ldurh" || mnem == "ldrsb" || mnem == "ldrsw") {
+            mnem == "ldrb" || mnem == "ldurb" || mnem == "ldrh" || mnem == "ldurh" || mnem == "ldrsb" || mnem == "ldrsw") {
             std::string dst = ops[0];
             std::string mem_arg = ops[1];
             for (size_t i = 2; i < ops.size(); ++i) mem_arg += ", " + ops[i];
@@ -1271,7 +1318,7 @@ struct KoFunctionIRBuilder {
                     emit_line(v + " = load i32, ptr " + ptr_r + ", align 1", ultrs::llvm_ir::OpTag::GuestMemLoad);
                     store_reg32(dst, v);
                 }
-            } else if (mnem == "ldrb") {
+            } else if (mnem == "ldrb" || mnem == "ldurb") {
                 std::string v8 = next_reg("ldb");
                 std::string z64 = next_reg("ldbz");
                 emit_line(v8 + " = load i8, ptr " + ptr_r + ", align 1", ultrs::llvm_ir::OpTag::GuestMemLoad);
@@ -1306,7 +1353,7 @@ struct KoFunctionIRBuilder {
             emit_fallthrough(next_pc, next_lbl);
             return;
         }
-        if (mnem == "str" || mnem == "stur" || mnem == "strb" || mnem == "strh" || mnem == "sturh") {
+        if (mnem == "str" || mnem == "stur" || mnem == "strb" || mnem == "sturb" || mnem == "strh" || mnem == "sturh") {
             std::string src = ops[0];
             std::string mem_arg = ops[1];
             for (size_t i = 2; i < ops.size(); ++i) mem_arg += ", " + ops[i];
@@ -1321,7 +1368,7 @@ struct KoFunctionIRBuilder {
                     std::string v = load_reg32(src);
                     emit_line("store i32 " + v + ", ptr " + ptr_r + ", align 1", ultrs::llvm_ir::OpTag::GuestMemStore);
                 }
-            } else if (mnem == "strb") {
+            } else if (mnem == "strb" || mnem == "sturb") {
                 std::string v64 = load_reg64(src);
                 std::string v8 = next_reg("stb");
                 emit_line(v8 + " = trunc i64 " + v64 + " to i8");
@@ -1473,7 +1520,7 @@ struct KoFunctionIRBuilder {
         if (mnem == "blr") {
             flush_bb_insn_count();
             if (count_insns) add_cpu_i64_at(360, 1); // cpu->calls_executed++
-            uint32_t prof_id = resolve_profile_id(mod_label);
+            uint32_t prof_id = mod.profile_id;
             uint32_t shim_id = KO_SHIM_INDIRECT_BLR;
             emit_line("call void @lifted_kernel_shim_dispatch_id(ptr %c, i32 " + std::to_string(prof_id) +
                       ", i32 " + std::to_string(shim_id) + ")",
@@ -1514,7 +1561,7 @@ struct KoFunctionIRBuilder {
                 emit_line(cr + " = call i64 @lifted_" + mod_label + "_" + target + "(ptr %c)",
                           ultrs::llvm_ir::OpTag::DirectCall);
             } else {
-                uint32_t prof_id = resolve_profile_id(mod_label);
+                uint32_t prof_id = mod.profile_id;
                 uint32_t shim_id = resolve_shim_id(target);
                 emit_line("call void @lifted_kernel_shim_dispatch_id(ptr %c, i32 " + std::to_string(prof_id) +
                           ", i32 " + std::to_string(shim_id) + ") ; " + target,
@@ -1717,7 +1764,208 @@ do_imm:
 )LLVM";
 }
 
+static void lift_parsed_module_into_ir(
+    const ParsedKoModule& m,
+    LLVMDisasmDynamic& dis,
+    ultrs::llvm_ir::Module& ir_mod,
+    ModuleStringPool& str_pool,
+    bool full_indirect_dispatch,
+    bool count_insns,
+    bool instrument_calls) {
+    for (const std::string& fn : kTargetFunctions) {
+        auto it = m.sym_by_name.find(fn);
+        if (it == m.sym_by_name.end()) continue;
+        uint64_t val = it->second.st_value;
+        uint64_t sz = it->second.st_size;
+        auto insns = dis.disasm_range(m.text, val, val + sz);
+
+        std::set<uint64_t> valid_pcs;
+        for (const auto& ins : insns) valid_pcs.insert(ins.addr);
+
+        bool has_indirect_br = false;
+        std::set<uint64_t> jump_table_targets;
+        std::set<uint64_t> block_leaders;
+
+        if (full_indirect_dispatch) {
+            block_leaders = valid_pcs;
+            jump_table_targets = valid_pcs;
+        } else {
+            if (!insns.empty()) block_leaders.insert(insns.front().addr);
+
+            // Generic ELF relocation & boundary-driven `.rodata` jump-table discovery:
+            // Collect all `.rodata` slices referenced by `adrp` in this function whose inferred
+            // boundary size is a 4-byte-aligned table in `[8, 512]` bytes.
+            std::vector<std::pair<uint64_t, const RodataTableDesc*>> fn_jtabs;
+            for (const auto& ins : insns) {
+                if (ins.mnemonic == "adrp") {
+                    auto r_it = m.relas.find(ins.addr);
+                    if (r_it != m.relas.end() && r_it->second.sym_shndx == m.ro_idx) {
+                        uint64_t off_ro = static_cast<uint64_t>(
+                            static_cast<int64_t>(r_it->second.sym_val) + r_it->second.r_addend);
+                        auto jt_it = m.ro_tables.find(off_ro);
+                        if (jt_it != m.ro_tables.end() &&
+                            jt_it->second.size >= 8U &&
+                            jt_it->second.size <= 512U) {
+                            fn_jtabs.emplace_back(ins.addr, &jt_it->second);
+                        }
+                    }
+                }
+            }
+
+            for (size_t idx = 0; idx < insns.size(); ++idx) {
+                const DisasmInsn& ins = insns[idx];
+                uint64_t pc = ins.addr;
+                const std::string& mnem = ins.mnemonic;
+                auto ops = ins.operands.empty() ? std::vector<std::string>{} : split_operands(ins.operands);
+
+                if (mnem == "b" || mnem.rfind("b.", 0) == 0) {
+                    if (!ops.empty()) {
+                        uint64_t t_pc = static_cast<uint64_t>(static_cast<int64_t>(pc) + parse_imm(ops[0]));
+                        if (valid_pcs.count(t_pc)) block_leaders.insert(t_pc);
+                    }
+                    if (valid_pcs.count(pc + 4)) block_leaders.insert(pc + 4);
+                } else if (mnem == "cbz" || mnem == "cbnz") {
+                    if (ops.size() >= 2) {
+                        uint64_t t_pc = static_cast<uint64_t>(static_cast<int64_t>(pc) + parse_imm(ops[1]));
+                        if (valid_pcs.count(t_pc)) block_leaders.insert(t_pc);
+                    }
+                    if (valid_pcs.count(pc + 4)) block_leaders.insert(pc + 4);
+                } else if (mnem == "tbz" || mnem == "tbnz") {
+                    if (ops.size() >= 3) {
+                        uint64_t t_pc = static_cast<uint64_t>(static_cast<int64_t>(pc) + parse_imm(ops[2]));
+                        if (valid_pcs.count(t_pc)) block_leaders.insert(t_pc);
+                    }
+                    if (valid_pcs.count(pc + 4)) block_leaders.insert(pc + 4);
+                } else if (mnem == "ret" || mnem == "brk") {
+                    if (valid_pcs.count(pc + 4)) block_leaders.insert(pc + 4);
+                } else if (mnem == "br") {
+                    has_indirect_br = true;
+                    if (valid_pcs.count(pc + 4)) block_leaders.insert(pc + 4);
+
+                    uint64_t adr_pc = pc - 12;
+                    for (size_t back = 1; back <= 6 && back <= idx; ++back) {
+                        if (insns[idx - back].mnemonic == "adr") {
+                            auto a_ops = split_operands(insns[idx - back].operands);
+                            int64_t a_off = (a_ops.size() >= 2) ? parse_imm(a_ops[1]) : 0;
+                            adr_pc = static_cast<uint64_t>(static_cast<int64_t>(insns[idx - back].addr) + a_off);
+                            break;
+                        }
+                    }
+
+                    auto table_matches_adr = [&](const RodataTableDesc* jt) -> bool {
+                        if (!jt || jt->offset + 4U > m.rodata.size()) return false;
+                        int32_t rel0 = read_s32_le(&m.rodata[jt->offset]);
+                        uint64_t t0 = static_cast<uint64_t>(static_cast<int64_t>(adr_pc) + rel0) & 0xFFFFFFFFULL;
+                        return valid_pcs.count(t0) != 0;
+                    };
+
+                    const RodataTableDesc* matched_jt = nullptr;
+                    for (auto it_jt = fn_jtabs.rbegin(); it_jt != fn_jtabs.rend(); ++it_jt) {
+                        if (it_jt->first < pc && table_matches_adr(it_jt->second)) {
+                            matched_jt = it_jt->second;
+                            break;
+                        }
+                    }
+                    if (!matched_jt) {
+                        for (const auto& jt_pair : fn_jtabs) {
+                            if (table_matches_adr(jt_pair.second)) {
+                                matched_jt = jt_pair.second;
+                                break;
+                            }
+                        }
+                    }
+                    if (matched_jt && matched_jt->offset + matched_jt->size <= m.rodata.size()) {
+                        uint32_t n_entries = matched_jt->size / 4U;
+                        for (uint32_t e = 0; e < n_entries; ++e) {
+                            int32_t rel32 = read_s32_le(&m.rodata[matched_jt->offset + e * 4U]);
+                            uint64_t t_pc = static_cast<uint64_t>(static_cast<int64_t>(adr_pc) + rel32) & 0xFFFFFFFFULL;
+                            if (valid_pcs.count(t_pc)) {
+                                jump_table_targets.insert(t_pc);
+                                block_leaders.insert(t_pc);
+                            }
+                        }
+                    }
+                }
+            }
+            if (has_indirect_br && jump_table_targets.empty()) {
+                jump_table_targets = block_leaders;
+            }
+        }
+
+        std::string full_fn_name = "lifted_" + m.label + "_" + fn;
+        std::string fn_str_sym = str_pool.intern(fn);
+        ultrs::llvm_ir::Function* ir_fn = ir_mod.create_function(full_fn_name, val, val + sz);
+
+        ultrs::llvm_ir::BasicBlock* entry_bb = ir_fn->create_block("entry", val);
+        {
+            ultrs::llvm_ir::Instruction i1;
+            i1.tag = ultrs::llvm_ir::OpTag::RawIR;
+            std::ostringstream entry_ss;
+            if (has_indirect_br || full_indirect_dispatch) {
+                entry_ss << "%ind_pc_slot = alloca i64, align 8\n"
+                         << "  store i64 0, ptr %ind_pc_slot, align 8\n  ";
+            }
+            if (instrument_calls) {
+                entry_ss << "call void @lifted_ko_trace_fn_enter(ptr %c, i32 " << m.profile_id
+                         << ", ptr " << fn_str_sym << ", i64 " << val << ")\n  ";
+            }
+            entry_ss << "br label %" << (insns.empty() ? std::string("exit_ret") : bb_label(insns.front().addr));
+            i1.text = entry_ss.str();
+            entry_bb->insts.push_back(std::move(i1));
+        }
+
+        KoFunctionIRBuilder fb(m.label, m, valid_pcs, block_leaders, str_pool, ir_fn, count_insns);
+        for (const DisasmInsn& ins : insns) {
+            fb.lift_insn_to_bb(ins);
+        }
+        fb.flush_bb_insn_count();
+
+        if (has_indirect_br || full_indirect_dispatch) {
+            ultrs::llvm_ir::BasicBlock* ind_bb = ir_fn->create_block("indirect_br_dispatch", val + sz);
+            std::ostringstream sw;
+            sw << "%ind_pc_val = load i64, ptr %ind_pc_slot, align 8\n"
+               << "  switch i64 %ind_pc_val, label %exit_ret [\n";
+            const std::set<uint64_t>& sw_targets = full_indirect_dispatch ? valid_pcs : jump_table_targets;
+            for (uint64_t pc_v : sw_targets) {
+                sw << "    i64 " << pc_v << ", label %" << bb_label(pc_v) << "\n";
+            }
+            sw << "  ]";
+            ultrs::llvm_ir::Instruction sw_inst;
+            sw_inst.tag = ultrs::llvm_ir::OpTag::RawIR;
+            sw_inst.text = sw.str();
+            ind_bb->insts.push_back(std::move(sw_inst));
+        }
+
+        ultrs::llvm_ir::BasicBlock* exit_bb = ir_fn->create_block("exit_ret", val + sz + 4);
+        {
+            ultrs::llvm_ir::Instruction ret_inst;
+            ret_inst.tag = ultrs::llvm_ir::OpTag::Return;
+            std::ostringstream ret_ss;
+            ret_ss << "%ret_x0_val = load i64, ptr %c, align 8\n"
+                   << "  %ret_w0_val = trunc i64 %ret_x0_val to i32\n"
+                   << "  %ret_sext = sext i32 %ret_w0_val to i64\n";
+            if (instrument_calls) {
+                ret_ss << "  call void @lifted_ko_trace_fn_exit(ptr %c, i32 " << m.profile_id
+                       << ", ptr " << fn_str_sym << ", i64 " << val << ", i64 %ret_sext)\n";
+            }
+            ret_ss << "  ret i64 %ret_sext";
+            ret_inst.text = ret_ss.str();
+            exit_bb->insts.push_back(std::move(ret_inst));
+        }
+    }
+}
+
 } // namespace
+
+uint32_t infer_rodata_slice_size(const ParsedKoModule& m, uint64_t off_ro) {
+    if (off_ro >= m.rodata.size()) return 4U;
+    auto it = std::upper_bound(m.ro_boundaries.begin(), m.ro_boundaries.end(), off_ro);
+    uint64_t next_b = (it != m.ro_boundaries.end()) ? *it : m.rodata.size();
+    if (next_b > m.rodata.size()) next_b = m.rodata.size();
+    uint32_t sz = (next_b > off_ro) ? static_cast<uint32_t>(next_b - off_ro) : 4U;
+    uint32_t rem = static_cast<uint32_t>(m.rodata.size() - off_ro);
+    return std::max<uint32_t>(1U, std::min<uint32_t>(sz, rem));
+}
 
 bool parse_elf64_ko(const std::string& label, const std::string& path, ParsedKoModule& out_mod, std::string& err) {
     std::ifstream f(path, std::ios::binary);
@@ -1730,8 +1978,10 @@ bool parse_elf64_ko(const std::string& label, const std::string& path, ParsedKoM
         err = "Invalid ELF64 header in: " + path;
         return false;
     }
+    out_mod = ParsedKoModule{};
     out_mod.label = label;
     out_mod.path = path;
+    out_mod.profile_id = resolve_profile_id(label);
 
     uint64_t e_shoff = read_u64_le(&data[40]);
     uint16_t e_shentsize = read_u16_le(&data[58]);
@@ -1787,6 +2037,8 @@ bool parse_elf64_ko(const std::string& label, const std::string& path, ParsedKoM
     out_mod.text.assign(data.begin() + text_sh.sh_offset, data.begin() + text_sh.sh_offset + text_sh.sh_size);
     out_mod.rodata.assign(data.begin() + ro_sh.sh_offset, data.begin() + ro_sh.sh_offset + ro_sh.sh_size);
 
+    std::set<uint64_t> ro_bounds = {0ULL, static_cast<uint64_t>(out_mod.rodata.size())};
+
     const Shdr& sym_sh = shdrs[sym_idx];
     const Shdr& str_sh = shdrs[sym_sh.sh_link];
     const char* strtab = reinterpret_cast<const char*>(&data[str_sh.sh_offset]);
@@ -1808,6 +2060,11 @@ bool parse_elf64_ko(const std::string& label, const std::string& path, ParsedKoM
         uint64_t st_size = read_u64_le(p + 16);
         std::string sname(strtab + st_name);
         syms.push_back({sname, st_info, st_shndx, st_value, st_size});
+        if (st_shndx == static_cast<uint16_t>(ro_idx)) {
+            if (st_value <= out_mod.rodata.size()) ro_bounds.insert(st_value);
+            if (st_size > 0 && st_value + st_size <= out_mod.rodata.size()) ro_bounds.insert(st_value + st_size);
+            if (!sname.empty() && sname[0] != '$') out_mod.ro_sym_by_addr[st_value] = sname;
+        }
         if (!sname.empty()) {
             out_mod.sym_by_name[sname] = {st_info, st_shndx, st_value, st_size};
             if (st_shndx == static_cast<uint16_t>(text_idx) && sname[0] != '$' &&
@@ -1834,8 +2091,109 @@ bool parse_elf64_ko(const std::string& label, const std::string& path, ParsedKoM
                         syms[r_sym].val,
                         r_addend
                     };
+                    if (syms[r_sym].shndx == static_cast<uint16_t>(ro_idx)) {
+                        int64_t target_ro = static_cast<int64_t>(syms[r_sym].val) + r_addend;
+                        if (target_ro >= 0 && static_cast<uint64_t>(target_ro) <= out_mod.rodata.size()) {
+                            ro_bounds.insert(static_cast<uint64_t>(target_ro));
+                        }
+                    }
                 }
             }
+        }
+    }
+    out_mod.ro_boundaries.assign(ro_bounds.begin(), ro_bounds.end());
+    return true;
+}
+
+bool lift_single_ko_module_to_ir(
+    const std::string& ko_path,
+    const std::string& label,
+    const std::string& out_ll_path,
+    std::string& err,
+    const std::string& out_obj_path,
+    bool full_indirect_dispatch,
+    bool count_insns,
+    bool instrument_calls) {
+    LLVMDisasmDynamic dis;
+    if (!dis.init(err)) return false;
+
+    ParsedKoModule mod;
+    if (!parse_elf64_ko(label, ko_path, mod, err)) return false;
+    discover_module_rodata_tables(mod, dis);
+
+    ultrs::llvm_ir::Module ir_mod("unified_horizon2llvm_" + label, "x86_64-pc-linux-gnu");
+    ModuleStringPool str_pool;
+    lift_parsed_module_into_ir(mod, dis, ir_mod, str_pool, full_indirect_dispatch, count_insns, instrument_calls);
+
+    {
+        ultrs::passes::PassPipelineConfig ko_cfg = ultrs::passes::PassPipelineConfig::forKernelKo();
+        ko_cfg.enable_cpu_state_promotion = false;
+        ko_cfg.enable_aapcs64_abi_contract = false;
+        ko_cfg.enable_tail_call_devirt = false;
+        ko_cfg.enable_nzcv_dead_flag_elim = false;
+        ko_cfg.enable_nzcv_fusion = false;
+        ultrs::passes::ModulePassManager mpm;
+        ultrs::passes::build_aarch64_lowering_pipeline(mpm, ko_cfg);
+        mpm.run(ir_mod);
+    }
+
+    std::ostringstream ll_ss;
+    ll_ss << "; ModuleID = 'unified_horizon2llvm_" << label << "'\n"
+          << "source_filename = \"unified_horizon2llvm_" << label << ".ll\"\n\n"
+          << "declare dso_local ptr @lifted_ko_rodata_ptr_id(ptr, i32, i32, ptr) nounwind\n"
+          << "declare dso_local void @lifted_kernel_shim_dispatch_id(ptr, i32, i32) nounwind\n"
+          << "declare dso_local void @lifted_ko_trace_fn_enter(ptr, i32, ptr, i64) nounwind\n"
+          << "declare dso_local void @lifted_ko_trace_fn_exit(ptr, i32, ptr, i64, i64) nounwind\n\n";
+
+    for (const auto& [off_ro, desc] : mod.ro_tables) {
+        ll_ss << "@" << desc.fallback_symbol << " = private unnamed_addr constant ["
+              << desc.size << " x i8] c\"";
+        for (uint32_t i = 0; i < desc.size; ++i) {
+            char b[8];
+            std::snprintf(b, sizeof(b), "\\%02X", static_cast<unsigned>(mod.rodata[desc.offset + i]));
+            ll_ss << b;
+        }
+        ll_ss << "\", align 16\n";
+    }
+    ll_ss << "\n";
+    str_pool.emit_globals(ll_ss);
+    emit_ir_flag_helpers(ll_ss);
+    ll_ss << "\n";
+
+    for (const auto& fn : ir_mod.functions) {
+        ll_ss << "; Function Attrs: nounwind\n"
+              << "define dso_local i64 @" << fn->name
+              << "(ptr noundef nonnull align 16 %c) nounwind {\n";
+        for (const auto& bb : fn->blocks) {
+            ll_ss << bb->name << ":\n";
+            for (const auto& inst : bb->insts) {
+                if (inst.dead) continue;
+                if (!inst.text.empty()) {
+                    std::string line = inst.text;
+                    auto md_pos = line.find(", !alias.scope");
+                    if (md_pos != std::string::npos) line = line.substr(0, md_pos);
+                    ll_ss << "  " << line << "\n";
+                }
+            }
+        }
+        ll_ss << "}\n\n";
+    }
+
+    std::string final_ir = ll_ss.str();
+    if (!out_ll_path.empty()) {
+        std::ofstream lf(out_ll_path, std::ios::binary);
+        if (!lf) {
+            err = "Cannot open output LLVM IR file: " + out_ll_path;
+            return false;
+        }
+        lf.write(final_ir.data(), static_cast<std::streamsize>(final_ir.size()));
+    }
+    if (!out_obj_path.empty()) {
+        auto res = ultrs::llvm_backend::process_module(
+            final_ir, "x86_64-pc-linux-gnu", true, "default<O2>", "", "", out_obj_path);
+        if (!res.ok) {
+            err = "x86_64 LLVM IR compilation failed: " + res.error_message;
+            return false;
         }
     }
     return true;
@@ -1851,20 +2209,60 @@ bool lift_ko_modules_to_c_and_ir(
     const std::string& out_obj_x86_path,
     const std::string& out_obj_arm64_path,
     bool full_indirect_dispatch,
-    bool count_insns) {
+    bool count_insns,
+    bool instrument_calls) {
     if (const char* env_full = std::getenv("HORIZON2LLVM_FULL_INDIRECT_DISPATCH")) {
         if (std::string(env_full) == "1" || std::string(env_full) == "true") {
             full_indirect_dispatch = true;
         }
     }
+    if (const char* env_inst = std::getenv("HORIZON2LLVM_INSTRUMENT_CALLS")) {
+        if (std::string(env_inst) == "0" || std::string(env_inst) == "false") {
+            instrument_calls = false;
+        } else if (std::string(env_inst) == "1" || std::string(env_inst) == "true") {
+            instrument_calls = true;
+        }
+    }
     LLVMDisasmDynamic dis;
     if (!dis.init(err)) return false;
 
-    ParsedKoModule r44_mod, husky_mod;
-    if (!parse_elf64_ko("r44p1", r44_ko_path, r44_mod, err)) return false;
-    if (!parse_elf64_ko("husky_r54p1", husky_ko_path, husky_mod, err)) return false;
+    std::vector<ParsedKoModule> parsed_mods;
+    parsed_mods.reserve(4);
 
-    const ParsedKoModule* mods[2] = {&r44_mod, &husky_mod};
+    {
+        ParsedKoModule r44_mod;
+        if (!parse_elf64_ko("r44p1", r44_ko_path, r44_mod, err)) return false;
+        discover_module_rodata_tables(r44_mod, dis);
+        parsed_mods.push_back(std::move(r44_mod));
+    }
+    {
+        ParsedKoModule husky_mod;
+        if (!parse_elf64_ko("husky_r54p1", husky_ko_path, husky_mod, err)) return false;
+        discover_module_rodata_tables(husky_mod, dis);
+        parsed_mods.push_back(std::move(husky_mod));
+    }
+
+    // Automatically discover & lift additional kernel/*.ko modules if present on disk:
+    //   - `kernel/mali_kbase_gs201_r47p0_csf_5_10_198.ko` (`gs201_r47p0`, Pixel 7 Tensor G2 r47p0 CSF 5.10.198)
+    //   - `kernel/mali_kbase_gs101_r47p0_jm_5_10_198.ko`  (`gs101_r47p0_jm`, Pixel 6 Tensor G1 r47p0 JM 5.10.198)
+    const std::pair<const char*, const char*> kExtraKoCandidates[] = {
+        {"gs201_r47p0", "kernel/mali_kbase_gs201_r47p0_csf_5_10_198.ko"},
+        {"gs101_r47p0_jm", "kernel/mali_kbase_gs101_r47p0_jm_5_10_198.ko"},
+    };
+    for (const auto& [extra_lbl, extra_path] : kExtraKoCandidates) {
+        std::ifstream test_f(extra_path, std::ios::binary);
+        if (test_f.good()) {
+            test_f.close();
+            ParsedKoModule extra_mod;
+            std::string extra_err;
+            if (parse_elf64_ko(extra_lbl, extra_path, extra_mod, extra_err)) {
+                discover_module_rodata_tables(extra_mod, dis);
+                parsed_mods.push_back(std::move(extra_mod));
+            }
+        }
+    }
+
+    const ParsedKoModule& r44_mod = parsed_mods[0];
 
     // 1. Emit `lifted_kbase_ko.h`
     std::ofstream hf(out_hdr_path, std::ios::binary);
@@ -1879,18 +2277,21 @@ bool lift_ko_modules_to_c_and_ir(
        << "#include <stdbool.h>\n"
        << "#include <stdint.h>\n"
        << "#include <stddef.h>\n"
+       << "#include <stdio.h>\n"
        << "#include \"aarch64_common_cpu_prefix.h\"\n\n"
        << "#ifdef __cplusplus\n"
        << "extern \"C\" {\n"
        << "#endif\n\n"
        << "typedef struct LiftedKbaseCPU LiftedKbaseCPU;\n"
        << "typedef void (*LiftedKbaseShimHook)(LiftedKbaseCPU *cpu, const char *ko_profile, const char *callee);\n\n"
-       << "/* Target kernel module hardware/platform profile ID (per Doc 48 comment doco.Sqmp-w0Al4UvqeikyjWXcQ) */\n"
+       << "/* Target kernel module hardware/platform profile ID */\n"
        << "enum LiftedKoProfileId {\n"
-       << "    KO_PROFILE_R44P1       = 0, /* MediaTek MT6878 Mali-G615 r44p1/r49p1 (kbase v1.21) */\n"
-       << "    KO_PROFILE_HUSKY_R54P1 = 1, /* Google Pixel 8 Pro Tensor G3 Husky Mali-G715 r54p1 (kbase v1.38) */\n"
+       << "    KO_PROFILE_R44P1          = 0, /* MediaTek MT6878 r44p1 / Pixel 7 Tensor G2 GS201 r47p0 CSF (5.10.189) */\n"
+       << "    KO_PROFILE_HUSKY_R54P1    = 1, /* Google Pixel 8 Pro Tensor G3 Husky Mali-G715 r54p1 CSF (kbase v1.38) */\n"
+       << "    KO_PROFILE_GS201_R47P0    = 2, /* Google Pixel 7 Tensor G2 GS201 Mali-G710 r47p0 CSF (5.10.198, UK 1.24) */\n"
+       << "    KO_PROFILE_GS101_R47P0_JM = 3, /* Google Pixel 6 Tensor G1 GS101 Mali-G78 r47p0 JM (5.10.198, UK 11.42) */\n"
        << "};\n\n"
-       << "/* Compile-time integer enum ID for external kernel shim callouts (per Doc 48 comment doco.fy1VMDUccXqURl_ae6DDiw) */\n"
+       << "/* Compile-time integer enum ID for external kernel shim callouts */\n"
        << "enum LiftedKernelShimId {\n"
        << "    KO_SHIM_UNKNOWN                          = 0,\n"
        << "    KO_SHIM_INDIRECT_BLR                     = 1,\n"
@@ -1917,14 +2318,35 @@ bool lift_ko_modules_to_c_and_ir(
        << "    KO_SHIM_CREATE_QUEUE_GROUP               = 22,\n"
        << "    KO_SHIM_KBASE_CSF_TILER_HEAP_INIT        = 23,\n"
        << "    KO_SHIM_NOOP_EXTERNAL                    = 24,\n"
+       << "    KO_SHIM_JD_SUBMIT_ATOM                   = 25,\n"
+       << "    KO_SHIM_JD_RUN_ATOM                      = 26,\n"
        << "};\n\n"
-       << "/*\n"
-       << " * Enclosing Kernel Heap Arena & Sanitizer State (`struct LiftedKoHeap`, per\n"
-       << " * doco.fye2LblI44z3tNk1mh5Euw, doco.mbTC_NolEN_X7AF0b4BFRQ & doco.AmlJA4WGBr86E_Cg1P7hMw).\n"
-       << " * Prepends a 16-byte `LiftedKoHeapBlockHdr` before every allocation, appends a\n"
-       << " * 16-byte `0xFE` redzone canary after every payload, poisons freed blocks with\n"
-       << " * `0x6B` (POISON_FREE), and prints a full guest + host stacktrace on any violation.\n"
-       << " */\n"
+       << "/* Debugging, Guest Stackframe Recording & Function Call Profiling Flags */\n"
+       << "#define LIFTED_KO_DEBUG_RECORD_STACKFRAMES (1U << 0)\n"
+       << "#define LIFTED_KO_DEBUG_TRACE_CALLS        (1U << 1)\n"
+       << "#define LIFTED_KO_DEBUG_PROFILE_CALLS      (1U << 2)\n"
+       << "#define LIFTED_KO_MAX_CALL_FRAMES          64U\n\n"
+       << "struct LiftedKoStackFrame {\n"
+       << "    const char *ko_profile;\n"
+       << "    const char *fn_name;\n"
+       << "    uint64_t entry_pc;\n"
+       << "    uint64_t caller_pc;\n"
+       << "    uint64_t sp;\n"
+       << "    uint64_t fp;\n"
+       << "    uint64_t lr;\n"
+       << "    uint64_t args[4];\n"
+       << "    uint64_t enter_ns;\n"
+       << "    uint64_t child_ns;\n"
+       << "};\n\n"
+       << "struct LiftedKoFnProfileEntry {\n"
+       << "    const char *ko_profile;\n"
+       << "    const char *fn_name;\n"
+       << "    uint64_t entry_pc;\n"
+       << "    uint64_t call_count;\n"
+       << "    uint64_t total_inclusive_ns;\n"
+       << "    uint64_t total_exclusive_ns;\n"
+       << "    uint64_t max_ns;\n"
+       << "};\n\n"
        << "#define LIFTED_KO_HEAP_MAGIC        0x4B414C43U\n"
        << "#define LIFTED_KO_STATE_ALLOCATED   0xA110CA7EU\n"
        << "#define LIFTED_KO_STATE_FREED       0xF2EED00DU\n"
@@ -1973,9 +2395,20 @@ bool lift_ko_modules_to_c_and_ir(
        << "    uint8_t task_struct[4096] __attribute__((aligned(16)));\n"
        << "    uint64_t cur_pc;\n"
        << "    const char *cur_fn;\n"
+       << "    uint32_t debug_flags;\n"
+       << "    uint32_t call_depth;\n"
+       << "    uint32_t max_call_depth;\n"
+       << "    struct LiftedKoStackFrame call_frames[LIFTED_KO_MAX_CALL_FRAMES];\n"
        << "};\n\n"
        << "AARCH64_STATIC_ASSERT_CPU_PREFIX(struct LiftedKbaseCPU);\n\n"
        << "void lifted_kbase_cpu_init(LiftedKbaseCPU *cpu, void *user_ctx, LiftedKbaseShimHook shim_hook);\n"
+       << "void lifted_ko_set_debug_flags(LiftedKbaseCPU *cpu, uint32_t flags);\n"
+       << "uint32_t lifted_ko_get_debug_flags(const LiftedKbaseCPU *cpu);\n"
+       << "void lifted_ko_trace_fn_enter(LiftedKbaseCPU *cpu, uint32_t profile_id, const char *fn_name, uint64_t entry_pc);\n"
+       << "void lifted_ko_trace_fn_exit(LiftedKbaseCPU *cpu, uint32_t profile_id, const char *fn_name, uint64_t entry_pc, int64_t ret_val);\n"
+       << "void lifted_ko_reset_profile(void);\n"
+       << "size_t lifted_ko_get_profile_entries(struct LiftedKoFnProfileEntry *out_entries, size_t max_entries);\n"
+       << "void lifted_ko_dump_profile(FILE *out);\n"
        << "void *lifted_ko_heap_alloc(LiftedKbaseCPU *cpu, size_t sz);\n"
        << "int lifted_ko_heap_free(LiftedKbaseCPU *cpu, void *ptr);\n"
        << "bool lifted_ko_check_mem_access(LiftedKbaseCPU *cpu, const void *ptr, size_t sz, bool is_write);\n"
@@ -1987,10 +2420,10 @@ bool lift_ko_modules_to_c_and_ir(
        << "void lifted_kernel_shim_dispatch_id(LiftedKbaseCPU *cpu, uint32_t profile_id, uint32_t shim_id);\n"
        << "void lifted_kernel_shim_dispatch(LiftedKbaseCPU *cpu, const char *ko_profile, const char *callee);\n\n";
 
-    for (const ParsedKoModule* m : mods) {
+    for (const ParsedKoModule& m : parsed_mods) {
         for (const std::string& fn : kTargetFunctions) {
-            if (m->sym_by_name.count(fn)) {
-                hf << "int64_t lifted_" << m->label << "_" << fn << "(LiftedKbaseCPU *cpu);\n";
+            if (m.sym_by_name.count(fn)) {
+                hf << "int64_t lifted_" << m.label << "_" << fn << "(LiftedKbaseCPU *cpu);\n";
             }
         }
     }
@@ -2007,578 +2440,713 @@ bool lift_ko_modules_to_c_and_ir(
        << "#endif /* LIFTED_KBASE_KO_H */\n";
     hf.close();
 
-    // 2. Emit thin runtime support file `lifted_kbase_ko.c` (ZERO lifted .ko functions in C;
-    //    all 68 lifted .ko functions live in `lifted_kbase_ko.ll` and are compiled to `.o` via LLVM!)
+    // 2. Emit thin runtime support file `lifted_kbase_ko.c`
     std::ofstream cf(out_c_path, std::ios::binary);
     if (!cf) {
         err = "Cannot open output C runtime support source: " + out_c_path;
         return false;
     }
 
-    cf << "/* Auto-generated by unified horizon2llvm (--lift-ko) — Thin Host Runtime Bridge for lifted_kbase_ko.ll.\n"
-       << " * All 68 lifted kernel functions (`lifted_r44p1_*` and `lifted_husky_r54p1_*`) are lowered directly\n"
-       << " * to SSA LLVM IR in `src/emulator/lifted_kbase_ko.ll` and compiled to `lifted_kbase_ko_ll.o` via LLVM.\n"
-       << " * This file contains ONLY the runtime support hooks (`lifted_kbase_cpu_init`, `lifted_ko_rodata_ptr`,\n"
-       << " * `lifted_ko_heap_alloc/free/check`, and `lifted_kernel_shim_dispatch`).\n"
-       << " */\n"
-       << "#include \"lifted_kbase_ko.h\"\n"
-       << "#include <fcntl.h>\n"
-       << "#include <stdlib.h>\n"
-       << "#include <string.h>\n"
-       << "#include <stdio.h>\n"
-       << "#include <sys/mman.h>\n"
-       << "#include <sys/stat.h>\n"
-       << "#include <unistd.h>\n"
-       << "#if defined(__GLIBC__)\n"
-       << "#include <execinfo.h>\n"
-       << "#endif\n\n"
-       << "struct MappedKoImage {\n"
-       << "    bool attempted;\n"
-       << "    bool valid;\n"
-       << "    const uint8_t *map_base;\n"
-       << "    size_t map_size;\n"
-       << "    const uint8_t *rodata_base;\n"
-       << "    size_t rodata_size;\n"
-       << "};\n\n"
-       << "static struct MappedKoImage g_mapped_r44p1;\n"
-       << "static struct MappedKoImage g_mapped_husky_r54p1;\n\n"
-       << "static void try_map_ko_image(struct MappedKoImage *img, const char *const *paths, size_t n_paths) {\n"
-       << "    if (img->attempted) return;\n"
-       << "    img->attempted = true;\n"
-       << "    for (size_t p = 0; p < n_paths; ++p) {\n"
-       << "        int fd = open(paths[p], O_RDONLY);\n"
-       << "        if (fd < 0) continue;\n"
-       << "        struct stat st;\n"
-       << "        if (fstat(fd, &st) != 0 || st.st_size < 128) { close(fd); continue; }\n"
-       << "        void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);\n"
-       << "        close(fd);\n"
-       << "        if (m == MAP_FAILED) continue;\n"
-       << "        const uint8_t *b = (const uint8_t *)m;\n"
-       << "        if (memcmp(b, \"\\x7f\" \"ELF\", 4) != 0) { munmap(m, (size_t)st.st_size); continue; }\n"
-       << "        uint64_t e_shoff = 0; memcpy(&e_shoff, b + 40, 8);\n"
-       << "        uint16_t e_shentsize = 0; memcpy(&e_shentsize, b + 58, 2);\n"
-       << "        uint16_t e_shnum = 0; memcpy(&e_shnum, b + 60, 2);\n"
-       << "        uint16_t e_shstrndx = 0; memcpy(&e_shstrndx, b + 62, 2);\n"
-       << "        if (e_shoff + (uint64_t)e_shnum * e_shentsize > (uint64_t)st.st_size || e_shstrndx >= e_shnum) {\n"
-       << "            munmap(m, (size_t)st.st_size);\n"
-       << "            continue;\n"
-       << "        }\n"
-       << "        uint64_t shstr_off = 0;\n"
-       << "        memcpy(&shstr_off, b + e_shoff + (size_t)e_shstrndx * e_shentsize + 24, 8);\n"
-       << "        const char *shstr = (const char *)(b + shstr_off);\n"
-       << "        for (uint16_t i = 0; i < e_shnum; ++i) {\n"
-       << "            const uint8_t *sh = b + e_shoff + (size_t)i * e_shentsize;\n"
-       << "            uint32_t sh_name = 0; memcpy(&sh_name, sh + 0, 4);\n"
-       << "            if (strcmp(shstr + sh_name, \".rodata\") == 0) {\n"
-       << "                uint64_t ro_off = 0, ro_sz = 0;\n"
-       << "                memcpy(&ro_off, sh + 24, 8);\n"
-       << "                memcpy(&ro_sz, sh + 32, 8);\n"
-       << "                if (ro_off + ro_sz <= (uint64_t)st.st_size) {\n"
-       << "                    img->map_base = b;\n"
-       << "                    img->map_size = (size_t)st.st_size;\n"
-       << "                    img->rodata_base = b + ro_off;\n"
-       << "                    img->rodata_size = (size_t)ro_sz;\n"
-       << "                    img->valid = true;\n"
-       << "                }\n"
-       << "                break;\n"
-       << "            }\n"
-       << "        }\n"
-       << "        if (img->valid) return;\n"
-       << "        munmap(m, (size_t)st.st_size);\n"
-       << "    }\n"
-       << "}\n\n"
-       << "static void ensure_ko_images_mapped(void) {\n"
-       << "    static const char *const r44_paths[] = {\n"
-       << "        \"kernel/mali_kbase_mt6878_r44p1.ko\",\n"
-       << "        \"kernel/mali_kbase_mtk.ko\",\n"
-       << "        \"mali_kbase.ko\",\n"
-       << "        \"../kernel/mali_kbase_mt6878_r44p1.ko\",\n"
-       << "        \"../mali_kbase.ko\",\n"
-       << "        \"../../mali_kbase.ko\",\n"
-       << "    };\n"
-       << "    static const char *const husky_paths[] = {\n"
-       << "        \"kernel/mali_kbase_husky_r54p1.ko\",\n"
-       << "        \"kernel/mali_kbase_husky.ko\",\n"
-       << "        \"predownloaded/mali_kbase_husky.ko\",\n"
-       << "        \"../kernel/mali_kbase_husky_r54p1.ko\",\n"
-       << "        \"../predownloaded/mali_kbase_husky.ko\",\n"
-       << "        \"../../predownloaded/mali_kbase_husky.ko\",\n"
-       << "    };\n"
-       << "    try_map_ko_image(&g_mapped_r44p1, r44_paths, sizeof(r44_paths) / sizeof(r44_paths[0]));\n"
-       << "    try_map_ko_image(&g_mapped_husky_r54p1, husky_paths, sizeof(husky_paths) / sizeof(husky_paths[0]));\n"
-       << "}\n\n"
-       << "bool lifted_ko_is_image_mapped(const char *ko_profile, size_t *out_rodata_size) {\n"
-       << "    ensure_ko_images_mapped();\n"
-       << "    const struct MappedKoImage *img = (ko_profile && strcmp(ko_profile, \"husky_r54p1\") == 0)\n"
-       << "        ? &g_mapped_husky_r54p1 : &g_mapped_r44p1;\n"
-       << "    if (out_rodata_size) *out_rodata_size = img->valid ? img->rodata_size : 0;\n"
-       << "    return img->valid;\n"
-       << "}\n\n"
-       << "const void *lifted_ko_rodata_ptr_id(LiftedKbaseCPU *cpu, uint32_t profile_id, uint32_t rodata_offset, const void *fallback_slice) {\n"
-       << "    (void)cpu;\n"
-       << "    ensure_ko_images_mapped();\n"
-       << "    const struct MappedKoImage *img = (profile_id == KO_PROFILE_HUSKY_R54P1)\n"
-       << "        ? &g_mapped_husky_r54p1 : &g_mapped_r44p1;\n"
-       << "    if (img->valid && (size_t)rodata_offset < img->rodata_size) {\n"
-       << "        return img->rodata_base + rodata_offset;\n"
-       << "    }\n"
-       << "    return fallback_slice;\n"
-       << "}\n\n"
-       << "const void *lifted_ko_rodata_ptr(LiftedKbaseCPU *cpu, const char *ko_profile, uint32_t rodata_offset, const void *fallback_slice) {\n"
-       << "    uint32_t prof_id = (ko_profile && strcmp(ko_profile, \"husky_r54p1\") == 0) ? KO_PROFILE_HUSKY_R54P1 : KO_PROFILE_R44P1;\n"
-       << "    return lifted_ko_rodata_ptr_id(cpu, prof_id, rodata_offset, fallback_slice);\n"
-       << "}\n\n"
-       << "void lifted_ko_print_stacktrace(LiftedKbaseCPU *cpu, const char *reason, const struct LiftedKoHeapBlockHdr *hdr) {\n"
-       << "    fprintf(stderr, \"[lifted_ko_violation] %s\\n\", reason ? reason : \"runtime violation\");\n"
-       << "    if (hdr) {\n"
-       << "        fprintf(stderr, \"  block seq=%u size=%u state=0x%08x\\n\", hdr->alloc_seq, hdr->payload_size, hdr->state);\n"
-       << "        fprintf(stderr, \"  allocated at guest fn=%s pc=0x%llx (host bt[0]=%p)\\n\",\n"
-       << "                hdr->alloc_fn ? hdr->alloc_fn : \"<unknown>\", (unsigned long long)hdr->alloc_guest_pc, hdr->alloc_host_bt[0]);\n"
-       << "        if (hdr->free_guest_pc || hdr->free_fn || hdr->free_host_bt[0]) {\n"
-       << "            fprintf(stderr, \"  freed     at guest fn=%s pc=0x%llx (host bt[0]=%p)\\n\",\n"
-       << "                    hdr->free_fn ? hdr->free_fn : \"<unknown>\", (unsigned long long)hdr->free_guest_pc, hdr->free_host_bt[0]);\n"
-       << "        }\n"
-       << "    }\n"
-       << "    if (cpu) {\n"
-       << "        fprintf(stderr, \"  guest trace: cur_fn=%s cur_pc=0x%llx lr(x30)=0x%llx\\n\",\n"
-       << "                cpu->cur_fn ? cpu->cur_fn : \"<top>\", (unsigned long long)cpu->cur_pc, (unsigned long long)cpu->x[30]);\n"
-       << "        uintptr_t scs_base = (uintptr_t)&cpu->scs_stack[0];\n"
-       << "        if (cpu->x18 > scs_base && cpu->x18 <= scs_base + sizeof(cpu->scs_stack)) {\n"
-       << "            size_t depth = (cpu->x18 - scs_base) / sizeof(uint64_t);\n"
-       << "            for (size_t i = depth; i > 0; --i) {\n"
-       << "                fprintf(stderr, \"    scs[%zu] = 0x%llx\\n\", i - 1, (unsigned long long)cpu->scs_stack[i - 1]);\n"
-       << "            }\n"
-       << "        }\n"
-       << "    }\n"
-       << "#if defined(__GLIBC__)\n"
-       << "    void *bt[8];\n"
-       << "    int n = backtrace(bt, 8);\n"
-       << "    char **syms = backtrace_symbols(bt, n);\n"
-       << "    if (syms) {\n"
-       << "        for (int i = 0; i < n; ++i) fprintf(stderr, \"  host[%d] %s\\n\", i, syms[i]);\n"
-       << "        free(syms);\n"
-       << "    }\n"
-       << "#endif\n"
-       << "}\n\n"
-       << "static bool check_redzone_intact(const struct LiftedKoHeapBlockHdr *hdr) {\n"
-       << "    size_t aligned_sz = ((size_t)hdr->payload_size + 15U) & ~15ULL;\n"
-       << "    const uint8_t *rz = (const uint8_t *)hdr + sizeof(struct LiftedKoHeapBlockHdr) + aligned_sz;\n"
-       << "    for (size_t i = 0; i < 16U; ++i) {\n"
-       << "        if (rz[i] != LIFTED_KO_REDZONE_BYTE) return false;\n"
-       << "    }\n"
-       << "    return true;\n"
-       << "}\n\n"
-       << "void *lifted_ko_heap_alloc(LiftedKbaseCPU *cpu, size_t sz) {\n"
-       << "    size_t aligned_sz = (sz + 15U) & ~15ULL;\n"
-       << "    size_t total = sizeof(struct LiftedKoHeapBlockHdr) + aligned_sz + 16U;\n"
-       << "    if (!cpu || (size_t)cpu->heap.used + total > sizeof(cpu->heap.arena)) {\n"
-       << "        if (cpu) lifted_ko_print_stacktrace(cpu, \"HEAP ARENA EXHAUSTION in lifted_ko_heap_alloc\", NULL);\n"
-       << "        return NULL;\n"
-       << "    }\n"
-       << "    uint8_t *base = &cpu->heap.arena[cpu->heap.used];\n"
-       << "    struct LiftedKoHeapBlockHdr *hdr = (struct LiftedKoHeapBlockHdr *)base;\n"
-       << "    memset(hdr, 0, sizeof(*hdr));\n"
-       << "    hdr->magic = LIFTED_KO_HEAP_MAGIC;\n"
-       << "    hdr->state = LIFTED_KO_STATE_ALLOCATED;\n"
-       << "    hdr->payload_size = (uint32_t)sz;\n"
-       << "    hdr->alloc_seq = ++cpu->heap.alloc_count;\n"
-       << "    hdr->alloc_guest_pc = cpu->cur_pc ? cpu->cur_pc : cpu->x[30];\n"
-       << "    hdr->alloc_fn = cpu->cur_fn ? cpu->cur_fn : \"kmalloc\";\n"
-       << "    hdr->alloc_host_bt[0] = __builtin_return_address(0);\n"
-       << "#if defined(__GLIBC__)\n"
-       << "    (void)backtrace(hdr->alloc_host_bt, 4);\n"
-       << "#endif\n"
-       << "    void *payload = base + sizeof(struct LiftedKoHeapBlockHdr);\n"
-       << "    memset(payload, 0, aligned_sz);\n"
-       << "    memset((uint8_t *)payload + aligned_sz, LIFTED_KO_REDZONE_BYTE, 16U);\n"
-       << "    cpu->heap.used += (uint32_t)total;\n"
-       << "    return payload;\n"
-       << "}\n\n"
-       << "int lifted_ko_heap_free(LiftedKbaseCPU *cpu, void *ptr) {\n"
-       << "    if (!cpu || !ptr) return 0;\n"
-       << "    uintptr_t p = (uintptr_t)ptr;\n"
-       << "    uintptr_t arena_lo = (uintptr_t)&cpu->heap.arena[0];\n"
-       << "    uintptr_t arena_hi = arena_lo + sizeof(cpu->heap.arena);\n"
-       << "    if (p < arena_lo + sizeof(struct LiftedKoHeapBlockHdr) || p >= arena_hi) {\n"
-       << "        lifted_ko_print_stacktrace(cpu, \"OUT-OF-ARENA pointer passed to lifted_ko_heap_free\", NULL);\n"
-       << "        return -1;\n"
-       << "    }\n"
-       << "    struct LiftedKoHeapBlockHdr *hdr = (struct LiftedKoHeapBlockHdr *)(p - sizeof(struct LiftedKoHeapBlockHdr));\n"
-       << "    if (hdr->magic != LIFTED_KO_HEAP_MAGIC) {\n"
-       << "        lifted_ko_print_stacktrace(cpu, \"HEAP HEADER MAGIC CORRUPTION detected in lifted_ko_heap_free\", hdr);\n"
-       << "        return -1;\n"
-       << "    }\n"
-       << "    if (hdr->state == LIFTED_KO_STATE_FREED) {\n"
-       << "        cpu->heap.double_free_errors++;\n"
-       << "        lifted_ko_print_stacktrace(cpu, \"DOUBLE-FREE detected in lifted_ko_heap_free\", hdr);\n"
-       << "        return -1;\n"
-       << "    }\n"
-       << "    if (!check_redzone_intact(hdr)) {\n"
-       << "        cpu->heap.uaf_errors++;\n"
-       << "        lifted_ko_print_stacktrace(cpu, \"REDZONE CANARY CORRUPTION detected in lifted_ko_heap_free\", hdr);\n"
-       << "        return -1;\n"
-       << "    }\n"
-       << "    hdr->state = LIFTED_KO_STATE_FREED;\n"
-       << "    hdr->free_guest_pc = cpu->cur_pc ? cpu->cur_pc : cpu->x[30];\n"
-       << "    hdr->free_fn = cpu->cur_fn ? cpu->cur_fn : \"kfree\";\n"
-       << "    hdr->free_host_bt[0] = __builtin_return_address(0);\n"
-       << "#if defined(__GLIBC__)\n"
-       << "    (void)backtrace(hdr->free_host_bt, 4);\n"
-       << "#endif\n"
-       << "    size_t aligned_sz = ((size_t)hdr->payload_size + 15U) & ~15ULL;\n"
-       << "    memset(ptr, LIFTED_KO_POISON_FREE_BYTE, aligned_sz);\n"
-       << "    cpu->heap.free_count++;\n"
-       << "    return 0;\n"
-       << "}\n\n"
-       << "bool lifted_ko_check_mem_access(LiftedKbaseCPU *cpu, const void *ptr, size_t sz, bool is_write) {\n"
-       << "    (void)is_write;\n"
-       << "    if (!cpu || !ptr || sz == 0) return false;\n"
-       << "    uintptr_t p = (uintptr_t)ptr;\n"
-       << "    uintptr_t arena_lo = (uintptr_t)&cpu->heap.arena[0];\n"
-       << "    uintptr_t arena_hi = arena_lo + cpu->heap.used;\n"
-       << "    if (p >= arena_lo && p < arena_hi) {\n"
-       << "        size_t off = 0;\n"
-       << "        while (off + sizeof(struct LiftedKoHeapBlockHdr) <= cpu->heap.used) {\n"
-       << "            struct LiftedKoHeapBlockHdr *hdr = (struct LiftedKoHeapBlockHdr *)&cpu->heap.arena[off];\n"
-       << "            if (hdr->magic != LIFTED_KO_HEAP_MAGIC) {\n"
-       << "                lifted_ko_print_stacktrace(cpu, \"HEAP HEADER MAGIC CORRUPTION in lifted_ko_check_mem_access\", hdr);\n"
-       << "                break;\n"
-       << "            }\n"
-       << "            size_t aligned_sz = ((size_t)hdr->payload_size + 15U) & ~15ULL;\n"
-       << "            uintptr_t blk_lo = arena_lo + off + sizeof(struct LiftedKoHeapBlockHdr);\n"
-       << "            uintptr_t blk_hi = blk_lo + aligned_sz;\n"
-       << "            if (p >= blk_lo && p < blk_hi) {\n"
-       << "                if (hdr->state == LIFTED_KO_STATE_FREED || p + sz > blk_lo + hdr->payload_size || !check_redzone_intact(hdr)) {\n"
-       << "                    cpu->heap.uaf_errors++;\n"
-       << "                    lifted_ko_print_stacktrace(cpu, \"USE-AFTER-FREE / OOB / REDZONE VIOLATION detected in lifted_ko_check_mem_access\", hdr);\n"
-       << "                    return false;\n"
-       << "                }\n"
-       << "                return true;\n"
-       << "            }\n"
-       << "            off += sizeof(struct LiftedKoHeapBlockHdr) + aligned_sz + 16U;\n"
-       << "        }\n"
-       << "        cpu->heap.uaf_errors++;\n"
-       << "        lifted_ko_print_stacktrace(cpu, \"UNALLOCATED / HEADER-ZONE ACCESS in lifted_ko_check_mem_access\", NULL);\n"
-       << "        return false;\n"
-       << "    }\n"
-       << "    return true;\n"
-       << "}\n\n"
-       << "void lifted_kbase_cpu_init(LiftedKbaseCPU *cpu, void *user_ctx, LiftedKbaseShimHook shim_hook) {\n"
-       << "    memset(cpu, 0, sizeof(*cpu));\n"
-       << "    cpu->sp = (uintptr_t)&cpu->stack[sizeof(cpu->stack) - 256];\n"
-       << "    cpu->x18 = (uintptr_t)&cpu->scs_stack[0];\n"
-       << "    cpu->sp_el0 = (uintptr_t)&cpu->task_struct[0];\n"
-       << "    cpu->totalram_pages = 2097152ULL; /* 8 GiB in 4K pages */\n"
-       << "    cpu->user_ctx = user_ctx;\n"
-       << "    cpu->shim_hook = shim_hook;\n"
-       << "    /* Linux kernel addr_limit / thread_info.flags = 0 (no TIF_32BIT) */\n"
-       << "    *(uint64_t *)(&cpu->task_struct[16]) = ~0ULL;\n"
-       << "    /* Direct self-linked list_head for kbase_device_get_list */\n"
-       << "    cpu->dev_list_head[0] = (uintptr_t)&cpu->dev_list_head[0];\n"
-       << "    cpu->dev_list_head[1] = (uintptr_t)&cpu->dev_list_head[0];\n"
-       << "    ensure_ko_images_mapped();\n"
-       << "}\n\n"
-       << "const char *lifted_kernel_shim_id_name(uint32_t shim_id) {\n"
-       << "    switch ((enum LiftedKernelShimId)shim_id) {\n"
-       << "    case KO_SHIM_INDIRECT_BLR:                    return \"__indirect_blr\";\n"
-       << "    case KO_SHIM_KMALLOC:                         return \"__kmalloc\";\n"
-       << "    case KO_SHIM_KMALLOC_TRACE:                   return \"kmalloc_trace\";\n"
-       << "    case KO_SHIM_KFREE:                           return \"kfree\";\n"
-       << "    case KO_SHIM_MEMSET:                          return \"memset\";\n"
-       << "    case KO_SHIM_MEMCPY:                          return \"memcpy\";\n"
-       << "    case KO_SHIM_COPY_FROM_USER:                  return \"_copy_from_user\";\n"
-       << "    case KO_SHIM_COPY_TO_USER:                    return \"_copy_to_user\";\n"
-       << "    case KO_SHIM_CHECK_OBJECT_SIZE:               return \"__check_object_size\";\n"
-       << "    case KO_SHIM_SW_HWEIGHT64:                    return \"__sw_hweight64\";\n"
-       << "    case KO_SHIM_KBASE_HAS_EXEC_VA_ZONE:          return \"kbase_has_exec_va_zone\";\n"
-       << "    case KO_SHIM_SCNPRINTF:                       return \"scnprintf\";\n"
-       << "    case KO_SHIM_KBASE_DEVICE_GET_LIST:           return \"kbase_device_get_list\";\n"
-       << "    case KO_SHIM_KBASE_CREATE_CONTEXT:            return \"kbase_create_context\";\n"
-       << "    case KO_SHIM_KBASE_DESTROY_CONTEXT:           return \"kbase_destroy_context\";\n"
-       << "    case KO_SHIM_KBASE_MEM_POOL_ALLOC_PAGES:      return \"kbase_mem_pool_alloc_pages\";\n"
-       << "    case KO_SHIM_KERNEL_MAP_USER_IO_PAGES:        return \"kernel_map_user_io_pages\";\n"
-       << "    case KO_SHIM_KBASE_MEM_ALLOC:                 return \"kbase_mem_alloc\";\n"
-       << "    case KO_SHIM_KBASE_MEM_ALIAS:                 return \"kbase_mem_alias\";\n"
-       << "    case KO_SHIM_KBASE_CSF_FIRMWARE_GET_GLB_IFACE: return \"kbase_csf_firmware_get_glb_iface\";\n"
-       << "    case KO_SHIM_CSF_QUEUE_REGISTER_INTERNAL:     return \"csf_queue_register_internal\";\n"
-       << "    case KO_SHIM_CREATE_QUEUE_GROUP:              return \"create_queue_group\";\n"
-       << "    case KO_SHIM_KBASE_CSF_TILER_HEAP_INIT:       return \"kbase_csf_tiler_heap_init\";\n"
-       << "    case KO_SHIM_NOOP_EXTERNAL:                   return \"__noop_external\";\n"
-       << "    default:                                      return \"unknown\";\n"
-       << "    }\n"
-       << "}\n\n"
-       << "void lifted_kernel_shim_dispatch_id(LiftedKbaseCPU *cpu, uint32_t profile_id, uint32_t shim_id) {\n"
-       << "    const char *ko_profile = (profile_id == KO_PROFILE_HUSKY_R54P1) ? \"husky_r54p1\" : \"r44p1\";\n"
-       << "    switch ((enum LiftedKernelShimId)shim_id) {\n"
-       << "    case KO_SHIM_KMALLOC:\n"
-       << "    case KO_SHIM_KMALLOC_TRACE: {\n"
-       << "        size_t sz = (shim_id == KO_SHIM_KMALLOC_TRACE) ? (size_t)cpu->x[2] : (size_t)cpu->x[0];\n"
-       << "        if (sz == 0) sz = 64;\n"
-       << "        void *ptr = lifted_ko_heap_alloc(cpu, sz);\n"
-       << "        cpu->x[0] = (uintptr_t)ptr;\n"
-       << "        return;\n"
-       << "    }\n"
-       << "    case KO_SHIM_KFREE:\n"
-       << "        (void)lifted_ko_heap_free(cpu, (void *)(uintptr_t)cpu->x[0]);\n"
-       << "        cpu->x[0] = 0;\n"
-       << "        return;\n"
-       << "    case KO_SHIM_MEMSET:\n"
-       << "        if (cpu->x[0] && cpu->x[2]) memset((void *)(uintptr_t)cpu->x[0], (int)(cpu->x[1] & 0xFF), (size_t)cpu->x[2]);\n"
-       << "        return;\n"
-       << "    case KO_SHIM_MEMCPY:\n"
-       << "        if (cpu->x[0] && cpu->x[1] && cpu->x[2]) memcpy((void *)(uintptr_t)cpu->x[0], (const void *)(uintptr_t)cpu->x[1], (size_t)cpu->x[2]);\n"
-       << "        return;\n"
-       << "    case KO_SHIM_COPY_FROM_USER:\n"
-       << "    case KO_SHIM_COPY_TO_USER:\n"
-       << "        if (cpu->x[0] && cpu->x[1] && cpu->x[2]) {\n"
-       << "            memcpy((void *)(uintptr_t)cpu->x[0], (const void *)(uintptr_t)cpu->x[1], (size_t)cpu->x[2]);\n"
-       << "            cpu->x[0] = 0;\n"
-       << "        } else {\n"
-       << "            cpu->x[0] = cpu->x[2];\n"
-       << "        }\n"
-       << "        return;\n"
-       << "    case KO_SHIM_CHECK_OBJECT_SIZE:\n"
-       << "        cpu->x[0] = 0;\n"
-       << "        return;\n"
-       << "    case KO_SHIM_SW_HWEIGHT64:\n"
-       << "        cpu->x[0] = (uint64_t)__builtin_popcountll(cpu->x[0]);\n"
-       << "        return;\n"
-       << "    case KO_SHIM_KBASE_HAS_EXEC_VA_ZONE: {\n"
-       << "        uint64_t v = *(uint64_t *)((uintptr_t)cpu->x[0] + 37072 + 192);\n"
-       << "        cpu->x[0] = (v != ~0ULL && v != 0ULL) ? 1ULL : 0ULL;\n"
-       << "        return;\n"
-       << "    }\n"
-       << "    case KO_SHIM_SCNPRINTF:\n"
-       << "        cpu->x[0] = 16ULL;\n"
-       << "        return;\n"
-       << "    case KO_SHIM_NOOP_EXTERNAL:\n"
-       << "        cpu->x[0] = 0;\n"
-       << "        return;\n"
-       << "    default:\n"
-       << "        if (cpu->shim_hook) {\n"
-       << "            cpu->shim_hook(cpu, ko_profile, lifted_kernel_shim_id_name(shim_id));\n"
-       << "            return;\n"
-       << "        }\n"
-       << "        cpu->x[0] = 0;\n"
-       << "        return;\n"
-       << "    }\n"
-       << "}\n\n"
-       << "void lifted_kernel_shim_dispatch(LiftedKbaseCPU *cpu, const char *ko_profile, const char *callee) {\n"
-       << "    uint32_t prof_id = (ko_profile && strcmp(ko_profile, \"husky_r54p1\") == 0) ? KO_PROFILE_HUSKY_R54P1 : KO_PROFILE_R44P1;\n"
-       << "    if (!callee) { cpu->x[0] = 0; return; }\n"
-       << "    if (strcmp(callee, \"__kmalloc\") == 0 || strcmp(callee, \"vzalloc\") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_KMALLOC); return; }\n"
-       << "    if (strcmp(callee, \"kmalloc_trace\") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_KMALLOC_TRACE); return; }\n"
-       << "    if (strcmp(callee, \"kfree\") == 0 || strcmp(callee, \"vfree\") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_KFREE); return; }\n"
-       << "    if (strcmp(callee, \"memset\") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_MEMSET); return; }\n"
-       << "    if (strcmp(callee, \"memcpy\") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_MEMCPY); return; }\n"
-       << "    if (strcmp(callee, \"__arch_copy_from_user\") == 0 || strncmp(callee, \"_copy_from_user\", 15) == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_COPY_FROM_USER); return; }\n"
-       << "    if (strcmp(callee, \"__arch_copy_to_user\") == 0 || strncmp(callee, \"_copy_to_user\", 13) == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_COPY_TO_USER); return; }\n"
-       << "    if (strcmp(callee, \"__check_object_size\") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_CHECK_OBJECT_SIZE); return; }\n"
-       << "    if (strcmp(callee, \"__sw_hweight64\") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_SW_HWEIGHT64); return; }\n"
-       << "    if (strcmp(callee, \"kbase_has_exec_va_zone\") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_KBASE_HAS_EXEC_VA_ZONE); return; }\n"
-       << "    if (strcmp(callee, \"scnprintf\") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_SCNPRINTF); return; }\n"
-       << "    if (cpu->shim_hook) { cpu->shim_hook(cpu, ko_profile, callee); return; }\n"
-       << "    cpu->x[0] = 0;\n"
-       << "}\n";
+    cf << R"C(/* Auto-generated by unified horizon2llvm (--lift-ko) — Thin Host Runtime Bridge for lifted_kbase_ko.ll.
+ * All lifted kernel functions across all .ko profiles (`lifted_r44p1_*`, `lifted_husky_r54p1_*`,
+ * `lifted_gs201_r47p0_*`, `lifted_gs101_r47p0_jm_*`) are lowered directly to SSA LLVM IR in
+ * `src/emulator/lifted_kbase_ko.ll` and compiled to `lifted_kbase_ko_*.o` via LLVM.
+ * This file contains ONLY the runtime support hooks (`lifted_kbase_cpu_init`, `lifted_ko_rodata_ptr`,
+ * `lifted_ko_trace_fn_enter/exit`, `lifted_ko_dump_profile`, `lifted_ko_heap_alloc/free/check`,
+ * and `lifted_kernel_shim_dispatch`).
+ */
+#include "lifted_kbase_ko.h"
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <time.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#if defined(__GLIBC__)
+#include <execinfo.h>
+#endif
 
-    // Emit external fallback slices (used only if .ko files are not on disk at runtime)
-    for (const auto& kv : kRodataTableMap) {
-        const std::string& label = kv.first.first;
-        const RodataTableDesc& desc = kv.second;
-        const ParsedKoModule& m = (label == "r44p1") ? r44_mod : husky_mod;
-        cf << "\n__attribute__((visibility(\"hidden\"), aligned(16))) const uint8_t " << desc.fallback_symbol << "[" << desc.size << "] = {\n";
-        for (uint32_t i = 0; i < desc.size; i += 16) {
-            cf << "    ";
-            uint32_t lim = std::min(desc.size, i + 16U);
-            for (uint32_t j = i; j < lim; ++j) {
-                char b[16];
-                std::snprintf(b, sizeof(b), "0x%02x", m.rodata[desc.offset + j]);
-                cf << b << (j + 1 < lim ? ", " : ",");
-            }
-            cf << "\n";
+struct MappedKoImage {
+    bool attempted;
+    bool valid;
+    const uint8_t *map_base;
+    size_t map_size;
+    const uint8_t *rodata_base;
+    size_t rodata_size;
+};
+
+static struct MappedKoImage g_mapped_r44p1;
+static struct MappedKoImage g_mapped_husky_r54p1;
+static struct MappedKoImage g_mapped_gs201_r47p0;
+static struct MappedKoImage g_mapped_gs101_r47p0_jm;
+
+static uint64_t ko_monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static uint32_t g_ko_env_debug_flags = 0;
+static bool g_ko_env_debug_checked = false;
+static size_t g_ko_profile_top_n = 0;
+
+#define LIFTED_KO_MAX_PROFILE_FUNCS 256U
+static struct LiftedKoFnProfileEntry g_ko_profile_table[LIFTED_KO_MAX_PROFILE_FUNCS];
+static size_t g_ko_profile_count = 0;
+
+static const char *ko_profile_id_str(uint32_t profile_id) {
+    switch ((enum LiftedKoProfileId)profile_id) {
+    case KO_PROFILE_HUSKY_R54P1:    return "husky_r54p1";
+    case KO_PROFILE_GS201_R47P0:    return "gs201_r47p0";
+    case KO_PROFILE_GS101_R47P0_JM: return "gs101_r47p0_jm";
+    case KO_PROFILE_R44P1:
+    default:                        return "r44p1";
+    }
+}
+
+static uint32_t ko_profile_str_to_id(const char *ko_profile) {
+    if (!ko_profile) return KO_PROFILE_R44P1;
+    if (strcmp(ko_profile, "husky_r54p1") == 0) return KO_PROFILE_HUSKY_R54P1;
+    if (strcmp(ko_profile, "gs201_r47p0") == 0) return KO_PROFILE_GS201_R47P0;
+    if (strcmp(ko_profile, "gs101_r47p0_jm") == 0) return KO_PROFILE_GS101_R47P0_JM;
+    return KO_PROFILE_R44P1;
+}
+
+static bool env_flag_on(const char *name) {
+    const char *v = getenv(name);
+    return v && v[0] && strcmp(v, "0") != 0 && strcmp(v, "false") != 0;
+}
+
+static void ensure_ko_debug_env_initialized(void) {
+    if (g_ko_env_debug_checked) return;
+    g_ko_env_debug_checked = true;
+    uint32_t flags = 0;
+    const char *raw_mask = getenv("LIFTED_KO_DEBUG_FLAGS");
+    if (!raw_mask || !raw_mask[0]) raw_mask = getenv("MALI_KO_DEBUG_FLAGS");
+    if (raw_mask && raw_mask[0]) {
+        flags |= (uint32_t)strtoul(raw_mask, NULL, 0) & 0x7U;
+    }
+    if (env_flag_on("LIFTED_KO_RECORD_STACKFRAMES") || env_flag_on("LIFTED_KO_STACK_TRACE") ||
+        env_flag_on("MALI_KO_RECORD_STACKFRAMES") || env_flag_on("MALI_LIFTED_RECORD_STACKFRAMES")) {
+        flags |= LIFTED_KO_DEBUG_RECORD_STACKFRAMES;
+    }
+    if (env_flag_on("LIFTED_KO_TRACE_CALLS") || env_flag_on("MALI_KO_TRACE_CALLS") ||
+        env_flag_on("MALI_LIFTED_TRACE_CALLS")) {
+        flags |= (LIFTED_KO_DEBUG_RECORD_STACKFRAMES | LIFTED_KO_DEBUG_TRACE_CALLS);
+    }
+    if (env_flag_on("LIFTED_KO_PROFILE_CALLS") || env_flag_on("MALI_KO_PROFILE_CALLS") ||
+        env_flag_on("MALI_LIFTED_PROFILE_CALLS")) {
+        flags |= (LIFTED_KO_DEBUG_RECORD_STACKFRAMES | LIFTED_KO_DEBUG_PROFILE_CALLS);
+    }
+    const char *top_n_env = getenv("LIFTED_KO_PROFILE_TOP_N");
+    if (!top_n_env || !top_n_env[0]) top_n_env = getenv("MALI_KO_PROFILE_TOP_N");
+    if (top_n_env && top_n_env[0]) {
+        g_ko_profile_top_n = (size_t)strtoull(top_n_env, NULL, 0);
+        if (g_ko_profile_top_n > 0) {
+            flags |= (LIFTED_KO_DEBUG_RECORD_STACKFRAMES | LIFTED_KO_DEBUG_PROFILE_CALLS);
         }
-        cf << "};\n";
+    }
+    if (flags & (LIFTED_KO_DEBUG_TRACE_CALLS | LIFTED_KO_DEBUG_PROFILE_CALLS)) {
+        flags |= LIFTED_KO_DEBUG_RECORD_STACKFRAMES;
+    }
+    g_ko_env_debug_flags = flags;
+}
+
+void lifted_ko_set_debug_flags(LiftedKbaseCPU *cpu, uint32_t flags) {
+    ensure_ko_debug_env_initialized();
+    if (flags & (LIFTED_KO_DEBUG_TRACE_CALLS | LIFTED_KO_DEBUG_PROFILE_CALLS)) {
+        flags |= LIFTED_KO_DEBUG_RECORD_STACKFRAMES;
+    }
+    if (cpu) cpu->debug_flags = flags;
+    else g_ko_env_debug_flags = flags;
+}
+
+uint32_t lifted_ko_get_debug_flags(const LiftedKbaseCPU *cpu) {
+    ensure_ko_debug_env_initialized();
+    return (cpu ? cpu->debug_flags : 0U) | g_ko_env_debug_flags;
+}
+
+void lifted_ko_reset_profile(void) {
+    memset(g_ko_profile_table, 0, sizeof(g_ko_profile_table));
+    g_ko_profile_count = 0;
+}
+
+size_t lifted_ko_get_profile_entries(struct LiftedKoFnProfileEntry *out_entries, size_t max_entries) {
+    size_t n = (g_ko_profile_count < max_entries) ? g_ko_profile_count : max_entries;
+    if (out_entries && n > 0) {
+        memcpy(out_entries, g_ko_profile_table, n * sizeof(struct LiftedKoFnProfileEntry));
+    }
+    return g_ko_profile_count;
+}
+
+static int cmp_ko_profile_desc(const void *a, const void *b) {
+    const struct LiftedKoFnProfileEntry *ea = (const struct LiftedKoFnProfileEntry *)a;
+    const struct LiftedKoFnProfileEntry *eb = (const struct LiftedKoFnProfileEntry *)b;
+    if (ea->total_inclusive_ns != eb->total_inclusive_ns)
+        return (ea->total_inclusive_ns < eb->total_inclusive_ns) ? 1 : -1;
+    if (ea->call_count != eb->call_count)
+        return (ea->call_count < eb->call_count) ? 1 : -1;
+    return 0;
+}
+
+void lifted_ko_dump_profile(FILE *out) {
+    if (!out) out = stderr;
+    ensure_ko_debug_env_initialized();
+    struct LiftedKoFnProfileEntry sorted[LIFTED_KO_MAX_PROFILE_FUNCS];
+    size_t total = g_ko_profile_count < LIFTED_KO_MAX_PROFILE_FUNCS ? g_ko_profile_count : LIFTED_KO_MAX_PROFILE_FUNCS;
+    if (total > 0) {
+        memcpy(sorted, g_ko_profile_table, total * sizeof(struct LiftedKoFnProfileEntry));
+        qsort(sorted, total, sizeof(struct LiftedKoFnProfileEntry), cmp_ko_profile_desc);
+    }
+    size_t show_n = total;
+    if (g_ko_profile_top_n > 0 && g_ko_profile_top_n < show_n) {
+        show_n = g_ko_profile_top_n;
+    }
+    fprintf(out, "================================================================================\n");
+    fprintf(out, " [Lifted mali_kbase.ko Profiler] Function Call & Latency Summary (showing %zu/%zu functions)\n", show_n, total);
+    fprintf(out, " %-16s %-42s %8s %12s %12s %10s\n",
+            "Profile", "Function", "Calls", "Incl (ns)", "Excl (ns)", "Max (ns)");
+    fprintf(out, "--------------------------------------------------------------------------------\n");
+    for (size_t i = 0; i < show_n; ++i) {
+        const struct LiftedKoFnProfileEntry *e = &sorted[i];
+        fprintf(out, " %-16s %-42s %8llu %12llu %12llu %10llu\n",
+                e->ko_profile ? e->ko_profile : "r44p1",
+                e->fn_name ? e->fn_name : "<unknown>",
+                (unsigned long long)e->call_count,
+                (unsigned long long)e->total_inclusive_ns,
+                (unsigned long long)e->total_exclusive_ns,
+                (unsigned long long)e->max_ns);
+    }
+    fprintf(out, "================================================================================\n");
+}
+
+void lifted_ko_trace_fn_enter(LiftedKbaseCPU *cpu, uint32_t profile_id, const char *fn_name, uint64_t entry_pc) {
+    if (!cpu) return;
+    ensure_ko_debug_env_initialized();
+    uint64_t prev_pc = cpu->cur_pc;
+    cpu->cur_fn = fn_name;
+    cpu->cur_pc = entry_pc;
+    uint32_t flags = cpu->debug_flags | g_ko_env_debug_flags;
+    if (__builtin_expect(flags == 0U, 1)) return;
+
+    const char *prof_str = ko_profile_id_str(profile_id);
+    uint64_t now_ns = (flags & (LIFTED_KO_DEBUG_TRACE_CALLS | LIFTED_KO_DEBUG_PROFILE_CALLS)) ? ko_monotonic_ns() : 0ULL;
+    uint32_t depth = cpu->call_depth;
+    if (depth < LIFTED_KO_MAX_CALL_FRAMES) {
+        struct LiftedKoStackFrame *fr = &cpu->call_frames[depth];
+        fr->ko_profile = prof_str;
+        fr->fn_name = fn_name;
+        fr->entry_pc = entry_pc;
+        fr->caller_pc = prev_pc ? prev_pc : cpu->x[30];
+        fr->sp = cpu->sp;
+        fr->fp = cpu->x[29];
+        fr->lr = cpu->x[30];
+        fr->args[0] = cpu->x[0];
+        fr->args[1] = cpu->x[1];
+        fr->args[2] = cpu->x[2];
+        fr->args[3] = cpu->x[3];
+        fr->enter_ns = now_ns;
+        fr->child_ns = 0ULL;
+    }
+    cpu->call_depth = depth + 1U;
+    if (cpu->call_depth > cpu->max_call_depth) {
+        cpu->max_call_depth = cpu->call_depth;
+    }
+    if (flags & LIFTED_KO_DEBUG_TRACE_CALLS) {
+        fprintf(stderr, "[KO_TRACE] %*s-> %s::%s(x0=0x%llx, x1=0x%llx, x2=0x%llx) [pc=0x%06llx sp=0x%llx lr=0x%llx depth=%u]\n",
+                (int)(depth * 2U), "", prof_str, fn_name ? fn_name : "<fn>",
+                (unsigned long long)cpu->x[0], (unsigned long long)cpu->x[1], (unsigned long long)cpu->x[2],
+                (unsigned long long)entry_pc, (unsigned long long)cpu->sp, (unsigned long long)cpu->x[30], depth);
+    }
+}
+
+void lifted_ko_trace_fn_exit(LiftedKbaseCPU *cpu, uint32_t profile_id, const char *fn_name, uint64_t entry_pc, int64_t ret_val) {
+    if (!cpu) return;
+    uint32_t flags = cpu->debug_flags | g_ko_env_debug_flags;
+    if (__builtin_expect(flags == 0U, 1)) return;
+
+    const char *prof_str = ko_profile_id_str(profile_id);
+    uint64_t now_ns = (flags & (LIFTED_KO_DEBUG_TRACE_CALLS | LIFTED_KO_DEBUG_PROFILE_CALLS)) ? ko_monotonic_ns() : 0ULL;
+    uint64_t elapsed_ns = 0ULL;
+    uint64_t excl_ns = 0ULL;
+
+    if (cpu->call_depth > 0U) {
+        cpu->call_depth--;
+        uint32_t idx = cpu->call_depth;
+        if (idx < LIFTED_KO_MAX_CALL_FRAMES) {
+            struct LiftedKoStackFrame *fr = &cpu->call_frames[idx];
+            if (now_ns >= fr->enter_ns && fr->enter_ns != 0ULL) {
+                elapsed_ns = now_ns - fr->enter_ns;
+                excl_ns = (elapsed_ns >= fr->child_ns) ? (elapsed_ns - fr->child_ns) : 0ULL;
+            }
+            if (idx > 0U) {
+                cpu->call_frames[idx - 1U].child_ns += elapsed_ns;
+                cpu->cur_fn = cpu->call_frames[idx - 1U].fn_name;
+                cpu->cur_pc = cpu->call_frames[idx - 1U].entry_pc;
+            } else {
+                cpu->cur_fn = fn_name;
+                cpu->cur_pc = entry_pc;
+            }
+        }
+    }
+
+    if (flags & LIFTED_KO_DEBUG_PROFILE_CALLS) {
+        struct LiftedKoFnProfileEntry *target = NULL;
+        for (size_t i = 0; i < g_ko_profile_count; ++i) {
+            if (g_ko_profile_table[i].entry_pc == entry_pc &&
+                g_ko_profile_table[i].ko_profile == prof_str &&
+                (g_ko_profile_table[i].fn_name == fn_name ||
+                 (g_ko_profile_table[i].fn_name && fn_name && strcmp(g_ko_profile_table[i].fn_name, fn_name) == 0))) {
+                target = &g_ko_profile_table[i];
+                break;
+            }
+        }
+        if (!target && g_ko_profile_count < LIFTED_KO_MAX_PROFILE_FUNCS) {
+            target = &g_ko_profile_table[g_ko_profile_count++];
+            target->ko_profile = prof_str;
+            target->fn_name = fn_name;
+            target->entry_pc = entry_pc;
+        }
+        if (target) {
+            target->call_count++;
+            target->total_inclusive_ns += elapsed_ns;
+            target->total_exclusive_ns += excl_ns;
+            if (elapsed_ns > target->max_ns) target->max_ns = elapsed_ns;
+        }
+    }
+
+    if (flags & LIFTED_KO_DEBUG_TRACE_CALLS) {
+        fprintf(stderr, "[KO_TRACE] %*s<- %s::%s = %lld (0x%llx) [%llu ns]\n",
+                (int)(cpu->call_depth * 2U), "", prof_str, fn_name ? fn_name : "<fn>",
+                (long long)ret_val, (unsigned long long)ret_val, (unsigned long long)elapsed_ns);
+    }
+}
+
+static void try_map_ko_image(struct MappedKoImage *img, const char *const *paths, size_t n_paths) {
+    if (img->attempted) return;
+    img->attempted = true;
+    for (size_t p = 0; p < n_paths; ++p) {
+        int fd = open(paths[p], O_RDONLY);
+        if (fd < 0) continue;
+        struct stat st;
+        if (fstat(fd, &st) != 0 || st.st_size < 128) { close(fd); continue; }
+        void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (m == MAP_FAILED) continue;
+        const uint8_t *b = (const uint8_t *)m;
+        if (memcmp(b, "\x7f" "ELF", 4) != 0) { munmap(m, (size_t)st.st_size); continue; }
+        uint64_t e_shoff = 0; memcpy(&e_shoff, b + 40, 8);
+        uint16_t e_shentsize = 0; memcpy(&e_shentsize, b + 58, 2);
+        uint16_t e_shnum = 0; memcpy(&e_shnum, b + 60, 2);
+        uint16_t e_shstrndx = 0; memcpy(&e_shstrndx, b + 62, 2);
+        if (e_shoff + (uint64_t)e_shnum * e_shentsize > (uint64_t)st.st_size || e_shstrndx >= e_shnum) {
+            munmap(m, (size_t)st.st_size);
+            continue;
+        }
+        uint64_t shstr_off = 0;
+        memcpy(&shstr_off, b + e_shoff + (size_t)e_shstrndx * e_shentsize + 24, 8);
+        const char *shstr = (const char *)(b + shstr_off);
+        for (uint16_t i = 0; i < e_shnum; ++i) {
+            const uint8_t *sh = b + e_shoff + (size_t)i * e_shentsize;
+            uint32_t sh_name = 0; memcpy(&sh_name, sh + 0, 4);
+            if (strcmp(shstr + sh_name, ".rodata") == 0) {
+                uint64_t ro_off = 0, ro_sz = 0;
+                memcpy(&ro_off, sh + 24, 8);
+                memcpy(&ro_sz, sh + 32, 8);
+                if (ro_off + ro_sz <= (uint64_t)st.st_size) {
+                    img->map_base = b;
+                    img->map_size = (size_t)st.st_size;
+                    img->rodata_base = b + ro_off;
+                    img->rodata_size = (size_t)ro_sz;
+                    img->valid = true;
+                }
+                break;
+            }
+        }
+        if (img->valid) return;
+        munmap(m, (size_t)st.st_size);
+    }
+}
+
+static void ensure_ko_images_mapped(void) {
+    static const char *const r44_paths[] = {
+        "kernel/mali_kbase_mt6878_r44p1.ko",
+        "kernel/mali_kbase_gs201_r47p0_csf_5_10_189.ko",
+        "../kernel/mali_kbase_mt6878_r44p1.ko",
+        "../kernel/mali_kbase_gs201_r47p0_csf_5_10_189.ko",
+        "../../kernel/mali_kbase_mt6878_r44p1.ko",
+        "../../kernel/mali_kbase_gs201_r47p0_csf_5_10_189.ko",
+    };
+    static const char *const husky_paths[] = {
+        "kernel/mali_kbase_husky_r54p1.ko",
+        "kernel/mali_kbase_husky.ko",
+        "../kernel/mali_kbase_husky_r54p1.ko",
+        "../kernel/mali_kbase_husky.ko",
+        "../../kernel/mali_kbase_husky_r54p1.ko",
+        "../../kernel/mali_kbase_husky.ko",
+    };
+    static const char *const gs201_paths[] = {
+        "kernel/mali_kbase_gs201_r47p0_csf_5_10_198.ko",
+        "../kernel/mali_kbase_gs201_r47p0_csf_5_10_198.ko",
+        "../../kernel/mali_kbase_gs201_r47p0_csf_5_10_198.ko",
+    };
+    static const char *const gs101_paths[] = {
+        "kernel/mali_kbase_gs101_r47p0_jm_5_10_198.ko",
+        "../kernel/mali_kbase_gs101_r47p0_jm_5_10_198.ko",
+        "../../kernel/mali_kbase_gs101_r47p0_jm_5_10_198.ko",
+    };
+    try_map_ko_image(&g_mapped_r44p1, r44_paths, sizeof(r44_paths) / sizeof(r44_paths[0]));
+    try_map_ko_image(&g_mapped_husky_r54p1, husky_paths, sizeof(husky_paths) / sizeof(husky_paths[0]));
+    try_map_ko_image(&g_mapped_gs201_r47p0, gs201_paths, sizeof(gs201_paths) / sizeof(gs201_paths[0]));
+    try_map_ko_image(&g_mapped_gs101_r47p0_jm, gs101_paths, sizeof(gs101_paths) / sizeof(gs101_paths[0]));
+}
+
+static const struct MappedKoImage *get_mapped_ko_by_id(uint32_t profile_id) {
+    switch ((enum LiftedKoProfileId)profile_id) {
+    case KO_PROFILE_HUSKY_R54P1:    return &g_mapped_husky_r54p1;
+    case KO_PROFILE_GS201_R47P0:    return &g_mapped_gs201_r47p0;
+    case KO_PROFILE_GS101_R47P0_JM: return &g_mapped_gs101_r47p0_jm;
+    case KO_PROFILE_R44P1:
+    default:                        return &g_mapped_r44p1;
+    }
+}
+
+bool lifted_ko_is_image_mapped(const char *ko_profile, size_t *out_rodata_size) {
+    ensure_ko_images_mapped();
+    const struct MappedKoImage *img = get_mapped_ko_by_id(ko_profile_str_to_id(ko_profile));
+    if (out_rodata_size) *out_rodata_size = img->valid ? img->rodata_size : 0;
+    return img->valid;
+}
+
+const void *lifted_ko_rodata_ptr_id(LiftedKbaseCPU *cpu, uint32_t profile_id, uint32_t rodata_offset, const void *fallback_slice) {
+    (void)cpu;
+    ensure_ko_images_mapped();
+    const struct MappedKoImage *img = get_mapped_ko_by_id(profile_id);
+    if (img->valid && (size_t)rodata_offset < img->rodata_size) {
+        return img->rodata_base + rodata_offset;
+    }
+    return fallback_slice;
+}
+
+const void *lifted_ko_rodata_ptr(LiftedKbaseCPU *cpu, const char *ko_profile, uint32_t rodata_offset, const void *fallback_slice) {
+    return lifted_ko_rodata_ptr_id(cpu, ko_profile_str_to_id(ko_profile), rodata_offset, fallback_slice);
+}
+
+void lifted_ko_print_stacktrace(LiftedKbaseCPU *cpu, const char *reason, const struct LiftedKoHeapBlockHdr *hdr) {
+    fprintf(stderr, "[lifted_ko_violation] %s\n", reason ? reason : "runtime violation");
+    if (hdr) {
+        fprintf(stderr, "  block seq=%u size=%u state=0x%08x\n", hdr->alloc_seq, hdr->payload_size, hdr->state);
+        fprintf(stderr, "  allocated at guest fn=%s pc=0x%llx (host bt[0]=%p)\n",
+                hdr->alloc_fn ? hdr->alloc_fn : "<unknown>", (unsigned long long)hdr->alloc_guest_pc, hdr->alloc_host_bt[0]);
+        if (hdr->free_guest_pc || hdr->free_fn || hdr->free_host_bt[0]) {
+            fprintf(stderr, "  freed     at guest fn=%s pc=0x%llx (host bt[0]=%p)\n",
+                    hdr->free_fn ? hdr->free_fn : "<unknown>", (unsigned long long)hdr->free_guest_pc, hdr->free_host_bt[0]);
+        }
+    }
+    if (cpu) {
+        fprintf(stderr, "  guest trace: cur_fn=%s cur_pc=0x%llx lr(x30)=0x%llx call_depth=%u\n",
+                cpu->cur_fn ? cpu->cur_fn : "<top>", (unsigned long long)cpu->cur_pc,
+                (unsigned long long)cpu->x[30], cpu->call_depth);
+        uint32_t lim = (cpu->call_depth < LIFTED_KO_MAX_CALL_FRAMES) ? cpu->call_depth : LIFTED_KO_MAX_CALL_FRAMES;
+        for (uint32_t i = lim; i > 0; --i) {
+            const struct LiftedKoStackFrame *fr = &cpu->call_frames[i - 1U];
+            fprintf(stderr, "    frame[%u] %s::%s (entry_pc=0x%06llx caller_pc=0x%06llx sp=0x%llx fp=0x%llx lr=0x%llx x0=0x%llx x1=0x%llx)\n",
+                    i - 1U,
+                    fr->ko_profile ? fr->ko_profile : "ko",
+                    fr->fn_name ? fr->fn_name : "<fn>",
+                    (unsigned long long)fr->entry_pc,
+                    (unsigned long long)fr->caller_pc,
+                    (unsigned long long)fr->sp,
+                    (unsigned long long)fr->fp,
+                    (unsigned long long)fr->lr,
+                    (unsigned long long)fr->args[0],
+                    (unsigned long long)fr->args[1]);
+        }
+        uintptr_t scs_base = (uintptr_t)&cpu->scs_stack[0];
+        if (cpu->x18 > scs_base && cpu->x18 <= scs_base + sizeof(cpu->scs_stack)) {
+            size_t depth = (cpu->x18 - scs_base) / sizeof(uint64_t);
+            for (size_t i = depth; i > 0; --i) {
+                fprintf(stderr, "    scs[%zu] = 0x%llx\n", i - 1, (unsigned long long)cpu->scs_stack[i - 1]);
+            }
+        }
+    }
+#if defined(__GLIBC__)
+    void *bt[8];
+    int n = backtrace(bt, 8);
+    char **syms = backtrace_symbols(bt, n);
+    if (syms) {
+        for (int i = 0; i < n; ++i) fprintf(stderr, "  host[%d] %s\n", i, syms[i]);
+        free(syms);
+    }
+#endif
+}
+
+static bool check_redzone_intact(const struct LiftedKoHeapBlockHdr *hdr) {
+    size_t aligned_sz = ((size_t)hdr->payload_size + 15U) & ~15ULL;
+    const uint8_t *rz = (const uint8_t *)hdr + sizeof(struct LiftedKoHeapBlockHdr) + aligned_sz;
+    for (size_t i = 0; i < 16U; ++i) {
+        if (rz[i] != LIFTED_KO_REDZONE_BYTE) return false;
+    }
+    return true;
+}
+
+void *lifted_ko_heap_alloc(LiftedKbaseCPU *cpu, size_t sz) {
+    size_t aligned_sz = (sz + 15U) & ~15ULL;
+    size_t total = sizeof(struct LiftedKoHeapBlockHdr) + aligned_sz + 16U;
+    if (!cpu || (size_t)cpu->heap.used + total > sizeof(cpu->heap.arena)) {
+        if (cpu) lifted_ko_print_stacktrace(cpu, "HEAP ARENA EXHAUSTION in lifted_ko_heap_alloc", NULL);
+        return NULL;
+    }
+    uint8_t *base = &cpu->heap.arena[cpu->heap.used];
+    struct LiftedKoHeapBlockHdr *hdr = (struct LiftedKoHeapBlockHdr *)base;
+    memset(hdr, 0, sizeof(*hdr));
+    hdr->magic = LIFTED_KO_HEAP_MAGIC;
+    hdr->state = LIFTED_KO_STATE_ALLOCATED;
+    hdr->payload_size = (uint32_t)sz;
+    hdr->alloc_seq = ++cpu->heap.alloc_count;
+    hdr->alloc_guest_pc = cpu->cur_pc ? cpu->cur_pc : cpu->x[30];
+    hdr->alloc_fn = cpu->cur_fn ? cpu->cur_fn : "kmalloc";
+    hdr->alloc_host_bt[0] = __builtin_return_address(0);
+#if defined(__GLIBC__)
+    (void)backtrace(hdr->alloc_host_bt, 4);
+#endif
+    void *payload = base + sizeof(struct LiftedKoHeapBlockHdr);
+    memset(payload, 0, aligned_sz);
+    memset((uint8_t *)payload + aligned_sz, LIFTED_KO_REDZONE_BYTE, 16U);
+    cpu->heap.used += (uint32_t)total;
+    return payload;
+}
+
+int lifted_ko_heap_free(LiftedKbaseCPU *cpu, void *ptr) {
+    if (!cpu || !ptr) return 0;
+    uintptr_t p = (uintptr_t)ptr;
+    uintptr_t arena_lo = (uintptr_t)&cpu->heap.arena[0];
+    uintptr_t arena_hi = arena_lo + sizeof(cpu->heap.arena);
+    if (p < arena_lo + sizeof(struct LiftedKoHeapBlockHdr) || p >= arena_hi) {
+        lifted_ko_print_stacktrace(cpu, "OUT-OF-ARENA pointer passed to lifted_ko_heap_free", NULL);
+        return -1;
+    }
+    struct LiftedKoHeapBlockHdr *hdr = (struct LiftedKoHeapBlockHdr *)(p - sizeof(struct LiftedKoHeapBlockHdr));
+    if (hdr->magic != LIFTED_KO_HEAP_MAGIC) {
+        lifted_ko_print_stacktrace(cpu, "HEAP HEADER MAGIC CORRUPTION detected in lifted_ko_heap_free", hdr);
+        return -1;
+    }
+    if (hdr->state == LIFTED_KO_STATE_FREED) {
+        cpu->heap.double_free_errors++;
+        lifted_ko_print_stacktrace(cpu, "DOUBLE-FREE detected in lifted_ko_heap_free", hdr);
+        return -1;
+    }
+    if (!check_redzone_intact(hdr)) {
+        cpu->heap.uaf_errors++;
+        lifted_ko_print_stacktrace(cpu, "REDZONE CANARY CORRUPTION detected in lifted_ko_heap_free", hdr);
+        return -1;
+    }
+    hdr->state = LIFTED_KO_STATE_FREED;
+    hdr->free_guest_pc = cpu->cur_pc ? cpu->cur_pc : cpu->x[30];
+    hdr->free_fn = cpu->cur_fn ? cpu->cur_fn : "kfree";
+    hdr->free_host_bt[0] = __builtin_return_address(0);
+#if defined(__GLIBC__)
+    (void)backtrace(hdr->free_host_bt, 4);
+#endif
+    size_t aligned_sz = ((size_t)hdr->payload_size + 15U) & ~15ULL;
+    memset(ptr, LIFTED_KO_POISON_FREE_BYTE, aligned_sz);
+    cpu->heap.free_count++;
+    return 0;
+}
+
+bool lifted_ko_check_mem_access(LiftedKbaseCPU *cpu, const void *ptr, size_t sz, bool is_write) {
+    (void)is_write;
+    if (!cpu || !ptr || sz == 0) return false;
+    uintptr_t p = (uintptr_t)ptr;
+    uintptr_t arena_lo = (uintptr_t)&cpu->heap.arena[0];
+    uintptr_t arena_hi = arena_lo + cpu->heap.used;
+    if (p >= arena_lo && p < arena_hi) {
+        size_t off = 0;
+        while (off + sizeof(struct LiftedKoHeapBlockHdr) <= cpu->heap.used) {
+            struct LiftedKoHeapBlockHdr *hdr = (struct LiftedKoHeapBlockHdr *)&cpu->heap.arena[off];
+            if (hdr->magic != LIFTED_KO_HEAP_MAGIC) {
+                lifted_ko_print_stacktrace(cpu, "HEAP HEADER MAGIC CORRUPTION in lifted_ko_check_mem_access", hdr);
+                break;
+            }
+            size_t aligned_sz = ((size_t)hdr->payload_size + 15U) & ~15ULL;
+            uintptr_t blk_lo = arena_lo + off + sizeof(struct LiftedKoHeapBlockHdr);
+            uintptr_t blk_hi = blk_lo + aligned_sz;
+            if (p >= blk_lo && p < blk_hi) {
+                if (hdr->state == LIFTED_KO_STATE_FREED || p + sz > blk_lo + hdr->payload_size || !check_redzone_intact(hdr)) {
+                    cpu->heap.uaf_errors++;
+                    lifted_ko_print_stacktrace(cpu, "USE-AFTER-FREE / OOB / REDZONE VIOLATION detected in lifted_ko_check_mem_access", hdr);
+                    return false;
+                }
+                return true;
+            }
+            off += sizeof(struct LiftedKoHeapBlockHdr) + aligned_sz + 16U;
+        }
+        cpu->heap.uaf_errors++;
+        lifted_ko_print_stacktrace(cpu, "UNALLOCATED / HEADER-ZONE ACCESS in lifted_ko_check_mem_access", NULL);
+        return false;
+    }
+    return true;
+}
+
+void lifted_kbase_cpu_init(LiftedKbaseCPU *cpu, void *user_ctx, LiftedKbaseShimHook shim_hook) {
+    memset(cpu, 0, sizeof(*cpu));
+    cpu->sp = (uintptr_t)&cpu->stack[sizeof(cpu->stack) - 256];
+    cpu->x18 = (uintptr_t)&cpu->scs_stack[0];
+    cpu->sp_el0 = (uintptr_t)&cpu->task_struct[0];
+    cpu->totalram_pages = 2097152ULL; /* 8 GiB in 4K pages */
+    cpu->user_ctx = user_ctx;
+    cpu->shim_hook = shim_hook;
+    /* Linux kernel addr_limit / thread_info.flags = 0 (no TIF_32BIT) */
+    *(uint64_t *)(&cpu->task_struct[16]) = ~0ULL;
+    /* Direct self-linked list_head for kbase_device_get_list */
+    cpu->dev_list_head[0] = (uintptr_t)&cpu->dev_list_head[0];
+    cpu->dev_list_head[1] = (uintptr_t)&cpu->dev_list_head[0];
+    ensure_ko_debug_env_initialized();
+    cpu->debug_flags = g_ko_env_debug_flags;
+    ensure_ko_images_mapped();
+}
+
+const char *lifted_kernel_shim_id_name(uint32_t shim_id) {
+    switch ((enum LiftedKernelShimId)shim_id) {
+    case KO_SHIM_INDIRECT_BLR:                    return "__indirect_blr";
+    case KO_SHIM_KMALLOC:                         return "__kmalloc";
+    case KO_SHIM_KMALLOC_TRACE:                   return "kmalloc_trace";
+    case KO_SHIM_KFREE:                           return "kfree";
+    case KO_SHIM_MEMSET:                          return "memset";
+    case KO_SHIM_MEMCPY:                          return "memcpy";
+    case KO_SHIM_COPY_FROM_USER:                  return "_copy_from_user";
+    case KO_SHIM_COPY_TO_USER:                    return "_copy_to_user";
+    case KO_SHIM_CHECK_OBJECT_SIZE:               return "__check_object_size";
+    case KO_SHIM_SW_HWEIGHT64:                    return "__sw_hweight64";
+    case KO_SHIM_KBASE_HAS_EXEC_VA_ZONE:          return "kbase_has_exec_va_zone";
+    case KO_SHIM_SCNPRINTF:                       return "scnprintf";
+    case KO_SHIM_KBASE_DEVICE_GET_LIST:           return "kbase_device_get_list";
+    case KO_SHIM_KBASE_CREATE_CONTEXT:            return "kbase_create_context";
+    case KO_SHIM_KBASE_DESTROY_CONTEXT:           return "kbase_destroy_context";
+    case KO_SHIM_KBASE_MEM_POOL_ALLOC_PAGES:      return "kbase_mem_pool_alloc_pages";
+    case KO_SHIM_KERNEL_MAP_USER_IO_PAGES:        return "kernel_map_user_io_pages";
+    case KO_SHIM_KBASE_MEM_ALLOC:                 return "kbase_mem_alloc";
+    case KO_SHIM_KBASE_MEM_ALIAS:                 return "kbase_mem_alias";
+    case KO_SHIM_KBASE_CSF_FIRMWARE_GET_GLB_IFACE: return "kbase_csf_firmware_get_glb_iface";
+    case KO_SHIM_CSF_QUEUE_REGISTER_INTERNAL:     return "csf_queue_register_internal";
+    case KO_SHIM_CREATE_QUEUE_GROUP:              return "create_queue_group";
+    case KO_SHIM_KBASE_CSF_TILER_HEAP_INIT:       return "kbase_csf_tiler_heap_init";
+    case KO_SHIM_JD_SUBMIT_ATOM:                  return "jd_submit_atom";
+    case KO_SHIM_JD_RUN_ATOM:                     return "jd_run_atom";
+    case KO_SHIM_NOOP_EXTERNAL:                   return "__noop_external";
+    default:                                      return "unknown";
+    }
+}
+
+void lifted_kernel_shim_dispatch_id(LiftedKbaseCPU *cpu, uint32_t profile_id, uint32_t shim_id) {
+    const char *ko_profile = ko_profile_id_str(profile_id);
+    switch ((enum LiftedKernelShimId)shim_id) {
+    case KO_SHIM_KMALLOC:
+    case KO_SHIM_KMALLOC_TRACE: {
+        size_t sz = (shim_id == KO_SHIM_KMALLOC_TRACE) ? (size_t)cpu->x[2] : (size_t)cpu->x[0];
+        if (sz == 0) sz = 64;
+        void *ptr = lifted_ko_heap_alloc(cpu, sz);
+        cpu->x[0] = (uintptr_t)ptr;
+        return;
+    }
+    case KO_SHIM_KFREE:
+        (void)lifted_ko_heap_free(cpu, (void *)(uintptr_t)cpu->x[0]);
+        cpu->x[0] = 0;
+        return;
+    case KO_SHIM_MEMSET:
+        if (cpu->x[0] && cpu->x[2]) memset((void *)(uintptr_t)cpu->x[0], (int)(cpu->x[1] & 0xFF), (size_t)cpu->x[2]);
+        return;
+    case KO_SHIM_MEMCPY:
+        if (cpu->x[0] && cpu->x[1] && cpu->x[2]) memcpy((void *)(uintptr_t)cpu->x[0], (const void *)(uintptr_t)cpu->x[1], (size_t)cpu->x[2]);
+        return;
+    case KO_SHIM_COPY_FROM_USER:
+    case KO_SHIM_COPY_TO_USER:
+        if (cpu->x[0] && cpu->x[1] && cpu->x[2]) {
+            memcpy((void *)(uintptr_t)cpu->x[0], (const void *)(uintptr_t)cpu->x[1], (size_t)cpu->x[2]);
+            cpu->x[0] = 0;
+        } else {
+            cpu->x[0] = cpu->x[2];
+        }
+        return;
+    case KO_SHIM_CHECK_OBJECT_SIZE:
+        cpu->x[0] = 0;
+        return;
+    case KO_SHIM_SW_HWEIGHT64:
+        cpu->x[0] = (uint64_t)__builtin_popcountll(cpu->x[0]);
+        return;
+    case KO_SHIM_KBASE_HAS_EXEC_VA_ZONE: {
+        uint64_t v = *(uint64_t *)((uintptr_t)cpu->x[0] + 37072 + 192);
+        cpu->x[0] = (v != ~0ULL && v != 0ULL) ? 1ULL : 0ULL;
+        return;
+    }
+    case KO_SHIM_SCNPRINTF:
+        cpu->x[0] = 16ULL;
+        return;
+    case KO_SHIM_NOOP_EXTERNAL:
+        cpu->x[0] = 0;
+        return;
+    default:
+        if (cpu->shim_hook) {
+            cpu->shim_hook(cpu, ko_profile, lifted_kernel_shim_id_name(shim_id));
+            return;
+        }
+        cpu->x[0] = 0;
+        return;
+    }
+}
+
+void lifted_kernel_shim_dispatch(LiftedKbaseCPU *cpu, const char *ko_profile, const char *callee) {
+    uint32_t prof_id = ko_profile_str_to_id(ko_profile);
+    if (!callee) { cpu->x[0] = 0; return; }
+    if (strcmp(callee, "__kmalloc") == 0 || strcmp(callee, "vzalloc") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_KMALLOC); return; }
+    if (strcmp(callee, "kmalloc_trace") == 0 || strcmp(callee, "kmem_cache_alloc_trace") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_KMALLOC_TRACE); return; }
+    if (strcmp(callee, "kfree") == 0 || strcmp(callee, "vfree") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_KFREE); return; }
+    if (strcmp(callee, "memset") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_MEMSET); return; }
+    if (strcmp(callee, "memcpy") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_MEMCPY); return; }
+    if (strcmp(callee, "__arch_copy_from_user") == 0 || strncmp(callee, "_copy_from_user", 15) == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_COPY_FROM_USER); return; }
+    if (strcmp(callee, "__arch_copy_to_user") == 0 || strncmp(callee, "_copy_to_user", 13) == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_COPY_TO_USER); return; }
+    if (strcmp(callee, "__check_object_size") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_CHECK_OBJECT_SIZE); return; }
+    if (strcmp(callee, "__sw_hweight64") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_SW_HWEIGHT64); return; }
+    if (strcmp(callee, "kbase_has_exec_va_zone") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_KBASE_HAS_EXEC_VA_ZONE); return; }
+    if (strcmp(callee, "scnprintf") == 0) { lifted_kernel_shim_dispatch_id(cpu, prof_id, KO_SHIM_SCNPRINTF); return; }
+    if (cpu->shim_hook) { cpu->shim_hook(cpu, ko_profile, callee); return; }
+    cpu->x[0] = 0;
+}
+)C";
+
+    // Emit external fallback slices discovered automatically from ELF relocations & symbol boundaries
+    for (const ParsedKoModule& m : parsed_mods) {
+        for (const auto& [off_ro, desc] : m.ro_tables) {
+            cf << "\n__attribute__((visibility(\"hidden\"), aligned(16))) const uint8_t "
+               << desc.fallback_symbol << "[" << desc.size << "] = {\n";
+            for (uint32_t i = 0; i < desc.size; i += 16) {
+                cf << "    ";
+                uint32_t lim = std::min(desc.size, i + 16U);
+                for (uint32_t j = i; j < lim; ++j) {
+                    char b[16];
+                    std::snprintf(b, sizeof(b), "0x%02x", m.rodata[desc.offset + j]);
+                    cf << b << (j + 1 < lim ? ", " : ",");
+                }
+                cf << "\n";
+            }
+            cf << "};\n";
+        }
     }
     cf.close();
 
-    // 3. Build `ultrs::llvm_ir::Module`, lift all 68 functions across `mali_kbase.ko` (r44p1)
-    //    and `mali_kbase_husky.ko` (husky_r54p1), and run the unified `horizon2llvm` lowering
-    //    pass pipeline (`PassPipelineConfig::forKernelKo()`).
+    // 3. Build `ultrs::llvm_ir::Module`, lift all target functions across all discovered `.ko` modules,
+    //    and run the unified `horizon2llvm` lowering pass pipeline (`PassPipelineConfig::forKernelKo()`).
     ultrs::llvm_ir::Module ir_mod("unified_horizon2llvm_kbase_ko", "x86_64-pc-linux-gnu");
     ModuleStringPool str_pool;
 
-    for (const ParsedKoModule* m : mods) {
-        for (const std::string& fn : kTargetFunctions) {
-            auto it = m->sym_by_name.find(fn);
-            if (it == m->sym_by_name.end()) continue;
-            uint64_t val = it->second.st_value;
-            uint64_t sz = it->second.st_size;
-            auto insns = dis.disasm_range(m->text, val, val + sz);
-
-            std::set<uint64_t> valid_pcs;
-            for (const auto& ins : insns) valid_pcs.insert(ins.addr);
-
-            // Pre-scan instructions to identify:
-            //   (a) whether the function contains any `BR Xn` indirect branch (`has_indirect_br`),
-            //   (b) statically recovered `.rodata` jump-table target PCs (`jump_table_targets`), and
-            //   (c) basic-block leader PCs (`block_leaders`), eliminating full-function indirect_br_dispatch
-            //       tables and coalescing straight-line instructions into single basic blocks unless
-            //       `--full-indirect-dispatch` (`HORIZON2LLVM_FULL_INDIRECT_DISPATCH=1`) is requested.
-            bool has_indirect_br = false;
-            std::set<uint64_t> jump_table_targets;
-            std::set<uint64_t> block_leaders;
-
-            if (full_indirect_dispatch) {
-                block_leaders = valid_pcs;
-                jump_table_targets = valid_pcs;
-            } else {
-                if (!insns.empty()) block_leaders.insert(insns.front().addr);
-
-                // Collect all .rodata jump tables referenced by `adrp` in this function
-                std::vector<std::pair<uint64_t, const RodataTableDesc*>> fn_jtabs;
-                for (const auto& ins : insns) {
-                    if (ins.mnemonic == "adrp") {
-                        auto r_it = m->relas.find(ins.addr);
-                        if (r_it != m->relas.end() && r_it->second.sym_shndx == m->ro_idx) {
-                            uint64_t off_ro = static_cast<uint64_t>(
-                                static_cast<int64_t>(r_it->second.sym_val) + r_it->second.r_addend);
-                            auto jt_it = kRodataTableMap.find({m->label, off_ro});
-                            if (jt_it != kRodataTableMap.end() && jt_it->second.size <= 256U) {
-                                fn_jtabs.emplace_back(ins.addr, &jt_it->second);
-                            }
-                        }
-                    }
-                }
-
-                for (size_t idx = 0; idx < insns.size(); ++idx) {
-                    const DisasmInsn& ins = insns[idx];
-                    uint64_t pc = ins.addr;
-                    const std::string& mnem = ins.mnemonic;
-                    auto ops = ins.operands.empty() ? std::vector<std::string>{} : split_operands(ins.operands);
-
-                    if (mnem == "b" || mnem.rfind("b.", 0) == 0) {
-                        if (!ops.empty()) {
-                            uint64_t t_pc = static_cast<uint64_t>(static_cast<int64_t>(pc) + parse_imm(ops[0]));
-                            if (valid_pcs.count(t_pc)) block_leaders.insert(t_pc);
-                        }
-                        if (valid_pcs.count(pc + 4)) block_leaders.insert(pc + 4);
-                    } else if (mnem == "cbz" || mnem == "cbnz") {
-                        if (ops.size() >= 2) {
-                            uint64_t t_pc = static_cast<uint64_t>(static_cast<int64_t>(pc) + parse_imm(ops[1]));
-                            if (valid_pcs.count(t_pc)) block_leaders.insert(t_pc);
-                        }
-                        if (valid_pcs.count(pc + 4)) block_leaders.insert(pc + 4);
-                    } else if (mnem == "tbz" || mnem == "tbnz") {
-                        if (ops.size() >= 3) {
-                            uint64_t t_pc = static_cast<uint64_t>(static_cast<int64_t>(pc) + parse_imm(ops[2]));
-                            if (valid_pcs.count(t_pc)) block_leaders.insert(t_pc);
-                        }
-                        if (valid_pcs.count(pc + 4)) block_leaders.insert(pc + 4);
-                    } else if (mnem == "ret" || mnem == "brk") {
-                        if (valid_pcs.count(pc + 4)) block_leaders.insert(pc + 4);
-                    } else if (mnem == "br") {
-                        has_indirect_br = true;
-                        if (valid_pcs.count(pc + 4)) block_leaders.insert(pc + 4);
-
-                        // Recover `adr` base PC (typically `pc - 12`)
-                        uint64_t adr_pc = pc - 12;
-                        for (size_t back = 1; back <= 6 && back <= idx; ++back) {
-                            if (insns[idx - back].mnemonic == "adr") {
-                                auto a_ops = split_operands(insns[idx - back].operands);
-                                int64_t a_off = (a_ops.size() >= 2) ? parse_imm(a_ops[1]) : 0;
-                                adr_pc = static_cast<uint64_t>(static_cast<int64_t>(insns[idx - back].addr) + a_off);
-                                break;
-                            }
-                        }
-
-                        // Find nearest preceding `adrp` jump table (or hoisted function jump table)
-                        const RodataTableDesc* matched_jt = nullptr;
-                        for (auto it_jt = fn_jtabs.rbegin(); it_jt != fn_jtabs.rend(); ++it_jt) {
-                            if (it_jt->first < pc) {
-                                matched_jt = it_jt->second;
-                                break;
-                            }
-                        }
-                        if (!matched_jt && !fn_jtabs.empty()) {
-                            matched_jt = fn_jtabs.front().second;
-                        }
-                        if (matched_jt && matched_jt->offset + matched_jt->size <= m->rodata.size()) {
-                            uint32_t n_entries = matched_jt->size / 4U;
-                            for (uint32_t e = 0; e < n_entries; ++e) {
-                                int32_t rel32 = read_s32_le(&m->rodata[matched_jt->offset + e * 4U]);
-                                uint64_t t_pc = static_cast<uint64_t>(static_cast<int64_t>(adr_pc) + rel32) & 0xFFFFFFFFULL;
-                                if (valid_pcs.count(t_pc)) {
-                                    jump_table_targets.insert(t_pc);
-                                    block_leaders.insert(t_pc);
-                                }
-                            }
-                        }
-                    }
-                }
-                if (has_indirect_br && jump_table_targets.empty()) {
-                    // Conservative fallback if a `br` has no recognized `.rodata` table
-                    jump_table_targets = block_leaders;
-                }
-            }
-
-            std::string full_fn_name = "lifted_" + m->label + "_" + fn;
-            ultrs::llvm_ir::Function* ir_fn = ir_mod.create_function(full_fn_name, val, val + sz);
-
-            // Entry block (only allocate `%ind_pc_slot` if the function uses `indirect_br_dispatch`)
-            ultrs::llvm_ir::BasicBlock* entry_bb = ir_fn->create_block("entry", val);
-            {
-                ultrs::llvm_ir::Instruction i1;
-                i1.tag = ultrs::llvm_ir::OpTag::RawIR;
-                std::string entry_br = "br label %" + (insns.empty() ? std::string("exit_ret") : bb_label(insns.front().addr));
-                if (has_indirect_br || full_indirect_dispatch) {
-                    i1.text = "%ind_pc_slot = alloca i64, align 8\n  store i64 0, ptr %ind_pc_slot, align 8\n  " + entry_br;
-                } else {
-                    i1.text = entry_br;
-                }
-                entry_bb->insts.push_back(std::move(i1));
-            }
-
-            KoFunctionIRBuilder fb(m->label, *m, valid_pcs, block_leaders, str_pool, ir_fn, count_insns);
-            for (const DisasmInsn& ins : insns) {
-                fb.lift_insn_to_bb(ins);
-            }
-            fb.flush_bb_insn_count();
-
-            // Emit `indirect_br_dispatch` ONLY when the function has an indirect branch (or `--full-indirect-dispatch` is set)
-            if (has_indirect_br || full_indirect_dispatch) {
-                ultrs::llvm_ir::BasicBlock* ind_bb = ir_fn->create_block("indirect_br_dispatch", val + sz);
-                std::ostringstream sw;
-                sw << "%ind_pc_val = load i64, ptr %ind_pc_slot, align 8\n"
-                   << "  switch i64 %ind_pc_val, label %exit_ret [\n";
-                const std::set<uint64_t>& sw_targets = full_indirect_dispatch ? valid_pcs : jump_table_targets;
-                for (uint64_t pc_v : sw_targets) {
-                    sw << "    i64 " << pc_v << ", label %" << bb_label(pc_v) << "\n";
-                }
-                sw << "  ]";
-                ultrs::llvm_ir::Instruction sw_inst;
-                sw_inst.tag = ultrs::llvm_ir::OpTag::RawIR;
-                sw_inst.text = sw.str();
-                ind_bb->insts.push_back(std::move(sw_inst));
-            }
-
-            // Unified exit block returning sign-extended w0 as i64
-            ultrs::llvm_ir::BasicBlock* exit_bb = ir_fn->create_block("exit_ret", val + sz + 4);
-            {
-                ultrs::llvm_ir::Instruction ret_inst;
-                ret_inst.tag = ultrs::llvm_ir::OpTag::Return;
-                ret_inst.text = "%ret_x0_val = load i64, ptr %c, align 8\n"
-                                "  %ret_w0_val = trunc i64 %ret_x0_val to i32\n"
-                                "  %ret_sext = sext i32 %ret_w0_val to i64\n"
-                                "  ret i64 %ret_sext";
-                exit_bb->insts.push_back(std::move(ret_inst));
-            }
-        }
+    for (const ParsedKoModule& m : parsed_mods) {
+        lift_parsed_module_into_ir(m, dis, ir_mod, str_pool, full_indirect_dispatch, count_insns, instrument_calls);
     }
 
-    // Run the unified horizon2llvm KernelModuleKo lowering pipeline!
     {
         ultrs::passes::PassPipelineConfig ko_cfg = ultrs::passes::PassPipelineConfig::forKernelKo();
-        // Keep exact LiftedKbaseCPU memory layout intact across kernel shim callouts
         ko_cfg.enable_cpu_state_promotion = false;
         ko_cfg.enable_aapcs64_abi_contract = false;
         ko_cfg.enable_tail_call_devirt = false;
@@ -2594,11 +3162,15 @@ bool lift_ko_modules_to_c_and_ir(
     ll_ss << "; ModuleID = 'unified_horizon2llvm_kbase_ko'\n"
           << "source_filename = \"unified_horizon2llvm_kbase_ko.ll\"\n\n"
           << "declare dso_local ptr @lifted_ko_rodata_ptr_id(ptr, i32, i32, ptr) nounwind\n"
-          << "declare dso_local void @lifted_kernel_shim_dispatch_id(ptr, i32, i32) nounwind\n\n";
+          << "declare dso_local void @lifted_kernel_shim_dispatch_id(ptr, i32, i32) nounwind\n"
+          << "declare dso_local void @lifted_ko_trace_fn_enter(ptr, i32, ptr, i64) nounwind\n"
+          << "declare dso_local void @lifted_ko_trace_fn_exit(ptr, i32, ptr, i64, i64) nounwind\n\n";
 
-    for (const auto& kv : kRodataTableMap) {
-        ll_ss << "@" << kv.second.fallback_symbol << " = external hidden constant ["
-              << kv.second.size << " x i8], align 16\n";
+    for (const ParsedKoModule& m : parsed_mods) {
+        for (const auto& [off_ro, desc] : m.ro_tables) {
+            ll_ss << "@" << desc.fallback_symbol << " = external hidden constant ["
+                  << desc.size << " x i8], align 16\n";
+        }
     }
     ll_ss << "\n";
     str_pool.emit_globals(ll_ss);
@@ -2614,7 +3186,6 @@ bool lift_ko_modules_to_c_and_ir(
             for (const auto& inst : bb->insts) {
                 if (inst.dead) continue;
                 if (!inst.text.empty()) {
-                    // Strip any !alias.scope metadata tags if metadata table is omitted
                     std::string line = inst.text;
                     auto md_pos = line.find(", !alias.scope");
                     if (md_pos != std::string::npos) {

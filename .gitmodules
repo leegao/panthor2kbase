@@ -1,0 +1,8 @@
+[submodule "third_party/compat_layer"]
+	path = third_party/compat_layer
+	url = git@github.com:leegao/compat_layer.git
+	branch = panthor2kbase-br
+[submodule "third_party/bcn_layer"]
+	path = third_party/bcn_layer
+	url = git@github.com:leegao/bcn_layer.git
+	branch = panthor2kbase-br

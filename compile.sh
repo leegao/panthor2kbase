@@ -144,3 +144,24 @@ if [ -n "$MESA_BUILD_TARGET" ]; then
       echo "  -> Exported build-android/libvulkan_panfrost.so (stripped) & build-android/libvulkan_panfrost.unstripped.so"
    fi
 fi
+
+# Build/export host x86-64 libvulkan_panfrost.so if build-x86-64/mesa is configured for panfrost
+if [ -f build-x86-64/mesa/build.ninja ] && grep -q "src/panfrost/vulkan/libvulkan_panfrost.so:" build-x86-64/mesa/build.ninja 2>/dev/null; then
+   echo "  [host-panvk] Building x86-64 host build-x86-64/libvulkan_panfrost.so..."
+   ninja -C build-x86-64/mesa src/panfrost/vulkan/libvulkan_panfrost.so -j"$(nproc 2>/dev/null || echo 4)"
+   if [ -f build-x86-64/mesa/src/panfrost/vulkan/libvulkan_panfrost.so ]; then
+      cp -f build-x86-64/mesa/src/panfrost/vulkan/libvulkan_panfrost.so build-x86-64/libvulkan_panfrost.unstripped.so
+      strip -o build-x86-64/libvulkan_panfrost.so build-x86-64/libvulkan_panfrost.unstripped.so 2>/dev/null || \
+         cp -f build-x86-64/libvulkan_panfrost.unstripped.so build-x86-64/libvulkan_panfrost.so
+      cat << EOF_ICD > build-x86-64/panfrost_host_icd.x86_64.json
+{
+    "file_format_version": "1.0.0",
+    "ICD": {
+        "library_path": "./libvulkan_panfrost.so",
+        "api_version": "1.3.250"
+    }
+}
+EOF_ICD
+      echo "  -> Exported build-x86-64/libvulkan_panfrost.so & build-x86-64/panfrost_host_icd.x86_64.json"
+   fi
+fi

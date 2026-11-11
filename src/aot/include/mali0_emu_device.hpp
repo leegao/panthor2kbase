@@ -186,9 +186,9 @@ public:
         }
 
         const MaliIdvsDrawPacket* draw_pkt = nullptr;
-        if (job.tsd_gpu_va >= 0x10000ULL && *reinterpret_cast<const uint32_t*>(job.tsd_gpu_va) == MALI_IDVS_MAGIC) {
+        if (opc != MALI_CS_OPCODE_RUN_COMPUTE && job.tsd_gpu_va >= 0x10000ULL && *reinterpret_cast<const uint32_t*>(job.tsd_gpu_va) == MALI_IDVS_MAGIC) {
             draw_pkt = reinterpret_cast<const MaliIdvsDrawPacket*>(job.tsd_gpu_va);
-        } else if (job.srt_gpu_va >= 0x10000ULL && *reinterpret_cast<const uint32_t*>(job.srt_gpu_va) == MALI_IDVS_MAGIC) {
+        } else if (opc != MALI_CS_OPCODE_RUN_COMPUTE && job.srt_gpu_va >= 0x10000ULL && *reinterpret_cast<const uint32_t*>(job.srt_gpu_va) == MALI_IDVS_MAGIC) {
             draw_pkt = reinterpret_cast<const MaliIdvsDrawPacket*>(job.srt_gpu_va);
         }
 
@@ -355,7 +355,6 @@ public:
             return static_cast<uint64_t>(dma_heap_fd);
         }
         if (std::strstr(path, "mali") != nullptr) {
-            fprintf(stderr, "MALI!!!!\n");
             ensureLiftedKernelBound();
             if (mali_kbase_emu_open_direct) {
                 (void)mali_kbase_emu_open_direct(path, 0);
@@ -620,9 +619,9 @@ public:
 
                         // Check if this is a 3D vkcube IDVS + Fragment graphics pipeline draw packet
                         const MaliIdvsDrawPacket* draw_pkt = nullptr;
-                        if (job.tsd_gpu_va && *reinterpret_cast<const uint32_t*>(job.tsd_gpu_va) == MALI_IDVS_MAGIC) {
+                        if (opc != MALI_CS_OPCODE_RUN_COMPUTE && job.tsd_gpu_va && *reinterpret_cast<const uint32_t*>(job.tsd_gpu_va) == MALI_IDVS_MAGIC) {
                             draw_pkt = reinterpret_cast<const MaliIdvsDrawPacket*>(job.tsd_gpu_va);
-                        } else if (job.srt_gpu_va && *reinterpret_cast<const uint32_t*>(job.srt_gpu_va) == MALI_IDVS_MAGIC) {
+                        } else if (opc != MALI_CS_OPCODE_RUN_COMPUTE && job.srt_gpu_va && *reinterpret_cast<const uint32_t*>(job.srt_gpu_va) == MALI_IDVS_MAGIC) {
                             draw_pkt = reinterpret_cast<const MaliIdvsDrawPacket*>(job.srt_gpu_va);
                         }
 

@@ -144,7 +144,7 @@ fi
 TOOLS_PKG="$OUT_DIR/host-tools-and-vulkan-bins-x86_64.tar.xz"
 TOOLS_MANIFEST="$OUT_DIR/host-tools-and-vulkan-bins-x86_64.manifest"
 TOOL_ITEMS=()
-for item in src/aot/bin/vkcube_khronos src/aot/bin/vkcube tools scripts; do
+for item in tools scripts; do
    [[ -e "$item" ]] && TOOL_ITEMS+=("$item")
 done
 

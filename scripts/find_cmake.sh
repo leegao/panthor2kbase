@@ -50,12 +50,13 @@ if [ -f "${ROOT_DIR}/predownloaded/cmake.zip" ]; then
     EXTRACT_DIR="${CACHE_DIR}/cmake"
     if [ ! -x "${EXTRACT_DIR}/3.22.1/bin/cmake" ]; then
         mkdir -p "${CACHE_DIR}" "${EXTRACT_DIR}"
-        unzip -q -o "${ROOT_DIR}/predownloaded/cmake.zip" -d "${CACHE_DIR}" 2>/dev/null || \
+        unzip -q -o -DD "${ROOT_DIR}/predownloaded/cmake.zip" -d "${CACHE_DIR}" 2>/dev/null || \
         python3 -c "import zipfile; zipfile.ZipFile('${ROOT_DIR}/predownloaded/cmake.zip').extractall('${CACHE_DIR}')" 2>/dev/null || true
         if [ -d "${EXTRACT_DIR}/cmake/3.22.1" ] && [ ! -d "${EXTRACT_DIR}/3.22.1" ]; then
             mv "${EXTRACT_DIR}/cmake/3.22.1" "${EXTRACT_DIR}/3.22.1" 2>/dev/null || true
         fi
         chmod +x "${EXTRACT_DIR}"/3.22.1/bin/* 2>/dev/null || true
+        find "${CACHE_DIR}" -exec touch -c {} + 2>/dev/null || true
     fi
     if [ -x "${EXTRACT_DIR}/3.22.1/bin/cmake" ]; then
         export PATH="${EXTRACT_DIR}/3.22.1/bin:$PATH"

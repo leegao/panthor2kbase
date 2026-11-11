@@ -13,6 +13,8 @@
 #include <sys/mman.h>
 
 #include "mali_kbase_csf_lvp_harness.hpp"
+#define AOT_SO_PROFILER_IMPLEMENTATION
+#include "../include/aot_so_profiler.hpp"
 
 static constexpr uint64_t IMAGE_BASE = 0x400000000ULL;
 static constexpr uint64_t HLE_MALLOC_MAGIC   = 0xF000FFF0ULL;

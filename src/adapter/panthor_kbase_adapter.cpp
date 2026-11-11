@@ -4687,7 +4687,7 @@ int panthor_kbase_adapter_ioctl(int fd, unsigned long request, void *arg)
             continue;
          }
 
-         bool is_initial = (sq->emitted_jobs == 0);
+         bool is_initial = (sq->emitted_jobs == 0 || (sq->cached_subq_ctx_va == 0 && sq->emitted_jobs <= 2));
 
          /* Fast-path for 8-byte (1-qword) pure-NOP streams emitted by PanVK */
          if (!is_initial && qs->stream_size == 8U && qs->stream_addr != 0ULL) {

@@ -133,3 +133,17 @@ STUB_FN(xshmfence_map_shm)
 STUB_FN(xshmfence_reset)
 STUB_FN(xshmfence_trigger)
 STUB_FN(xshmfence_unmap_shm)
+
+__attribute__((weak)) long xcb_randr_get_screen_resources_reply(void) { return 0; }
+__attribute__((weak)) long xcb_randr_get_screen_resources_outputs(void) { return 0; }
+__attribute__((weak)) long xcb_randr_get_screen_resources_crtcs(void) { return 0; }
+__attribute__((weak)) long xcb_randr_get_screen_resources_current_modes_iterator(void) { return 0; }
+__attribute__((weak)) long xcb_randr_mode_info_next(void) { return 0; }
+__attribute__((weak)) long xcb_randr_get_crtc_info_outputs_length(void) { return 0; }
+__attribute__((weak)) long xcb_randr_get_crtc_info_outputs(void) { return 0; }
+__attribute__((weak)) long xcb_randr_get_crtc_info_possible_length(void) { return 0; }
+__attribute__((weak)) long xcb_randr_get_crtc_info_possible(void) { return 0; }
+__attribute__((weak)) long xcb_randr_get_output_info_modes(void) { return 0; }
+__attribute__((weak)) long xcb_randr_get_screen_resources_current(void) { return 0; }
+__attribute__((weak)) long xcb_randr_get_screen_resources(void) { return 0; }
+__attribute__((weak)) long xcb_randr_get_crtc_info(void) { return 0; }

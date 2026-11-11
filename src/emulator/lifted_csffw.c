@@ -16,6 +16,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+
+static bool csffw_is_mapped_va(uint64_t va, size_t len) {
+    if (va < 0x10000ULL || len == 0 || (va + len) < va) return false;
+    uint64_t p0 = va & ~4095ULL;
+    uint64_t p1 = (va + len - 1ULL) & ~4095ULL;
+    return msync((void *)(uintptr_t)p0, (size_t)(p1 - p0 + 4096ULL), MS_ASYNC) == 0;
+}
 
 static uint32_t read_u32_le(const uint8_t *p)
 {
@@ -31,11 +39,8 @@ bool csffw_parse_binary_file(const char *path, struct csffw_parsed_image *out_im
         return false;
     memset(out_img, 0, sizeof(*out_img));
 
-    const char *cands[6] = {
+    const char *cands[] = {
         path,
-        "predownloaded/mali_csffw.bin",
-        "../predownloaded/mali_csffw.bin",
-        "../../predownloaded/mali_csffw.bin",
         "kernel/mali_csffw.bin",
         "../kernel/mali_csffw.bin",
         "../../kernel/mali_csffw.bin",
@@ -339,7 +344,7 @@ enum csffw_opcode_ret lifted_csffw_dispatch_opcode(
             return csffw_raise_invalid_insn_fault(st);
         uint64_t sync_va = csffw_read_reg64(st, addr_reg);
         /* 0x008016ac / 0x008016d4: 8-byte alignment check for 32-bit, 16-byte or 8-byte for 64-bit */
-        if ((sync_va & 0x7ULL) != 0ULL || sync_va < 0x10000ULL)
+        if ((sync_va & 0x7ULL) != 0ULL || sync_va < 0x10000ULL || !csffw_is_mapped_va(sync_va, is_64 ? 8U : 4U))
             return csffw_raise_invalid_insn_fault(st);
         if (is_64) {
             uint64_t v64 = csffw_read_reg64(st, val_reg);
@@ -373,7 +378,7 @@ enum csffw_opcode_ret lifted_csffw_dispatch_opcode(
         if (cond > 5U || (((1U << cond) & 0x23U) == 0U))
             return csffw_raise_invalid_insn_fault(st);
         uint64_t sync_va = csffw_read_reg64(st, addr_reg);
-        if ((sync_va & 0x7ULL) != 0ULL || sync_va < 0x10000ULL)
+        if ((sync_va & 0x7ULL) != 0ULL || sync_va < 0x10000ULL || !csffw_is_mapped_va(sync_va, is_64 ? 8U : 4U))
             return csffw_raise_invalid_insn_fault(st);
         bool satisfied = false;
         if (is_64) {

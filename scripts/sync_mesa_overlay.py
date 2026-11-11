@@ -10,14 +10,16 @@ Addressing Doc 56 comment `doco.eAzfyYFe1LW8n5dega5p5A`:
 
 Modes:
   1. `--mode auto` (default):
-     For each file tracked in `mesa_overlay/` (and any modified/untracked files
-     under `mesa/` if `mesa/.git` exists or relative to the overlay manifest),
-     compares content and mtime between `mesa/<relpath>` and `mesa_overlay/<relpath>`,
-     copying the newer modified version to the older/missing side so edits made
-     directly in `mesa/` automatically propagate back into `mesa_overlay/` and
-     vice versa.
+     Uses content-hash baseline tracking (`mesa/.mesa_overlay_state.json`) plus
+     mtime comparison so freshly unpacked upstream `mesa/` trees (even when
+     extracted with `tar -m` / newer mtimes) NEVER overwrite `mesa_overlay/`
+     with unmodified upstream files. Only when `mesa/.mesa_overlay_state.json`
+     proves that `mesa/<relpath>` was previously synced from `mesa_overlay/`
+     and subsequently edited in-place in `mesa/` does `auto` propagate
+     `mesa/<relpath> -> mesa_overlay/<relpath>`.
   2. `--mode to-mesa` (`mesa_overlay/ -> mesa/`):
-     Applies all files from `mesa_overlay/` into `mesa/`.
+     Applies all files from `mesa_overlay/` into `mesa/` and updates
+     `mesa/.mesa_overlay_state.json`.
   3. `--mode from-mesa` (`mesa/ -> mesa_overlay/`):
      Captures all modified overlay files (plus any new files in `mesa/` listed
      via `--add <relpath>`) from `mesa/` back into `mesa_overlay/`.
@@ -29,11 +31,14 @@ Modes:
 import argparse
 import filecmp
 import hashlib
+import json
 import os
 import shutil
 import sys
 from pathlib import Path
-from typing import List, Set, Tuple
+from typing import Dict, List, Set, Tuple
+
+STATE_FILENAME = ".mesa_overlay_state.json"
 
 
 def sha256_file(path: Path) -> str:
@@ -42,6 +47,29 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def load_sync_state(mesa_dir: Path) -> Dict[str, str]:
+    state_path = mesa_dir / STATE_FILENAME
+    if not state_path.is_file():
+        return {}
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def save_sync_state(mesa_dir: Path, state: Dict[str, str]) -> None:
+    if not mesa_dir.is_dir():
+        return
+    state_path = mesa_dir / STATE_FILENAME
+    try:
+        state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except Exception:
+        pass
 
 
 def collect_overlay_relpaths(overlay_dir: Path) -> List[Path]:
@@ -76,11 +104,15 @@ def sync_two_way(
             clean = Path(p.strip("/"))
             rel_set.add(clean)
 
+    state = load_sync_state(mesa_dir)
+    state_dirty = False
+
     copied_to_mesa = 0
     copied_to_overlay = 0
     drifted = 0
 
     for rel in sorted(rel_set):
+        rel_key = str(rel)
         ov_file = overlay_dir / rel
         ms_file = mesa_dir / rel
 
@@ -89,21 +121,35 @@ def sync_two_way(
 
         if ov_exists and ms_exists:
             if filecmp.cmp(str(ov_file), str(ms_file), shallow=False):
+                if mode != "check" and not dry_run:
+                    h = sha256_file(ov_file)
+                    if state.get(rel_key) != h:
+                        state[rel_key] = h
+                        state_dirty = True
                 continue
             drifted += 1
+            ov_hash = sha256_file(ov_file)
+            ms_hash = sha256_file(ms_file)
             if mode == "check":
                 if not quiet:
-                    print(f"[DRIFT] {rel}: mesa_overlay ({sha256_file(ov_file)[:10]}) != mesa ({sha256_file(ms_file)[:10]})")
+                    print(f"[DRIFT] {rel}: mesa_overlay ({ov_hash[:10]}) != mesa ({ms_hash[:10]})")
                 continue
             elif mode == "to-mesa":
                 direction = "to-mesa"
             elif mode == "from-mesa":
                 direction = "from-mesa"
             else:
-                # auto: compare mtime (with 1ms tolerance; if mesa file is newer, sync from-mesa -> mesa_overlay)
+                # Safe 2-way auto mode:
+                # Only sync from-mesa -> mesa_overlay if mesa/.mesa_overlay_state.json
+                # records that mesa/<rel> was previously synced to ov_hash AND mesa/<rel>
+                # was subsequently modified in-place with a newer mtime.
+                prev_hash = state.get(rel_key)
                 ov_mtime = ov_file.stat().st_mtime
                 ms_mtime = ms_file.stat().st_mtime
-                direction = "from-mesa" if ms_mtime > ov_mtime + 1e-3 else "to-mesa"
+                if prev_hash is not None and prev_hash == ov_hash and ms_hash != prev_hash and ms_mtime > ov_mtime + 1e-3:
+                    direction = "from-mesa"
+                else:
+                    direction = "to-mesa"
 
             if direction == "to-mesa":
                 if not quiet:
@@ -111,6 +157,8 @@ def sync_two_way(
                 if not dry_run:
                     ms_file.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(ov_file, ms_file)
+                    state[rel_key] = ov_hash
+                    state_dirty = True
                 copied_to_mesa += 1
             else:
                 if not quiet:
@@ -118,6 +166,8 @@ def sync_two_way(
                 if not dry_run:
                     ov_file.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(ms_file, ov_file)
+                    state[rel_key] = ms_hash
+                    state_dirty = True
                 copied_to_overlay += 1
 
         elif ov_exists and not ms_exists:
@@ -134,6 +184,8 @@ def sync_two_way(
                 if not dry_run:
                     ms_file.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(ov_file, ms_file)
+                    state[rel_key] = sha256_file(ov_file)
+                    state_dirty = True
                 copied_to_mesa += 1
 
         elif ms_exists and not ov_exists:
@@ -148,7 +200,12 @@ def sync_two_way(
                 if not dry_run:
                     ov_file.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(ms_file, ov_file)
+                    state[rel_key] = sha256_file(ms_file)
+                    state_dirty = True
                 copied_to_overlay += 1
+
+    if state_dirty and not dry_run and mode != "check":
+        save_sync_state(mesa_dir, state)
 
     return copied_to_mesa, copied_to_overlay, drifted
 
@@ -172,7 +229,7 @@ def main() -> int:
         "--mode",
         choices=["auto", "to-mesa", "from-mesa", "check"],
         default="auto",
-        help="Sync direction: 'auto' (mtime-based 2-way sync), 'to-mesa' (overlay -> mesa), 'from-mesa' (mesa -> overlay), or 'check'",
+        help="Sync direction: 'auto' (hash+mtime 2-way sync), 'to-mesa' (overlay -> mesa), 'from-mesa' (mesa -> overlay), or 'check'",
     )
     parser.add_argument(
         "--check",

@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 #include "aarch64_common_cpu_prefix.h"
 
 #ifdef __cplusplus
@@ -14,13 +15,15 @@ extern "C" {
 typedef struct LiftedKbaseCPU LiftedKbaseCPU;
 typedef void (*LiftedKbaseShimHook)(LiftedKbaseCPU *cpu, const char *ko_profile, const char *callee);
 
-/* Target kernel module hardware/platform profile ID (per Doc 48 comment doco.Sqmp-w0Al4UvqeikyjWXcQ) */
+/* Target kernel module hardware/platform profile ID */
 enum LiftedKoProfileId {
-    KO_PROFILE_R44P1       = 0, /* MediaTek MT6878 Mali-G615 r44p1/r49p1 (kbase v1.21) */
-    KO_PROFILE_HUSKY_R54P1 = 1, /* Google Pixel 8 Pro Tensor G3 Husky Mali-G715 r54p1 (kbase v1.38) */
+    KO_PROFILE_R44P1          = 0, /* MediaTek MT6878 r44p1 / Pixel 7 Tensor G2 GS201 r47p0 CSF (5.10.189) */
+    KO_PROFILE_HUSKY_R54P1    = 1, /* Google Pixel 8 Pro Tensor G3 Husky Mali-G715 r54p1 CSF (kbase v1.38) */
+    KO_PROFILE_GS201_R47P0    = 2, /* Google Pixel 7 Tensor G2 GS201 Mali-G710 r47p0 CSF (5.10.198, UK 1.24) */
+    KO_PROFILE_GS101_R47P0_JM = 3, /* Google Pixel 6 Tensor G1 GS101 Mali-G78 r47p0 JM (5.10.198, UK 11.42) */
 };
 
-/* Compile-time integer enum ID for external kernel shim callouts (per Doc 48 comment doco.fy1VMDUccXqURl_ae6DDiw) */
+/* Compile-time integer enum ID for external kernel shim callouts */
 enum LiftedKernelShimId {
     KO_SHIM_UNKNOWN                          = 0,
     KO_SHIM_INDIRECT_BLR                     = 1,
@@ -47,15 +50,39 @@ enum LiftedKernelShimId {
     KO_SHIM_CREATE_QUEUE_GROUP               = 22,
     KO_SHIM_KBASE_CSF_TILER_HEAP_INIT        = 23,
     KO_SHIM_NOOP_EXTERNAL                    = 24,
+    KO_SHIM_JD_SUBMIT_ATOM                   = 25,
+    KO_SHIM_JD_RUN_ATOM                      = 26,
 };
 
-/*
- * Enclosing Kernel Heap Arena & Sanitizer State (`struct LiftedKoHeap`, per
- * doco.fye2LblI44z3tNk1mh5Euw, doco.mbTC_NolEN_X7AF0b4BFRQ & doco.AmlJA4WGBr86E_Cg1P7hMw).
- * Prepends a 16-byte `LiftedKoHeapBlockHdr` before every allocation, appends a
- * 16-byte `0xFE` redzone canary after every payload, poisons freed blocks with
- * `0x6B` (POISON_FREE), and prints a full guest + host stacktrace on any violation.
- */
+/* Debugging, Guest Stackframe Recording & Function Call Profiling Flags */
+#define LIFTED_KO_DEBUG_RECORD_STACKFRAMES (1U << 0)
+#define LIFTED_KO_DEBUG_TRACE_CALLS        (1U << 1)
+#define LIFTED_KO_DEBUG_PROFILE_CALLS      (1U << 2)
+#define LIFTED_KO_MAX_CALL_FRAMES          64U
+
+struct LiftedKoStackFrame {
+    const char *ko_profile;
+    const char *fn_name;
+    uint64_t entry_pc;
+    uint64_t caller_pc;
+    uint64_t sp;
+    uint64_t fp;
+    uint64_t lr;
+    uint64_t args[4];
+    uint64_t enter_ns;
+    uint64_t child_ns;
+};
+
+struct LiftedKoFnProfileEntry {
+    const char *ko_profile;
+    const char *fn_name;
+    uint64_t entry_pc;
+    uint64_t call_count;
+    uint64_t total_inclusive_ns;
+    uint64_t total_exclusive_ns;
+    uint64_t max_ns;
+};
+
 #define LIFTED_KO_HEAP_MAGIC        0x4B414C43U
 #define LIFTED_KO_STATE_ALLOCATED   0xA110CA7EU
 #define LIFTED_KO_STATE_FREED       0xF2EED00DU
@@ -107,11 +134,22 @@ struct LiftedKbaseCPU {
     uint8_t task_struct[4096] __attribute__((aligned(16)));
     uint64_t cur_pc;
     const char *cur_fn;
+    uint32_t debug_flags;
+    uint32_t call_depth;
+    uint32_t max_call_depth;
+    struct LiftedKoStackFrame call_frames[LIFTED_KO_MAX_CALL_FRAMES];
 };
 
 AARCH64_STATIC_ASSERT_CPU_PREFIX(struct LiftedKbaseCPU);
 
 void lifted_kbase_cpu_init(LiftedKbaseCPU *cpu, void *user_ctx, LiftedKbaseShimHook shim_hook);
+void lifted_ko_set_debug_flags(LiftedKbaseCPU *cpu, uint32_t flags);
+uint32_t lifted_ko_get_debug_flags(const LiftedKbaseCPU *cpu);
+void lifted_ko_trace_fn_enter(LiftedKbaseCPU *cpu, uint32_t profile_id, const char *fn_name, uint64_t entry_pc);
+void lifted_ko_trace_fn_exit(LiftedKbaseCPU *cpu, uint32_t profile_id, const char *fn_name, uint64_t entry_pc, int64_t ret_val);
+void lifted_ko_reset_profile(void);
+size_t lifted_ko_get_profile_entries(struct LiftedKoFnProfileEntry *out_entries, size_t max_entries);
+void lifted_ko_dump_profile(FILE *out);
 void *lifted_ko_heap_alloc(LiftedKbaseCPU *cpu, size_t sz);
 int lifted_ko_heap_free(LiftedKbaseCPU *cpu, void *ptr);
 bool lifted_ko_check_mem_access(LiftedKbaseCPU *cpu, const void *ptr, size_t sz, bool is_write);
@@ -133,6 +171,7 @@ int64_t lifted_r44p1_kbase_gpuprops_get_curr_config_props(LiftedKbaseCPU *cpu);
 int64_t lifted_r44p1_kbase_gpuprops_populate_user_buffer(LiftedKbaseCPU *cpu);
 int64_t lifted_r44p1_kbase_file_create_kctx(LiftedKbaseCPU *cpu);
 int64_t lifted_r44p1_kbase_file_delete(LiftedKbaseCPU *cpu);
+int64_t lifted_r44p1_kbase_api_mem_jit_init(LiftedKbaseCPU *cpu);
 int64_t lifted_r44p1_kbase_api_mem_alloc_ex(LiftedKbaseCPU *cpu);
 int64_t lifted_r44p1_kbase_api_mem_alloc(LiftedKbaseCPU *cpu);
 int64_t lifted_r44p1_kbase_api_mem_alias(LiftedKbaseCPU *cpu);
@@ -189,6 +228,66 @@ int64_t lifted_husky_r54p1_kbase_release(LiftedKbaseCPU *cpu);
 int64_t lifted_husky_r54p1_kbase_mmap(LiftedKbaseCPU *cpu);
 int64_t lifted_husky_r54p1_kbase_poll(LiftedKbaseCPU *cpu);
 int64_t lifted_husky_r54p1_kbase_ioctl(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_check_flags(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_mali_kbase_supports_cap(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_check_alloc_flags(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_check_import_flags(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_check_alloc_sizes(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_gpuprops_parse_gpu_id(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_gpuprops_get_curr_config_props(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_gpuprops_populate_user_buffer(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_file_create_kctx(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_file_delete(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_api_mem_jit_init(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_api_mem_alloc_ex(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_api_mem_alloc(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_api_mem_alias(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_api_mem_import(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_api_get_cpu_gpu_timeinfo(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_ioctl_cs_get_glb_iface(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_ioctl_read_user_page(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_mem_flags_change(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_csf_queue_register(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_csf_queue_register_ex(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_csf_alloc_command_stream_user_pages(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_csf_queue_bind(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_csf_queue_group_create(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbasep_cs_queue_group_create(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbasep_cs_queue_group_create_1_6(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbasep_cs_queue_group_create_1_18(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbasep_cs_tiler_heap_init(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbasep_cs_tiler_heap_init_1_13(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_open(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_release(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_mmap(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_poll(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_kfile_ioctl(LiftedKbaseCPU *cpu);
+int64_t lifted_gs201_r47p0_kbase_ioctl(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_check_flags(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_mali_kbase_supports_cap(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_check_alloc_flags(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_check_import_flags(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_check_alloc_sizes(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_gpuprops_parse_gpu_id(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_gpuprops_get_curr_config_props(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_gpuprops_populate_user_buffer(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_file_create_kctx(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_file_delete(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_api_set_flags(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_api_mem_jit_init(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_api_mem_alloc(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_api_mem_alias(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_api_mem_import(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_api_get_cpu_gpu_timeinfo(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_mem_flags_change(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_jd_submit(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_jd_submit_atom(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_open(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_release(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_mmap(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_poll(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_kfile_ioctl(LiftedKbaseCPU *cpu);
+int64_t lifted_gs101_r47p0_jm_kbase_ioctl(LiftedKbaseCPU *cpu);
 
 /* Single-.ko unified entrypoints (defaulting to active specialized .ko profile) */
 int64_t lifted_kbase_kbase_check_flags(LiftedKbaseCPU *cpu);
@@ -201,6 +300,7 @@ int64_t lifted_kbase_kbase_gpuprops_get_curr_config_props(LiftedKbaseCPU *cpu);
 int64_t lifted_kbase_kbase_gpuprops_populate_user_buffer(LiftedKbaseCPU *cpu);
 int64_t lifted_kbase_kbase_file_create_kctx(LiftedKbaseCPU *cpu);
 int64_t lifted_kbase_kbase_file_delete(LiftedKbaseCPU *cpu);
+int64_t lifted_kbase_kbase_api_mem_jit_init(LiftedKbaseCPU *cpu);
 int64_t lifted_kbase_kbase_api_mem_alloc_ex(LiftedKbaseCPU *cpu);
 int64_t lifted_kbase_kbase_api_mem_alloc(LiftedKbaseCPU *cpu);
 int64_t lifted_kbase_kbase_api_mem_alias(LiftedKbaseCPU *cpu);

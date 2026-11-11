@@ -12,9 +12,9 @@ export MESON_WORKING_DIR="$PWD"
 "$MESON_WORKING_DIR/scripts/apply_mesa_overlay.sh" "$MESON_WORKING_DIR/mesa"
 
 meson setup build-x86-64/mesa mesa \
-    -Dplatforms=[] \
+    -Dplatforms=x11,wayland \
     -Dgallium-drivers=[] \
-    -Dvulkan-drivers=[] \
+    -Dvulkan-drivers=panfrost \
     -Dtools=panfrost \
     -Dprecomp-compiler=enabled \
     -Dinstall-precomp-compiler=true \

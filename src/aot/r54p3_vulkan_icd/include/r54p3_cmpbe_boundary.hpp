@@ -83,7 +83,7 @@ enum CmpbeStatus : int32_t {
 // RVA 0x01c9ec10: cmpbe_v2_init_options
 inline void cmpbe_v2_init_options(CmpbeV2Options* opts) {
     if (!opts) return;
-    std::memset(opts, 0, sizeof(CmpbeV2Options));
+    *opts = CmpbeV2Options{};
     opts->magic   = 0x434D5032U;
     opts->version = 2U;
 }

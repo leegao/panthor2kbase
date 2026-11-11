@@ -21,6 +21,74 @@ echo "  -> Using CMake: $CMAKE_BIN"
 "$CMAKE_BIN" -S "$ROOT_DIR" -B "$ROOT_DIR/build-x86-64" -DCMAKE_BUILD_TYPE=Release
 "$CMAKE_BIN" --build "$ROOT_DIR/build-x86-64" -j"$(nproc 2>/dev/null || echo 4)"
 
+if [ -d $ROOT_DIR/third_party/compat_layer ] && ([ -f $ROOT_DIR/third_party/compat_layer/CMakeLists.txt ]); then
+    echo "  -> Building third_party/compat_layer"
+    "$CMAKE_BIN" -S "$ROOT_DIR/third_party/compat_layer" -B "$ROOT_DIR/build-x86-64/compat_layer" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_WARN_DEPRECATED=OFF
+
+    cmake --build "$ROOT_DIR/build-x86-64/compat_layer" -j"$(nproc 2>/dev/null || echo 4)"
+    echo "  -> Built libdxvk_mali_compat_layer.so in build-x86-64/compat_layer"
+    cp "$ROOT_DIR/build-x86-64/compat_layer/libdxvk_mali_compat_layer.so" "$ROOT_DIR/build-x86-64/"
+    cat > "$ROOT_DIR/build-x86-64/libdxvk_mali_compat_layer.json" << EOF
+{
+    "file_format_version" : "1.0.0",
+    "layer" : {
+        "name": "VK_LAYER_COMPAT_DxvkMaliCompatLayer",
+        "type": "GLOBAL",
+        "library_path": "./libdxvk_mali_compat_layer.so",
+        "api_version": "1.0.0",
+        "implementation_version": "1",
+        "description": "Descriptor Buffer Layer",
+        "functions": {
+            "vkGetInstanceProcAddr": "DxvkMaliCompatLayer_GetInstanceProcAddr",
+            "vkGetDeviceProcAddr": "DxvkMaliCompatLayer_GetDeviceProcAddr"
+        },
+        "enable_environment": {
+            "ENABLE_MALI_COMPAT": "1"
+        },
+        "disable_environment": {
+            "DISABLE_MALI_COMPAT": "1"
+        }
+    }
+}
+EOF
+fi
+
+if [ -d $ROOT_DIR/third_party/bcn_layer ] && ([ -f $ROOT_DIR/third_party/bcn_layer/CMakeLists.txt ]); then
+    echo "  -> Building third_party/bcn_layer"
+    "$CMAKE_BIN" -S "$ROOT_DIR/third_party/bcn_layer" -B "$ROOT_DIR/build-x86-64/bcn_layer" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_WARN_DEPRECATED=OFF
+
+    cmake --build "$ROOT_DIR/build-x86-64/bcn_layer" -j"$(nproc 2>/dev/null || echo 4)"
+    echo "  -> Built libbcn_layer.so in build-x86-64/bcn_layer"
+    cp "$ROOT_DIR/build-x86-64/bcn_layer/libbcn_layer.so" "$ROOT_DIR/build-x86-64/"
+    cat > "$ROOT_DIR/build-x86-64/libbcn_layer.json" << EOF
+{
+    "file_format_version" : "1.0.0",
+    "layer" : {
+        "name": "VK_LAYER_BCN_BCnLayer",
+        "type": "GLOBAL",
+        "library_path": "./libbcn_layer.so",
+        "api_version": "1.0.0",
+        "implementation_version": "1",
+        "description": "BCn Decompression Layer",
+        "functions": {
+            "vkGetInstanceProcAddr": "BCnLayer_GetInstanceProcAddr",
+            "vkGetDeviceProcAddr": "BCnLayer_GetDeviceProcAddr"
+        },
+        "enable_environment": {
+            "ENABLE_BCN": "1"
+        },
+        "disable_environment": {
+            "DISABLE_BCN": "1"
+        }
+    }
+}
+EOF
+fi
+
 echo "================================================================================"
 echo " [2/3] Building Android Panthor-to-Kbase Adapter, /dev/mali0 Emulator & Tracer  "
 echo "================================================================================"
@@ -45,6 +113,85 @@ if [ -n "$NDK_TOOLCHAIN" ]; then
         -DPANTHOR_KBASE_BUILD_AOT=OFF
     "$CMAKE_BIN" --build "$ROOT_DIR/build-android" -j"$(nproc 2>/dev/null || echo 4)"
     echo "  -> Built Android aarch64 native libraries in build-android/"
+    if [ -d $ROOT_DIR/third_party/compat_layer ] && ([ -f $ROOT_DIR/third_party/compat_layer/CMakeLists.txt ]); then
+        echo "  -> Building third_party/compat_layer"
+        "$CMAKE_BIN" -S "$ROOT_DIR/third_party/compat_layer" -B "$ROOT_DIR/build-android/compat_layer" \
+            -DCMAKE_SYSTEM_NAME=Android \
+            -DANDROID_PLATFORM=26 \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_TOOLCHAIN=clang \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="${NDK_TOOLCHAIN}" \
+            -DCMAKE_WARN_DEPRECATED=OFF
+
+        cmake --build "$ROOT_DIR/build-android/compat_layer" -j"$(nproc 2>/dev/null || echo 4)"
+        echo "  -> Built libdxvk_mali_compat_layer.so in build-android/compat_layer"
+        cp "$ROOT_DIR/build-android/compat_layer/libdxvk_mali_compat_layer.so" "$ROOT_DIR/build-android/"
+        cat > "$ROOT_DIR/build-android/libdxvk_mali_compat_layer.json" << EOF
+{
+    "file_format_version" : "1.0.0",
+    "layer" : {
+        "name": "VK_LAYER_COMPAT_DxvkMaliCompatLayer",
+        "type": "GLOBAL",
+        "library_path": "./libdxvk_mali_compat_layer.so",
+        "api_version": "1.0.0",
+        "implementation_version": "1",
+        "description": "Descriptor Buffer Layer",
+        "functions": {
+            "vkGetInstanceProcAddr": "DxvkMaliCompatLayer_GetInstanceProcAddr",
+            "vkGetDeviceProcAddr": "DxvkMaliCompatLayer_GetDeviceProcAddr"
+        },
+        "enable_environment": {
+            "ENABLE_MALI_COMPAT": "1"
+        },
+        "disable_environment": {
+            "DISABLE_MALI_COMPAT": "1"
+        }
+    }
+}
+EOF
+    fi
+
+    if [ -d $ROOT_DIR/third_party/bcn_layer ] && ([ -f $ROOT_DIR/third_party/bcn_layer/CMakeLists.txt ]); then
+        echo "  -> Building third_party/bcn_layer"
+        "$CMAKE_BIN" -S "$ROOT_DIR/third_party/bcn_layer" -B "$ROOT_DIR/build-android/bcn_layer" \
+            -DCMAKE_SYSTEM_NAME=Android \
+            -DANDROID_PLATFORM=26 \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_TOOLCHAIN=clang \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="${NDK_TOOLCHAIN}" \
+            -DCMAKE_WARN_DEPRECATED=OFF
+
+        cmake --build "$ROOT_DIR/build-android/bcn_layer" -j"$(nproc 2>/dev/null || echo 4)"
+        echo "  -> Built libbcn_layer.so in build-android/bcn_layer"
+        cp "$ROOT_DIR/build-android/bcn_layer/libbcn_layer.so" "$ROOT_DIR/build-android/"
+        cat > "$ROOT_DIR/build-android/libbcn_layer.json" << EOF
+{
+    "file_format_version" : "1.0.0",
+    "layer" : {
+        "name": "VK_LAYER_BCN_BCnLayer",
+        "type": "GLOBAL",
+        "library_path": "./libbcn_layer.so",
+        "api_version": "1.0.0",
+        "implementation_version": "1",
+        "description": "BCn Decompression Layer",
+        "functions": {
+            "vkGetInstanceProcAddr": "BCnLayer_GetInstanceProcAddr",
+            "vkGetDeviceProcAddr": "BCnLayer_GetDeviceProcAddr"
+        },
+        "enable_environment": {
+            "ENABLE_BCN": "1"
+        },
+        "disable_environment": {
+            "DISABLE_BCN": "1"
+        }
+    }
+}
+EOF
+    fi
 else
     echo "  -> Android NDK toolchain not found, skipping Android CMake build."
 fi

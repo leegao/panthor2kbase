@@ -34,6 +34,51 @@ static void apply_dxvk_mali_features(uint32_t* feat_words) {
     ++g_compat_queries;
 }
 
+struct CompatVkExtProp { char extensionName[256]; uint32_t specVersion; };
+static const CompatVkExtProp kCompatWsiInstanceExts[] = {
+    {"VK_KHR_surface", 25},
+    {"VK_KHR_xcb_surface", 6},
+    {"VK_KHR_xlib_surface", 6},
+    {"VK_KHR_wayland_surface", 6},
+    {"VK_KHR_win32_surface", 6},
+    {"VK_EXT_headless_surface", 1},
+    {"VK_KHR_display", 23},
+    {"VK_KHR_get_physical_device_properties2", 2},
+    {"VK_KHR_get_surface_capabilities2", 1},
+    {"VK_EXT_surface_maintenance1", 1},
+    {"VK_EXT_swapchain_colorspace", 4},
+    {"VK_EXT_debug_utils", 2},
+    {"VK_EXT_debug_report", 10},
+    {"VK_KHR_external_memory_capabilities", 1},
+    {"VK_KHR_external_semaphore_capabilities", 1},
+    {"VK_KHR_external_fence_capabilities", 1},
+    {"VK_KHR_device_group_creation", 1},
+};
+
+__attribute__((visibility("default")))
+int32_t CompatLayer_EnumerateInstanceExtensionProperties(const char* pLayerName, uint32_t* pPropertyCount, void* pProperties) {
+    if (pLayerName && (std::strcmp(pLayerName, "VK_LAYER_COMPAT_DxvkMaliCompatLayer") == 0 ||
+                       std::strcmp(pLayerName, "VK_LAYER_COMPAT_DxvkMaliCompatLayer1") == 0)) {
+        if (pPropertyCount) *pPropertyCount = 0;
+        return 0;
+    }
+    if (g_compat_next_gipa) {
+        auto fn = reinterpret_cast<int32_t (*)(const char*, uint32_t*, void*)>(
+            g_compat_next_gipa(g_compat_instance, "vkEnumerateInstanceExtensionProperties"));
+        if (fn) return fn(pLayerName, pPropertyCount, pProperties);
+    }
+    if (!pLayerName && pPropertyCount) {
+        const uint32_t kCount = static_cast<uint32_t>(sizeof(kCompatWsiInstanceExts) / sizeof(kCompatWsiInstanceExts[0]));
+        if (!pProperties) { *pPropertyCount = kCount; return 0; }
+        uint32_t to_copy = (*pPropertyCount < kCount) ? *pPropertyCount : kCount;
+        std::memcpy(pProperties, kCompatWsiInstanceExts, to_copy * sizeof(CompatVkExtProp));
+        *pPropertyCount = to_copy;
+        return (to_copy < kCount) ? 5 : 0;
+    }
+    if (pPropertyCount) *pPropertyCount = 0;
+    return 0;
+}
+
 __attribute__((visibility("default")))
 int32_t CompatLayer_EnumerateInstanceLayerProperties(uint32_t* pPropertyCount, void* pProperties) {
     if (!pPropertyCount) return -3;
@@ -126,6 +171,7 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(void* instance, const char* pName) {
     if (!pName) return nullptr;
     if (std::strcmp(pName, "vkGetInstanceProcAddr") == 0)              return reinterpret_cast<PFN_vkVoidFunction>(&vkGetInstanceProcAddr);
     if (std::strcmp(pName, "vkEnumerateInstanceLayerProperties") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&CompatLayer_EnumerateInstanceLayerProperties);
+    if (std::strcmp(pName, "vkEnumerateInstanceExtensionProperties") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&CompatLayer_EnumerateInstanceExtensionProperties);
     if (std::strcmp(pName, "vkCreateInstance") == 0)                   return reinterpret_cast<PFN_vkVoidFunction>(&CompatLayer_CreateInstance);
     if (std::strcmp(pName, "vkCreateDevice") == 0)                     return reinterpret_cast<PFN_vkVoidFunction>(&CompatLayer_CreateDevice);
     if (std::strcmp(pName, "vkGetPhysicalDeviceFeatures") == 0)        return reinterpret_cast<PFN_vkVoidFunction>(&CompatLayer_GetPhysicalDeviceFeatures);

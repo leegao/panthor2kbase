@@ -135,6 +135,12 @@ void vkDestroyDevice(void* device, const void* /*pAllocator*/) {
                (unsigned long long)kst.lifted_ko_calls_executed,
                (unsigned long long)kst.lifted_ko_insns_executed);
     }
+    if (aot_so_get_debug_flags() & AOT_SO_DEBUG_PROFILE_CALLS) {
+        aot_so_dump_profile(stderr);
+    }
+    if (lifted_ko_get_debug_flags(nullptr) & LIFTED_KO_DEBUG_PROFILE_CALLS) {
+        lifted_ko_dump_profile(stderr);
+    }
     delete static_cast<MaliIcdDevice*>(device);
 }
 
@@ -211,6 +217,35 @@ int32_t vkMapMemory(void* /*device*/, uint64_t memory, uint64_t offset, uint64_t
 
 __attribute__((visibility("default")))
 void vkUnmapMemory(void* /*device*/, uint64_t /*memory*/) {}
+
+__attribute__((visibility("default")))
+int32_t vkMapMemory2(void* device, const void* pMemoryMapInfo, void** ppData) {
+    if (!pMemoryMapInfo || !ppData) return -3;
+    struct VkMemoryMapInfoKHR_Icd {
+        uint32_t sType;
+        const void* pNext;
+        uint32_t flags;
+        uint64_t memory;
+        uint64_t offset;
+        uint64_t size;
+    };
+    const auto* info = static_cast<const VkMemoryMapInfoKHR_Icd*>(pMemoryMapInfo);
+    return vkMapMemory(device, info->memory, info->offset, info->size, info->flags, ppData);
+}
+
+__attribute__((visibility("default")))
+int32_t vkUnmapMemory2(void* device, const void* pMemoryUnmapInfo) {
+    if (!pMemoryUnmapInfo) return -3;
+    struct VkMemoryUnmapInfoKHR_Icd {
+        uint32_t sType;
+        const void* pNext;
+        uint32_t flags;
+        uint64_t memory;
+    };
+    const auto* info = static_cast<const VkMemoryUnmapInfoKHR_Icd*>(pMemoryUnmapInfo);
+    vkUnmapMemory(device, info->memory);
+    return 0;
+}
 
 __attribute__((visibility("default")))
 int32_t vkBindBufferMemory(void* /*device*/, uint64_t buffer, uint64_t memory, uint64_t memoryOffset) {
@@ -418,32 +453,68 @@ __attribute__((visibility("default")))
 void vkDestroyDescriptorPool(void* /*device*/, uint64_t /*descriptorPool*/, const void* /*pAllocator*/) {}
 
 __attribute__((visibility("default")))
-int32_t vkAllocateDescriptorSets(void* /*device*/, const void* /*pAllocateInfo*/, uint64_t* pDescriptorSets) {
+int32_t vkAllocateDescriptorSets(void* /*device*/, const void* pAllocateInfo, uint64_t* pDescriptorSets) {
     if (!pDescriptorSets) return -3;
-    pDescriptorSets[0] = reinterpret_cast<uint64_t>(new MaliIcdDescriptorSet());
+    struct AllocInfo { uint32_t sType; const void* pNext; uint64_t pool; uint32_t count; const uint64_t* pLayouts; };
+    const auto* ai = static_cast<const AllocInfo*>(pAllocateInfo);
+    uint32_t n = (ai && ai->count > 0 && ai->count <= 4096U) ? ai->count : 1U;
+    for (uint32_t i = 0; i < n; ++i) {
+        pDescriptorSets[i] = reinterpret_cast<uint64_t>(new MaliIcdDescriptorSet());
+    }
     return 0;
 }
 
 __attribute__((visibility("default")))
 void vkUpdateDescriptorSets(void* /*device*/, uint32_t descriptorWriteCount, const void* pDescriptorWrites,
-                            uint32_t /*descriptorCopyCount*/, const void* /*pDescriptorCopies*/) {
-    if (!pDescriptorWrites) return;
+                            uint32_t descriptorCopyCount, const void* pDescriptorCopies) {
     struct ImgInfo { uint64_t sampler; uint64_t imageView; uint32_t imageLayout; };
-    const auto* writes = static_cast<const VkWriteDescriptorSetIcd*>(pDescriptorWrites);
-    for (uint32_t i = 0; i < descriptorWriteCount; ++i) {
-        auto* dset = reinterpret_cast<MaliIcdDescriptorSet*>(writes[i].dstSet);
-        if (!dset || writes[i].dstBinding >= 16) continue;
-        if (writes[i].pBufferInfo && writes[i].pBufferInfo->buffer) {
-            auto* buf = reinterpret_cast<MaliIcdBuffer*>(writes[i].pBufferInfo->buffer);
-            if (buf) {
-                dset->bound_buffer_va[writes[i].dstBinding]    = buf->bound_gpu_va + writes[i].pBufferInfo->offset;
-                dset->bound_buffer_range[writes[i].dstBinding] = writes[i].pBufferInfo->range;
+    if (pDescriptorWrites && descriptorWriteCount > 0) {
+        const auto* writes = static_cast<const VkWriteDescriptorSetIcd*>(pDescriptorWrites);
+        for (uint32_t i = 0; i < descriptorWriteCount; ++i) {
+            auto* dset = reinterpret_cast<MaliIcdDescriptorSet*>(writes[i].dstSet);
+            if (!dset || writes[i].dstBinding >= 64) continue;
+            uint32_t dtype = writes[i].descriptorType;
+            bool is_buf = (dtype >= 6U && dtype <= 9U);
+            bool is_img = (dtype <= 3U || dtype == 10U);
+            uint32_t cnt = std::max<uint32_t>(1U, writes[i].descriptorCount);
+            for (uint32_t j = 0; j < cnt; ++j) {
+                uint32_t b = writes[i].dstBinding + j;
+                if (b >= 64) break;
+                if (is_buf && writes[i].pBufferInfo) {
+                    const auto& bi = writes[i].pBufferInfo[j];
+                    if (bi.buffer) {
+                        auto* buf = reinterpret_cast<MaliIcdBuffer*>(bi.buffer);
+                        dset->bound_buffer_va[b]    = buf->bound_gpu_va + bi.offset;
+                        dset->bound_buffer_range[b] = bi.range;
+                    }
+                } else if (is_img && writes[i].pImageInfo) {
+                    const auto* ii = static_cast<const ImgInfo*>(writes[i].pImageInfo) + j;
+                    if (ii->imageView) dset->bound_image_view[b] = reinterpret_cast<MaliIcdImageView*>(ii->imageView);
+                    if (ii->sampler)   dset->bound_sampler[b]    = reinterpret_cast<MaliIcdSampler*>(ii->sampler);
+                }
             }
         }
-        if (writes[i].pImageInfo) {
-            const auto* ii = static_cast<const ImgInfo*>(writes[i].pImageInfo);
-            if (ii->imageView) dset->bound_image_view[writes[i].dstBinding] = reinterpret_cast<MaliIcdImageView*>(ii->imageView);
-            if (ii->sampler)   dset->bound_sampler[writes[i].dstBinding]    = reinterpret_cast<MaliIcdSampler*>(ii->sampler);
+    }
+    struct CopyDesc {
+        uint32_t sType; const void* pNext; uint64_t srcSet; uint32_t srcBinding; uint32_t srcElem;
+        uint64_t dstSet; uint32_t dstBinding; uint32_t dstElem; uint32_t count;
+    };
+    if (pDescriptorCopies && descriptorCopyCount > 0) {
+        const auto* copies = static_cast<const CopyDesc*>(pDescriptorCopies);
+        for (uint32_t i = 0; i < descriptorCopyCount; ++i) {
+            auto* src = reinterpret_cast<MaliIcdDescriptorSet*>(copies[i].srcSet);
+            auto* dst = reinterpret_cast<MaliIcdDescriptorSet*>(copies[i].dstSet);
+            if (!src || !dst) continue;
+            for (uint32_t j = 0; j < copies[i].count; ++j) {
+                uint32_t sb = copies[i].srcBinding + j;
+                uint32_t db = copies[i].dstBinding + j;
+                if (sb < 64 && db < 64) {
+                    dst->bound_buffer_va[db]    = src->bound_buffer_va[sb];
+                    dst->bound_buffer_range[db] = src->bound_buffer_range[sb];
+                    dst->bound_image_view[db]   = src->bound_image_view[sb];
+                    dst->bound_sampler[db]      = src->bound_sampler[sb];
+                }
+            }
         }
     }
 }
@@ -476,7 +547,6 @@ static const std::vector<uint32_t>& getCanonicalLunarGTexture256() {
             cands.push_back(dir + "/../bin/vkcube_khronos");
         }
     }
-    cands.push_back("src/aot/bin/vkcube_khronos");
     cands.push_back("/usr/bin/vkcube");
     for (const auto& path : cands) {
         std::ifstream in(path, std::ios::binary);
@@ -520,17 +590,21 @@ static const std::vector<uint32_t>& getCanonicalLunarGTexture256() {
 static void populateAotStubTexture(MaliIcdImage* img) {
     uint32_t w = std::max<uint32_t>(1U, img->width);
     uint32_t h = std::max<uint32_t>(1U, img->height);
-    img->stub_texture_backing.resize(static_cast<size_t>(w) * h * 4);
-    uint32_t* px = reinterpret_cast<uint32_t*>(img->stub_texture_backing.data());
-    const auto& lunarg = getCanonicalLunarGTexture256();
-    for (uint32_t y = 0; y < h; ++y) {
-        uint32_t sy = (y * 256U) / h;
-        for (uint32_t x = 0; x < w; ++x) {
-            uint32_t sx = (x * 256U) / w;
-            px[y * w + x] = lunarg[(sy & 255U) * 256U + (sx & 255U)];
+    uint32_t d = std::max<uint32_t>(1U, img->depth);
+    uint32_t layers = std::max<uint32_t>(1U, img->array_layers);
+    img->byte_size = static_cast<uint64_t>(w) * h * d * layers * 4ULL;
+    if (w <= 256U && h <= 256U && d == 1U && layers == 1U) {
+        img->stub_texture_backing.resize(static_cast<size_t>(w) * h * 4);
+        uint32_t* px = reinterpret_cast<uint32_t*>(img->stub_texture_backing.data());
+        const auto& lunarg = getCanonicalLunarGTexture256();
+        for (uint32_t y = 0; y < h; ++y) {
+            uint32_t sy = (y * 256U) / h;
+            for (uint32_t x = 0; x < w; ++x) {
+                uint32_t sx = (x * 256U) / w;
+                px[y * w + x] = lunarg[(sy & 255U) * 256U + (sx & 255U)];
+            }
         }
     }
-    img->byte_size = img->stub_texture_backing.size();
 }
 
 __attribute__((visibility("default")))
@@ -583,7 +657,8 @@ int32_t vkBindImageMemory(void* /*device*/, uint64_t image, uint64_t memory, uin
     auto* img = reinterpret_cast<MaliIcdImage*>(image);
     auto* mem = reinterpret_cast<MaliIcdDeviceMemory*>(memory);
     uint64_t va = mem->gpu_va + memoryOffset;
-    if (va && !img->stub_texture_backing.empty() && *reinterpret_cast<const uint32_t*>(va) == 0) {
+    if (va && !img->stub_texture_backing.empty() && memoryOffset < mem->size_bytes &&
+        *reinterpret_cast<const uint32_t*>(va) == 0) {
         std::memcpy(reinterpret_cast<void*>(va), img->stub_texture_backing.data(),
                     std::min<size_t>(img->stub_texture_backing.size(), mem->size_bytes - memoryOffset));
     }
@@ -1051,8 +1126,7 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
                     dev->ring_write_off += 8;
                 };
 
-                if (cmd.type == MaliIcdRecordedCmd::CMD_DISPATCH && cmd.pipeline && cmd.pipeline->shader_mod && cmd.desc_set) {
-                    auto* mod  = cmd.pipeline->shader_mod;
+                if (cmd.type == MaliIcdRecordedCmd::CMD_DISPATCH && cmd.pipeline && cmd.pipeline->exec_bo_gpu_va != 0 && cmd.desc_set) {
                     auto* dset = cmd.desc_set;
 
                     uint64_t* srt_ptr = reinterpret_cast<uint64_t*>(dev->srt_bo_va);
@@ -1635,11 +1709,26 @@ int32_t vkGetPhysicalDeviceToolProperties(void* /*physicalDevice*/, uint32_t* pT
     return 0;
 }
 
+static void clearDedicatedReqsChain(void* pMemoryRequirements2) {
+    if (!pMemoryRequirements2) return;
+    struct VkBaseOut { uint32_t sType; VkBaseOut* pNext; };
+    auto* cur = static_cast<VkBaseOut*>(pMemoryRequirements2)->pNext;
+    while (cur) {
+        if (cur->sType == 1000127000U /* VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS */) {
+            auto* flags = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(cur) + 16);
+            flags[0] = 0U; /* prefersDedicatedAllocation */
+            flags[1] = 0U; /* requiresDedicatedAllocation */
+        }
+        cur = cur->pNext;
+    }
+}
+
 __attribute__((visibility("default")))
 void vkGetBufferMemoryRequirements2(void* device, const void* pInfo, void* pMemoryRequirements) {
     if (!pInfo || !pMemoryRequirements) return;
     uint64_t buf = *reinterpret_cast<const uint64_t*>(static_cast<const uint8_t*>(pInfo) + 16);
     vkGetBufferMemoryRequirements(device, buf, static_cast<uint8_t*>(pMemoryRequirements) + 16);
+    clearDedicatedReqsChain(pMemoryRequirements);
 }
 
 __attribute__((visibility("default")))
@@ -1647,7 +1736,103 @@ void vkGetImageMemoryRequirements2(void* device, const void* pInfo, void* pMemor
     if (!pInfo || !pMemoryRequirements) return;
     uint64_t img = *reinterpret_cast<const uint64_t*>(static_cast<const uint8_t*>(pInfo) + 16);
     vkGetImageMemoryRequirements(device, img, static_cast<uint8_t*>(pMemoryRequirements) + 16);
+    clearDedicatedReqsChain(pMemoryRequirements);
 }
+
+__attribute__((visibility("default")))
+void vkGetDeviceBufferMemoryRequirements(void* /*device*/, const void* pInfo, void* pMemoryRequirements) {
+    if (!pInfo || !pMemoryRequirements) return;
+    const auto* create_info = *reinterpret_cast<const VkBufferCreateInfoIcd* const*>(static_cast<const uint8_t*>(pInfo) + 16);
+    auto* req = reinterpret_cast<VkMemoryRequirementsIcd*>(static_cast<uint8_t*>(pMemoryRequirements) + 16);
+    uint64_t sz = create_info ? create_info->size : 4096ULL;
+    req->size = std::max<uint64_t>(4096ULL, (sz + 4095ULL) & ~4095ULL);
+    req->alignment = 4096ULL;
+    req->memoryTypeBits = 0x3U;
+    clearDedicatedReqsChain(pMemoryRequirements);
+}
+
+__attribute__((visibility("default")))
+void vkGetDeviceImageMemoryRequirements(void* /*device*/, const void* pInfo, void* pMemoryRequirements) {
+    if (!pInfo || !pMemoryRequirements) return;
+    struct ImgInfo {
+        uint32_t sType; const void* pNext; uint32_t flags; uint32_t imageType; uint32_t format;
+        uint32_t width; uint32_t height; uint32_t depth; uint32_t mipLevels; uint32_t arrayLayers;
+    };
+    const auto* ii = *reinterpret_cast<const ImgInfo* const*>(static_cast<const uint8_t*>(pInfo) + 16);
+    auto* req = reinterpret_cast<VkMemoryRequirementsIcd*>(static_cast<uint8_t*>(pMemoryRequirements) + 16);
+    uint64_t w = ii ? std::max<uint32_t>(1U, ii->width) : 64ULL;
+    uint64_t h = ii ? std::max<uint32_t>(1U, ii->height) : 64ULL;
+    uint64_t d = ii ? std::max<uint32_t>(1U, ii->depth) : 1ULL;
+    uint64_t l = ii ? std::max<uint32_t>(1U, ii->arrayLayers) : 1ULL;
+    uint64_t sz = w * h * d * l * 4ULL;
+    req->size = std::max<uint64_t>(4096ULL, (sz + 4095ULL) & ~4095ULL);
+    req->alignment = 4096ULL;
+    req->memoryTypeBits = 0x3U;
+    clearDedicatedReqsChain(pMemoryRequirements);
+}
+
+__attribute__((visibility("default")))
+void vkGetDeviceImageSparseMemoryRequirements(void* /*device*/, const void* /*pInfo*/, uint32_t* pCount, void* /*pReqs*/) {
+    if (pCount) *pCount = 0;
+}
+
+__attribute__((visibility("default")))
+void vkGetImageSparseMemoryRequirements(void* /*device*/, uint64_t /*image*/, uint32_t* pCount, void* /*pReqs*/) {
+    if (pCount) *pCount = 0;
+}
+
+__attribute__((visibility("default")))
+void vkGetImageSparseMemoryRequirements2(void* /*device*/, const void* /*pInfo*/, uint32_t* pCount, void* /*pReqs*/) {
+    if (pCount) *pCount = 0;
+}
+
+__attribute__((visibility("default")))
+int32_t vkResetDescriptorPool(void* /*device*/, uint64_t /*descriptorPool*/, uint32_t /*flags*/) { return 0; }
+
+__attribute__((visibility("default")))
+int32_t vkCreateBufferView(void* /*device*/, const void* /*pCreateInfo*/, const void* /*pAllocator*/, uint64_t* pView) {
+    static uint64_t s_bv = 0xBF000001ULL;
+    if (pView) *pView = s_bv++;
+    return 0;
+}
+
+__attribute__((visibility("default")))
+void vkDestroyBufferView(void* /*device*/, uint64_t /*bufferView*/, const void* /*pAllocator*/) {}
+
+__attribute__((visibility("default")))
+int32_t vkCreateSamplerYcbcrConversion(void* /*device*/, const void* /*pCreateInfo*/, const void* /*pAllocator*/, uint64_t* pConv) {
+    static uint64_t s_yc = 0xCB000001ULL;
+    if (pConv) *pConv = s_yc++;
+    return 0;
+}
+
+__attribute__((visibility("default")))
+void vkDestroySamplerYcbcrConversion(void* /*device*/, uint64_t /*ycbcrConversion*/, const void* /*pAllocator*/) {}
+
+__attribute__((visibility("default")))
+int32_t vkCreatePrivateDataSlot(void* /*device*/, const void* /*pCreateInfo*/, const void* /*pAllocator*/, uint64_t* pSlot) {
+    static uint64_t s_pd = 0x9D000001ULL;
+    if (pSlot) *pSlot = s_pd++;
+    return 0;
+}
+
+__attribute__((visibility("default")))
+void vkDestroyPrivateDataSlot(void* /*device*/, uint64_t /*slot*/, const void* /*pAllocator*/) {}
+
+__attribute__((visibility("default")))
+int32_t vkSetPrivateData(void* /*device*/, uint32_t /*objType*/, uint64_t /*objHandle*/, uint64_t /*slot*/, uint64_t /*data*/) { return 0; }
+
+__attribute__((visibility("default")))
+void vkGetPrivateData(void* /*device*/, uint32_t /*objType*/, uint64_t /*objHandle*/, uint64_t /*slot*/, uint64_t* pData) {
+    if (pData) *pData = 0;
+}
+
+__attribute__((visibility("default")))
+void vkGetDeviceGroupPeerMemoryFeatures(void* /*device*/, uint32_t /*heapIdx*/, uint32_t /*localIdx*/, uint32_t /*remoteIdx*/, uint32_t* pFeatures) {
+    if (pFeatures) *pFeatures = 0xFU;
+}
+
+
 
 __attribute__((visibility("default")))
 int32_t vkBindBufferMemory2(void* device, uint32_t bindInfoCount, const void* pBindInfos) {
@@ -1886,6 +2071,33 @@ void vkGetRenderAreaGranularity(void* /*device*/, uint64_t /*renderPass*/, void*
 }
 
 __attribute__((visibility("default")))
+void vkGetRenderingAreaGranularityKHR(void* /*device*/, const void* /*pRenderingAreaInfo*/, void* pGranularity) {
+    if (pGranularity) {
+        auto* u32 = static_cast<uint32_t*>(pGranularity);
+        u32[0] = 1U; u32[1] = 1U;
+    }
+}
+
+__attribute__((visibility("default")))
+void vkGetImageSubresourceLayout2KHR(void* device, uint64_t image, const void* pSubresource, void* pLayout) {
+    if (!pSubresource || !pLayout) return;
+    vkGetImageSubresourceLayout(device, image,
+                                static_cast<const uint8_t*>(pSubresource) + 16,
+                                static_cast<uint8_t*>(pLayout) + 16);
+}
+
+__attribute__((visibility("default")))
+void vkGetDeviceImageSubresourceLayoutKHR(void* /*device*/, const void* /*pInfo*/, void* pLayout) {
+    if (!pLayout) return;
+    auto* u64 = reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(pLayout) + 16);
+    u64[0] = 0;
+    u64[1] = 262144;
+    u64[2] = 1024;
+    u64[3] = 262144;
+    u64[4] = 262144;
+}
+
+__attribute__((visibility("default")))
 void vkGetDeviceMemoryCommitment(void* /*device*/, uint64_t /*memory*/, uint64_t* pCommittedMemoryInBytes) {
     if (pCommittedMemoryInBytes) *pCommittedMemoryInBytes = 0ULL;
 }
@@ -1933,6 +2145,10 @@ PFN_vkVoidFunction vkGetDeviceProcAddr(void* /*device*/, const char* pName) {
     if (std::strcmp(pName, "vkFreeMemory") == 0)                return reinterpret_cast<PFN_vkVoidFunction>(&vkFreeMemory);
     if (std::strcmp(pName, "vkMapMemory") == 0)                 return reinterpret_cast<PFN_vkVoidFunction>(&vkMapMemory);
     if (std::strcmp(pName, "vkUnmapMemory") == 0)               return reinterpret_cast<PFN_vkVoidFunction>(&vkUnmapMemory);
+    if (std::strcmp(pName, "vkMapMemory2") == 0 ||
+        std::strcmp(pName, "vkMapMemory2KHR") == 0)             return reinterpret_cast<PFN_vkVoidFunction>(&vkMapMemory2);
+    if (std::strcmp(pName, "vkUnmapMemory2") == 0 ||
+        std::strcmp(pName, "vkUnmapMemory2KHR") == 0)           return reinterpret_cast<PFN_vkVoidFunction>(&vkUnmapMemory2);
     if (std::strcmp(pName, "vkBindBufferMemory") == 0)          return reinterpret_cast<PFN_vkVoidFunction>(&vkBindBufferMemory);
     if (std::strcmp(pName, "vkCreateShaderModule") == 0)        return reinterpret_cast<PFN_vkVoidFunction>(&vkCreateShaderModule);
     if (std::strcmp(pName, "vkDestroyShaderModule") == 0)       return reinterpret_cast<PFN_vkVoidFunction>(&vkDestroyShaderModule);
@@ -2096,8 +2312,51 @@ PFN_vkVoidFunction vkGetDeviceProcAddr(void* /*device*/, const char* pName) {
         std::strcmp(pName, "vkGetPhysicalDeviceToolPropertiesEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceToolProperties);
     /* Safe fallback for any additional vkCmd* dynamic state / extension entrypoints so
      * loader_init_device_dispatch_table never leaves a NULL slot in VkDevice's table. */
+    if (std::strcmp(pName, "vkGetDeviceBufferMemoryRequirements") == 0 ||
+        std::strcmp(pName, "vkGetDeviceBufferMemoryRequirementsKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetDeviceBufferMemoryRequirements);
+    if (std::strcmp(pName, "vkGetDeviceImageMemoryRequirements") == 0 ||
+        std::strcmp(pName, "vkGetDeviceImageMemoryRequirementsKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetDeviceImageMemoryRequirements);
+    if (std::strcmp(pName, "vkGetDeviceImageSparseMemoryRequirements") == 0 ||
+        std::strcmp(pName, "vkGetDeviceImageSparseMemoryRequirementsKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetDeviceImageSparseMemoryRequirements);
+    if (std::strcmp(pName, "vkGetImageSparseMemoryRequirements") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetImageSparseMemoryRequirements);
+    if (std::strcmp(pName, "vkGetImageSparseMemoryRequirements2") == 0 ||
+        std::strcmp(pName, "vkGetImageSparseMemoryRequirements2KHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetImageSparseMemoryRequirements2);
+    if (std::strcmp(pName, "vkResetDescriptorPool") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkResetDescriptorPool);
+    if (std::strcmp(pName, "vkCreateBufferView") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkCreateBufferView);
+    if (std::strcmp(pName, "vkDestroyBufferView") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkDestroyBufferView);
+    if (std::strcmp(pName, "vkCreateSamplerYcbcrConversion") == 0 ||
+        std::strcmp(pName, "vkCreateSamplerYcbcrConversionKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkCreateSamplerYcbcrConversion);
+    if (std::strcmp(pName, "vkDestroySamplerYcbcrConversion") == 0 ||
+        std::strcmp(pName, "vkDestroySamplerYcbcrConversionKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkDestroySamplerYcbcrConversion);
+    if (std::strcmp(pName, "vkCreatePrivateDataSlot") == 0 ||
+        std::strcmp(pName, "vkCreatePrivateDataSlotEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkCreatePrivateDataSlot);
+    if (std::strcmp(pName, "vkDestroyPrivateDataSlot") == 0 ||
+        std::strcmp(pName, "vkDestroyPrivateDataSlotEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkDestroyPrivateDataSlot);
+    if (std::strcmp(pName, "vkSetPrivateData") == 0 ||
+        std::strcmp(pName, "vkSetPrivateDataEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkSetPrivateData);
+    if (std::strcmp(pName, "vkGetPrivateData") == 0 ||
+        std::strcmp(pName, "vkGetPrivateDataEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPrivateData);
+    if (std::strcmp(pName, "vkGetDeviceGroupPeerMemoryFeatures") == 0 ||
+        std::strcmp(pName, "vkGetDeviceGroupPeerMemoryFeaturesKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetDeviceGroupPeerMemoryFeatures);
+    if (std::strcmp(pName, "vkGetRenderingAreaGranularity") == 0 ||
+        std::strcmp(pName, "vkGetRenderingAreaGranularityKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetRenderingAreaGranularityKHR);
+    if (std::strcmp(pName, "vkGetImageSubresourceLayout2") == 0 ||
+        std::strcmp(pName, "vkGetImageSubresourceLayout2KHR") == 0 ||
+        std::strcmp(pName, "vkGetImageSubresourceLayout2EXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetImageSubresourceLayout2KHR);
+    if (std::strcmp(pName, "vkGetDeviceImageSubresourceLayout") == 0 ||
+        std::strcmp(pName, "vkGetDeviceImageSubresourceLayoutKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetDeviceImageSubresourceLayoutKHR);
     if ( std::strncmp(pName, "vkCmd", 5) == 0 ) {
         return reinterpret_cast<PFN_vkVoidFunction>(&mali_icd_noop_cmd);
+    }
+    if ( std::strncmp(pName, "vk", 2) == 0 &&
+         std::strncmp(pName, "vkGet", 5) != 0 &&
+         std::strncmp(pName, "vkMap", 5) != 0 &&
+         std::strncmp(pName, "vkCreate", 8) != 0 &&
+         std::strncmp(pName, "vkAllocate", 10) != 0 &&
+         std::strncmp(pName, "vkAcquire", 9) != 0 &&
+         std::strncmp(pName, "vkEnumerate", 11) != 0 ) {
+        mali_icd_log("vkGetDeviceProcAddr: returning safe noop stub for '%s'", pName);
+        return reinterpret_cast<PFN_vkVoidFunction>(&mali_icd_noop_ok);
     }
     mali_icd_log("vkGetDeviceProcAddr: unimplemented symbol '%s'", pName);
     return nullptr;

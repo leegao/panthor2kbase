@@ -27,3 +27,12 @@ install(TARGETS r54p3_vulkan_icd_shared r54p3_vulkan_icd_static
         LIBRARY DESTINATION lib)
 install(FILES ${ICD_JSON_PATH} DESTINATION share/vulkan/icd.d)
 install(DIRECTORY include/ DESTINATION include)
+
+if(TARGET mali_kbase_emu)
+  target_link_libraries(r54p3_vulkan_icd PRIVATE mali_kbase_emu)
+endif()
+set_target_properties(r54p3_vulkan_icd PROPERTIES
+  BUILD_RPATH "$ORIGIN;$ORIGIN/..;$ORIGIN/../.."
+  INSTALL_RPATH "$ORIGIN;$ORIGIN/..;$ORIGIN/../.."
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+)

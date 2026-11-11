@@ -36,6 +36,7 @@ verify: test
 
 clean:
 	@if [ -d "$(BUILD_DIR)" ]; then $(CMAKE) --build $(BUILD_DIR) --target clean 2>/dev/null || true; fi
+	@if [ -d "build-android" ]; then $(CMAKE) --build build-android --target clean 2>/dev/null || true; fi
 	@rm -f libpanthor_kbase_adapter.so libmali_kbase_emu.so panthor_drm_replayer panthor_vk_replayer \
 	      libvulkan_panfrost_patched.so libmali_uapi_tracer.so \
 	      tests/run_vulkan_samples_and_equivalence_suite \

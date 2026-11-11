@@ -1257,9 +1257,24 @@ public:
         int atomic_ops_lifted = 0;
     } stats;
 
-    explicit AArch64ToLLVMIRLiftingPass(const ELF64LoaderAndCallGraphPass &ld)
-        : loader(ld), func_set(ld.closure_funcs.begin(), ld.closure_funcs.end()) {
+    bool instrument_calls = true;
+
+    explicit AArch64ToLLVMIRLiftingPass(const ELF64LoaderAndCallGraphPass &ld, bool inst_calls = true)
+        : loader(ld), func_set(ld.closure_funcs.begin(), ld.closure_funcs.end()), instrument_calls(inst_calls) {
         stats.total_functions = static_cast<int>(ld.closure_funcs.size());
+    }
+
+    static std::string escapeIrString(const std::string &str) {
+        std::ostringstream oss;
+        for (unsigned char c : str) {
+            if (c >= 32 && c < 127 && c != '"' && c != '\\') oss << static_cast<char>(c);
+            else {
+                char b[8];
+                std::snprintf(b, sizeof(b), "\\%02X", static_cast<unsigned>(c));
+                oss << b;
+            }
+        }
+        return oss.str();
     }
 
     std::string newTmp(const char *prefix = "t") {
@@ -1630,6 +1645,9 @@ public:
         emit("store i1 false, ptr %flag_z, align 1");
         emit("store i1 false, ptr %flag_c, align 1");
         emit("store i1 false, ptr %flag_v, align 1");
+        if (instrument_calls) {
+            emit("call void @aot_so_trace_fn_enter(ptr %cpu, i64 " + std::to_string(IMAGE_BASE + faddr) + ", ptr @.aot_fn_str_" + hex8(faddr) + ")");
+        }
         emit("br label %bb_" + hex8(faddr));
 
         for (size_t bi = 0; bi < sorted_leaders.size(); ++bi) {
@@ -2844,6 +2862,9 @@ public:
 
         emitRaw("exit_ret:");
         flushState(true);
+        if (instrument_calls) {
+            emit("call void @aot_so_trace_fn_exit(ptr %cpu, i64 " + std::to_string(IMAGE_BASE + faddr) + ", ptr @.aot_fn_str_" + hex8(faddr) + ")");
+        }
         emit("ret void");
         emitRaw("}\n");
     }
@@ -2887,6 +2908,8 @@ public:
         emitRaw("declare i64 @bionic_mali_read_stub(i64, i64, i64)");
         emitRaw("declare i64 @bionic_mali_poll_stub(i64, i64, i64)");
         emitRaw("declare void @aot_unhandled_plt(ptr, i64)");
+        emitRaw("declare void @aot_so_trace_fn_enter(ptr, i64, ptr)");
+        emitRaw("declare void @aot_so_trace_fn_exit(ptr, i64, ptr)");
         emitRaw("declare i32 @llvm.fshr.i32(i32, i32, i32)");
         emitRaw("declare i64 @llvm.fshr.i64(i64, i64, i64)");
         emitRaw("declare <4 x i32> @llvm.fshr.v4i32(<4 x i32>, <4 x i32>, <4 x i32>)");
@@ -2915,6 +2938,15 @@ public:
         emitRaw("declare i32 @llvm.vector.reduce.umax.v2i32(<2 x i32>)");
         emitRaw("declare i32 @llvm.vector.reduce.umax.v4i32(<4 x i32>)\n");
 
+        if (instrument_calls) {
+            for (uint64_t faddr : loader.closure_funcs) {
+                auto fname_sz = loader.func_by_addr.count(faddr) ? loader.func_by_addr.at(faddr) : std::make_pair("sub_" + hex8(faddr), uint64_t(4));
+                std::string fn_label = fname_sz.first.empty() ? ("sub_" + hex8(faddr)) : fname_sz.first;
+                emitRaw("@.aot_fn_str_" + hex8(faddr) + " = private unnamed_addr constant [" +
+                        std::to_string(fn_label.size() + 1) + " x i8] c\"" + escapeIrString(fn_label) + "\\00\", align 1");
+            }
+            emitRaw("");
+        }
         for (uint64_t faddr : loader.closure_funcs) {
             liftFunction(faddr);
         }
@@ -3597,8 +3629,27 @@ int main(int argc, char **argv) {
         printf("  Closure functions   : %zu internal functions, %zu PLT imports\n", loader.closure_funcs.size(), loader.closure_plts.size());
         printf("  Auto ctx malloc off : 0x%02" PRIx64 " | Vulkan HMI RVA: 0x%08" PRIx64 "\n", loader.ctx_malloc_offset, loader.hmi_rva);
 
-        printf("[LLVM Pass 2 & 3] CFGRecoveryAndPicJumpTablePass + AArch64ToLLVMIRLiftingPass...\n");
-        AArch64ToLLVMIRLiftingPass lifter(loader);
+        bool instrumentCalls = true;
+        if (const char *envInst = std::getenv("MALI_AOT_INSTRUMENT_CALLS")) {
+            if (std::strcmp(envInst, "0") == 0 || std::strcmp(envInst, "false") == 0) instrumentCalls = false;
+        }
+        if (const char *envH2l = std::getenv("HORIZON2LLVM_INSTRUMENT_CALLS")) {
+            if (std::strcmp(envH2l, "0") == 0 || std::strcmp(envH2l, "false") == 0) instrumentCalls = false;
+        }
+        for (int i = 4; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--instrument-calls") == 0 ||
+                std::strcmp(argv[i], "--record-stackframes") == 0 ||
+                std::strcmp(argv[i], "--profile-functions") == 0 ||
+                std::strcmp(argv[i], "--debug-trace") == 0) {
+                instrumentCalls = true;
+            } else if (std::strcmp(argv[i], "--no-instrument-calls") == 0 ||
+                       std::strcmp(argv[i], "--no-record-stackframes") == 0 ||
+                       std::strcmp(argv[i], "--no-profile-functions") == 0) {
+                instrumentCalls = false;
+            }
+        }
+        printf("[LLVM Pass 2 & 3] CFGRecoveryAndPicJumpTablePass + AArch64ToLLVMIRLiftingPass (instrument_calls=%d)...\n", instrumentCalls ? 1 : 0);
+        AArch64ToLLVMIRLiftingPass lifter(loader, instrumentCalls);
         std::string irText = lifter.generateModuleText();
         printf("  Lifted instructions : %d (%d PIC jump tables, %d SIMD ops, %d Crypto SHA-1 ops, %d Atomics)\n",
                lifter.stats.total_instructions, lifter.stats.jump_tables_lowered, lifter.stats.simd_ops_lifted,

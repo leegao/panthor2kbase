@@ -31,15 +31,15 @@ Commands:
                                 with --hook-Vulkan-calls).
   --vulkaninfo                  Run driver-accurate Vulkan physical-device, extension (170+ exts),
                                 queue-family, memory-type, and pNext (DriverProperties) introspection
-                                against the AOT-lifted libvulkan_mali_aot_icd.so.
-  --run-vkcube-xcb [frames]     Run Khronos vkcube against libvulkan_mali_aot_icd.so using XCB/X11 WSI
+                                against the AOT-lifted libr54p3_vulkan_icd.so.
+  --run-vkcube-xcb [frames]     Run Khronos vkcube against libr54p3_vulkan_icd.so using XCB/X11 WSI
                                 (or headless display fallback when DISPLAY is unset).
-  --run-vkcube-wayland [frames] Run Khronos vkcube against libvulkan_mali_aot_icd.so using Wayland WSI
+  --run-vkcube-wayland [frames] Run Khronos vkcube against libr54p3_vulkan_icd.so using Wayland WSI
                                 (VK_KHR_wayland_surface + wl_shm_pool buffer presentation).
   --run-app [--wayland|--x11] <cmd> [args...]
                                 Run ANY generic x86-64 Vulkan application (e.g., vkgears, vulkaninfo,
                                 vkcube, vkmark, SaschaWillems demos, or custom binaries) against the
-                                AOT-lifted libvulkan_mali_aot_icd.so ICD with full WSI & ICD logging.
+                                AOT-lifted libr54p3_vulkan_icd.so ICD with full WSI & ICD logging.
                                 Automatically detects `--wsi wayland` in application arguments and
                                 preserves WAYLAND_DISPLAY and VK_KHR_wayland_surface.
   --run-panvk-app <cmd>         Run ANY generic x86-64 Vulkan application against the host-compiled
@@ -51,7 +51,7 @@ Commands:
   --run-dxvk [args...]          Run DXVK 1.10.3 + bcn_layer + compat_layer on AOT-lifted libGLES_mali.so
                                 (delegates to ./scripts/run_dxvk_aot.sh; supports --test / --self-test).
   --run-40-samples              Run the expanded 40 Khronos Vulkan-Samples + PanProbe compliance suite
-                                against libvulkan_mali_aot_icd.so via the system libvulkan.so.1 loader.
+                                against libr54p3_vulkan_icd.so via the system libvulkan.so.1 loader.
   --decode-csf <log.txt>        Decode CSF ring/stream instructions, breadcrumbs, and fault snapshots
                                 from a captured Winlator log file.
   --analyze-stall <log>         Run the CSF Ringbuffer Wrap, Breadcrumb & Stall Forensic Analyzer
@@ -69,7 +69,7 @@ CMD="$1"
 shift
 
 resolve_active_icd_json() {
-    local default_json="$ROOT_DIR/src/aot/build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json"
+    local default_json="$ROOT_DIR/build-x86-64/r54p3_decompiled_icd.x86_64.json"
     if [ -n "${MALI_AOT_ICD_JSON:-}" ] && [ -f "${MALI_AOT_ICD_JSON}" ]; then
         echo "${MALI_AOT_ICD_JSON}"
         return 0
@@ -92,8 +92,8 @@ ensure_aot_icd_built() {
     icd_json="$(resolve_active_icd_json)"
     local icd_dir
     icd_dir="$(dirname "$icd_json")"
-    if [ ! -f "$icd_dir/libvulkan_mali_aot_icd.so" ]; then
-        echo "[AOT Runner] libvulkan_mali_aot_icd.so not found; building via ./src/aot/translate.sh..." >&2
+    if [ ! -f "$icd_dir/libr54p3_vulkan_icd.so" ]; then
+        echo "[AOT Runner] libr54p3_vulkan_icd.so not found; building via ./src/aot/translate.sh..." >&2
         "$ROOT_DIR/src/aot/translate.sh"
     fi
 }
@@ -124,61 +124,6 @@ for p in props:
         ICD_JSON="$(resolve_active_icd_json)"
         VK_DRIVER_FILES="$ICD_JSON" VK_ICD_FILENAMES="$ICD_JSON" ./src/aot/bin/test_vulkan_samples_compliance | grep -E "Active PhysicalDevice|vulkaninfo pNext"
         ;;
-    --run-vkcube-xcb)
-        ensure_aot_icd_built
-        ICD_JSON="$(resolve_active_icd_json)"
-        ICD_DIR="$(dirname "$ICD_JSON")"
-        export MALI_AOT_ICD_LOG="${MALI_AOT_ICD_LOG:-1}"
-        export NODEVICE_SELECT="${NODEVICE_SELECT:-1}"
-        export VK_LOADER_LAYERS_DISABLE="${VK_LOADER_LAYERS_DISABLE:-~implicit~}"
-        VKCUBE_BIN="$ROOT_DIR/build-x86-64/aot/aot_vkcube"
-        if [ ! -x "$VKCUBE_BIN" ] && [ -x "$ROOT_DIR/src/aot/bin/vkcube" ]; then
-            VKCUBE_BIN="$ROOT_DIR/src/aot/bin/vkcube"
-        elif [ ! -x "$VKCUBE_BIN" ] && command -v vkcube >/dev/null 2>&1; then
-            VKCUBE_BIN="$(command -v vkcube)"
-        fi
-        if [ -n "${DISPLAY:-}" ]; then
-            env -u WAYLAND_DISPLAY MALI_AOT_DISABLE_WAYLAND_EXT=1 \
-                LD_LIBRARY_PATH="$ICD_DIR:$ROOT_DIR:${LD_LIBRARY_PATH:-}" \
-                VK_DRIVER_FILES="$ICD_JSON" \
-                VK_ICD_FILENAMES="$ICD_JSON" \
-                "$VKCUBE_BIN" --wsi xcb --c "${1:-10}"
-        else
-            MALI_VKCUBE_HIRES=1 \
-                LD_LIBRARY_PATH="$ICD_DIR:$ROOT_DIR:${LD_LIBRARY_PATH:-}" \
-                VK_DRIVER_FILES="$ICD_JSON" \
-                VK_ICD_FILENAMES="$ICD_JSON" \
-                $VKCUBE_BIN --wsi display --c "${1:-10}"
-        fi
-        ;;
-    --run-vkcube-wayland)
-        ensure_aot_icd_built
-        ICD_JSON="$(resolve_active_icd_json)"
-        ICD_DIR="$(dirname "$ICD_JSON")"
-        export MALI_AOT_ICD_LOG="${MALI_AOT_ICD_LOG:-1}"
-        export NODEVICE_SELECT="${NODEVICE_SELECT:-1}"
-        export VK_LOADER_LAYERS_DISABLE="${VK_LOADER_LAYERS_DISABLE:-~implicit~}"
-        VKCUBE_BIN="$ROOT_DIR/build-x86-64/aot/aot_vkcube"
-        if [ ! -x "$VKCUBE_BIN" ] && [ -x "$ROOT_DIR/src/aot/bin/vkcube" ]; then
-            VKCUBE_BIN="$ROOT_DIR/src/aot/bin/vkcube"
-        elif [ ! -x "$VKCUBE_BIN" ] && command -v vkcube >/dev/null 2>&1; then
-            VKCUBE_BIN="$(command -v vkcube)"
-        fi
-        if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -x "$VKCUBE_BIN" ]; then
-            env -u MALI_AOT_DISABLE_WAYLAND_EXT \
-                LD_LIBRARY_PATH="$ICD_DIR:$ROOT_DIR:${LD_LIBRARY_PATH:-}" \
-                VK_DRIVER_FILES="$ICD_JSON" \
-                VK_ICD_FILENAMES="$ICD_JSON" \
-                "$VKCUBE_BIN" --wsi wayland --c "${1:-10}"
-        else
-            echo "[AOT Runner] WAYLAND_DISPLAY is unset; running built-in Wayland compositor + vkcube WSI test (${BUILD_DIR:-$ROOT_DIR/build-x86-64}/tests/test_wayland_and_vkgears_e2e)..." >&2
-            env -u MALI_AOT_DISABLE_WAYLAND_EXT \
-                LD_LIBRARY_PATH="$ICD_DIR:$ROOT_DIR:${LD_LIBRARY_PATH:-}" \
-                VK_DRIVER_FILES="$ICD_JSON" \
-                VK_ICD_FILENAMES="$ICD_JSON" \
-                ${BUILD_DIR:-$ROOT_DIR/build-x86-64}/tests/test_wayland_and_vkgears_e2e
-        fi
-        ;;
     --run-app)
         WSI_PREF="auto"
         if [ "${1:-}" = "--wayland" ]; then
@@ -208,36 +153,44 @@ for p in props:
         done
 
         ensure_aot_icd_built
+        LAYER_DIR="$ROOT_DIR/src/aot/layers"
+        if [ ! -f "$LAYER_DIR/libVkLayer_WSI_panthor_wsi.so" ]; then
+            "$LAYER_DIR/build_layers.sh" >/dev/null 2>&1 || true
+        fi
+        cat << JSON_EOF > "$LAYER_DIR/VkLayer_WSI_panthor_wsi.json"
+{
+    "file_format_version": "1.2.0",
+    "layer": {
+        "name": "VK_LAYER_WSI_PanthorWsiLayer",
+        "type": "GLOBAL",
+        "library_path": "$LAYER_DIR/libVkLayer_WSI_panthor_wsi.so",
+        "api_version": "1.3.0",
+        "implementation_version": "1",
+        "description": "Panthor WSI Compatibility Layer (VK_KHR_surface + X11/XCB/Wayland/Win32/Headless)"
+    }
+}
+JSON_EOF
         ICD_JSON="$(resolve_active_icd_json)"
         ICD_DIR="$(dirname "$ICD_JSON")"
         export MALI_AOT_ICD_LOG="${MALI_AOT_ICD_LOG:-1}"
         export NODEVICE_SELECT="${NODEVICE_SELECT:-1}"
-        if [ -z "${VK_INSTANCE_LAYERS:-}" ]; then
-            export VK_LOADER_LAYERS_DISABLE="${VK_LOADER_LAYERS_DISABLE:-~implicit~}"
-        fi
-        export LD_LIBRARY_PATH="$ICD_DIR:$ROOT_DIR:${LD_LIBRARY_PATH:-}"
+        export VK_LOADER_LAYERS_DISABLE="${VK_LOADER_LAYERS_DISABLE:-~implicit~}"
+        export VK_LAYER_PATH="$LAYER_DIR${VK_LAYER_PATH:+:$VK_LAYER_PATH}"
+        export VK_ADD_LAYER_PATH="$LAYER_DIR${VK_ADD_LAYER_PATH:+:$VK_ADD_LAYER_PATH}"
+        # export VK_INSTANCE_LAYERS="${VK_INSTANCE_LAYERS:-VK_LAYER_WSI_PanthorWsiLayer}"
+        export LD_LIBRARY_PATH="$LAYER_DIR:$ICD_DIR:$ROOT_DIR:${LD_LIBRARY_PATH:-}"
         export VK_DRIVER_FILES="$ICD_JSON"
         export VK_ICD_FILENAMES="$ICD_JSON"
         export VK_ADD_DRIVER_FILES=""
-        export VK_LOADER_DRIVERS_SELECT="*mali_aot*"
+        # export VK_LOADER_DRIVERS_SELECT="*mali_aot*"
         export VK_LOADER_DRIVERS_DISABLE="*radeon*,*radv*,*lvp*,*intel*,*anv*,*nouveau*,*nvk*,*nvidia*"
 
-        if ! command -v "$1" >/dev/null 2>&1; then
-            if [ "$1" = "vkcube" ] && [ -x "$ROOT_DIR/build-x86-64/aot/aot_vkcube" ]; then
-                shift
-                set -- "$ROOT_DIR/build-x86-64/aot/aot_vkcube" "$@"
-            elif [ -x "$ROOT_DIR/build-x86-64/aot/$1" ]; then
-                _app="$ROOT_DIR/build-x86-64/aot/$1"; shift; set -- "$_app" "$@"
-            elif [ -x "$ROOT_DIR/src/aot/bin/$1" ]; then
-                _app="$ROOT_DIR/src/aot/bin/$1"; shift; set -- "$_app" "$@"
-            fi
-        fi
         APP_BIN="$(command -v "$1" 2>/dev/null || echo "$1")"
         echo "================================================================================" >&2
         echo " [AOT Runner] Launching Generic x86-64 Vulkan Application" >&2
         echo "   Command          : $* ($APP_BIN)" >&2
         echo "   Active ICD JSON  : $ICD_JSON" >&2
-        echo "   ICD Shared Lib   : $ICD_DIR/libvulkan_mali_aot_icd.so" >&2
+        echo "   ICD Shared Lib   : $ICD_DIR/libr54p3_vulkan_icd.so" >&2
         echo "   Host DISPLAY     : ${DISPLAY:-(unset)}" >&2
         echo "   WAYLAND_DISPLAY  : ${WAYLAND_DISPLAY:-(unset)} (mode=$WSI_PREF)" >&2
         echo "   MALI_AOT_ICD_LOG : $MALI_AOT_ICD_LOG" >&2
@@ -261,17 +214,33 @@ for p in props:
         fi
         ;;
     --run-panvk-app)
+        LAYER_DIR="$ROOT_DIR/src/aot/layers"
+        if [ ! -f "$LAYER_DIR/libVkLayer_WSI_panthor_wsi.so" ]; then
+            "$LAYER_DIR/build_layers.sh" >/dev/null 2>&1 || true
+        fi
+        PANVK_ICD_JSON="${PANVK_HOST_ICD_JSON:-$ROOT_DIR/build-x86-64/panfrost_host_icd.x86_64.json}"
+        if [ -f "$PANVK_ICD_JSON" ]; then
+            export VK_DRIVER_FILES="${VK_DRIVER_FILES:-$PANVK_ICD_JSON}"
+            export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-$PANVK_ICD_JSON}"
+        fi
+        export VK_LAYER_PATH="$LAYER_DIR${VK_LAYER_PATH:+:$VK_LAYER_PATH}"
+        export VK_ADD_LAYER_PATH="$LAYER_DIR${VK_ADD_LAYER_PATH:+:$VK_ADD_LAYER_PATH}"
+        # export VK_INSTANCE_LAYERS="${VK_INSTANCE_LAYERS:-VK_LAYER_WSI_PanthorWsiLayer}"
+        EMU_SO="$ROOT_DIR/build-x86-64/libmali_kbase_emu.so"
+        [ ! -f "$EMU_SO" ] && EMU_SO="$ROOT_DIR/libmali_kbase_emu.so"
+        ADAPT_SO="$ROOT_DIR/build-x86-64/libpanthor_kbase_adapter.so"
+        [ ! -f "$ADAPT_SO" ] && ADAPT_SO="$ROOT_DIR/libpanthor_kbase_adapter.so"
         if [ "${1:-}" = "--x11" ] || [ -n "${DISPLAY:-}" ]; then
             [ "${1:-}" = "--x11" ] && shift
             PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1 \
                 env -u WAYLAND_DISPLAY \
-                LD_PRELOAD="$ROOT_DIR/libmali_kbase_emu.so:$ROOT_DIR/libpanthor_kbase_adapter.so" \
-                LD_LIBRARY_PATH="$ROOT_DIR:${LD_LIBRARY_PATH:-}" \
+                LD_PRELOAD="$EMU_SO:$ADAPT_SO" \
+                LD_LIBRARY_PATH="$LAYER_DIR:$ROOT_DIR/build-x86-64:$ROOT_DIR:${LD_LIBRARY_PATH:-}" \
                 "$@"
         else
             PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1 \
-                LD_PRELOAD="$ROOT_DIR/libmali_kbase_emu.so:$ROOT_DIR/libpanthor_kbase_adapter.so" \
-                LD_LIBRARY_PATH="$ROOT_DIR:${LD_LIBRARY_PATH:-}" \
+                LD_PRELOAD="$EMU_SO:$ADAPT_SO" \
+                LD_LIBRARY_PATH="$LAYER_DIR:$ROOT_DIR/build-x86-64:$ROOT_DIR:${LD_LIBRARY_PATH:-}" \
                 "$@"
         fi
         ;;

@@ -140,21 +140,22 @@ fi
 
 BUILD_HOST_DIR="${2:-${BUILD_DIR:-$REPO_ROOT/build-x86-64}}"
 
-# Ensure static adapter and emulator archives are compiled in $BUILD_HOST_DIR
-if [ ! -f "$BUILD_HOST_DIR/emulator/libmali_kbase_emu.a" ] || [ ! -f "$BUILD_HOST_DIR/adapter/libpanthor_kbase_adapter.a" ]; then
+# Ensure shared and static adapter and emulator libraries are compiled in $BUILD_HOST_DIR
+if [ ! -f "$BUILD_HOST_DIR/libmali_kbase_emu.so" ] || [ ! -f "$BUILD_HOST_DIR/libpanthor_kbase_adapter.so" ]; then
     CMAKE_BIN="$("${REPO_ROOT}/scripts/find_cmake.sh")"
     "$CMAKE_BIN" -S "$REPO_ROOT" -B "$BUILD_HOST_DIR" -DCMAKE_BUILD_TYPE=Release
-    "$CMAKE_BIN" --build "$BUILD_HOST_DIR" --target mali_kbase_emu_static panthor_kbase_adapter_static
+    "$CMAKE_BIN" --build "$BUILD_HOST_DIR" --target mali_kbase_emu panthor_kbase_adapter mali_kbase_emu_static panthor_kbase_adapter_static
 fi
 
-STATIC_EMU="-Wl,--whole-archive $BUILD_HOST_DIR/emulator/libmali_kbase_emu.a $BUILD_HOST_DIR/adapter/libpanthor_kbase_adapter.a -Wl,--no-whole-archive"
+DYN_EMU="-Wl,--no-as-needed -L$BUILD_HOST_DIR -L$BUILD_HOST_DIR/emulator -L$BUILD_HOST_DIR/adapter -lmali_kbase_emu -lpanthor_kbase_adapter"
+AOT_RPATH='$ORIGIN:$ORIGIN/..:$ORIGIN/../..:$ORIGIN/../../..:$ORIGIN/emulator:$ORIGIN/../emulator:$ORIGIN/adapter:$ORIGIN/../adapter:$ORIGIN/../../../../build-x86-64:$ORIGIN/../../../build-x86-64'
 
-echo "[Link] Statically linking mali_kbase_emu + panthor_kbase_adapter into runner and ICD..."
+echo "[Link] Dynamically linking libmali_kbase_emu.so + libpanthor_kbase_adapter.so into runner and ICD..."
 g++ -O2 -fno-strict-aliasing -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
     -I"$REPO_ROOT/include" -I"$REPO_ROOT/src/adapter" -I"$REPO_ROOT/src/emulator" \
     "$ROOT_DIR/src/mali_aot_runner.cpp" "$OUT_DIR/mali_mbs2_aot.o" "${EXTRA_AOT_OBJS[@]}" \
-    $STATIC_EMU -ldl -lpthread \
-    -Wl,-rpath,'$ORIGIN' \
+    $DYN_EMU -ldl -lpthread \
+    -Wl,-rpath,"$AOT_RPATH" \
     -o "$OUT_DIR/mali_aot_runner"
 
 g++ -O2 -std=c++17 -fno-strict-aliasing -shared -fPIC \
@@ -162,8 +163,8 @@ g++ -O2 -std=c++17 -fno-strict-aliasing -shared -fPIC \
     -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
     -I"$REPO_ROOT/include" -I"$REPO_ROOT/src/adapter" -I"$REPO_ROOT/src/emulator" \
     "$ROOT_DIR/src/mali_vulkan_icd.cpp" "$OUT_DIR/mali_mbs2_aot.o" "${EXTRA_AOT_OBJS[@]}" \
-    $STATIC_EMU -ldl -lm -lpthread \
-    -Wl,-rpath,'$ORIGIN' \
+    $DYN_EMU -ldl -lm -lpthread \
+    -Wl,-rpath,"$AOT_RPATH" \
     -o "$OUT_DIR/libvulkan_mali_aot_icd.so"
 
 if [ "${MALI_AOT_KEEP_LL:-0}" != "1" ]; then
@@ -187,12 +188,14 @@ if [ -d "$BUILD_HOST_DIR" ]; then
     cp -f "$OUT_DIR/mali_aot_runner" "$BUILD_HOST_DIR/aot/mali_aot_runner" 2>/dev/null || true
     cp -f "$OUT_DIR/mali_aot_icd.x86_64.json" "$BUILD_HOST_DIR/mali_aot_icd.x86_64.json" 2>/dev/null || true
     cp -f "$OUT_DIR/mali_aot_icd.x86_64.json" "$BUILD_HOST_DIR/aot/mali_aot_icd.x86_64.json" 2>/dev/null || true
+    cp -f "$OUT_DIR/mali_mbs2_aot.o" "$BUILD_HOST_DIR/aot/mali_mbs2_aot.o" 2>/dev/null || true
 fi
 
 mkdir -p "$ROOT_DIR/build/$ELF_TAG"
 cp -f "$OUT_DIR/libvulkan_mali_aot_icd.so" "$ROOT_DIR/build/$ELF_TAG/" 2>/dev/null || true
 cp -f "$OUT_DIR/mali_aot_runner" "$ROOT_DIR/build/$ELF_TAG/" 2>/dev/null || true
 cp -f "$OUT_DIR/mali_aot_icd.x86_64.json" "$ROOT_DIR/build/$ELF_TAG/" 2>/dev/null || true
+cp -f "$OUT_DIR/mali_mbs2_aot.o" "$ROOT_DIR/build/$ELF_TAG/" 2>/dev/null || true
 
 echo "================================================================================"
 echo " [SUCCESS] 64-Bit C++ LLVM AOT Translation Complete!"

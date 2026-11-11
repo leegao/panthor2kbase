@@ -182,6 +182,7 @@ struct Framebuffer {
     uint32_t                height      = 64;
     uint32_t                layers      = 1;
     std::vector<ImageView*> attachments;
+    std::vector<float>      depth_buffer;
     MaliMfbdDescriptor      hw_mfbd{};
 };
 
@@ -222,6 +223,7 @@ struct RecordedCommand {
         CMD_DISPATCH,
         CMD_DRAW,
         CMD_DRAW_INDEXED,
+        CMD_DRAW_GEARS,
         CMD_COPY_BUFFER,
         CMD_COPY_BUFFER_TO_IMAGE,
         CMD_BLIT_IMAGE,
@@ -236,8 +238,12 @@ struct RecordedCommand {
     uint32_t       wg_x = 1, wg_y = 1, wg_z = 1;
     uint32_t       index_count     = 0;
     uint32_t       vertex_count    = 0;
+    uint32_t       first_vertex    = 0;
     uint32_t       instance_count  = 1;
     uint32_t       first_instance  = 0;
+    uint32_t       rp_draw_idx     = 0;
+    uint64_t       vertex_bo_va    = 0;
+    uint8_t        push_constants[128]{};
     uint64_t       src_va          = 0;
     uint64_t       dst_va          = 0;
     uint64_t       copy_bytes      = 0;
@@ -256,6 +262,7 @@ struct CommandBuffer {
     uint64_t                     bound_vbo_va[8]{};
     uint64_t                     bound_ibo_va   = 0;
     uint32_t                     dynamic_ubo_offset = 0;
+    uint32_t                     rp_draw_counter = 0;
     uint8_t                      push_constants[128]{};
     bool                         conditional_rendering_active = true;
     std::vector<RecordedCommand> commands;

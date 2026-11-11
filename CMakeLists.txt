@@ -11,6 +11,11 @@ option(PANTHOR_KBASE_BUILD_TESTS "Build unit, compliance, and equivalence test s
 option(PANTHOR_KBASE_BUILD_AOT "Build AOT lifter, libvulkan_mali_aot_icd.so, and DXVK layers" ON)
 option(PANTHOR_KBASE_ENABLE_COVERAGE "Enable gcov/lcov coverage instrumentation" OFF)
 
+if(CMAKE_C_COMPILER MATCHES "android" OR CMAKE_CXX_COMPILER MATCHES "android")
+   set(ANDROID ON)
+   set(PANTHOR_KBASE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+   set(PANTHOR_KBASE_BUILD_AOT OFF CACHE BOOL "" FORCE)
+endif()
 if(ANDROID)
    message(STATUS "Configuring Panthor-to-Kbase C++ Adapter Suite for Android NDK (${ANDROID_ABI}, API ${ANDROID_PLATFORM})")
    set(PLATFORM_LIBS dl log m)
@@ -243,6 +248,7 @@ add_library(mali_kbase_emu SHARED
    ${LIFTED_KBASE_KO_LL_OBJ}
    src/emulator/panfrost_valhall_disasm_gen.c
 )
+target_link_options(mali_kbase_emu PRIVATE -Wl,-Bsymbolic -Wl,-Bsymbolic-functions)
 target_link_libraries(mali_kbase_emu PRIVATE panthor_kbase_adapter ${PLATFORM_LIBS})
 set_target_properties(mali_kbase_emu PROPERTIES
    LIBRARY_OUTPUT_DIRECTORY "${EMULATOR_DIR}"
@@ -274,7 +280,8 @@ add_library(vulkan_panfrost_patched SHARED
    src/vulkan_android_icd/panvk_android_icd.c
 )
 target_compile_definitions(vulkan_panfrost_patched PRIVATE PANTHOR_KBASE_PATCHED_KMOD=1)
-target_link_libraries(vulkan_panfrost_patched PRIVATE panthor_kbase_adapter ${PLATFORM_LIBS})
+target_link_libraries(vulkan_panfrost_patched PRIVATE panthor_kbase_adapter mali_kbase_emu ${PLATFORM_LIBS})
+target_link_options(vulkan_panfrost_patched PRIVATE -Wl,--no-as-needed)
 set_target_properties(vulkan_panfrost_patched PROPERTIES
    LIBRARY_OUTPUT_DIRECTORY "${ADAPTER_DIR}"
 )
@@ -323,6 +330,16 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
       LIBRARY_OUTPUT_DIRECTORY "${AOT_DIR}"
    )
    target_copy_to_source_tree(VkLayer_COMPAT_dxvk_mali_compat "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/layers/libVkLayer_COMPAT_dxvk_mali_compat.so")
+
+   add_library(VkLayer_WSI_panthor_wsi SHARED
+      src/aot/layers/wsi_layer_host.cpp
+   )
+   target_link_options(VkLayer_WSI_panthor_wsi PRIVATE -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -Wl,-soname,libVkLayer_WSI_panthor_wsi.so)
+   target_link_libraries(VkLayer_WSI_panthor_wsi PRIVATE ${PLATFORM_LIBS})
+   set_target_properties(VkLayer_WSI_panthor_wsi PROPERTIES
+      LIBRARY_OUTPUT_DIRECTORY "${AOT_DIR}"
+   )
+   target_copy_to_source_tree(VkLayer_WSI_panthor_wsi "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/layers/libVkLayer_WSI_panthor_wsi.so")
 
    add_library(VkLayer_PANTHOR_capture SHARED
       src/aot/layers/panthor_vk_capture_layer.cpp
@@ -394,14 +411,29 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
       RUNTIME_OUTPUT_DIRECTORY "${AOT_DIR}"
    )
 
+   set(AOT_MBS2_OBJ "${CMAKE_BINARY_DIR}/mali_mbs2_aot.o")
+   set_source_files_properties("${AOT_MBS2_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+
    add_library(r54p3_vulkan_icd SHARED
       src/aot/r54p3_vulkan_icd/src/r54p3_vulkan_icd.cpp
+      "${AOT_MBS2_OBJ}"
    )
-   target_include_directories(r54p3_vulkan_icd PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/r54p3_vulkan_icd/include")
-   target_link_options(r54p3_vulkan_icd PRIVATE -Wl,-Bsymbolic -Wl,-Bsymbolic-functions)
-   target_link_libraries(r54p3_vulkan_icd PRIVATE mali_kbase_emu_static panthor_kbase_adapter_static ${PLATFORM_LIBS})
+   add_dependencies(r54p3_vulkan_icd aot_targets)
+   target_include_directories(r54p3_vulkan_icd PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/r54p3_vulkan_icd/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/src"
+   )
+   target_link_options(r54p3_vulkan_icd PRIVATE -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -Wl,--no-as-needed)
+   target_link_libraries(r54p3_vulkan_icd PRIVATE mali_kbase_emu panthor_kbase_adapter ${PLATFORM_LIBS})
    set_target_properties(r54p3_vulkan_icd PROPERTIES
       LIBRARY_OUTPUT_DIRECTORY "${AOT_DIR}"
+   )
+   file(WRITE "${CMAKE_BINARY_DIR}/r54p3_decompiled_icd.x86_64.json" "{\n    \"file_format_version\": \"1.0.0\",\n    \"ICD\": {\n        \"library_path\": \"./libr54p3_vulkan_icd.so\",\n        \"api_version\": \"1.3.250\"\n    }\n}\n")
+   file(WRITE "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json" "{\n    \"file_format_version\": \"1.0.0\",\n    \"ICD\": {\n        \"library_path\": \"./libr54p3_vulkan_icd.so\",\n        \"api_version\": \"1.3.250\"\n    }\n}\n")
+   add_custom_command(TARGET r54p3_vulkan_icd POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:r54p3_vulkan_icd> "${CMAKE_BINARY_DIR}/libr54p3_vulkan_icd.so"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:r54p3_vulkan_icd> "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/r54p3_vulkan_icd/lib/libr54p3_vulkan_icd.so"
    )
 
    add_executable(mali_llvm_pass_driver
@@ -424,10 +456,12 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
    set(AOT_JSON   "${CMAKE_BINARY_DIR}/mali_aot_icd.x86_64.json")
 
    add_custom_command(
-      OUTPUT "${AOT_ICD_SO}" "${AOT_RUNNER}" "${AOT_JSON}"
+      OUTPUT "${AOT_ICD_SO}" "${AOT_RUNNER}" "${AOT_JSON}" "${AOT_MBS2_OBJ}"
       COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/translate.sh" libGLES_mali.so "${CMAKE_BINARY_DIR}"
       WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-      DEPENDS mali_kbase_emu_static
+      DEPENDS mali_kbase_emu
+              panthor_kbase_adapter
+              mali_kbase_emu_static
               panthor_kbase_adapter_static
               mali_llvm_pass_driver
               horizon2llvm

@@ -41,6 +41,9 @@
 #include <cstdarg>
 #include <unistd.h>
 #include "../include/mali0_emu.hpp"
+#define AOT_SO_PROFILER_IMPLEMENTATION
+#include "../include/aot_so_profiler.hpp"
+#include "../../emulator/lifted_kbase_ko.h"
 #include "../generated/mali_bionic_stubs_autogen.h"
 
 static bool mali_icd_log_enabled() {
@@ -596,6 +599,7 @@ struct MaliAotGlobalRuntime {
             "libGLES_mali.r44.so",
             "../libGLES_mali.so",
             "src/aot/libGLES_mali.so",
+            "src/aot/driver/r54p3-00eac0-6eda07/lib64/egl/libGLES_mali.so",
             icd_dir_so.empty() ? nullptr : icd_dir_so.c_str(),
             icd_aot_so.empty() ? nullptr : icd_aot_so.c_str(),
             icd_repo_so.empty() ? nullptr : icd_repo_so.c_str(),
@@ -1041,10 +1045,10 @@ struct MaliIcdQueryPool {
 };
 
 struct MaliIcdDescriptorSet {
-    uint64_t          bound_buffer_va[16]{};
-    uint64_t          bound_buffer_range[16]{};
-    MaliIcdImageView* bound_image_view[16]{};
-    MaliIcdSampler*   bound_sampler[16]{};
+    uint64_t          bound_buffer_va[64]{};
+    uint64_t          bound_buffer_range[64]{};
+    MaliIcdImageView* bound_image_view[64]{};
+    MaliIcdSampler*   bound_sampler[64]{};
 };
 
 struct MaliIcdRecordedCmd {
@@ -1150,8 +1154,6 @@ static uint64_t icdAllocKbaseBo(MaliIcdDevice* dev, uint64_t pages, uint64_t fla
     std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
     auto& cpu = g_aot_rt.cpu;
     if (aot_kbase_version_check_csf && aot_kbase_mem_alloc && dev && !dev->kctx_mem.empty()) {
-        uint64_t out_flags = 0;
-        uint64_t out_gpu_va = 0;
         uint64_t* sp_args = reinterpret_cast<uint64_t*>(cpu.sp);
         sp_args[0] = 0;
         sp_args[1] = 0;
@@ -1160,11 +1162,17 @@ static uint64_t icdAllocKbaseBo(MaliIcdDevice* dev, uint64_t pages, uint64_t fla
         cpu.x[2] = pages;
         cpu.x[3] = 0;
         cpu.x[4] = flags;
-        cpu.x[5] = reinterpret_cast<uint64_t>(&out_gpu_va);
-        cpu.x[6] = reinterpret_cast<uint64_t>(&out_flags);
+        cpu.x[5] = 0; /* fixed_address = 0 for r54p3 kbase_mem_alloc (0x01c69c00) */
+        cpu.x[6] = 0;
         cpu.x[7] = 0;
         aot_kbase_mem_alloc(&cpu);
-        if (cpu.x[0] == 0 && out_gpu_va != 0) return out_gpu_va;
+        if (cpu.x[0] > 0x1000ULL && cpu.x[0] != ~0ULL) {
+            uint64_t va = cpu.x[0] & ~0xFFFULL;
+            if ((flags & BASE_MEM_SAME_VA) != 0 && (flags & BASE_MEM_PROT_GPU_EX) == 0 && va < 0x10000000ULL) {
+                return bionic_mali_mmap_stub(0, pages * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, 100, va);
+            }
+            return va;
+        }
     }
     uint64_t req[8]{};
     req[0] = pages;

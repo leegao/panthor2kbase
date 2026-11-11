@@ -174,6 +174,7 @@ struct emu_cs_queue {
    uint64_t mmap_handle;
    void *user_io_pages; /* 3 * 4096 bytes */
    uint64_t extract_offset;
+   uint64_t cs_regs[128];
 };
 
 struct emu_tiler_heap {
@@ -592,10 +593,10 @@ static size_t build_valhall_gpuprops_blob(uint8_t *buf, size_t cap)
       sync_lifted_stats_locked(prev_insns);
       void *kbuf = *(void **)(kbdev + 10568);
       if (kbuf) {
+         (void)lifted_ko_heap_free(&g_lifted_cpu, kbuf);
          *(void **)(kbdev + 10568) = NULL;
       }
    } else {
-      *(uint64_t *)(kbdev + 11064) = (uint64_t)(uintptr_t)regdump;
       *(uint32_t *)(regdump + 40) = 0x07130206U;
       *(uint64_t *)(regdump + 48) = 0x00000809ULL;
       *(uint64_t *)(regdump + 56) = 0x00000101ULL;
@@ -608,6 +609,13 @@ static size_t build_valhall_gpuprops_blob(uint8_t *buf, size_t cap)
       *(uint32_t *)(regdump + 184) = 1024U;
       *(uint32_t *)(regdump + 188) = (0x0aU << 24) | 1024U;
       *(uint32_t *)(regdump + 196) = 65536U;
+      void *heap_regdump = lifted_ko_heap_alloc(&g_lifted_cpu, 256);
+      if (heap_regdump) {
+         memcpy(heap_regdump, regdump, 256);
+         *(uint64_t *)(kbdev + 11064) = (uint64_t)(uintptr_t)heap_regdump;
+      } else {
+         *(uint64_t *)(kbdev + 11064) = (uint64_t)(uintptr_t)regdump;
+      }
       *(uint64_t *)(kbdev + 10792) = 0x3ULL;
       *(uint64_t *)(kbdev + 10800) = 0x1ULL;
       *(uint64_t *)(kbdev + 10808) = 0x1ULL;
@@ -625,6 +633,7 @@ static size_t build_valhall_gpuprops_blob(uint8_t *buf, size_t cap)
       sync_lifted_stats_locked(prev_insns);
       void *kbuf = *(void **)(kbdev + 11056);
       if (kbuf) {
+         (void)lifted_ko_heap_free(&g_lifted_cpu, kbuf);
          *(void **)(kbdev + 11056) = NULL;
       }
    }
@@ -753,6 +762,29 @@ static void execute_valhall_shader(const struct valhall_shader_desc *spd)
    }
 }
 
+static bool emu_is_valid_host_range(uint64_t va, size_t len)
+{
+   if (va < 0x10000ULL || len == 0 || (va + len) < va)
+      return false;
+   for (size_t r = 0; r < 2048; r++) {
+      if (g_kfile.regions[r].active && g_kfile.regions[r].cpu_ptr != NULL &&
+          va >= g_kfile.regions[r].gpu_va &&
+          (va + len) <= g_kfile.regions[r].gpu_va + g_kfile.regions[r].size) {
+         return true;
+      }
+   }
+   for (size_t h = 0; h < 16; h++) {
+      if (g_kfile.heaps[h].active && g_kfile.heaps[h].heap_mem != NULL &&
+          va >= g_kfile.heaps[h].gpu_heap_va &&
+          (va + len) <= g_kfile.heaps[h].gpu_heap_va + g_kfile.heaps[h].heap_mem_size) {
+         return true;
+      }
+   }
+   uint64_t p0 = va & ~4095ULL;
+   uint64_t p1 = (va + len - 1ULL) & ~4095ULL;
+   return msync((void *)(uintptr_t)p0, (size_t)(p1 - p0 + 4096ULL), MS_ASYNC) == 0;
+}
+
 /* Recursively execute CSF command stream instructions (ring or CALL target) */
 static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes,
                                      uint64_t *cs_regs, struct emu_tiler_heap *heap,
@@ -769,7 +801,8 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
                                      uint64_t *cs_regs, struct emu_tiler_heap *heap,
                                      uint32_t call_depth, bool *io_unwaited_def_sync)
 {
-   if (!stream || size_bytes < sizeof(uint64_t))
+   if (!stream || size_bytes < sizeof(uint64_t) ||
+       !emu_is_valid_host_range((uint64_t)(uintptr_t)stream, size_bytes))
       return;
 
    uint32_t count = size_bytes / sizeof(uint64_t);
@@ -778,7 +811,9 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
       uint64_t opcode = (insn >> 56) & 0xffULL;
       g_stats.csf_instructions_executed++;
       if (opcode >= 0x20ULL && opcode <= 0x80ULL && opcode != CSF_OP_CALL && opcode != 33ULL &&
-          opcode != 49ULL && opcode != CSF_OP_HEAP_OPERATION) {
+          opcode != 49ULL && opcode != CSF_OP_HEAP_OPERATION &&
+          opcode != 0x25ULL && opcode != 0x26ULL && opcode != 0x27ULL &&
+          opcode != 0x33ULL && opcode != 0x34ULL && opcode != 0x35ULL) {
          (void)lifted_csffw_dispatch_opcode(&g_csffw_state, 0,
                                             (uint32_t)(insn & 0xffffffffULL),
                                             (uint32_t)(insn >> 32));
@@ -834,7 +869,7 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
       case CSF_OP_MOVE48: {
          uint8_t reg = (insn >> 48) & 0xffU;
          uint64_t imm48 = insn & 0xffffffffffffULL;
-         if (reg < 95) {
+         if (reg < 127) {
             cs_regs[reg] = imm48 & 0xffffffffULL;
             cs_regs[reg + 1] = (imm48 >> 32) & 0xffffULL;
          }
@@ -844,7 +879,7 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
       case CSF_OP_MOVE32: {
          uint8_t reg = (insn >> 48) & 0xffU;
          uint32_t imm32 = (uint32_t)(insn & 0xffffffffULL);
-         if (reg < 96)
+         if (reg < 128)
             cs_regs[reg] = imm32;
          break;
       }
@@ -853,7 +888,7 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
          uint8_t dst = (insn >> 48) & 0xffU;
          uint8_t src = (insn >> 40) & 0xffU;
          uint32_t imm = (uint32_t)(insn & 0xffffffffULL);
-         if (dst < 96 && src < 96)
+         if (dst < 128 && src < 128)
             cs_regs[dst] = (uint32_t)cs_regs[src] + imm;
          break;
       }
@@ -862,7 +897,7 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
          uint8_t dst = (insn >> 48) & 0xffU;
          uint8_t src = (insn >> 40) & 0xffU;
          int64_t imm = (int32_t)(insn & 0xffffffffULL);
-         if (dst < 95 && src < 95) {
+         if (dst < 127 && src < 127) {
             uint64_t sv = (cs_regs[src + 1] << 32) | (cs_regs[src] & 0xffffffffULL);
             uint64_t dv = (uint64_t)((int64_t)sv + imm);
             cs_regs[dst] = dv & 0xffffffffULL;
@@ -875,10 +910,11 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
       case 33: /* HW_CSF_OP_JUMP (0x21) */ {
          uint8_t addr_reg = (insn >> 40) & 0xffU;
          uint8_t sz_reg = (insn >> 32) & 0xffU;
-         if (addr_reg < 95 && sz_reg < 96) {
+         if (addr_reg < 127 && sz_reg < 128) {
             uint64_t target_va = (cs_regs[addr_reg + 1] << 32) | cs_regs[addr_reg];
             uint32_t target_sz = (uint32_t)cs_regs[sz_reg];
-            if (target_va >= 0x10000ULL && target_sz >= 8U && target_sz <= (4U * 1024U * 1024U)) {
+            if (target_va >= 0x10000ULL && target_sz >= 8U && target_sz <= (4U * 1024U * 1024U) &&
+                emu_is_valid_host_range(target_va, target_sz)) {
                if (opcode == CSF_OP_CALL) {
                   if (call_depth < 8U /* MALI_CSF_MAX_CALL_STACK_DEPTH */) {
                      g_stats.csf_calls_followed++;
@@ -912,16 +948,20 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
          uint8_t base_reg = (uint8_t)((insn >> 48) & 0xffU);
          uint8_t addr_reg = (uint8_t)((insn >> 40) & 0xffU);
          int16_t imm_off = (int16_t)(insn & 0xffffU);
-         if (mask != 0 && addr_reg < 95 && base_reg < 96) {
+         if (mask != 0 && addr_reg < 127 && base_reg < 128) {
             uint64_t base_va = (cs_regs[addr_reg + 1] << 32) | cs_regs[addr_reg];
-            if (base_va >= 0x10000ULL) {
-               const uint32_t *src = (const uint32_t *)((const uint8_t *)(uintptr_t)base_va + imm_off);
+            uint64_t eff_va = (uint64_t)((int64_t)base_va + (int64_t)imm_off);
+            uint32_t n_words = (uint32_t)__builtin_popcount((unsigned int)mask);
+            if (base_va >= 0x10000ULL && n_words > 0 &&
+                emu_is_valid_host_range(eff_va, (size_t)n_words * sizeof(uint32_t))) {
+               const uint32_t *src = (const uint32_t *)(uintptr_t)eff_va;
                uint32_t r_off = 0;
                for (uint32_t b = 0; b < 16; b++) {
-                  if ((mask & (1U << b)) && (base_reg + r_off) < 96)
-                     cs_regs[base_reg + r_off] = src[r_off];
-                  if (mask & (1U << b))
+                  if (mask & (1U << b)) {
+                     if ((base_reg + b) < 128)
+                        cs_regs[base_reg + b] = src[r_off];
                      r_off++;
+                  }
                }
             }
          }
@@ -933,16 +973,20 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
          uint8_t base_reg = (uint8_t)((insn >> 48) & 0xffU);
          uint8_t addr_reg = (uint8_t)((insn >> 40) & 0xffU);
          int16_t imm_off = (int16_t)(insn & 0xffffU);
-         if (mask != 0 && addr_reg < 95 && base_reg < 96) {
+         if (mask != 0 && addr_reg < 127 && base_reg < 128) {
             uint64_t base_va = (cs_regs[addr_reg + 1] << 32) | cs_regs[addr_reg];
-            if (base_va >= 0x10000ULL) {
-               uint32_t *dst = (uint32_t *)((uint8_t *)(uintptr_t)base_va + imm_off);
+            uint64_t eff_va = (uint64_t)((int64_t)base_va + (int64_t)imm_off);
+            uint32_t n_words = (uint32_t)__builtin_popcount((unsigned int)mask);
+            if (base_va >= 0x10000ULL && n_words > 0 &&
+                emu_is_valid_host_range(eff_va, (size_t)n_words * sizeof(uint32_t))) {
+               uint32_t *dst = (uint32_t *)(uintptr_t)eff_va;
                uint32_t r_off = 0;
                for (uint32_t b = 0; b < 16; b++) {
-                  if ((mask & (1U << b)) && (base_reg + r_off) < 96)
-                     dst[r_off] = (uint32_t)cs_regs[base_reg + r_off];
-                  if (mask & (1U << b))
+                  if (mask & (1U << b)) {
+                     if ((base_reg + b) < 128)
+                        dst[r_off] = (uint32_t)cs_regs[base_reg + b];
                      r_off++;
+                  }
                }
             }
          }
@@ -982,10 +1026,10 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
          uint64_t leg_scope = (insn >> 28) & 0x3ULL;
          if ((hw_scope == 0ULL && leg_scope == CSF_SYNC_SCOPE_CSG && ((insn >> 24) & 1ULL) == 0ULL && addr_reg < 60))
             g_stats.csg_scope_warnings++;
-         if (addr_reg < 95 && val_reg < 96) {
+         if (addr_reg < 127 && val_reg < 128) {
             uint64_t sync_va = (cs_regs[addr_reg + 1] << 32) | cs_regs[addr_reg];
             uint32_t val = (uint32_t)cs_regs[val_reg];
-            if (sync_va >= 0x10000ULL) {
+            if (sync_va >= 0x10000ULL && emu_is_valid_host_range(sync_va, sizeof(uint32_t))) {
                uint32_t *ptr = (uint32_t *)(uintptr_t)sync_va;
                if (opcode == CSF_OP_SYNC_ADD32)
                   *ptr += val;
@@ -1013,10 +1057,10 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
          uint64_t leg_scope = (insn >> 28) & 0x3ULL;
          if ((hw_scope == 0ULL && leg_scope == CSF_SYNC_SCOPE_CSG && ((insn >> 24) & 1ULL) == 0ULL && addr_reg < 60))
             g_stats.csg_scope_warnings++;
-         if (addr_reg < 95 && val_reg < 95) {
+         if (addr_reg < 127 && val_reg < 127) {
             uint64_t sync_va = (cs_regs[addr_reg + 1] << 32) | cs_regs[addr_reg];
             uint64_t val = (cs_regs[val_reg + 1] << 32) | cs_regs[val_reg];
-            if (sync_va >= 0x10000ULL) {
+            if (sync_va >= 0x10000ULL && emu_is_valid_host_range(sync_va, sizeof(uint64_t))) {
                uint64_t *ptr = (uint64_t *)(uintptr_t)sync_va;
                if (opcode == CSF_OP_SYNC_ADD64)
                   *ptr += val;
@@ -1049,16 +1093,19 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
          }
          if (spd_reg < 95) {
             uint64_t spd_va = (cs_regs[spd_reg + 1] << 32) | cs_regs[spd_reg];
-            if (spd_va >= 0x10000ULL && (spd_va & 0x7ULL) == 0 && *(const uint32_t*)(uintptr_t)spd_va != 0x4D494456U) {
-               /* Only execute synthetic Valhall shader descriptors when marked with valid shader_va */
+            if (spd_va >= 0x10000ULL && (spd_va & 0x7ULL) == 0) {
+               /* Only execute synthetic Valhall shader descriptors when spd_va lies inside a mapped BO region */
                for (size_t r = 0; r < 2048; r++) {
-                  if (g_kfile.regions[r].active &&
+                  if (g_kfile.regions[r].active && g_kfile.regions[r].cpu_ptr != NULL &&
                       spd_va >= g_kfile.regions[r].gpu_va &&
                       spd_va + sizeof(struct valhall_shader_desc) <= g_kfile.regions[r].gpu_va + g_kfile.regions[r].size) {
-                     const struct valhall_shader_desc *spd =
-                        (const struct valhall_shader_desc *)(uintptr_t)spd_va;
-                     if (spd->shader_va >= 0x10000ULL && spd->shader_size >= 8 && spd->shader_size <= 65536)
-                        execute_valhall_shader(spd);
+                     if (*(const uint32_t *)(uintptr_t)spd_va != 0x4D494456U) {
+                        const struct valhall_shader_desc *spd =
+                           (const struct valhall_shader_desc *)(uintptr_t)spd_va;
+                        if (spd->shader_va >= 0x10000ULL && spd->shader_size >= 8 && spd->shader_size <= 65536 &&
+                            emu_is_valid_host_range(spd->shader_va, spd->shader_size))
+                           execute_valhall_shader(spd);
+                     }
                      break;
                   }
                }
@@ -1274,6 +1321,7 @@ int open(const char *pathname, int flags, ...)
       void *alloc_kfile = *(void **)(g_kfile.sim_filp + 216);
       if (alloc_kfile) {
          memcpy(g_kfile.sim_kfile_buf, alloc_kfile, 160);
+         (void)lifted_ko_heap_free(&g_lifted_cpu, alloc_kfile);
       }
       *(uint64_t *)(g_kfile.sim_filp + 216) = (uint64_t)(uintptr_t)g_kfile.sim_kfile_buf;
       record_trace_ioctl("OPEN_MALI0", 0, 0, 0, 0, (uint64_t)flags, 0, 0, fd, 0);
@@ -1303,9 +1351,17 @@ int close(int fd)
    if (fd >= 0 && fd == g_kfile.fd && g_kfile.state != EMU_KFILE_UNOPENED) {
       pthread_mutex_lock(&g_emu_lock);
       enum mali_kbase_emu_profile prof = resolve_active_emu_profile();
-      *(uint64_t *)(g_kfile.sim_filp + 216) = (uint64_t)(uintptr_t)g_kfile.sim_kfile_buf;
-      *(uint32_t *)(g_kfile.sim_kfile_buf + 100) = 0U;
-      *(uint32_t *)(g_kfile.sim_kfile_buf + 104) = 0U;
+      void *rel_kfile = lifted_ko_heap_alloc(&g_lifted_cpu, 160);
+      if (rel_kfile) {
+         memcpy(rel_kfile, g_kfile.sim_kfile_buf, 160);
+         *(uint32_t *)((uint8_t *)rel_kfile + 100) = 0U;
+         *(uint32_t *)((uint8_t *)rel_kfile + 104) = 0U;
+         *(uint64_t *)(g_kfile.sim_filp + 216) = (uint64_t)(uintptr_t)rel_kfile;
+      } else {
+         *(uint64_t *)(g_kfile.sim_filp + 216) = (uint64_t)(uintptr_t)g_kfile.sim_kfile_buf;
+         *(uint32_t *)(g_kfile.sim_kfile_buf + 100) = 0U;
+         *(uint32_t *)(g_kfile.sim_kfile_buf + 104) = 0U;
+      }
       (void)call_nested_lifted_fn_locked(
          (prof == MALI_EMU_PROFILE_HUSKY_R54)
             ? lifted_husky_r54p1_kbase_release
@@ -1684,6 +1740,7 @@ int ioctl(int fd, unsigned long request, ...)
                g_kfile.queues[i].buffer_gpu_addr = qr->buffer_gpu_addr;
                g_kfile.queues[i].buffer_size = qr->buffer_size;
                g_kfile.queues[i].extract_offset = 0ULL;
+               memset(g_kfile.queues[i].cs_regs, 0, sizeof(g_kfile.queues[i].cs_regs));
                record_trace_ioctl("KBASE_IOCTL_CS_QUEUE_REGISTER", request, qr->buffer_size >> 12, 0, 0, qr->priority, qr->buffer_gpu_addr, qr->buffer_gpu_addr, 0, 0);
                g_trace[g_trace_count - 1].buffer_size = qr->buffer_size;
                g_trace[g_trace_count - 1].buffer_gpu_addr = qr->buffer_gpu_addr;
@@ -1760,8 +1817,7 @@ int ioctl(int fd, unsigned long request, ...)
                if (cs_insert > cs_extract) {
                   uint32_t buf_sz = g_kfile.queues[i].buffer_size;
                   uint64_t cur = cs_extract;
-                  uint64_t cs_regs[96];
-                  memset(cs_regs, 0, sizeof(cs_regs));
+                  uint64_t *cs_regs = g_kfile.queues[i].cs_regs;
                   struct emu_tiler_heap *heap = g_kfile.heaps[0].active ? &g_kfile.heaps[0] : NULL;
                   while (cur < cs_insert && buf_sz > 0) {
                      uint32_t ring_off = (uint32_t)(cur % buf_sz);
@@ -1984,7 +2040,7 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
             (uint64_t)(uintptr_t)g_kfile.sim_filp,
             (uint64_t)(uintptr_t)sim_vma, 0, 0, 0);
       }
-      record_trace_ioctl("MMAP_MALI0", 0, length >> 12, 0, 0, (uint64_t)prot, 0, 0, 0, 0);
+      record_trace_ioctl("MMAP_MALI0", 0, length >> 12, uoff, 0, (uint64_t)prot, 0, 0, 0, 0);
       g_trace[g_trace_count - 1].mmap_offset = uoff;
       g_trace[g_trace_count - 1].mmap_len = (uint64_t)length;
       if (uoff == BASE_MEM_MAP_TRACKING_HANDLE || uoff == 0x2000ULL || uoff == 0x4000ULL) {
@@ -2166,6 +2222,9 @@ static void mali_kbase_emu_auto_dump_trace_on_exit(void)
          fprintf(stderr, "[mali_kbase_emu] Dumped %u UAPI trace events to %s\n",
                  g_trace_count, out_path);
       }
+   }
+   if ((lifted_ko_get_debug_flags(&g_lifted_cpu) & LIFTED_KO_DEBUG_PROFILE_CALLS) != 0U) {
+      lifted_ko_dump_profile(stderr);
    }
 }
 

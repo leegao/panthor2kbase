@@ -20,6 +20,30 @@
 extern "C" {
     typedef void (*mali_kbase_emu_csf_job_hook_fn)(uint8_t cs_opcode, uint64_t insn, const uint64_t *cs_regs, void *user_data);
     __attribute__((weak)) void mali_kbase_emu_register_csf_job_hook(mali_kbase_emu_csf_job_hook_fn fn, void *user_data);
+    struct kbase_emu_stats {
+        uint32_t ioctl_count;
+        uint32_t mem_alloc_count;
+        uint32_t queue_kick_count;
+        uint32_t csf_instructions_executed;
+        uint32_t csf_calls_followed;
+        uint32_t valhall_shaders_executed;
+        uint32_t valhall_instructions_executed;
+        uint32_t compute_jobs_run;
+        uint32_t idvs_jobs_run;
+        uint32_t fragment_jobs_run;
+        uint32_t lvp_bridges_run;
+        uint32_t csg_scope_warnings;
+        uint32_t oom_heap_stat_errors;
+        uint32_t same_va_munmap_destroys;
+        uint32_t unwaited_deferred_sync_errors;
+        uint32_t csf_jumps_followed;
+        uint32_t lifted_ko_calls_executed;
+        uint64_t lifted_ko_insns_executed;
+        uint32_t active_profile;
+        uint16_t kbase_ver_major;
+        uint16_t kbase_ver_minor;
+    };
+    __attribute__((weak)) void mali_kbase_emu_get_stats(struct kbase_emu_stats *out);
     __attribute__((weak)) int mali_kbase_emu_open_direct(const char *pathname, int flags);
     __attribute__((weak)) int mali_kbase_emu_close_direct(int fd);
     __attribute__((weak)) int mali_kbase_emu_ioctl_direct(int fd, unsigned long request, void *arg);
@@ -162,9 +186,9 @@ public:
         }
 
         const MaliIdvsDrawPacket* draw_pkt = nullptr;
-        if (job.tsd_gpu_va >= 0x10000ULL && *reinterpret_cast<const uint32_t*>(job.tsd_gpu_va) == MALI_IDVS_MAGIC) {
+        if (opc != MALI_CS_OPCODE_RUN_COMPUTE && job.tsd_gpu_va >= 0x10000ULL && *reinterpret_cast<const uint32_t*>(job.tsd_gpu_va) == MALI_IDVS_MAGIC) {
             draw_pkt = reinterpret_cast<const MaliIdvsDrawPacket*>(job.tsd_gpu_va);
-        } else if (job.srt_gpu_va >= 0x10000ULL && *reinterpret_cast<const uint32_t*>(job.srt_gpu_va) == MALI_IDVS_MAGIC) {
+        } else if (opc != MALI_CS_OPCODE_RUN_COMPUTE && job.srt_gpu_va >= 0x10000ULL && *reinterpret_cast<const uint32_t*>(job.srt_gpu_va) == MALI_IDVS_MAGIC) {
             draw_pkt = reinterpret_cast<const MaliIdvsDrawPacket*>(job.srt_gpu_va);
         }
 
@@ -177,13 +201,13 @@ public:
             }
             if (opc == MALI_CS_OPCODE_RUN_IDVS) {
                 job.lifted_spirv = MaliVkCubeIsaPipelineTranslator::liftVertexObjcToSpirv(
-                    reinterpret_cast<const uint64_t*>(job.shader_objc_va),
-                    job.shader_objc_bytes / 8, false);
+                    (job.shader_objc_va >= 0x10000ULL) ? reinterpret_cast<const uint64_t*>(job.shader_objc_va) : nullptr,
+                    (job.shader_objc_va >= 0x10000ULL) ? (job.shader_objc_bytes / 8) : 0, false);
                 job.executed_on_lvp = lvp_executor.validateShaderModuleOnLvpipe(job.lifted_spirv);
             } else if (opc == MALI_CS_OPCODE_RUN_FRAGMENT) {
                 job.lifted_spirv = MaliVkCubeIsaPipelineTranslator::liftFragmentObjcToSpirv(
-                    reinterpret_cast<const uint64_t*>(job.shader_objc_va),
-                    job.shader_objc_bytes / 8, false);
+                    (job.shader_objc_va >= 0x10000ULL) ? reinterpret_cast<const uint64_t*>(job.shader_objc_va) : nullptr,
+                    (job.shader_objc_va >= 0x10000ULL) ? (job.shader_objc_bytes / 8) : 0, false);
                 auto vs_spv = MaliVkCubeIsaPipelineTranslator::liftVertexObjcToSpirv(nullptr, 0, false);
                 auto* mfbd  = reinterpret_cast<MaliMfbdDescriptor*>(draw_pkt->mfbd_gpu_va);
                 VkCubeFrameStats fstats{};
@@ -595,9 +619,9 @@ public:
 
                         // Check if this is a 3D vkcube IDVS + Fragment graphics pipeline draw packet
                         const MaliIdvsDrawPacket* draw_pkt = nullptr;
-                        if (job.tsd_gpu_va && *reinterpret_cast<const uint32_t*>(job.tsd_gpu_va) == MALI_IDVS_MAGIC) {
+                        if (opc != MALI_CS_OPCODE_RUN_COMPUTE && job.tsd_gpu_va && *reinterpret_cast<const uint32_t*>(job.tsd_gpu_va) == MALI_IDVS_MAGIC) {
                             draw_pkt = reinterpret_cast<const MaliIdvsDrawPacket*>(job.tsd_gpu_va);
-                        } else if (job.srt_gpu_va && *reinterpret_cast<const uint32_t*>(job.srt_gpu_va) == MALI_IDVS_MAGIC) {
+                        } else if (opc != MALI_CS_OPCODE_RUN_COMPUTE && job.srt_gpu_va && *reinterpret_cast<const uint32_t*>(job.srt_gpu_va) == MALI_IDVS_MAGIC) {
                             draw_pkt = reinterpret_cast<const MaliIdvsDrawPacket*>(job.srt_gpu_va);
                         }
 
@@ -817,8 +841,8 @@ public:
             // directly into our lifted /dev/mali0 kernel emulator (mali_kbase_emu.c + lifted_kbase_ko.ll + lifted_csffw.c)!
             // Keep GET_GPUPROPS (nr=3), CS_GET_GLB_IFACE (nr=51), JM JOB_SUBMIT (nr=2), and UMM MEM_IMPORT (nr=22)
             // augmented with the runner's 85-property TLV / 64-stream / virtual-dmabuf tables after running lifted_kbase_ko!
-            int krc = mali_kbase_emu_ioctl_direct(static_cast<int>(fd), static_cast<unsigned long>(ucmd), reinterpret_cast<void*>(arg_addr));
-            if (nr != 0 && nr != 2 && nr != 3 && nr != 22 && nr != 28 && nr != 51) {
+            if (nr != 0 && nr != 2 && nr != 3 && nr != 22 && nr != 28 && ucmd != 0xc0048036U && ucmd != 0xc0018036U) {
+                int krc = mali_kbase_emu_ioctl_direct(static_cast<int>(fd), static_cast<unsigned long>(ucmd), reinterpret_cast<void*>(arg_addr));
                 ioctl_trace.push_back("lifted_kbase_ko_ioctl(cmd=0x" + std::to_string(ucmd) + ")");
                 return (krc == 0) ? 0ULL : static_cast<uint64_t>(static_cast<int64_t>(krc));
             }

@@ -13,6 +13,11 @@
 
 #ifdef __cplusplus
 extern "C" {
+#ifndef DRM_PLANE_TYPE_OVERLAY
+#define DRM_PLANE_TYPE_OVERLAY 0
+#define DRM_PLANE_TYPE_PRIMARY 1
+#define DRM_PLANE_TYPE_CURSOR  2
+#endif
 #endif
 
 typedef struct _drmModeRes {
@@ -166,6 +171,16 @@ int drmModeCreateLease(int fd, const uint32_t *objects, int num_objects, int fla
 
 #ifdef __cplusplus
 }
+#ifndef DRM_PLANE_TYPE_OVERLAY
+#define DRM_PLANE_TYPE_OVERLAY 0
+#define DRM_PLANE_TYPE_PRIMARY 1
+#define DRM_PLANE_TYPE_CURSOR  2
+#endif
 #endif
 
+#ifndef DRM_PLANE_TYPE_OVERLAY
+#define DRM_PLANE_TYPE_OVERLAY 0
+#define DRM_PLANE_TYPE_PRIMARY 1
+#define DRM_PLANE_TYPE_CURSOR  2
+#endif
 #endif /* _XF86DRMMODE_H_ */
