@@ -64,10 +64,10 @@ export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-d3d11,dxgi,d3d10core,d3d10,d3d10_1,
 install_dxvk_dlls_into_prefix() {
     local prefix="$1"
     local target_exe="${2:-}"
-    if [ ! -f "$DXVK_TARBALL" ]; then
-        return 0
-    fi
     if [ ! -f "$DXVK_DIST_DIR/x64/d3d11.dll" ] || [ ! -f "$DXVK_DIST_DIR/x32/d3d11.dll" ]; then
+        if [ ! -f "$DXVK_TARBALL" ]; then
+            return 0
+        fi
         mkdir -p "$DXVK_DIST_DIR"
         tar -xJf "$DXVK_TARBALL" -C "$DXVK_DIST_DIR" --strip-components=1
     fi
@@ -125,7 +125,6 @@ export VK_LAYER_PATH="$ROOT_DIR/third_party/prebuilts/bcn_layer/x86-64:$ROOT_DIR
 export VK_ADD_LAYER_PATH="$LAYER_DIR"
 export VK_INSTANCE_LAYERS="VK_LAYER_window_system_integration:VK_LAYER_COMPAT_DxvkMaliCompatLayer:VK_LAYER_BCN_BCnLayer"
 export LD_LIBRARY_PATH="$LAYER_DIR:$ICD_DIR:$ROOT_DIR:${LD_LIBRARY_PATH:-}"
-export DXVK_FILTER_DEVICE_NAME="${DXVK_FILTER_DEVICE_NAME:-Mali}"
 export DXVK_HUD="${DXVK_HUD:-devinfo,fps,submissions}"
 export MALI_AOT_ICD_LOG="${MALI_AOT_ICD_LOG:-1}"
 
@@ -147,7 +146,6 @@ if [ $# -eq 0 ] || [ "${1:-}" = "--self-test" ] || [ "${1:-}" = "--test" ] || [ 
     echo "   ICD Shared Lib    : $ICD_DIR/libr54p3_vulkan_icd.so"
     echo "   VK_LAYER_PATH     : $VK_LAYER_PATH"
     echo "   VK_INSTANCE_LAYERS: $VK_INSTANCE_LAYERS"
-    echo "   DXVK_FILTER_DEVICE: $DXVK_FILTER_DEVICE_NAME"
     echo "================================================================================"
     exec "$TEST_BIN"
 fi
@@ -202,7 +200,6 @@ echo "   Active ICD JSON   : $ICD_JSON" >&2
 echo "   ICD Shared Lib    : $ICD_DIR/libr54p3_vulkan_icd.so" >&2
 echo "   VK_LAYER_PATH     : $VK_LAYER_PATH" >&2
 echo "   VK_INSTANCE_LAYERS: $VK_INSTANCE_LAYERS" >&2
-echo "   DXVK_FILTER_DEVICE: $DXVK_FILTER_DEVICE_NAME" >&2
 echo "================================================================================" >&2
 
 if [[ "${1:-}" == *.exe ]] || [ -n "$CUSTOM_WINE" ]; then

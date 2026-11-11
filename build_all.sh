@@ -41,6 +41,7 @@ if [ -d $ROOT_DIR/third_party/compat_layer ] && ([ -f $ROOT_DIR/third_party/comp
         "implementation_version": "1",
         "description": "Descriptor Buffer Layer",
         "functions": {
+            "vkNegotiateLoaderLayerInterfaceVersion": "DxvkMaliCompatLayer_NegotiateLoaderLayerInterfaceVersion",
             "vkGetInstanceProcAddr": "DxvkMaliCompatLayer_GetInstanceProcAddr",
             "vkGetDeviceProcAddr": "DxvkMaliCompatLayer_GetDeviceProcAddr"
         },
@@ -53,6 +54,11 @@ if [ -d $ROOT_DIR/third_party/compat_layer ] && ([ -f $ROOT_DIR/third_party/comp
     }
 }
 EOF
+    PREBUILT_COMPAT_DIR="$ROOT_DIR/third_party/prebuilts/compat_layer/x86-64"
+    mkdir -p "$PREBUILT_COMPAT_DIR"
+    cp "$ROOT_DIR/build-x86-64/libdxvk_mali_compat_layer.so" "$PREBUILT_COMPAT_DIR/"
+    cp "$ROOT_DIR/build-x86-64/libdxvk_mali_compat_layer.json" "$PREBUILT_COMPAT_DIR/"
+    echo "  -> Cached layer to $PREBUILT_COMPAT_DIR"
 fi
 
 if [ -d $ROOT_DIR/third_party/bcn_layer ] && ([ -f $ROOT_DIR/third_party/bcn_layer/CMakeLists.txt ]); then
@@ -75,6 +81,7 @@ if [ -d $ROOT_DIR/third_party/bcn_layer ] && ([ -f $ROOT_DIR/third_party/bcn_lay
         "implementation_version": "1",
         "description": "BCn Decompression Layer",
         "functions": {
+            "vkNegotiateLoaderLayerInterfaceVersion": "BCnLayer_NegotiateLoaderLayerInterfaceVersion",
             "vkGetInstanceProcAddr": "BCnLayer_GetInstanceProcAddr",
             "vkGetDeviceProcAddr": "BCnLayer_GetDeviceProcAddr"
         },
@@ -87,6 +94,11 @@ if [ -d $ROOT_DIR/third_party/bcn_layer ] && ([ -f $ROOT_DIR/third_party/bcn_lay
     }
 }
 EOF
+    PREBUILT_BCN_DIR="$ROOT_DIR/third_party/prebuilts/bcn_layer/x86-64"
+    mkdir -p "$PREBUILT_BCN_DIR"
+    cp "$ROOT_DIR/build-x86-64/libbcn_layer.so" "$PREBUILT_BCN_DIR/"
+    cp "$ROOT_DIR/build-x86-64/libbcn_layer.json" "$PREBUILT_BCN_DIR/"
+    echo "  -> Cached layer to $PREBUILT_BCN_DIR"
 fi
 
 WSI_LAYER_DIR=""
@@ -171,6 +183,7 @@ if [ -n "$NDK_TOOLCHAIN" ]; then
         "implementation_version": "1",
         "description": "Descriptor Buffer Layer",
         "functions": {
+            "vkNegotiateLoaderLayerInterfaceVersion": "DxvkMaliCompatLayer_NegotiateLoaderLayerInterfaceVersion",
             "vkGetInstanceProcAddr": "DxvkMaliCompatLayer_GetInstanceProcAddr",
             "vkGetDeviceProcAddr": "DxvkMaliCompatLayer_GetDeviceProcAddr"
         },
@@ -211,6 +224,7 @@ EOF
         "implementation_version": "1",
         "description": "BCn Decompression Layer",
         "functions": {
+            "vkNegotiateLoaderLayerInterfaceVersion": "BCnLayer_NegotiateLoaderLayerInterfaceVersion",
             "vkGetInstanceProcAddr": "BCnLayer_GetInstanceProcAddr",
             "vkGetDeviceProcAddr": "BCnLayer_GetDeviceProcAddr"
         },
