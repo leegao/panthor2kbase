@@ -61,7 +61,8 @@ EOF
     echo "  -> Cached layer to $PREBUILT_COMPAT_DIR"
 fi
 
-if [ -d $ROOT_DIR/third_party/bcn_layer ] && ([ -f $ROOT_DIR/third_party/bcn_layer/CMakeLists.txt ]); then
+PREBUILT_BCN_DIR="$ROOT_DIR/third_party/prebuilts/bcn_layer/x86-64"
+if [ -d "$ROOT_DIR/third_party/bcn_layer" ] && [ -f "$ROOT_DIR/third_party/bcn_layer/CMakeLists.txt" ] && command -v glslc >/dev/null 2>&1; then
     echo "  -> Building third_party/bcn_layer"
     "$CMAKE_BIN" -S "$ROOT_DIR/third_party/bcn_layer" -B "$ROOT_DIR/build-x86-64/bcn_layer" \
         -DCMAKE_BUILD_TYPE=Release \
@@ -94,15 +95,18 @@ if [ -d $ROOT_DIR/third_party/bcn_layer ] && ([ -f $ROOT_DIR/third_party/bcn_lay
     }
 }
 EOF
-    PREBUILT_BCN_DIR="$ROOT_DIR/third_party/prebuilts/bcn_layer/x86-64"
     mkdir -p "$PREBUILT_BCN_DIR"
     cp "$ROOT_DIR/build-x86-64/libbcn_layer.so" "$PREBUILT_BCN_DIR/"
     cp "$ROOT_DIR/build-x86-64/libbcn_layer.json" "$PREBUILT_BCN_DIR/"
     echo "  -> Cached layer to $PREBUILT_BCN_DIR"
+elif [ -f "$PREBUILT_BCN_DIR/libbcn_layer.so" ]; then
+    echo "  -> Using prebuilt bcn_layer from third_party/prebuilts/bcn_layer/x86-64"
+    cp "$PREBUILT_BCN_DIR/libbcn_layer.so" "$ROOT_DIR/build-x86-64/"
+    cp "$PREBUILT_BCN_DIR/libbcn_layer.json" "$ROOT_DIR/build-x86-64/"
 fi
 
 WSI_LAYER_DIR=""
-if [ -d "$ROOT_DIR/third_party/vulkan-wsi-layer" ] && [ -f "$ROOT_DIR/third_party/vulkan-wsi-layer/CMakeLists.txt" ]; then
+if [ -d "$ROOT_DIR/third_party/vulkan-wsi-layer" ] && [ -f "$ROOT_DIR/third_party/vulkan-wsi-layer/CMakeLists.txt" ] && command -v pkg-config >/dev/null 2>&1; then
     WSI_LAYER_DIR="$ROOT_DIR/third_party/vulkan-wsi-layer"
 fi
 
@@ -198,7 +202,7 @@ if [ -n "$NDK_TOOLCHAIN" ]; then
 EOF
     fi
 
-    if [ -d $ROOT_DIR/third_party/bcn_layer ] && ([ -f $ROOT_DIR/third_party/bcn_layer/CMakeLists.txt ]); then
+    if [ -d "$ROOT_DIR/third_party/bcn_layer" ] && [ -f "$ROOT_DIR/third_party/bcn_layer/CMakeLists.txt" ] && command -v glslc >/dev/null 2>&1; then
         echo "  -> Building third_party/bcn_layer"
         "$CMAKE_BIN" -S "$ROOT_DIR/third_party/bcn_layer" -B "$ROOT_DIR/build-android/bcn_layer" \
             -DCMAKE_SYSTEM_NAME=Android \

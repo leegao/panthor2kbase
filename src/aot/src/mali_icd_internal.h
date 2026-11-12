@@ -30,6 +30,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -41,6 +42,7 @@
 #include <cstdarg>
 #include <unistd.h>
 #include "../include/mali0_emu.hpp"
+#include "../include/mali_aapcs64_auto_thunks.hpp"
 #define AOT_SO_PROFILER_IMPLEMENTATION
 #include "../include/aot_so_profiler.hpp"
 #include "../../emulator/lifted_kbase_ko.h"
@@ -573,6 +575,38 @@ struct MaliAotGlobalRuntime {
         return 0;
     }
 
+    void resetGuestStackLocked() {
+        if (stack_mem) {
+            cpu.sp    = reinterpret_cast<uint64_t>(stack_mem + stack_size - 0x10000);
+            cpu.x[29] = cpu.sp;
+        }
+    }
+
+    uint64_t invokeLiftedVkByRva(uint64_t rva,
+                                 uint64_t x0 = 0, uint64_t x1 = 0,
+                                 uint64_t x2 = 0, uint64_t x3 = 0,
+                                 uint64_t x4 = 0, uint64_t x5 = 0,
+                                 uint64_t x6 = 0, uint64_t x7 = 0) {
+        if (!rva) return static_cast<uint64_t>(-3LL);
+        std::lock_guard<std::mutex> lock(mtx);
+        resetGuestStackLocked();
+        cpu.x[0] = x0; cpu.x[1] = x1; cpu.x[2] = x2; cpu.x[3] = x3;
+        cpu.x[4] = x4; cpu.x[5] = x5; cpu.x[6] = x6; cpu.x[7] = x7;
+        lifted_vk_calls_executed++;
+        aot_indirect_dispatch(&cpu, IMAGE_BASE + rva);
+        return cpu.x[0];
+    }
+
+    uint64_t invokeLiftedVkByName(const char* name,
+                                  uint64_t x0 = 0, uint64_t x1 = 0,
+                                  uint64_t x2 = 0, uint64_t x3 = 0,
+                                  uint64_t x4 = 0, uint64_t x5 = 0,
+                                  uint64_t x6 = 0, uint64_t x7 = 0) {
+        uint64_t rva = lookupDispatchEntryRva(name);
+        if (!rva) return static_cast<uint64_t>(-3LL);
+        return invokeLiftedVkByRva(rva, x0, x1, x2, x3, x4, x5, x6, x7);
+    }
+
     bool ensureInitialized() {
         std::lock_guard<std::mutex> lock(mtx);
         if (initialized) return true;
@@ -652,9 +686,10 @@ struct MaliAotGlobalRuntime {
         tls_mem   = static_cast<uint8_t*>(mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
         *reinterpret_cast<uint64_t*>(tls_mem + 0x28) = BIONIC_STACK_GUARD_CANARY;
         cpu.sp        = reinterpret_cast<uint64_t>(stack_mem + stack_size - 0x10000);
+        cpu.x[29]     = cpu.sp;
         cpu.tpidr_el0 = reinterpret_cast<uint64_t>(tls_mem);
 
-        if (aot_get_kbase_page_shift_addr) {
+        {
             uint64_t ps_addr = aot_get_kbase_page_shift_addr();
             if (ps_addr >= IMAGE_BASE) {
                 *reinterpret_cast<uint32_t*>(ps_addr) = 12U;
@@ -975,9 +1010,12 @@ struct MaliIcdDevice {
     uint64_t             cqs_bo_va      = 0;
     uint64_t             srt_bo_va      = 0;
     uint64_t             spd_bo_va      = 0;
+    uint64_t             rsd_bo_va      = 0;
+    uint64_t             tsd_bo_va      = 0;
+    uint64_t             tiler_heap_va  = 0;
+    uint8_t              kcpu_queue_id  = 0;
 };
 
-// Non-dispatchable ICD Handles
 struct MaliIcdDeviceMemory {
     uint64_t gpu_va     = 0;
     uint64_t size_bytes = 0;
@@ -998,17 +1036,91 @@ struct MaliIcdShaderModule {
     uint64_t              exec_bo_gpu_va           = 0;
     uint8_t               sha1_digest[20]{};
     std::string           deserialized_c_source;
+    uint32_t              execution_model          = 0; // 0=Vertex, 4=Fragment, 5=GLCompute
+    bool                  has_image_sample         = false;
+    bool                  has_ubo_load             = false;
+    bool                  has_push_constant        = false;
+    bool                  has_const_color          = false;
+    float                 const_color[4]           = {1.0f, 1.0f, 1.0f, 1.0f};
+};
+
+struct MaliVertexBindingDesc {
+    uint32_t binding    = 0;
+    uint32_t stride     = 0;
+    uint32_t input_rate = 0;
+};
+
+struct MaliVertexAttrDesc {
+    uint32_t location = 0;
+    uint32_t binding  = 0;
+    uint32_t format   = 0;
+    uint32_t offset   = 0;
 };
 
 struct MaliIcdPipeline {
-    MaliIcdShaderModule* shader_mod     = nullptr;
-    MaliIcdShaderModule* vs_mod         = nullptr;
-    MaliIcdShaderModule* fs_mod         = nullptr;
-    uint64_t             exec_bo_gpu_va = 0;
-    size_t               objc_bytes     = 0;
-    bool                 is_compute     = true;
-    uint32_t             vertex_stride  = 0;
-    uint32_t             topology       = 3;
+    MaliIcdShaderModule*           shader_mod     = nullptr;
+    MaliIcdShaderModule*           vs_mod         = nullptr;
+    MaliIcdShaderModule*           fs_mod         = nullptr;
+    uint64_t                       exec_bo_gpu_va = 0;
+    uint64_t                       fs_exec_bo_va  = 0;
+    size_t                         objc_bytes     = 0;
+    size_t                         fs_objc_bytes  = 0;
+    bool                           is_compute     = true;
+    uint32_t                       vertex_stride  = 0;
+    uint32_t                       topology       = 3; // VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+    uint32_t                       cull_mode      = 0;
+    uint32_t                       front_face     = 0;
+    bool                           depth_test     = true;
+    bool                           depth_write    = true;
+    uint32_t                       depth_compare  = 1; // VK_COMPARE_OP_LESS
+    bool                           blend_enable   = false;
+    std::vector<MaliVertexBindingDesc> vertex_bindings;
+    std::vector<MaliVertexAttrDesc>    vertex_attrs;
+};
+
+struct MaliIcdDescriptorSetLayoutBinding {
+    uint32_t binding         = 0;
+    uint32_t descriptor_type = 0;
+    uint32_t count           = 1;
+    uint32_t stage_flags     = 0;
+};
+
+struct MaliIcdDescriptorSetLayout {
+    std::vector<uint8_t>                          aot_handle_mem;
+    std::vector<MaliIcdDescriptorSetLayoutBinding> bindings;
+};
+
+struct MaliIcdPipelineLayout {
+    std::vector<uint8_t>  aot_handle_mem;
+    std::vector<uint64_t> set_layouts;
+    uint32_t              push_constant_size = 128;
+};
+
+struct MaliIcdDescriptorPool {
+    uint32_t max_sets = 4096;
+};
+
+struct MaliIcdCommandPool {
+    uint32_t queue_family_index = 0;
+    uint32_t flags              = 0;
+};
+
+struct MaliIcdFence {
+    std::vector<uint8_t> aot_fence_mem;
+    bool                 signaled = false;
+};
+
+struct MaliIcdSemaphore {
+    bool     is_timeline   = false;
+    uint64_t counter_value = 0;
+};
+
+struct MaliIcdEvent {
+    bool signaled = false;
+};
+
+struct MaliIcdPipelineCache {
+    std::vector<uint8_t> cache_data;
 };
 
 struct MaliIcdImage {
@@ -1016,6 +1128,7 @@ struct MaliIcdImage {
     uint64_t             bound_gpu_va = 0;
     uint64_t             byte_size = 16384;
     uint64_t             aot_image_handle = 0;
+    bool                 has_uploaded_data = false;
     std::vector<uint8_t> stub_texture_backing;
 };
 
@@ -1031,12 +1144,15 @@ struct MaliIcdSampler {
 
 struct MaliIcdRenderPass {
     uint32_t attachment_count = 1;
+    uint32_t color_load_op    = 0;
+    uint32_t depth_load_op    = 0;
 };
 
 struct MaliIcdFramebuffer {
     uint32_t           width = 64, height = 64;
     MaliMfbdDescriptor hw_mfbd{};
     std::vector<float> depth_buffer;
+    bool               cleared_in_rp = false;
 };
 
 struct MaliIcdQueryPool {
@@ -1053,14 +1169,18 @@ struct MaliIcdDescriptorSet {
 
 struct MaliIcdRecordedCmd {
     enum Type {
-        CMD_DISPATCH,
-        CMD_DRAW_INDEXED_VKCUBE,
-        CMD_DRAW_GEARS,
-        CMD_COPY_BUFFER,
-        CMD_COPY_BUFFER_TO_IMAGE,
-        CMD_BLIT_IMAGE,
-        CMD_WRITE_TIMESTAMP,
-        CMD_PIPELINE_BARRIER
+        CMD_DISPATCH = 0,
+        CMD_DRAW = 1,
+        CMD_DRAW_INDEXED = 2,
+        CMD_COPY_BUFFER = 3,
+        CMD_COPY_BUFFER_TO_IMAGE = 4,
+        CMD_BLIT_IMAGE = 5,
+        CMD_CLEAR_COLOR_IMAGE = 6,
+        CMD_CLEAR_ATTACHMENTS = 7,
+        CMD_WRITE_TIMESTAMP = 8,
+        CMD_PIPELINE_BARRIER = 9,
+        CMD_DRAW_INDEXED_VKCUBE = CMD_DRAW_INDEXED,
+        CMD_DRAW_GEARS          = CMD_DRAW
     } type;
     uint32_t              rp_draw_idx = 0;
     MaliIcdPipeline*      pipeline = nullptr;
@@ -1070,12 +1190,23 @@ struct MaliIcdRecordedCmd {
     uint32_t              wg_x = 1, wg_y = 1, wg_z = 1;
     uint32_t              index_count = 0, instance_count = 1;
     uint32_t              first_vertex = 0;
+    uint32_t              first_index = 0;
+    int32_t               vertex_offset = 0;
+    uint32_t              first_instance = 0;
     uint64_t              vertex_bo_va = 0;
-    uint8_t               push_constants[128]{};
+    uint64_t              vertex_bo_size = 0;
+    uint64_t              vertex_bo_vas[8]{};
+    uint64_t              vertex_bo_sizes[8]{};
+    uint64_t              index_bo_va = 0;
+    uint64_t              index_bo_size = 0;
+    uint32_t              index_type = 1; // 0 = UINT16, 1 = UINT32
+    uint8_t               push_constants[256]{};
     float                 vkcube_angle_deg = 25.0f;
     uint32_t              vkcube_frame_idx = 0;
     uint64_t              src_va = 0, dst_va = 0, copy_bytes = 0;
+    MaliIcdImage*         src_image = nullptr;
     MaliIcdImage*         dst_image = nullptr;
+    uint32_t              clear_rgba8 = 0xFF000000U;
     MaliIcdQueryPool*     query_pool = nullptr;
     uint32_t              query_index = 0;
 };
@@ -1083,13 +1214,31 @@ struct MaliIcdRecordedCmd {
 struct MaliIcdCommandBuffer {
     uintptr_t                        loader_magic = ICD_LOADER_MAGIC;
     MaliIcdDevice*                   device = nullptr;
+    std::vector<uint8_t>             aot_cmdbuf_mem;
     MaliIcdPipeline*                 current_pipeline = nullptr;
     MaliIcdDescriptorSet*            current_desc_set = nullptr;
+    MaliIcdDescriptorSet*            bound_desc_sets[4]{};
     MaliIcdFramebuffer*              active_fb = nullptr;
+    std::unique_ptr<MaliIcdFramebuffer> dynamic_rendering_fb;
     uint64_t                         bound_vertex_bo_va = 0;
+    uint64_t                         bound_vertex_bo_size = 0;
+    uint64_t                         bound_vertex_bo_vas[8]{};
+    uint64_t                         bound_vertex_bo_sizes[8]{};
     uint64_t                         bound_index_bo_va  = 0;
+    uint64_t                         bound_index_bo_size = 0;
+    uint32_t                         bound_index_type   = 1;
     uint32_t                         dynamic_ubo_offset = 0;
-    uint8_t                          push_constants[128]{};
+    uint8_t                          push_constants[256]{};
+    float                            blend_constants[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float                            line_width         = 1.0f;
+    float                            depth_bias_const   = 0.0f;
+    float                            depth_bias_clamp   = 0.0f;
+    float                            depth_bias_slope   = 0.0f;
+    float                            min_depth_bounds   = 0.0f;
+    float                            max_depth_bounds   = 1.0f;
+    uint32_t                         stencil_comp_mask  = 0xFFFFFFFFU;
+    uint32_t                         stencil_write_mask = 0xFFFFFFFFU;
+    uint32_t                         stencil_ref        = 0;
     bool                             conditional_active = true;
     uint32_t                         rp_draw_counter    = 0;
     std::vector<MaliIcdRecordedCmd>  cmds;

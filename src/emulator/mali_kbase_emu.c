@@ -163,6 +163,8 @@ struct emu_mem_region {
    int backing_fd;
    uint64_t aliased_src_va;
    size_t alias_stride_bytes;
+   uint32_t pte_cpu_prot;
+   uint32_t pte_gpu_prot;
 };
 
 struct emu_cs_queue {
@@ -1127,6 +1129,10 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
             uint32_t n_words = (uint32_t)__builtin_popcount((unsigned int)mask);
             if (base_va >= 0x10000ULL && n_words > 0 &&
                 emu_is_writable_host_range(eff_va, (size_t)n_words * sizeof(uint32_t))) {
+               const char *strict_gpu_prot = getenv("KBASE_EMU_STRICT_GPU_PROT");
+               bool strict_ro = (strict_gpu_prot && strict_gpu_prot[0] == '1');
+               uintptr_t page_va = (uintptr_t)(eff_va & ~4095ULL);
+               if (strict_ro) mprotect((void *)page_va, 8192, PROT_READ | PROT_WRITE);
                uint32_t *dst = (uint32_t *)(uintptr_t)eff_va;
                uint32_t r_off = 0;
                for (uint32_t b = 0; b < 16; b++) {
@@ -1136,6 +1142,7 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
                      r_off++;
                   }
                }
+               if (strict_ro) mprotect((void *)page_va, 8192, PROT_READ);
             }
          }
          break;
@@ -1356,7 +1363,17 @@ static int emu_handle_mem_alloc(uint64_t va_pages, uint64_t commit_pages,
          reg->flags = in_flags;
          reg->cookie_or_va = (uint64_t)(g_kfile.next_cookie++) << 12;
          if (!(in_flags & BASE_MEM_SAME_VA)) {
-            reg->cpu_ptr = orig_mmap(NULL, sz, PROT_READ | PROT_WRITE,
+            void *hint = NULL;
+            /* Allocate EXEC_VA shader BOs inside the 32-bit VA space [0x10000000, 0x70000000)
+             * (< 2 GiB) matching mali_kbase.ko and Panthor 32-bit EXEC_VA conventions so
+             * 32-bit shader PCs/offsets never truncate! */
+            if (in_flags & BASE_MEM_PROT_GPU_EX) {
+               static uint64_t s_next_exec_va = 0x10000000ULL;
+               hint = (void *)(uintptr_t)s_next_exec_va;
+               s_next_exec_va += (sz + 0xFFFFULL) & ~0xFFFFULL;
+               if (s_next_exec_va >= 0x70000000ULL) s_next_exec_va = 0x10000000ULL;
+            }
+            reg->cpu_ptr = orig_mmap(hint, sz, PROT_READ | PROT_WRITE,
                                      MAP_SHARED | MAP_ANONYMOUS, -1, 0);
             reg->gpu_va = (uintptr_t)reg->cpu_ptr;
             *out_gpu_va = reg->gpu_va;
@@ -1516,9 +1533,6 @@ int close(int fd)
             : lifted_r44p1_kbase_release,
          (uint64_t)(uintptr_t)g_kfile.sim_inode,
          (uint64_t)(uintptr_t)g_kfile.sim_filp, 0, 0, 0);
-      g_kfile.fd = -1;
-      g_kfile.ino = 0;
-      g_kfile.state = EMU_KFILE_UNOPENED;
       *(uint64_t *)(g_kfile.sim_filp + 216) = (uint64_t)(uintptr_t)g_kfile.sim_kfile_buf;
       pthread_mutex_unlock(&g_emu_lock);
    }
@@ -2262,10 +2276,22 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
              * aliases where the CPU VMA requested PROT_READ) must be mapped with
              * PROT_WRITE on the host so GPU instructions (STORE_MULTIPLE, SYNC_ADD/SET)
              * do not fault with SIGSEGV (SEGV_ACCERR) when writing to GPU VA! */
-            int host_prot = prot | PROT_READ |
-               ((g_kfile.regions[i].flags & (BASE_MEM_PROT_GPU_WR | BASE_MEM_PROT_CPU_WR))
-                   ? PROT_WRITE
-                   : 0);
+            g_kfile.regions[i].pte_cpu_prot =
+               ((g_kfile.regions[i].flags & BASE_MEM_PROT_CPU_RD) ? PROT_READ : 0) |
+               ((g_kfile.regions[i].flags & BASE_MEM_PROT_CPU_WR) ? PROT_WRITE : 0);
+            g_kfile.regions[i].pte_gpu_prot =
+               ((g_kfile.regions[i].flags & BASE_MEM_PROT_GPU_RD) ? PROT_READ : 0) |
+               ((g_kfile.regions[i].flags & BASE_MEM_PROT_GPU_WR) ? PROT_WRITE : 0);
+            const char *strict_gpu_prot = getenv("KBASE_EMU_STRICT_GPU_PROT");
+            bool enforce_strict_cpu_ro = (strict_gpu_prot && strict_gpu_prot[0] == '1') &&
+               !(g_kfile.regions[i].flags & BASE_MEM_PROT_CPU_WR) &&
+               (g_kfile.regions[i].flags & BASE_MEM_PROT_GPU_WR);
+            int host_prot = enforce_strict_cpu_ro
+               ? (prot | PROT_READ)
+               : (prot | PROT_READ |
+                  ((g_kfile.regions[i].flags & (BASE_MEM_PROT_GPU_WR | BASE_MEM_PROT_CPU_WR))
+                      ? PROT_WRITE
+                      : 0));
             void *p = orig_mmap((flags & MAP_FIXED) ? addr : NULL, length, host_prot,
                                 MAP_SHARED | MAP_ANONYMOUS | (flags & MAP_FIXED), -1, 0);
             if (p != MAP_FAILED) {

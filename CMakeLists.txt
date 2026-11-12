@@ -281,7 +281,7 @@ add_library(vulkan_panfrost_patched SHARED
 )
 target_compile_definitions(vulkan_panfrost_patched PRIVATE PANTHOR_KBASE_PATCHED_KMOD=1)
 target_link_libraries(vulkan_panfrost_patched PRIVATE panthor_kbase_adapter mali_kbase_emu ${PLATFORM_LIBS})
-target_link_options(vulkan_panfrost_patched PRIVATE -Wl,--no-as-needed)
+target_link_options(vulkan_panfrost_patched PRIVATE -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -Wl,--no-as-needed)
 set_target_properties(vulkan_panfrost_patched PROPERTIES
    LIBRARY_OUTPUT_DIRECTORY "${ADAPTER_DIR}"
 )

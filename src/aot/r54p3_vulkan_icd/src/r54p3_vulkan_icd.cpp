@@ -41,7 +41,7 @@ namespace bridge {
 // `/dev/mali0` emulator (`libmali_kbase_emu.so`).
 extern "C" __attribute__((visibility("default")))
 uint64_t r54p3_icd_get_lifted_entrypoint_count(void) {
-    return aot_get_lifted_vk_entrypoint_count ? aot_get_lifted_vk_entrypoint_count() : 456ULL;
+    return aot_get_lifted_vk_entrypoint_count();
 }
 
 extern "C" __attribute__((visibility("default")))

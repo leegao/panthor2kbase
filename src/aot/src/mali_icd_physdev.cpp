@@ -138,7 +138,7 @@ int32_t vkCreateInstance(const void* pCreateInfo, const void* /*pAllocator*/, vo
         mali_icd_log("vkCreateInstance -> instance=%p driver_so='%s' lifted_vk_entrypoints=%lu enabled_exts(%u)=[%s]",
                      static_cast<void*>(inst),
                      g_aot_rt.mapper.so_path_loaded.empty() ? "standalone-builtin" : g_aot_rt.mapper.so_path_loaded.c_str(),
-                     static_cast<unsigned long>(aot_get_lifted_vk_entrypoint_count ? aot_get_lifted_vk_entrypoint_count() : 456ULL),
+                     static_cast<unsigned long>(aot_get_lifted_vk_entrypoint_count()),
                      ci->extCount, exts_str.c_str());
     }
     return 0;

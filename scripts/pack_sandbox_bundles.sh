@@ -61,18 +61,18 @@ ensure_python_wheels() {
 # ==============================================================================
 # 1. panthor-kbase-source-checkpoint.zip (Separate source archive, <16 MB)
 # ==============================================================================
-B1_TARGET="$OUT_DIR/panthor-kbase-source-checkpoint.zip"
-B1_MANIFEST="$OUT_DIR/panthor-kbase-source-checkpoint.manifest"
-B1_CUR_STATE="$(git rev-parse HEAD 2>/dev/null || echo "no-git")-$(git status --porcelain 2>/dev/null | sha256sum | awk '{print $1}')"
-
-echo "[1/4] Packing Standalone Source Checkpoint: panthor-kbase-source-checkpoint.zip ..."
-if [[ -f "$B1_TARGET" && -f "$B1_MANIFEST" && "$(cat "$B1_MANIFEST")" == "$B1_CUR_STATE" ]]; then
-   echo "  [skip] Source checkpoint already up to date (git state unchanged)."
-else
-   ./mkarchive.sh "$B1_TARGET"
-   echo "$B1_CUR_STATE" > "$B1_MANIFEST"
-   ls -lh "$B1_TARGET"
-fi
+# B1_TARGET="$OUT_DIR/panthor-kbase-source-checkpoint.zip"
+# B1_MANIFEST="$OUT_DIR/panthor-kbase-source-checkpoint.manifest"
+# B1_CUR_STATE="$(git rev-parse HEAD 2>/dev/null || echo "no-git")-$(git status --porcelain 2>/dev/null | sha256sum | awk '{print $1}')"
+#
+# echo "[1/4] Packing Standalone Source Checkpoint: panthor-kbase-source-checkpoint.zip ..."
+# if [[ -f "$B1_TARGET" && -f "$B1_MANIFEST" && "$(cat "$B1_MANIFEST")" == "$B1_CUR_STATE" ]]; then
+#    echo "  [skip] Source checkpoint already up to date (git state unchanged)."
+# else
+#    ./mkarchive.sh "$B1_TARGET"
+#    echo "$B1_CUR_STATE" > "$B1_MANIFEST"
+#    ls -lh "$B1_TARGET"
+# fi
 
 # ==============================================================================
 # 2. Build Sub-Components for Unified Offline Bundle
@@ -249,7 +249,7 @@ UNIFIED_HASH_FILE="$OUT_DIR/panthor2kbase-offline-sandbox-bundle.manifest.hash"
 UNIFIED_INPUTS_HASH=$( (
    [[ -f "$NDK_PKG" ]] && sha256sum "$NDK_PKG"
    [[ -f "$MESA_PKG" ]] && sha256sum "$MESA_PKG"
-   [[ -f "$TOOLS_PKG" ]] && sha256sum "$TOOLS_PKG"
+   # [[ -f "$TOOLS_PKG" ]] && sha256sum "$TOOLS_PKG"
    for f in "${LOCAL_REF_BINS[@]}"; do
       [[ -f "$f" ]] && sha256sum "$f"
    done
@@ -266,9 +266,10 @@ else
    mkdir -p "$STAGE_DIR"
 
    # Link components
-   [[ -f "$NDK_PKG" ]] && ln -f "$NDK_PKG" "$STAGE_DIR/"
+   # [[ -f "$NDK_PKG" ]] && ln -f "$NDK_PKG" "$STAGE_DIR/"
    [[ -f "$MESA_PKG" ]] && ln -f "$MESA_PKG" "$STAGE_DIR/"
-   [[ -f "$TOOLS_PKG" ]] && ln -f "$TOOLS_PKG" "$STAGE_DIR/"
+   # [[ -f "$TOOLS_PKG" ]] && ln -f "$TOOLS_PKG" "$STAGE_DIR/"
+   [[ -d "$ROOT_DIR/kernel" ]] && cp -rf "$ROOT_DIR/kernel" "$STAGE_DIR/"
    for f in "${LOCAL_REF_BINS[@]}"; do
       [[ -f "$f" ]] && ln -f "$f" "$STAGE_DIR/"
    done

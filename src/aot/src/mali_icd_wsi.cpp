@@ -467,7 +467,12 @@ __attribute__((visibility("default")))
 int32_t vkInvalidateMappedMemoryRanges(void* /*device*/, uint32_t /*memoryRangeCount*/, const void* /*pMemoryRanges*/) { return 0; }
 
 __attribute__((visibility("default")))
-int32_t vkGetFenceStatus(void* /*device*/, uint64_t /*fence*/) { return 0; }
+int32_t vkGetFenceStatus(void* /*device*/, uint64_t fence) {
+    if (fence && fence != 0xFE000001ULL) {
+        return reinterpret_cast<MaliIcdFence*>(fence)->signaled ? 0 : 1 /* VK_NOT_READY */;
+    }
+    return 0;
+}
 
 __attribute__((visibility("default")))
 int32_t vkCreateHeadlessSurfaceEXT(void* /*instance*/, const void* /*pCreateInfo*/, const void* /*pAllocator*/, uint64_t* pSurface) {
@@ -923,25 +928,83 @@ int32_t vkDeviceWaitIdle(void* /*device*/) { return 0; }
 
 
 __attribute__((visibility("default")))
-void vkCmdClearAttachments(void* /*commandBuffer*/, uint32_t /*attachmentCount*/, const void* /*pAttachments*/, uint32_t /*rectCount*/, const void* /*pRects*/) {}
+void vkCmdClearAttachments(void* commandBuffer, uint32_t attachmentCount, const void* pAttachments, uint32_t /*rectCount*/, const void* /*pRects*/) {
+    if (!commandBuffer || attachmentCount == 0 || !pAttachments) return;
+    auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
+    struct ClearAtt { uint32_t aspectMask; uint32_t colorAttachment; float clearVal[4]; };
+    const auto* atts = static_cast<const ClearAtt*>(pAttachments);
+    for (uint32_t i = 0; i < attachmentCount; ++i) {
+        if (atts[i].aspectMask & 1U /* VK_IMAGE_ASPECT_COLOR_BIT */) {
+            uint32_t r8 = static_cast<uint32_t>(std::clamp(atts[i].clearVal[0], 0.0f, 1.0f) * 255.0f + 0.5f);
+            uint32_t g8 = static_cast<uint32_t>(std::clamp(atts[i].clearVal[1], 0.0f, 1.0f) * 255.0f + 0.5f);
+            uint32_t b8 = static_cast<uint32_t>(std::clamp(atts[i].clearVal[2], 0.0f, 1.0f) * 255.0f + 0.5f);
+            uint32_t a8 = static_cast<uint32_t>(std::clamp(atts[i].clearVal[3], 0.0f, 1.0f) * 255.0f + 0.5f);
+            MaliIcdRecordedCmd cmd{};
+            cmd.type        = MaliIcdRecordedCmd::CMD_CLEAR_ATTACHMENTS;
+            cmd.framebuffer = cb->active_fb;
+            cmd.clear_rgba8 = (a8 << 24) | (b8 << 16) | (g8 << 8) | r8;
+            cb->cmds.push_back(cmd);
+        }
+    }
+}
 __attribute__((visibility("default")))
-void vkCmdClearColorImage(void* /*commandBuffer*/, uint64_t /*image*/, uint32_t /*imageLayout*/, const void* /*pColor*/, uint32_t /*rangeCount*/, const void* /*pRanges*/) {}
+void vkCmdClearColorImage(void* commandBuffer, uint64_t image, uint32_t /*imageLayout*/, const void* pColor, uint32_t /*rangeCount*/, const void* /*pRanges*/) {
+    if (!commandBuffer || !image || !pColor) return;
+    auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
+    const float* cf = static_cast<const float*>(pColor);
+    uint32_t r8 = static_cast<uint32_t>(std::clamp(cf[0], 0.0f, 1.0f) * 255.0f + 0.5f);
+    uint32_t g8 = static_cast<uint32_t>(std::clamp(cf[1], 0.0f, 1.0f) * 255.0f + 0.5f);
+    uint32_t b8 = static_cast<uint32_t>(std::clamp(cf[2], 0.0f, 1.0f) * 255.0f + 0.5f);
+    uint32_t a8 = static_cast<uint32_t>(std::clamp(cf[3], 0.0f, 1.0f) * 255.0f + 0.5f);
+    MaliIcdRecordedCmd cmd{};
+    cmd.type        = MaliIcdRecordedCmd::CMD_CLEAR_COLOR_IMAGE;
+    cmd.dst_image   = reinterpret_cast<MaliIcdImage*>(image);
+    cmd.clear_rgba8 = (a8 << 24) | (b8 << 16) | (g8 << 8) | r8;
+    cb->cmds.push_back(cmd);
+}
 __attribute__((visibility("default")))
 void vkCmdClearDepthStencilImage(void* /*commandBuffer*/, uint64_t /*image*/, uint32_t /*imageLayout*/, const void* /*pDepthStencil*/, uint32_t /*rangeCount*/, const void* /*pRanges*/) {}
 __attribute__((visibility("default")))
-void vkCmdExecuteCommands(void* /*commandBuffer*/, uint32_t /*commandBufferCount*/, void* const* /*pCommandBuffers*/) {}
+void vkCmdExecuteCommands(void* commandBuffer, uint32_t commandBufferCount, void* const* pCommandBuffers) {
+    if (!commandBuffer || commandBufferCount == 0 || !pCommandBuffers) return;
+    auto* primary = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
+    for (uint32_t i = 0; i < commandBufferCount; ++i) {
+        const auto* sec = static_cast<const MaliIcdCommandBuffer*>(pCommandBuffers[i]);
+        if (!sec) continue;
+        for (auto cmd : sec->cmds) {
+            if (!cmd.framebuffer) cmd.framebuffer = primary->active_fb;
+            primary->cmds.push_back(cmd);
+        }
+    }
+}
 __attribute__((visibility("default")))
 void vkCmdNextSubpass(void* /*commandBuffer*/, uint32_t /*contents*/) {}
 __attribute__((visibility("default")))
-int32_t vkCreateEvent(void* /*device*/, const void* /*pCreateInfo*/, const void* /*pAllocator*/, uint64_t* pEvent) { if (pEvent) *pEvent = 0xE7000001ULL; return 0; }
+int32_t vkCreateEvent(void* /*device*/, const void* /*pCreateInfo*/, const void* /*pAllocator*/, uint64_t* pEvent) {
+    if (!pEvent) return -3;
+    *pEvent = reinterpret_cast<uint64_t>(new MaliIcdEvent());
+    return 0;
+}
 __attribute__((visibility("default")))
-void vkDestroyEvent(void* /*device*/, uint64_t /*event*/, const void* /*pAllocator*/) {}
+void vkDestroyEvent(void* /*device*/, uint64_t event, const void* /*pAllocator*/) {
+    if (event && event != 0xE7000001ULL) delete reinterpret_cast<MaliIcdEvent*>(event);
+}
 __attribute__((visibility("default")))
-int32_t vkGetEventStatus(void* /*device*/, uint64_t /*event*/) { return 0; }
+int32_t vkGetEventStatus(void* /*device*/, uint64_t event) {
+    if (event && event != 0xE7000001ULL)
+        return reinterpret_cast<MaliIcdEvent*>(event)->signaled ? 3 /* VK_EVENT_SET */ : 4 /* VK_EVENT_RESET */;
+    return 0;
+}
 __attribute__((visibility("default")))
-int32_t vkSetEvent(void* /*device*/, uint64_t /*event*/) { return 0; }
+int32_t vkSetEvent(void* /*device*/, uint64_t event) {
+    if (event && event != 0xE7000001ULL) reinterpret_cast<MaliIcdEvent*>(event)->signaled = true;
+    return 0;
+}
 __attribute__((visibility("default")))
-int32_t vkResetEvent(void* /*device*/, uint64_t /*event*/) { return 0; }
+int32_t vkResetEvent(void* /*device*/, uint64_t event) {
+    if (event && event != 0xE7000001ULL) reinterpret_cast<MaliIcdEvent*>(event)->signaled = false;
+    return 0;
+}
 __attribute__((visibility("default")))
 void vkCmdSetEvent(void* /*commandBuffer*/, uint64_t /*event*/, uint32_t /*stageMask*/) {}
 __attribute__((visibility("default")))

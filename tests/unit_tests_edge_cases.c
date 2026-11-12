@@ -1923,7 +1923,7 @@ static void test_v31_panvk_vkcube_mem_alias_and_v11_csf_opcodes(void)
    cs[0] = (1ULL << 56) | (38ULL << 48) | (alias_va & 0xffffffffffffULL); /* MOVE48 r38:r39 = alias_va */
    cs[1] = (2ULL << 56) | (68ULL << 48) | 0xCAFEBABEULL;                  /* MOVE32 r68 = 0xCAFEBABE */
    cs[2] = (2ULL << 56) | (69ULL << 48) | 0x0000FF00ULL;                  /* MOVE32 r69 = 0x0000FF00 */
-   cs[3] = (19ULL << 56) | (70ULL << 48) | (68ULL << 40) | (69ULL << 16) | (1ULL << 11) | (6ULL << 12); /* LOGIC_OP32 OR32 r70 = r68 | r69 */
+   cs[3] = (19ULL << 56) | (70ULL << 48) | (68ULL << 40) | (69ULL << 32) | 7ULL; /* LOGIC_OP32 OR32 r70 = r68 | r69 */
    cs[4] = (18ULL << 56) | (71ULL << 48) | (69ULL << 40) | (68ULL << 32) | (69ULL << 24) | (68ULL << 16) | 4ULL; /* UMIN32 r71 */
    cs[5] = (21ULL << 56) | (68ULL << 48) | (38ULL << 40) | (0x000fULL << 16) | 0ULL; /* STORE_MULTIPLE r68..r71 -> [alias_va + 0] */
    cs[6] = (22ULL << 56) | (0ULL << 40) | (6ULL << 28) | 1ULL;            /* BRANCH ALWAYS +1 (skips cs[7]) */
@@ -1974,6 +1974,352 @@ static void test_v31_panvk_vkcube_mem_alias_and_v11_csf_opcodes(void)
    printf("  -> PASS: 2x MEM_ALIAS render_desc_ringbuf STORE_MULTIPLE + v11 CSF ALU/BRANCH verified!\n");
 }
 
+/* ============================================================================
+ * TEST 22 (Checkpoint v32): Full De-Shimming of Lifted r54p3 Vulkan ICD
+ * - Real MaliIcdDescriptorSetLayout, MaliIcdPipelineLayout, MaliIcdFence,
+ *   MaliIcdSemaphore (timeline), MaliIcdCommandPool, MaliIcdEvent structs
+ * - Lifted aot_vkCmdSet* dynamic state execution & aot_vkDestroy* dispatch
+ * - Real SPIR-V OpConstantComposite / OpEntryPoint parsing & VBO+IBO draw
+ *   rasterization without synthetic vkcube/vkgears leakage + vkCmdBlitImage
+ * ============================================================================ */
+static void test_v32_full_r54p3_icd_deshimming_and_real_draw_pipeline(void)
+{
+   printf("[TEST 22] Verifying Checkpoint v32 Full r54p3 ICD De-Shimming, Real Sync/Layout State & Real VBO/IBO Draw + Blit...\n");
+
+   void *icd_h = dlopen("aot/libvulkan_mali_aot_icd.so", RTLD_NOW | RTLD_LOCAL);
+   if (!icd_h) icd_h = dlopen("build-x86-64/aot/libvulkan_mali_aot_icd.so", RTLD_NOW | RTLD_LOCAL);
+   if (!icd_h) icd_h = dlopen("build-x86-64/libr54p3_vulkan_icd.so", RTLD_NOW | RTLD_LOCAL);
+   assert(icd_h != NULL);
+
+   typedef void *(*pfn_gipa)(void *, const char *);
+   typedef void *(*pfn_gdpa)(void *, const char *);
+   pfn_gipa gipa = (pfn_gipa)dlsym(icd_h, "vk_icdGetInstanceProcAddr");
+   pfn_gdpa gdpa = (pfn_gdpa)dlsym(icd_h, "vkGetDeviceProcAddr");
+   assert(gipa != NULL && gdpa != NULL);
+
+   typedef int32_t (*pfn_create_inst)(const void *, const void *, void **);
+   typedef int32_t (*pfn_enum_pd)(void *, uint32_t *, void **);
+   typedef int32_t (*pfn_create_dev)(void *, const void *, const void *, void **);
+   typedef void (*pfn_get_queue)(void *, uint32_t, uint32_t, void **);
+   typedef void (*pfn_destroy_dev)(void *, const void *);
+   typedef void (*pfn_destroy_inst)(void *, const void *);
+
+   pfn_create_inst create_inst = (pfn_create_inst)gipa(NULL, "vkCreateInstance");
+   pfn_enum_pd enum_pd = (pfn_enum_pd)gipa(NULL, "vkEnumeratePhysicalDevices");
+   pfn_create_dev create_dev = (pfn_create_dev)gipa(NULL, "vkCreateDevice");
+   pfn_get_queue get_queue = (pfn_get_queue)gdpa(NULL, "vkGetDeviceQueue");
+   pfn_destroy_dev destroy_dev = (pfn_destroy_dev)gdpa(NULL, "vkDestroyDevice");
+   pfn_destroy_inst destroy_inst = (pfn_destroy_inst)gipa(NULL, "vkDestroyInstance");
+
+   struct { uint32_t sType; const void *pNext; uint32_t flags; const void *pApp; uint32_t lCnt; const void *pL; uint32_t eCnt; const void *pE; } ici = { 1U, NULL, 0, NULL, 0, NULL, 0, NULL };
+   void *inst = NULL;
+   assert(create_inst(&ici, NULL, &inst) == 0 && inst != NULL);
+   uint32_t pd_cnt = 1;
+   void *pdev = NULL;
+   assert(enum_pd(inst, &pd_cnt, &pdev) == 0 && pdev != NULL);
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t qciCnt; const void *pQci; uint32_t lCnt; const void *pL; uint32_t eCnt; const void *pE; const void *pFeat; } dci = { 3U, NULL, 0, 0, NULL, 0, NULL, 0, NULL, NULL };
+   void *dev = NULL;
+   assert(create_dev(pdev, &dci, NULL, &dev) == 0 && dev != NULL);
+   void *queue = NULL;
+   get_queue(dev, 0, 0, &queue);
+   assert(queue != NULL);
+
+   /* 1. Verify real non-constant handles for DescriptorSetLayout, PipelineLayout, Fence, Semaphore, CommandPool, Event */
+   typedef int32_t (*pfn_create_obj)(void *, const void *, const void *, uint64_t *);
+   typedef void (*pfn_destroy_obj)(void *, uint64_t, const void *);
+   pfn_create_obj create_dsl = (pfn_create_obj)gdpa(dev, "vkCreateDescriptorSetLayout");
+   pfn_destroy_obj destroy_dsl = (pfn_destroy_obj)gdpa(dev, "vkDestroyDescriptorSetLayout");
+   pfn_create_obj create_pl = (pfn_create_obj)gdpa(dev, "vkCreatePipelineLayout");
+   pfn_destroy_obj destroy_pl = (pfn_destroy_obj)gdpa(dev, "vkDestroyPipelineLayout");
+   pfn_create_obj create_fence = (pfn_create_obj)gdpa(dev, "vkCreateFence");
+   pfn_destroy_obj destroy_fence = (pfn_destroy_obj)gdpa(dev, "vkDestroyFence");
+   typedef int32_t (*pfn_fence_status)(void *, uint64_t);
+   typedef int32_t (*pfn_reset_fences)(void *, uint32_t, const uint64_t *);
+   pfn_fence_status get_fence_status = (pfn_fence_status)gdpa(dev, "vkGetFenceStatus");
+   pfn_reset_fences reset_fences = (pfn_reset_fences)gdpa(dev, "vkResetFences");
+
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t bindingCount; const void *pBindings; } dsl_ci = { 32U, NULL, 0U, 0U, NULL };
+   uint64_t dsl1 = 0, dsl2 = 0;
+   assert(create_dsl(dev, &dsl_ci, NULL, &dsl1) == 0 && create_dsl(dev, &dsl_ci, NULL, &dsl2) == 0);
+   assert(dsl1 != 0 && dsl2 != 0 && dsl1 != dsl2 && dsl1 != 0xD5100001ULL);
+
+   uint64_t dsl_arr[1] = { dsl1 };
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t setLayoutCount; const uint64_t *pSetLayouts; uint32_t pcCount; const void *pPC; } pl_ci = { 30U, NULL, 0U, 1U, dsl_arr, 0U, NULL };
+   uint64_t pl1 = 0, pl2 = 0;
+   assert(create_pl(dev, &pl_ci, NULL, &pl1) == 0 && create_pl(dev, &pl_ci, NULL, &pl2) == 0);
+   assert(pl1 != 0 && pl2 != 0 && pl1 != pl2 && pl1 != 0xB1000001ULL);
+
+   struct { uint32_t sType; const void *pNext; uint32_t flags; } f_unsig_ci = { 8U, NULL, 0U };
+   struct { uint32_t sType; const void *pNext; uint32_t flags; } f_sig_ci = { 8U, NULL, 1U /* VK_FENCE_CREATE_SIGNALED_BIT */ };
+   uint64_t f_unsig = 0, f_sig = 0;
+   assert(create_fence(dev, &f_unsig_ci, NULL, &f_unsig) == 0);
+   assert(create_fence(dev, &f_sig_ci, NULL, &f_sig) == 0);
+   assert(f_unsig != f_sig && f_unsig != 0xFE000001ULL);
+   assert(get_fence_status(dev, f_unsig) == 1 /* VK_NOT_READY */);
+   assert(get_fence_status(dev, f_sig) == 0 /* VK_SUCCESS */);
+   assert(reset_fences(dev, 1U, &f_sig) == 0);
+   assert(get_fence_status(dev, f_sig) == 1 /* VK_NOT_READY */);
+
+   /* Timeline semaphore initial value + signal/query */
+   pfn_create_obj create_sem = (pfn_create_obj)gdpa(dev, "vkCreateSemaphore");
+   pfn_destroy_obj destroy_sem = (pfn_destroy_obj)gdpa(dev, "vkDestroySemaphore");
+   typedef int32_t (*pfn_get_sem_val)(void *, uint64_t, uint64_t *);
+   typedef int32_t (*pfn_sig_sem)(void *, const void *);
+   pfn_get_sem_val get_sem_val = (pfn_get_sem_val)gdpa(dev, "vkGetSemaphoreCounterValue");
+   pfn_sig_sem sig_sem = (pfn_sig_sem)gdpa(dev, "vkSignalSemaphore");
+   struct { uint32_t sType; const void *pNext; uint32_t semaphoreType; uint64_t initialValue; } sem_type_ci = {
+      1000207002U /* VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO */, NULL, 1U /* TIMELINE */, 42ULL
+   };
+   struct { uint32_t sType; const void *pNext; uint32_t flags; } sem_ci = { 9U, &sem_type_ci, 0U };
+   uint64_t sem1 = 0;
+   assert(create_sem(dev, &sem_ci, NULL, &sem1) == 0 && sem1 != 0 && sem1 != 0x5E000001ULL);
+   uint64_t sem_val = 0;
+   assert(get_sem_val(dev, sem1, &sem_val) == 0 && sem_val == 42ULL);
+   struct { uint32_t sType; const void *pNext; uint64_t semaphore; uint64_t value; } sem_sig_info = { 1000207005U, NULL, sem1, 99ULL };
+   assert(sig_sem(dev, &sem_sig_info) == 0);
+   assert(get_sem_val(dev, sem1, &sem_val) == 0 && sem_val == 99ULL);
+
+   /* Event state machine */
+   pfn_create_obj create_ev = (pfn_create_obj)gdpa(dev, "vkCreateEvent");
+   pfn_destroy_obj destroy_ev = (pfn_destroy_obj)gdpa(dev, "vkDestroyEvent");
+   pfn_fence_status get_ev_status = (pfn_fence_status)gdpa(dev, "vkGetEventStatus");
+   pfn_fence_status set_ev = (pfn_fence_status)gdpa(dev, "vkSetEvent");
+   pfn_fence_status reset_ev = (pfn_fence_status)gdpa(dev, "vkResetEvent");
+   struct { uint32_t sType; const void *pNext; uint32_t flags; } ev_ci = { 10U, NULL, 0U };
+   uint64_t ev1 = 0;
+   assert(create_ev(dev, &ev_ci, NULL, &ev1) == 0 && ev1 != 0 && ev1 != 0xE7000001ULL);
+   assert(get_ev_status(dev, ev1) == 4 /* VK_EVENT_RESET */);
+   assert(set_ev(dev, ev1) == 0 && get_ev_status(dev, ev1) == 3 /* VK_EVENT_SET */);
+   assert(reset_ev(dev, ev1) == 0 && get_ev_status(dev, ev1) == 4 /* VK_EVENT_RESET */);
+
+   /* 2. Verify real SPIR-V OpConstantComposite + VBO/IBO draw rasterizer + vkCmdBlitImage */
+   pfn_create_obj create_img = (pfn_create_obj)gdpa(dev, "vkCreateImage");
+   pfn_destroy_obj destroy_img = (pfn_destroy_obj)gdpa(dev, "vkDestroyImage");
+   pfn_create_obj create_iv = (pfn_create_obj)gdpa(dev, "vkCreateImageView");
+   pfn_destroy_obj destroy_iv = (pfn_destroy_obj)gdpa(dev, "vkDestroyImageView");
+   pfn_create_obj create_buf = (pfn_create_obj)gdpa(dev, "vkCreateBuffer");
+   pfn_destroy_obj destroy_buf = (pfn_destroy_obj)gdpa(dev, "vkDestroyBuffer");
+   pfn_create_obj alloc_mem = (pfn_create_obj)gdpa(dev, "vkAllocateMemory");
+   pfn_destroy_obj free_mem = (pfn_destroy_obj)gdpa(dev, "vkFreeMemory");
+   typedef int32_t (*pfn_bind_mem)(void *, uint64_t, uint64_t, uint64_t);
+   typedef int32_t (*pfn_map_mem)(void *, uint64_t, uint64_t, uint64_t, uint32_t, void **);
+   pfn_bind_mem bind_img_mem = (pfn_bind_mem)gdpa(dev, "vkBindImageMemory");
+   pfn_bind_mem bind_buf_mem = (pfn_bind_mem)gdpa(dev, "vkBindBufferMemory");
+   pfn_map_mem map_mem = (pfn_map_mem)gdpa(dev, "vkMapMemory");
+
+   struct {
+      uint32_t sType; const void *pNext; uint32_t flags; uint32_t imageType; uint32_t format;
+      uint32_t width; uint32_t height; uint32_t depth; uint32_t mipLevels; uint32_t arrayLayers;
+      uint32_t samples; uint32_t tiling; uint32_t usage; uint32_t sharingMode;
+      uint32_t qfCnt; const uint32_t *pQf; uint32_t initialLayout;
+   } img_ci = { 14U, NULL, 0U, 1U /* 2D */, 44U /* B8G8R8A8_UNORM */, 32U, 32U, 1U, 1U, 1U, 1U, 0U, 0x17U, 0U, 0U, NULL, 0U };
+   uint64_t src_img = 0, dst_img = 0;
+   assert(create_img(dev, &img_ci, NULL, &src_img) == 0 && create_img(dev, &img_ci, NULL, &dst_img) == 0);
+
+   struct { uint32_t sType; const void *pNext; uint64_t allocationSize; uint32_t memoryTypeIndex; } mai = { 5U, NULL, 65536ULL, 0U };
+   uint64_t src_mem = 0, dst_mem = 0, vbo_mem = 0, ibo_mem = 0;
+   assert(alloc_mem(dev, &mai, NULL, &src_mem) == 0 && alloc_mem(dev, &mai, NULL, &dst_mem) == 0);
+   assert(alloc_mem(dev, &mai, NULL, &vbo_mem) == 0 && alloc_mem(dev, &mai, NULL, &ibo_mem) == 0);
+   assert(bind_img_mem(dev, src_img, src_mem, 0) == 0 && bind_img_mem(dev, dst_img, dst_mem, 0) == 0);
+
+   uint32_t *src_px = NULL, *dst_px = NULL;
+   assert(map_mem(dev, src_mem, 0, 65536ULL, 0, (void **)&src_px) == 0 && src_px != NULL);
+   assert(map_mem(dev, dst_mem, 0, 65536ULL, 0, (void **)&dst_px) == 0 && dst_px != NULL);
+   memset(src_px, 0, 32 * 32 * 4);
+   memset(dst_px, 0, 32 * 32 * 4);
+
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint64_t size; uint32_t usage; uint32_t sharingMode; uint32_t qfCnt; const uint32_t *pQf; } buf_ci = {
+      12U, NULL, 0U, 4096ULL, 0xC0U /* VERTEX | INDEX */, 0U, 0U, NULL
+   };
+   uint64_t vbo = 0, ibo = 0;
+   assert(create_buf(dev, &buf_ci, NULL, &vbo) == 0 && create_buf(dev, &buf_ci, NULL, &ibo) == 0);
+   assert(bind_buf_mem(dev, vbo, vbo_mem, 0) == 0 && bind_buf_mem(dev, ibo, ibo_mem, 0) == 0);
+
+   float *vbo_ptr = NULL;
+   uint16_t *ibo_ptr = NULL;
+   assert(map_mem(dev, vbo_mem, 0, 4096ULL, 0, (void **)&vbo_ptr) == 0);
+   assert(map_mem(dev, ibo_mem, 0, 4096ULL, 0, (void **)&ibo_ptr) == 0);
+   /* Full-screen quad (4 vertices: x, y, z, w) covering [-1, 1] x [-1, 1] */
+   float quad_verts[16] = {
+      -1.0f, -1.0f, 0.5f, 1.0f,
+       1.0f, -1.0f, 0.5f, 1.0f,
+       1.0f,  1.0f, 0.5f, 1.0f,
+      -1.0f,  1.0f, 0.5f, 1.0f,
+   };
+   uint16_t quad_idx[6] = { 0, 1, 2, 0, 2, 3 };
+   memcpy(vbo_ptr, quad_verts, sizeof(quad_verts));
+   memcpy(ibo_ptr, quad_idx, sizeof(quad_idx));
+
+   /* Minimal valid SPIR-V with OpEntryPoint Fragment (model=4) and OpConstantComposite vec4(0.25, 0.75, 0.5, 1.0) */
+   uint32_t spirv_fs[] = {
+      0x07230203U, 0x00010000U, 0x00080001U, 0x00000010U, 0x00000000U,
+      (4U << 16) | 15U /* OpEntryPoint */, 4U /* Fragment */, 1U, 0x0069616DU /* "mai\0" */,
+      (4U << 16) | 21U /* OpTypeFloat */, 2U, 32U,
+      (4U << 16) | 23U /* OpTypeVector */, 3U, 2U, 4U,
+      (4U << 16) | 43U /* OpConstant */, 2U, 4U, 0x3E800000U /* 0.25f */,
+      (4U << 16) | 43U /* OpConstant */, 2U, 5U, 0x3F400000U /* 0.75f */,
+      (4U << 16) | 43U /* OpConstant */, 2U, 6U, 0x3F000000U /* 0.50f */,
+      (4U << 16) | 43U /* OpConstant */, 2U, 7U, 0x3F800000U /* 1.00f */,
+      (7U << 16) | 44U /* OpConstantComposite */, 3U, 8U, 4U, 5U, 6U, 7U,
+   };
+   pfn_create_obj create_sm = (pfn_create_obj)gdpa(dev, "vkCreateShaderModule");
+   pfn_destroy_obj destroy_sm = (pfn_destroy_obj)gdpa(dev, "vkDestroyShaderModule");
+   struct { uint32_t sType; const void *pNext; uint32_t flags; size_t codeSize; const uint32_t *pCode; } sm_ci = {
+      16U, NULL, 0U, sizeof(spirv_fs), spirv_fs
+   };
+   uint64_t fs_mod = 0;
+   assert(create_sm(dev, &sm_ci, NULL, &fs_mod) == 0 && fs_mod != 0);
+
+   typedef int32_t (*pfn_create_gp)(void *, uint64_t, uint32_t, const void *, const void *, uint64_t *);
+   pfn_create_gp create_gp = (pfn_create_gp)gdpa(dev, "vkCreateGraphicsPipelines");
+   pfn_destroy_obj destroy_pipe = (pfn_destroy_obj)gdpa(dev, "vkDestroyPipeline");
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t stage; uint64_t module; const char *pName; const void *pSpec; } stage_ci = {
+      18U, NULL, 0U, 0x10U /* VK_SHADER_STAGE_FRAGMENT_BIT */, fs_mod, "main", NULL
+   };
+   struct { uint32_t binding; uint32_t stride; uint32_t inputRate; } vbind = { 0U, 16U, 0U };
+   struct { uint32_t location; uint32_t binding; uint32_t format; uint32_t offset; } vattr = { 0U, 0U, 106U /* R32G32B32A32_SFLOAT */, 0U };
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t bCnt; const void *pB; uint32_t aCnt; const void *pA; } vi_state = {
+      19U, NULL, 0U, 1U, &vbind, 1U, &vattr
+   };
+   struct {
+      uint32_t sType; const void *pNext; uint32_t flags; uint32_t stageCount; const void *pStages;
+      const void *pVertexInputState; const void *pInputAssemblyState; const void *pTessellationState;
+      const void *pViewportState; const void *pRasterizationState; const void *pMultisampleState;
+      const void *pDepthStencilState; const void *pColorBlendState; const void *pDynamicState;
+      uint64_t layout; uint64_t renderPass; uint32_t subpass; uint64_t basePipelineHandle; int32_t basePipelineIndex;
+   } gp_ci = {
+      28U, NULL, 0U, 1U, &stage_ci, &vi_state, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, pl1, 0ULL, 0U, 0ULL, -1
+   };
+   uint64_t pipe = 0;
+   assert(create_gp(dev, 0ULL, 1U, &gp_ci, NULL, &pipe) == 0 && pipe != 0);
+
+   struct {
+      uint32_t sType; const void *pNext; uint32_t flags; uint64_t image; uint32_t viewType; uint32_t format;
+      uint32_t r, g, b, a; uint32_t aspect; uint32_t baseMip; uint32_t levelCnt; uint32_t baseLayer; uint32_t layerCnt;
+   } iv_ci = { 15U, NULL, 0U, src_img, 1U, 44U, 0, 0, 0, 0, 1U, 0U, 1U, 0U, 1U };
+   uint64_t src_iv = 0;
+   assert(create_iv(dev, &iv_ci, NULL, &src_iv) == 0 && src_iv != 0);
+
+   pfn_create_obj create_fb = (pfn_create_obj)gdpa(dev, "vkCreateFramebuffer");
+   pfn_destroy_obj destroy_fb = (pfn_destroy_obj)gdpa(dev, "vkDestroyFramebuffer");
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint64_t rp; uint32_t attCnt; const uint64_t *pAtt; uint32_t w; uint32_t h; uint32_t layers; } fb_ci = {
+      37U, NULL, 0U, 0ULL, 1U, &src_iv, 32U, 32U, 1U
+   };
+   uint64_t fb = 0;
+   assert(create_fb(dev, &fb_ci, NULL, &fb) == 0 && fb != 0);
+
+   pfn_create_obj create_cp = (pfn_create_obj)gdpa(dev, "vkCreateCommandPool");
+   pfn_destroy_obj destroy_cp = (pfn_destroy_obj)gdpa(dev, "vkDestroyCommandPool");
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t qfi; } cp_ci = { 39U, NULL, 2U, 0U };
+   uint64_t cp = 0;
+   assert(create_cp(dev, &cp_ci, NULL, &cp) == 0 && cp != 0 && cp != 0xC8000001ULL);
+
+   typedef int32_t (*pfn_alloc_cb)(void *, const void *, void **);
+   pfn_alloc_cb alloc_cb = (pfn_alloc_cb)gdpa(dev, "vkAllocateCommandBuffers");
+   struct { uint32_t sType; const void *pNext; uint64_t commandPool; uint32_t level; uint32_t count; } cb_ai = { 40U, NULL, cp, 0U, 1U };
+   void *cb = NULL;
+   assert(alloc_cb(dev, &cb_ai, &cb) == 0 && cb != NULL);
+
+   typedef int32_t (*pfn_begin_cb)(void *, const void *);
+   typedef int32_t (*pfn_end_cb)(void *);
+   typedef void (*pfn_cmd_begin_rp)(void *, const void *, uint32_t);
+   typedef void (*pfn_cmd_end_rp)(void *);
+   typedef void (*pfn_cmd_bind_pipe)(void *, uint32_t, uint64_t);
+   typedef void (*pfn_cmd_bind_vb)(void *, uint32_t, uint32_t, const uint64_t *, const uint64_t *);
+   typedef void (*pfn_cmd_bind_ib)(void *, uint64_t, uint64_t, uint32_t);
+   typedef void (*pfn_cmd_draw_idx)(void *, uint32_t, uint32_t, uint32_t, int32_t, uint32_t);
+   typedef void (*pfn_cmd_set_lw)(void *, float);
+   typedef void (*pfn_cmd_set_bc)(void *, const float *);
+   typedef void (*pfn_cmd_blit)(void *, uint64_t, uint32_t, uint64_t, uint32_t, uint32_t, const void *, uint32_t);
+
+   pfn_begin_cb begin_cb = (pfn_begin_cb)gdpa(dev, "vkBeginCommandBuffer");
+   pfn_end_cb end_cb = (pfn_end_cb)gdpa(dev, "vkEndCommandBuffer");
+   pfn_cmd_begin_rp cmd_begin_rp = (pfn_cmd_begin_rp)gdpa(dev, "vkCmdBeginRenderPass");
+   pfn_cmd_end_rp cmd_end_rp = (pfn_cmd_end_rp)gdpa(dev, "vkCmdEndRenderPass");
+   pfn_cmd_bind_pipe cmd_bind_pipe = (pfn_cmd_bind_pipe)gdpa(dev, "vkCmdBindPipeline");
+   pfn_cmd_bind_vb cmd_bind_vb = (pfn_cmd_bind_vb)gdpa(dev, "vkCmdBindVertexBuffers");
+   pfn_cmd_bind_ib cmd_bind_ib = (pfn_cmd_bind_ib)gdpa(dev, "vkCmdBindIndexBuffer");
+   pfn_cmd_draw_idx cmd_draw_idx = (pfn_cmd_draw_idx)gdpa(dev, "vkCmdDrawIndexed");
+   pfn_cmd_set_lw cmd_set_lw = (pfn_cmd_set_lw)gdpa(dev, "vkCmdSetLineWidth");
+   pfn_cmd_set_bc cmd_set_bc = (pfn_cmd_set_bc)gdpa(dev, "vkCmdSetBlendConstants");
+   pfn_cmd_blit cmd_blit = (pfn_cmd_blit)gdpa(dev, "vkCmdBlitImage");
+
+   struct { uint32_t sType; const void *pNext; uint32_t flags; const void *pInh; } cb_bi = { 42U, NULL, 0U, NULL };
+   assert(begin_cb(cb, &cb_bi) == 0);
+   float bc[4] = { 1.0f, 0.5f, 0.25f, 1.0f };
+   cmd_set_lw(cb, 2.0f);
+   cmd_set_bc(cb, bc);
+
+   float clear_col[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+   struct {
+      uint32_t sType; const void *pNext; uint64_t rp; uint64_t fb;
+      int32_t rx, ry; uint32_t rw, rh; uint32_t cvCnt; const void *pCv;
+   } rp_bi = { 43U, NULL, 0ULL, fb, 0, 0, 32U, 32U, 1U, clear_col };
+   cmd_begin_rp(cb, &rp_bi, 0U);
+   cmd_bind_pipe(cb, 0U, pipe);
+   uint64_t vb_off = 0ULL;
+   cmd_bind_vb(cb, 0U, 1U, &vbo, &vb_off);
+   cmd_bind_ib(cb, ibo, 0ULL, 0U /* VK_INDEX_TYPE_UINT16 */);
+   cmd_draw_idx(cb, 6U, 1U, 0U, 0, 0U);
+   cmd_end_rp(cb);
+
+   struct {
+      uint32_t srcAspect, srcMip, srcBaseLayer, srcLayerCnt;
+      int32_t sx0, sy0, sz0, sx1, sy1, sz1;
+      uint32_t dstAspect, dstMip, dstBaseLayer, dstLayerCnt;
+      int32_t dx0, dy0, dz0, dx1, dy1, dz1;
+   } blit_reg = {
+      1U, 0U, 0U, 1U, 0, 0, 0, 32, 32, 1,
+      1U, 0U, 0U, 1U, 0, 0, 0, 32, 32, 1
+   };
+   cmd_blit(cb, src_img, 0U, dst_img, 0U, 1U, &blit_reg, 0U);
+   assert(end_cb(cb) == 0);
+
+   typedef int32_t (*pfn_qsubmit)(void *, uint32_t, const void *, uint64_t);
+   pfn_qsubmit qsubmit = (pfn_qsubmit)gdpa(dev, "vkQueueSubmit");
+   struct {
+      uint32_t sType; const void *pNext; uint32_t waitCnt; const void *pWaitSems; const void *pWaitMask;
+      uint32_t cbCnt; void *const *pCbs; uint32_t sigCnt; const void *pSigSems;
+   } sub_info = { 4U, NULL, 0U, NULL, NULL, 1U, &cb, 0U, NULL };
+   assert(qsubmit(queue, 1U, &sub_info, f_unsig) == 0);
+   assert(get_fence_status(dev, f_unsig) == 0 /* VK_SUCCESS */);
+
+   /* Verify center pixel of src_img and blitted dst_img was shaded by our real quad + SPIR-V OpConstantComposite */
+   uint32_t center_src = src_px[16 * 32 + 16];
+   uint32_t center_dst = dst_px[16 * 32 + 16];
+   assert(center_src != 0U && center_src == center_dst);
+   /* R=0.25 (64), G=0.75 (191), B=0.50 (128) in BGRA -> green channel ((center_src >> 8) & 0xFF) > 150 */
+   uint32_t g_chan = (center_src >> 8) & 0xFFU;
+   assert(g_chan > 150U);
+
+   destroy_cp(dev, cp, NULL);
+   destroy_fb(dev, fb, NULL);
+   destroy_iv(dev, src_iv, NULL);
+   destroy_pipe(dev, pipe, NULL);
+   destroy_sm(dev, fs_mod, NULL);
+   destroy_buf(dev, vbo, NULL);
+   destroy_buf(dev, ibo, NULL);
+   destroy_img(dev, src_img, NULL);
+   destroy_img(dev, dst_img, NULL);
+   free_mem(dev, src_mem, NULL);
+   free_mem(dev, dst_mem, NULL);
+   free_mem(dev, vbo_mem, NULL);
+   free_mem(dev, ibo_mem, NULL);
+   destroy_ev(dev, ev1, NULL);
+   destroy_sem(dev, sem1, NULL);
+   destroy_fence(dev, f_unsig, NULL);
+   destroy_fence(dev, f_sig, NULL);
+   destroy_pl(dev, pl1, NULL);
+   destroy_pl(dev, pl2, NULL);
+   destroy_dsl(dev, dsl1, NULL);
+   destroy_dsl(dev, dsl2, NULL);
+   destroy_dev(dev, NULL);
+   destroy_inst(inst, NULL);
+   dlclose(icd_h);
+
+   printf("  -> PASS: Full r54p3 ICD de-shimming, real sync/layout structs, SPIR-V OpConstantComposite VBO/IBO draw & vkCmdBlitImage verified! (center=0x%08x)\n", center_dst);
+}
+
 int main(void)
 {
    printf("[Unit Tests] Running edge cases, mali_kbase.ko flag invariants, and RAII logging suite...\n");
@@ -1997,6 +2343,8 @@ int main(void)
    test_v25_llvm_ir_ko_lowering_and_recompilation();
    test_v26_csffw_lifting_qemu_and_pruned_indirect_dispatch();
    test_v29_wsi_layer_godot_4_7_2_and_host_panvk();
+   test_v31_panvk_vkcube_mem_alias_and_v11_csf_opcodes();
+   test_v32_full_r54p3_icd_deshimming_and_real_draw_pipeline();
    printf("[Unit Tests] ALL EDGE CASES PASSED!\n");
    return 0;
 }
