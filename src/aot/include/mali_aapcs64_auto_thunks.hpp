@@ -1,14 +1,22 @@
 #pragma once
 // ============================================================================
-// Function-Signature Template-Metaprogrammed SysV x86-64 <-> ARM64 AAPCS64 ABI
+// Function-Signature & Arity Template-Metaprogrammed SysV x86-64 <-> AAPCS64 ABI
 // ============================================================================
-// Instantiates a specialized compile-time invoker (`Aapcs64FnTraits<FnSig>`)
-// per Vulkan C function prototype `Ret(Args...)` or function pointer type
-// `Ret(*)(Args...)`:
-//   - Zero runtime loop / dead branch overhead: only the exact `N = sizeof...(Args)`
-//     arguments are marshaled at compile time (`if constexpr (Idx < 8)` writes
-//     directly to `cpu.x[Idx]`; stack spill code `[cpu.sp + 8 * (Idx - 8)]` is
-//     only emitted by the compiler for functions with `sizeof...(Args) > 8`).
+// Provides both:
+//   1. `Aapcs64FnTraits<FnSig>` / `Aapcs64Invoker<FnSig>` / `callAapcs64AutoThunk<FnSig>`:
+//      Introspects a Vulkan C function prototype `Ret(Args...)` or function
+//      pointer type `Ret(*)(Args...)` (`PFN_vk*`) at compile time to extract
+//      `ReturnType`, `kArity = sizeof...(Args)`, and `kSpillsToStack = (kArity > 8)`.
+//   2. `callAapcs64AutoThunk<N, Ret>(...)`:
+//      Explicitly templated on argument count `N = sizeof...(Args)` with
+//      compile-time arity verification (`static_assert(sizeof...(Args) == N)`).
+//
+// Zero runtime loop / dead branch overhead:
+//   - Only the exact `N = sizeof...(Args)` arguments are marshaled via a fold
+//     expression over `std::index_sequence_for<Args...>`.
+//   - `if constexpr (Idx < 8)` writes directly to `cpu.x[Idx]`.
+//   - Stack spill code `[cpu.sp + 8 * (Idx - 8)]` is ONLY emitted by the C++
+//     compiler for functions with `N > 8` (such as `cmpbe_v2_compile_multiple_shaders`).
 //   - Void return (`std::is_void_v<Ret>`) emits zero return-value unmarshaling.
 //   - RAII `Aapcs64StackFrameGuard` saves/restores `x19..x30` and `sp` and
 //     guarantees `cpu.x[29] == cpu.sp` before every lifted call.
@@ -16,6 +24,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -101,10 +110,32 @@ inline void marshalSingleArgAt(CpuStateT &cpu, ArgT arg) noexcept {
     }
 }
 
-template <typename CpuStateT, typename... Args, std::size_t... Is>
-inline void marshalArgPack(CpuStateT &cpu, std::index_sequence<Is...>, Args... args) noexcept {
+template <std::size_t N, typename CpuStateT, typename... Args, std::size_t... Is>
+inline void marshalArgPackN(CpuStateT &cpu, std::index_sequence<Is...>, Args... args) noexcept {
+    static_assert(sizeof...(Args) == N, "Arity mismatch in marshalArgPackN<N>");
     (marshalSingleArgAt<Is>(cpu, args), ...);
 }
+
+template <typename CpuStateT, typename... Args, std::size_t... Is>
+inline void marshalArgPack(CpuStateT &cpu, std::index_sequence<Is...> seq, Args... args) noexcept {
+    marshalArgPackN<sizeof...(Args)>(cpu, seq, args...);
+}
+
+// Compile-time Function-Type Traits (`Ret(Args...)` and `Ret(*)(Args...)`)
+template <typename FnSig>
+struct Aapcs64FnTraits;
+
+template <typename Ret, typename... Args>
+struct Aapcs64FnTraits<Ret(Args...)> {
+    using ReturnType = Ret;
+    using ArgsTuple  = std::tuple<Args...>;
+    static constexpr std::size_t kArity          = sizeof...(Args);
+    static constexpr bool        kSpillsToStack  = (sizeof...(Args) > 8);
+    static constexpr bool        kHasReturnValue = !std::is_void_v<Ret>;
+};
+
+template <typename Ret, typename... Args>
+struct Aapcs64FnTraits<Ret (*)(Args...)> : Aapcs64FnTraits<Ret(Args...)> {};
 
 // Primary template for function-pointer / function-signature introspection
 template <typename FnSig>
@@ -112,10 +143,8 @@ struct Aapcs64Invoker;
 
 // Specialization for `Ret(Args...)`
 template <typename Ret, typename... Args>
-struct Aapcs64Invoker<Ret(Args...)> {
-    static constexpr std::size_t kArity = sizeof...(Args);
-    static constexpr bool kSpillsToStack = (sizeof...(Args) > 8);
-    static constexpr bool kHasReturnValue = !std::is_void_v<Ret>;
+struct Aapcs64Invoker<Ret(Args...)> : Aapcs64FnTraits<Ret(Args...)> {
+    using Traits = Aapcs64FnTraits<Ret(Args...)>;
 
     template <typename CpuStateT>
     static inline Ret invoke(void (*aot_fn)(CpuStateT *),
@@ -125,11 +154,11 @@ struct Aapcs64Invoker<Ret(Args...)> {
                              uintptr_t tls_base,
                              Args... args) noexcept {
         Aapcs64StackFrameGuard<CpuStateT> frame(cpu, stack_base, stack_size, tls_base);
-        if constexpr (kArity > 0) {
-            marshalArgPack(cpu, std::index_sequence_for<Args...>{}, args...);
+        if constexpr (Traits::kArity > 0) {
+            marshalArgPackN<Traits::kArity>(cpu, std::index_sequence_for<Args...>{}, args...);
         }
         aot_fn(&cpu);
-        if constexpr (kHasReturnValue) {
+        if constexpr (Traits::kHasReturnValue) {
             return unmarshalRetFromX0<Ret>(cpu.x[0]);
         }
     }
@@ -139,7 +168,33 @@ struct Aapcs64Invoker<Ret(Args...)> {
 template <typename Ret, typename... Args>
 struct Aapcs64Invoker<Ret (*)(Args...)> : Aapcs64Invoker<Ret(Args...)> {};
 
-// Deduced invoker from explicit return type `Ret` and argument pack `Args...`
+// 1. Explicit arity-templated `callAapcs64AutoThunk<N, Ret>(...)`
+template <std::size_t N, typename Ret = uint64_t, typename CpuStateT, typename... Args>
+inline Ret callAapcs64AutoThunk(CpuStateT &cpu,
+                                uint8_t *stack_base,
+                                size_t stack_size,
+                                void (*aot_fn)(CpuStateT *),
+                                Args... args) noexcept {
+    static_assert(sizeof...(Args) == N, "callAapcs64AutoThunk<N>: argument pack length must equal N");
+    return Aapcs64Invoker<Ret(Args...)>::invoke(
+        aot_fn, cpu, stack_base, stack_size, static_cast<uintptr_t>(cpu.tpidr_el0), args...);
+}
+
+// 2. Function-pointer / signature-type-templated `callAapcs64AutoThunk<FnSig>(...)`
+template <typename FnSig, typename CpuStateT, typename... CallArgs>
+inline typename Aapcs64FnTraits<FnSig>::ReturnType
+callAapcs64AutoThunk(CpuStateT &cpu,
+                     uint8_t *stack_base,
+                     size_t stack_size,
+                     void (*aot_fn)(CpuStateT *),
+                     CallArgs... args) noexcept {
+    static_assert(sizeof...(CallArgs) == Aapcs64FnTraits<FnSig>::kArity,
+                  "callAapcs64AutoThunk<FnSig>: call arguments must match function signature arity");
+    return Aapcs64Invoker<FnSig>::invoke(
+        aot_fn, cpu, stack_base, stack_size, static_cast<uintptr_t>(cpu.tpidr_el0), args...);
+}
+
+// 3. Deduced invoker from explicit return type `Ret` and argument pack `Args...`
 template <typename Ret, typename CpuStateT, typename... Args>
 inline Ret invokeLiftedAapcs64(void (*aot_fn)(CpuStateT *),
                                CpuStateT &cpu,
@@ -156,19 +211,17 @@ inline Ret invokeLiftedAapcs64(CpuStateT &cpu,
                                size_t stack_size,
                                void (*aot_fn)(CpuStateT *),
                                Args... args) noexcept {
-    return Aapcs64Invoker<Ret(Args...)>::invoke(
-        aot_fn, cpu, stack_base, stack_size, static_cast<uintptr_t>(cpu.tpidr_el0), args...);
+    return callAapcs64AutoThunk<sizeof...(Args), Ret>(cpu, stack_base, stack_size, aot_fn, args...);
 }
 
-// Invoker specialized directly on a Vulkan PFN_* function pointer type `FnPtrT`
+// 4. Invoker specialized directly on a Vulkan PFN_* function pointer type `FnPtrT`
 template <typename FnPtrT, typename CpuStateT, typename... CallArgs>
 inline auto invokeLiftedByFnType(CpuStateT &cpu,
                                  uint8_t *stack_base,
                                  size_t stack_size,
                                  void (*aot_fn)(CpuStateT *),
                                  CallArgs... args) noexcept {
-    return Aapcs64Invoker<FnPtrT>::invoke(
-        aot_fn, cpu, stack_base, stack_size, static_cast<uintptr_t>(cpu.tpidr_el0), args...);
+    return callAapcs64AutoThunk<FnPtrT>(cpu, stack_base, stack_size, aot_fn, args...);
 }
 
 } // namespace mali_aapcs64

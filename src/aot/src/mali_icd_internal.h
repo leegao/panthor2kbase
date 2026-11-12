@@ -135,6 +135,20 @@ extern "C" {
     void aot_vkEnumerateDeviceLayerProperties(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkGetDeviceQueue(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkGetDeviceQueue2(AOTCPUState* cpu) __attribute__((weak));
+    void aot_vkCreateBuffer(AOTCPUState* cpu) __attribute__((weak));
+    void aot_vkDestroyBuffer(AOTCPUState* cpu) __attribute__((weak));
+    void aot_vkCreateEvent(AOTCPUState* cpu) __attribute__((weak));
+    void aot_vkDestroyEvent(AOTCPUState* cpu) __attribute__((weak));
+    void aot_vkGetEventStatus(AOTCPUState* cpu) __attribute__((weak));
+    void aot_vkSetEvent(AOTCPUState* cpu) __attribute__((weak));
+    void aot_vkResetEvent(AOTCPUState* cpu) __attribute__((weak));
+    void aot_vkGetFenceStatus(AOTCPUState* cpu) __attribute__((weak));
+    void aot_vkWaitForFences(AOTCPUState* cpu) __attribute__((weak));
+    void aot_vkCreateDescriptorSetLayout(AOTCPUState* cpu) __attribute__((weak));
+    void aot_vkCreatePipelineLayout(AOTCPUState* cpu) __attribute__((weak));
+    void aot_vkDeviceWaitIdle(AOTCPUState* cpu) __attribute__((weak));
+    void aot_vkQueueWaitIdle(AOTCPUState* cpu) __attribute__((weak));
+    void aot_kbase_cs_event_signal(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkGetBufferMemoryRequirements(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkGetBufferMemoryRequirements2(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkGetBufferDeviceAddress(AOTCPUState* cpu) __attribute__((weak));
@@ -317,7 +331,67 @@ extern "C" void __mali_stack_chk_fail_diag(AOTCPUState* cpu) {
                  cpu->sp, cpu->x[30]);
     std::abort();
 }
+struct HostVkAllocatorTable {
+    std::mutex mtx;
+    std::unordered_map<uint64_t, void* (*)(void*, size_t, size_t, uint32_t)> alloc_fns;
+    std::unordered_map<uint64_t, void* (*)(void*, void*, size_t, size_t, uint32_t)> realloc_fns;
+    std::unordered_map<uint64_t, void (*)(void*, void*)> free_fns;
+
+    void registerCallbacks(const void* pAllocator) {
+        if (!pAllocator) return;
+        const uint64_t* words = static_cast<const uint64_t*>(pAllocator);
+        std::lock_guard<std::mutex> lk(mtx);
+        if (words[1]) alloc_fns[words[1]] = reinterpret_cast<void* (*)(void*, size_t, size_t, uint32_t)>(words[1]);
+        if (words[2]) realloc_fns[words[2]] = reinterpret_cast<void* (*)(void*, void*, size_t, size_t, uint32_t)>(words[2]);
+        if (words[3]) free_fns[words[3]] = reinterpret_cast<void (*)(void*, void*)>(words[3]);
+    }
+
+    bool tryDispatch(AOTCPUState* cpu, uint64_t target_va) {
+        void* (*afn)(void*, size_t, size_t, uint32_t) = nullptr;
+        void* (*rfn)(void*, void*, size_t, size_t, uint32_t) = nullptr;
+        void (*ffn)(void*, void*) = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            auto it_a = alloc_fns.find(target_va);
+            if (it_a != alloc_fns.end()) afn = it_a->second;
+            auto it_r = realloc_fns.find(target_va);
+            if (it_r != realloc_fns.end()) rfn = it_r->second;
+            auto it_f = free_fns.find(target_va);
+            if (it_f != free_fns.end()) ffn = it_f->second;
+        }
+        if (afn) {
+            void* res = afn(reinterpret_cast<void*>(cpu->x[0]),
+                            static_cast<size_t>(cpu->x[1]),
+                            static_cast<size_t>(cpu->x[2]),
+                            static_cast<uint32_t>(cpu->x[3]));
+            cpu->x[0] = reinterpret_cast<uint64_t>(res);
+            return true;
+        }
+        if (rfn) {
+            void* res = rfn(reinterpret_cast<void*>(cpu->x[0]),
+                            reinterpret_cast<void*>(cpu->x[1]),
+                            static_cast<size_t>(cpu->x[2]),
+                            static_cast<size_t>(cpu->x[3]),
+                            static_cast<uint32_t>(cpu->x[4]));
+            cpu->x[0] = reinterpret_cast<uint64_t>(res);
+            return true;
+        }
+        if (ffn) {
+            ffn(reinterpret_cast<void*>(cpu->x[0]),
+                reinterpret_cast<void*>(cpu->x[1]));
+            cpu->x[0] = 0;
+            return true;
+        }
+        return false;
+    }
+};
+
+static HostVkAllocatorTable g_host_vk_allocators;
+
 extern "C" void aot_unhandled_plt(AOTCPUState* cpu, uint64_t target_va) {
+    if (g_host_vk_allocators.tryDispatch(cpu, target_va)) {
+        return;
+    }
     std::fprintf(stderr, "[MALI_ICD_ERROR] Unhandled indirect/PLT target VA: 0x%016lx LR=0x%016lx\n",
                  target_va, cpu->x[30]);
     std::abort();
@@ -962,6 +1036,7 @@ struct MaliIcdPhysicalDevice {
         // 1 MemoryHeap at +712: 8 GiB DEVICE_LOCAL
         *reinterpret_cast<uint64_t*>(aot_internal + 712) = (8ULL << 30);
         *reinterpret_cast<uint32_t*>(aot_internal + 720) = 1U; // VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
+        *reinterpret_cast<uint32_t*>(aot_internal + 0x2e0) = 4096U; // buffer alignment in aot_vkGetBufferMemoryRequirements (0x00939670)
         *reinterpret_cast<uint32_t*>(aot_internal + 752) = 0xFFFFFFFFU; // hw extension bitmask + timestampValidBits = 64
 
         // (x0 + 8) shifted view for aot_vkGetPhysicalDeviceProperties (0x977730 -> 0x977738)
@@ -998,7 +1073,9 @@ struct MaliIcdDevice {
     uintptr_t            loader_magic = ICD_LOADER_MAGIC;
     MaliIcdPhysicalDevice* phys_dev = nullptr;
     MaliIcdQueue         queue{};
+    int32_t              mali_fd = 100;
     std::vector<uint8_t> kctx_mem;
+    std::vector<uint8_t> aot_cctx_mem;
     std::vector<uint8_t> aot_vk_device_mem;
     std::vector<uint8_t> csg_group_struct;
     std::vector<uint8_t> csi_queue_struct;
@@ -1023,11 +1100,24 @@ struct MaliIcdDeviceMemory {
 };
 
 struct MaliIcdBuffer {
-    uint64_t size_bytes   = 0;
-    uint64_t size         = 0;
-    uint32_t usage        = 0;
-    uint64_t bound_gpu_va = 0;
+    uint64_t hdr_meta     = 9;     // +0x00: libGLES_mali.so object type = 9 (VkBuffer)
+    uint64_t dev_plus_8   = 0;     // +0x08: device + 8
+    uint64_t usage        = 0;     // +0x10: 64-bit usage (VkBufferCreateInfo::usage or VkBufferUsageFlags2CreateInfoKHR)
+    uint32_t create_flags = 0;     // +0x18: VkBufferCreateFlags
+    uint32_t ext_handles  = 0;     // +0x1c: VkExternalMemoryHandleTypeFlags
+    uint64_t bound_gpu_va = 0;     // +0x20: GPU VA (read by aot_vkGetBufferDeviceAddress @ 0x009398c0)
+    uint64_t size_bytes   = 0;     // +0x28: size in bytes (read by aot_vkGetBufferMemoryRequirements @ 0x00939670)
+    uint8_t  is_sparse    = 0;     // +0x30: (flags >> 3) & 1 (read by aot_vkGetBufferMemoryRequirements @ 0x00939670)
+    uint8_t  pad31[7]{};           // +0x31..0x37
+    uint64_t size         = 0;     // +0x38: alias of size_bytes
+    uint64_t reserved40   = 0;     // +0x40
 };
+static_assert(offsetof(MaliIcdBuffer, bound_gpu_va) == 0x20,
+              "MaliIcdBuffer::bound_gpu_va must be at byte offset 0x20 (matching libGLES_mali.so)");
+static_assert(offsetof(MaliIcdBuffer, size_bytes) == 0x28,
+              "MaliIcdBuffer::size_bytes must be at byte offset 0x28 (matching libGLES_mali.so)");
+static_assert(sizeof(MaliIcdBuffer) == 0x48,
+              "MaliIcdBuffer must be 0x48 bytes (matching libGLES_mali.so vkCreateBuffer @ 0x009392f0)");
 
 struct MaliIcdShaderModule {
     std::vector<uint32_t> spirv_words;
@@ -1300,9 +1390,11 @@ static IcdImageMap  g_images;
 
 // Helper: Allocate a /dev/mali0 BO via AOT aot_kbase_mem_alloc or ioctl
 static uint64_t icdAllocKbaseBo(MaliIcdDevice* dev, uint64_t pages, uint64_t flags) {
+    int32_t fd = (dev && dev->mali_fd >= 0) ? dev->mali_fd : 100;
     std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
     auto& cpu = g_aot_rt.cpu;
     if (aot_kbase_version_check_csf && aot_kbase_mem_alloc && dev && !dev->kctx_mem.empty()) {
+        g_aot_rt.resetGuestStackLocked();
         uint64_t* sp_args = reinterpret_cast<uint64_t*>(cpu.sp);
         sp_args[0] = 0;
         sp_args[1] = 0;
@@ -1318,7 +1410,7 @@ static uint64_t icdAllocKbaseBo(MaliIcdDevice* dev, uint64_t pages, uint64_t fla
         if (cpu.x[0] > 0x1000ULL && cpu.x[0] != ~0ULL) {
             uint64_t va = cpu.x[0] & ~0xFFFULL;
             if ((flags & BASE_MEM_SAME_VA) != 0 && (flags & BASE_MEM_PROT_GPU_EX) == 0 && va < 0x10000000ULL) {
-                return bionic_mali_mmap_stub(0, pages * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, 100, va);
+                return bionic_mali_mmap_stub(0, pages * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, static_cast<uint64_t>(fd), va);
             }
             return va;
         }
@@ -1327,10 +1419,10 @@ static uint64_t icdAllocKbaseBo(MaliIcdDevice* dev, uint64_t pages, uint64_t fla
     req[0] = pages;
     req[1] = pages;
     req[3] = flags;
-    bionic_mali_kbase_ioctl_stub(100, 0xc040803bU, reinterpret_cast<uint64_t>(req));
+    bionic_mali_kbase_ioctl_stub(static_cast<uint64_t>(fd), 0xc040803bU, reinterpret_cast<uint64_t>(req));
     uint64_t cookie_or_va = req[1];
     if ((flags & BASE_MEM_SAME_VA) != 0 && (flags & BASE_MEM_PROT_GPU_EX) == 0) {
-        return bionic_mali_mmap_stub(0, pages * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, 100, cookie_or_va);
+        return bionic_mali_mmap_stub(0, pages * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, static_cast<uint64_t>(fd), cookie_or_va);
     }
     return cookie_or_va;
 }

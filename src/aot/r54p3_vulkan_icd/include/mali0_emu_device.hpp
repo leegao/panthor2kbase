@@ -101,8 +101,9 @@ public:
     static constexpr uint32_t MALI_G615_PRODUCT_ID = 0xB883U;
     static constexpr uint64_t MALI_G615_RAW_GPU_ID = 0xB8830001ULL;
 
-    int      virtual_fd     = 100; // /dev/mali0
+    int      virtual_fd     = 100; // /dev/mali0 default virtual fd
     int      dma_heap_fd    = 101; // /dev/dma_heap/system
+    std::map<int, bool> active_mali_fds; // Per-FD /dev/mali0 contexts opened via libmali_kbase_emu.so
     int      next_dmabuf_fd = 200; // Exported DMA-BUF fds from DMA_HEAP_IOCTL_ALLOC
     uint32_t gpu_product_id = MALI_G615_PRODUCT_ID;
     uint64_t raw_gpu_id     = MALI_G615_RAW_GPU_ID;
@@ -348,7 +349,11 @@ public:
         return tmp.buildGpupropsTlv();
     }
 
-    uint64_t handleOpen(const char* path, uint64_t /*flags*/) {
+    bool isMaliFd(int ifd) const {
+        return ifd == virtual_fd || ifd == -1 || active_mali_fds.count(ifd) > 0;
+    }
+
+    uint64_t handleOpen(const char* path, uint64_t flags) {
         if (!path) return static_cast<uint64_t>(-1LL);
         if (std::strstr(path, "dma_heap") != nullptr) {
             ioctl_trace.push_back(std::string("open(") + path + ") -> fd=" + std::to_string(dma_heap_fd));
@@ -356,18 +361,27 @@ public:
         }
         if (std::strstr(path, "mali") != nullptr) {
             ensureLiftedKernelBound();
+            int opened_fd = virtual_fd;
             if (mali_kbase_emu_open_direct) {
-                (void)mali_kbase_emu_open_direct(path, 0);
+                int kfd = mali_kbase_emu_open_direct(path, static_cast<int>(flags));
+                if (kfd >= 0) {
+                    opened_fd = kfd;
+                    active_mali_fds[kfd] = true;
+                }
             }
-            ioctl_trace.push_back(std::string("open(") + path + ") -> fd=" + std::to_string(virtual_fd));
-            return static_cast<uint64_t>(virtual_fd);
+            ioctl_trace.push_back(std::string("open(") + path + ") -> fd=" + std::to_string(opened_fd));
+            return static_cast<uint64_t>(opened_fd);
         }
         return static_cast<uint64_t>(-1LL);
     }
 
     uint64_t handleClose(uint64_t fd) {
-        if (mali_kbase_emu_close_direct && static_cast<int>(fd) == virtual_fd) {
-            (void)mali_kbase_emu_close_direct(static_cast<int>(fd));
+        int ifd = static_cast<int>(fd);
+        if (mali_kbase_emu_close_direct && isMaliFd(ifd)) {
+            active_mali_fds.erase(ifd);
+            if (ifd != virtual_fd) {
+                return static_cast<uint64_t>(mali_kbase_emu_close_direct(ifd));
+            }
         }
         return 0;
     }
@@ -380,7 +394,7 @@ public:
             ioctl_trace.push_back("mmap(dmabuf_fd=" + std::to_string(ifd) + ")");
             return reinterpret_cast<uint64_t>(p);
         }
-        if (mali_kbase_emu_mmap_direct && (ifd == virtual_fd || ifd == -1) &&
+        if (mali_kbase_emu_mmap_direct && isMaliFd(ifd) &&
             !bos_by_cookie.count(offset) && !mmap_handle_to_queue_va.count(offset)) {
             void* p = mali_kbase_emu_mmap_direct(
                 reinterpret_cast<void*>(addr),
@@ -394,7 +408,7 @@ public:
                 return reinterpret_cast<uint64_t>(p);
             }
         }
-        if (ifd != virtual_fd && ifd != -1) {
+        if (!isMaliFd(ifd)) {
             void* p = mmap(reinterpret_cast<void*>(addr), length, static_cast<int>(prot) | PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             return reinterpret_cast<uint64_t>(p);
@@ -845,6 +859,16 @@ public:
                 int krc = mali_kbase_emu_ioctl_direct(static_cast<int>(fd), static_cast<unsigned long>(ucmd), reinterpret_cast<void*>(arg_addr));
                 ioctl_trace.push_back("lifted_kbase_ko_ioctl(cmd=0x" + std::to_string(ucmd) + ")");
                 return (krc == 0) ? 0ULL : static_cast<uint64_t>(static_cast<int64_t>(krc));
+            } else {
+                // Also forward VERSION_CHECK, GET_GPUPROPS, JOB_SUBMIT, MEM_IMPORT, and SOFT_EVENT_UPDATE
+                // to libmali_kbase_emu.so so 100% of /dev/mali0 UAPI operations are recorded on the per-FD context!
+                uint8_t scratch_arg[64]{};
+                if (arg_addr && (nr == 0 || nr == 3 || ucmd == 0xc0048036U || ucmd == 0xc0018036U)) {
+                    std::memcpy(scratch_arg, reinterpret_cast<const void*>(arg_addr), 16);
+                    (void)mali_kbase_emu_ioctl_direct(static_cast<int>(fd), static_cast<unsigned long>(ucmd), scratch_arg);
+                } else if (nr == 28) {
+                    (void)mali_kbase_emu_ioctl_direct(static_cast<int>(fd), static_cast<unsigned long>(ucmd), reinterpret_cast<void*>(arg_addr));
+                }
             }
         }
 

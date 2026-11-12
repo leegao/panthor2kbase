@@ -54,6 +54,10 @@ static void *(*orig_mmap)(void *, size_t, int, int, int, off_t) = NULL;
 static int (*orig_munmap)(void *, size_t) = NULL;
 static ssize_t (*orig_read)(int, void *, size_t) = NULL;
 static int (*orig_stat)(const char *, struct stat *) = NULL;
+static int (*orig_access)(const char *, int) = NULL;
+static int (*orig_dup)(int) = NULL;
+static int (*orig_dup2)(int, int) = NULL;
+static int (*orig_fcntl)(int, int, ...) = NULL;
 
 static void init_orig_syscalls(void)
 {
@@ -71,6 +75,14 @@ static void init_orig_syscalls(void)
       orig_read = dlsym(RTLD_NEXT, "read");
    if (!orig_stat)
       orig_stat = dlsym(RTLD_NEXT, "stat");
+   if (!orig_access)
+      orig_access = dlsym(RTLD_NEXT, "access");
+   if (!orig_dup)
+      orig_dup = dlsym(RTLD_NEXT, "dup");
+   if (!orig_dup2)
+      orig_dup2 = dlsym(RTLD_NEXT, "dup2");
+   if (!orig_fcntl)
+      orig_fcntl = dlsym(RTLD_NEXT, "fcntl");
 }
 
 
@@ -225,9 +237,29 @@ struct emu_kfile {
    uint64_t cur_ioctl_in_flags;
    bool has_cur_ioctl_in_flags;
    int cur_ioctl_errno;
+   int refcnt;
+   int slot_index;
 };
 
-static struct emu_kfile g_kfile;
+#define EMU_MAX_KFILES 32
+#define EMU_MAX_FDS    4096
+
+enum emu_aux_fd_kind {
+   EMU_AUX_FD_NONE = 0,
+   EMU_AUX_FD_DMA_HEAP,
+   EMU_AUX_FD_DMABUF,
+   EMU_AUX_FD_ASHMEM,
+   EMU_AUX_FD_SW_SYNC,
+   EMU_AUX_FD_SYNC_FENCE,
+};
+
+static struct emu_kfile g_default_kfile;
+static struct emu_kfile *g_kfiles[EMU_MAX_KFILES];
+static struct emu_kfile *g_fd_map[EMU_MAX_FDS];
+static uint8_t g_aux_fd_map[EMU_MAX_FDS];
+static struct emu_kfile *g_active_kfile = &g_default_kfile;
+static int g_default_direct_fd = -1;
+#define g_kfile (*g_active_kfile)
 static int g_emu_profile_override = -1;
 static LiftedKbaseCPU g_lifted_cpu;
 static struct csffw_emu_state g_csffw_state;
@@ -431,18 +463,90 @@ static void sync_lifted_stats_locked(uint64_t prev_insns)
       g_stats.lifted_ko_insns_executed += (g_lifted_cpu.insns_executed - prev_insns);
 }
 
+static struct emu_kfile *find_kfile_by_fd_locked(int fd)
+{
+   if (fd < 0)
+      return NULL;
+   if (fd < EMU_MAX_FDS && g_fd_map[fd] != NULL &&
+       g_fd_map[fd]->state != EMU_KFILE_UNOPENED) {
+      return g_fd_map[fd];
+   }
+   for (int i = 0; i < EMU_MAX_KFILES; i++) {
+      struct emu_kfile *kf = g_kfiles[i];
+      if (kf && kf->state != EMU_KFILE_UNOPENED && kf->fd == fd)
+         return kf;
+   }
+   if (g_default_kfile.state != EMU_KFILE_UNOPENED && g_default_kfile.fd == fd)
+      return &g_default_kfile;
+   struct stat st;
+   if (fstat(fd, &st) == 0 && st.st_ino != 0) {
+      for (int i = 0; i < EMU_MAX_KFILES; i++) {
+         struct emu_kfile *kf = g_kfiles[i];
+         if (kf && kf->state != EMU_KFILE_UNOPENED &&
+             kf->ino != 0 && kf->dev == st.st_dev && kf->ino == st.st_ino) {
+            if (fd < EMU_MAX_FDS && g_fd_map[fd] == NULL) {
+               g_fd_map[fd] = kf;
+               kf->refcnt++;
+            }
+            return kf;
+         }
+      }
+      if (g_default_kfile.state != EMU_KFILE_UNOPENED &&
+          g_default_kfile.ino != 0 &&
+          g_default_kfile.dev == st.st_dev && g_default_kfile.ino == st.st_ino) {
+         return &g_default_kfile;
+      }
+   }
+   return NULL;
+}
+
+static struct emu_kfile *alloc_kfile_slot_locked(void)
+{
+   for (int i = 0; i < EMU_MAX_KFILES; i++) {
+      if (g_kfiles[i] == NULL) {
+         g_kfiles[i] = (struct emu_kfile *)calloc(1, sizeof(struct emu_kfile));
+         if (g_kfiles[i]) {
+            g_kfiles[i]->slot_index = i;
+            return g_kfiles[i];
+         }
+      } else if (g_kfiles[i]->state == EMU_KFILE_UNOPENED && g_kfiles[i]->refcnt <= 0) {
+         memset(g_kfiles[i], 0, sizeof(struct emu_kfile));
+         g_kfiles[i]->slot_index = i;
+         return g_kfiles[i];
+      }
+   }
+   memset(&g_default_kfile, 0, sizeof(g_default_kfile));
+   g_default_kfile.slot_index = -1;
+   return &g_default_kfile;
+}
+
+static uint32_t count_open_kfiles_locked(void)
+{
+   uint32_t cnt = 0;
+   for (int i = 0; i < EMU_MAX_KFILES; i++) {
+      if (g_kfiles[i] && g_kfiles[i]->state != EMU_KFILE_UNOPENED && g_kfiles[i]->refcnt > 0)
+         cnt++;
+   }
+   return cnt;
+}
+
+__attribute__((visibility("default")))
+uint32_t mali_kbase_emu_get_open_fd_count(void)
+{
+   pthread_mutex_lock(&g_emu_lock);
+   uint32_t cnt = count_open_kfiles_locked();
+   pthread_mutex_unlock(&g_emu_lock);
+   return cnt;
+}
+
 static bool is_emulated_mali_fd(int fd)
 {
-   if (fd < 0 || g_kfile.state == EMU_KFILE_UNOPENED)
+   if (fd < 0)
       return false;
-   if (fd == g_kfile.fd)
-      return true;
-   struct stat st;
-   if (g_kfile.ino != 0 && fstat(fd, &st) == 0) {
-      if (st.st_dev == g_kfile.dev && st.st_ino == g_kfile.ino)
-         return true;
-   }
-   return false;
+   pthread_mutex_lock(&g_emu_lock);
+   struct emu_kfile *kf = find_kfile_by_fd_locked(fd);
+   pthread_mutex_unlock(&g_emu_lock);
+   return kf != NULL;
 }
 
 /* Lavapipe headless Vulkan bridge state */
@@ -524,6 +628,7 @@ void mali_kbase_emu_get_stats(struct kbase_emu_stats *out)
    g_stats.kbase_ver_major = g_kfile.kbase_ver_major ? g_kfile.kbase_ver_major : 1U;
    g_stats.kbase_ver_minor = g_kfile.kbase_ver_minor ? g_kfile.kbase_ver_minor :
       (g_stats.active_profile == MALI_EMU_PROFILE_HUSKY_R54 ? 38U : 21U);
+   g_stats.active_kfile_count = count_open_kfiles_locked();
    if (out)
       *out = g_stats;
    pthread_mutex_unlock(&g_emu_lock);
@@ -681,14 +786,18 @@ static void execute_valhall_shader(const struct valhall_shader_desc *spd)
    if (!spd || !spd->shader_va || spd->shader_size < 8)
       return;
 
-   /* Verify shader resides in an active, non-munmapped region */
+   /* Verify shader resides in an active, non-munmapped region across any open kfile */
    bool found_active = false;
-   for (size_t i = 0; i < 2048; i++) {
-      if (g_kfile.regions[i].active && !g_kfile.regions[i].freed_by_munmap &&
-          spd->shader_va >= g_kfile.regions[i].gpu_va &&
-          spd->shader_va + spd->shader_size <= g_kfile.regions[i].gpu_va + g_kfile.regions[i].size) {
-         found_active = true;
-         break;
+   for (int k = -1; k < EMU_MAX_KFILES && !found_active; k++) {
+      struct emu_kfile *kf = (k < 0) ? g_active_kfile : g_kfiles[k];
+      if (!kf) continue;
+      for (size_t i = 0; i < 2048; i++) {
+         if (kf->regions[i].active && !kf->regions[i].freed_by_munmap &&
+             spd->shader_va >= kf->regions[i].gpu_va &&
+             spd->shader_va + spd->shader_size <= kf->regions[i].gpu_va + kf->regions[i].size) {
+            found_active = true;
+            break;
+         }
       }
    }
    if (!found_active) return;
@@ -770,19 +879,23 @@ static bool emu_is_valid_host_range(uint64_t va, size_t len)
 {
    if (va < 0x10000ULL || len == 0 || (va + len) < va)
       return false;
-   for (size_t r = 0; r < 2048; r++) {
-      if (g_kfile.regions[r].active && !g_kfile.regions[r].freed_by_munmap &&
-          g_kfile.regions[r].cpu_ptr != NULL &&
-          va >= g_kfile.regions[r].gpu_va &&
-          (va + len) <= g_kfile.regions[r].gpu_va + g_kfile.regions[r].size) {
-         return true;
+   for (int k = -1; k < EMU_MAX_KFILES; k++) {
+      struct emu_kfile *kf = (k < 0) ? g_active_kfile : g_kfiles[k];
+      if (!kf) continue;
+      for (size_t r = 0; r < 2048; r++) {
+         if (kf->regions[r].active && !kf->regions[r].freed_by_munmap &&
+             kf->regions[r].cpu_ptr != NULL &&
+             va >= kf->regions[r].gpu_va &&
+             (va + len) <= kf->regions[r].gpu_va + kf->regions[r].size) {
+            return true;
+         }
       }
-   }
-   for (size_t h = 0; h < 16; h++) {
-      if (g_kfile.heaps[h].active && g_kfile.heaps[h].heap_mem != NULL &&
-          va >= g_kfile.heaps[h].gpu_heap_va &&
-          (va + len) <= g_kfile.heaps[h].gpu_heap_va + g_kfile.heaps[h].heap_mem_size) {
-         return true;
+      for (size_t h = 0; h < 16; h++) {
+         if (kf->heaps[h].active && kf->heaps[h].heap_mem != NULL &&
+             va >= kf->heaps[h].gpu_heap_va &&
+             (va + len) <= kf->heaps[h].gpu_heap_va + kf->heaps[h].heap_mem_size) {
+            return true;
+         }
       }
    }
    uint64_t p0 = va & ~4095ULL;
@@ -794,29 +907,33 @@ static bool emu_is_writable_host_range(uint64_t va, size_t len)
 {
    if (va < 0x10000ULL || len == 0 || (va + len) < va)
       return false;
-   for (size_t r = 0; r < 2048; r++) {
-      if (g_kfile.regions[r].active && !g_kfile.regions[r].freed_by_munmap &&
-          g_kfile.regions[r].cpu_ptr != NULL &&
-          va >= g_kfile.regions[r].gpu_va &&
-          (va + len) <= g_kfile.regions[r].gpu_va + g_kfile.regions[r].size) {
-         if ((g_kfile.regions[r].flags & (BASE_MEM_PROT_GPU_WR | BASE_MEM_PROT_CPU_WR)) == 0ULL)
-            return false;
-         const char *strict_commit = getenv("PANTHOR_EMU_STRICT_CPU_COMMIT");
-         if (strict_commit && strict_commit[0] == '1' &&
-             (g_kfile.regions[r].flags & BASE_MEM_GROW_ON_GPF) &&
-             g_kfile.regions[r].commit_pages < g_kfile.regions[r].va_pages) {
-            size_t committed_bytes = (size_t)g_kfile.regions[r].commit_pages * 4096U;
-            if ((va + len) > g_kfile.regions[r].gpu_va + committed_bytes)
+   for (int k = -1; k < EMU_MAX_KFILES; k++) {
+      struct emu_kfile *kf = (k < 0) ? g_active_kfile : g_kfiles[k];
+      if (!kf) continue;
+      for (size_t r = 0; r < 2048; r++) {
+         if (kf->regions[r].active && !kf->regions[r].freed_by_munmap &&
+             kf->regions[r].cpu_ptr != NULL &&
+             va >= kf->regions[r].gpu_va &&
+             (va + len) <= kf->regions[r].gpu_va + kf->regions[r].size) {
+            if ((kf->regions[r].flags & (BASE_MEM_PROT_GPU_WR | BASE_MEM_PROT_CPU_WR)) == 0ULL)
                return false;
+            const char *strict_commit = getenv("PANTHOR_EMU_STRICT_CPU_COMMIT");
+            if (strict_commit && strict_commit[0] == '1' &&
+                (kf->regions[r].flags & BASE_MEM_GROW_ON_GPF) &&
+                kf->regions[r].commit_pages < kf->regions[r].va_pages) {
+               size_t committed_bytes = (size_t)kf->regions[r].commit_pages * 4096U;
+               if ((va + len) > kf->regions[r].gpu_va + committed_bytes)
+                  return false;
+            }
+            return true;
          }
-         return true;
       }
-   }
-   for (size_t h = 0; h < 16; h++) {
-      if (g_kfile.heaps[h].active && g_kfile.heaps[h].heap_mem != NULL &&
-          va >= g_kfile.heaps[h].gpu_heap_va &&
-          (va + len) <= g_kfile.heaps[h].gpu_heap_va + g_kfile.heaps[h].heap_mem_size) {
-         return true;
+      for (size_t h = 0; h < 16; h++) {
+         if (kf->heaps[h].active && kf->heaps[h].heap_mem != NULL &&
+             va >= kf->heaps[h].gpu_heap_va &&
+             (va + len) <= kf->heaps[h].gpu_heap_va + kf->heaps[h].heap_mem_size) {
+            return true;
+         }
       }
    }
    uint64_t p0 = va & ~4095ULL;
@@ -1389,25 +1506,57 @@ static int emu_handle_mem_alloc(uint64_t va_pages, uint64_t commit_pages,
    return -1;
 }
 
+int access(const char *pathname, int mode)
+{
+   init_orig_syscalls();
+   const char *volatile p = pathname;
+   if (p != NULL) {
+      if (strcmp(pathname, "/dev/mali") == 0 ||
+          strcmp(pathname, "/dev/mali0") == 0 ||
+          strcmp(pathname, "/dev/dri/renderD128") == 0 ||
+          strcmp(pathname, "/dev/dri/card0") == 0 ||
+          strncmp(pathname, "/dev/dma_heap", 13) == 0 ||
+          strcmp(pathname, "/dev/ion") == 0 ||
+          strcmp(pathname, "/dev/ashmem") == 0) {
+         return 0;
+      }
+      if (strncmp(pathname, "/dev/mali", 9) == 0 && pathname[9] != '\0') {
+         errno = ENOENT;
+         return -1;
+      }
+   }
+   return orig_access ? orig_access(pathname, mode) : -1;
+}
+
 int stat(const char *pathname, struct stat *statbuf)
 {
    init_orig_syscalls();
    const char *volatile p = pathname;
    struct stat *volatile sb = statbuf;
-   if (p != NULL && sb != NULL &&
-       (strcmp(pathname, "/dev/dri/renderD128") == 0 ||
-        strcmp(pathname, "/dev/dri/card0") == 0 ||
-        strncmp(pathname, "/dev/mali", 9) == 0)) {
-      memset(statbuf, 0, sizeof(*statbuf));
-      statbuf->st_mode = S_IFCHR | 0666;
-      if (strstr(pathname, "card") != NULL) {
-         statbuf->st_rdev = makedev(226, 0);
-         statbuf->st_ino = 10001;
-      } else {
-         statbuf->st_rdev = makedev(226, 128);
-         statbuf->st_ino = 10128;
+   if (p != NULL && sb != NULL) {
+      if (strncmp(pathname, "/dev/mali", 9) == 0 &&
+          pathname[9] != '\0' && strcmp(pathname, "/dev/mali0") != 0) {
+         errno = ENOENT;
+         return -1;
       }
-      return 0;
+      if (strcmp(pathname, "/dev/dri/renderD128") == 0 ||
+          strcmp(pathname, "/dev/dri/card0") == 0 ||
+          strcmp(pathname, "/dev/mali") == 0 ||
+          strcmp(pathname, "/dev/mali0") == 0 ||
+          strncmp(pathname, "/dev/dma_heap", 13) == 0 ||
+          strcmp(pathname, "/dev/ion") == 0 ||
+          strcmp(pathname, "/dev/ashmem") == 0) {
+         memset(statbuf, 0, sizeof(*statbuf));
+         statbuf->st_mode = S_IFCHR | 0666;
+         if (strstr(pathname, "card") != NULL) {
+            statbuf->st_rdev = makedev(226, 0);
+            statbuf->st_ino = 10001;
+         } else {
+            statbuf->st_rdev = makedev(226, 128);
+            statbuf->st_ino = 10128;
+         }
+         return 0;
+      }
    }
    return orig_stat(pathname, statbuf);
 }
@@ -1430,13 +1579,46 @@ int open(const char *pathname, int flags, ...)
       return panthor_kbase_adapter_open(pathname, flags);
    }
 
+   if (p != NULL &&
+       (strncmp(pathname, "/dev/dma_heap", 13) == 0 || strcmp(pathname, "/dev/ion") == 0)) {
+      int hfd = memfd_create("emulated_dma_heap", MFD_CLOEXEC);
+      if (hfd >= 0 && hfd < EMU_MAX_FDS)
+         g_aux_fd_map[hfd] = EMU_AUX_FD_DMA_HEAP;
+      return hfd;
+   }
+
+   if (p != NULL && strcmp(pathname, "/dev/ashmem") == 0) {
+      int afd = memfd_create("emulated_ashmem", MFD_CLOEXEC);
+      if (afd >= 0) {
+         (void)ftruncate(afd, 65536);
+         if (afd < EMU_MAX_FDS)
+            g_aux_fd_map[afd] = EMU_AUX_FD_ASHMEM;
+      }
+      return afd;
+   }
+
+   if (p != NULL &&
+       (strcmp(pathname, "/dev/sw_sync") == 0 ||
+        strcmp(pathname, "/sys/kernel/debug/sync/sw_sync") == 0)) {
+      int sfd = memfd_create("emulated_sw_sync", MFD_CLOEXEC);
+      if (sfd >= 0 && sfd < EMU_MAX_FDS)
+         g_aux_fd_map[sfd] = EMU_AUX_FD_SW_SYNC;
+      return sfd;
+   }
+
    if (p != NULL && strncmp(pathname, "/dev/mali", 9) == 0) {
+      if (pathname[9] != '\0' && strcmp(pathname, "/dev/mali0") != 0) {
+         errno = ENOENT;
+         return -1;
+      }
       pthread_mutex_lock(&g_emu_lock);
+      struct emu_kfile *kf = alloc_kfile_slot_locked();
+      g_active_kfile = kf;
       if (g_lifted_cpu.sp == 0ULL)
          lifted_kbase_cpu_init(&g_lifted_cpu, &g_kfile, lifted_emu_shim_hook);
       enum mali_kbase_emu_profile prof = resolve_active_emu_profile();
       ensure_lifted_cpu_ready_locked();
-   uint64_t prev_insns = g_lifted_cpu.insns_executed;
+      uint64_t prev_insns = g_lifted_cpu.insns_executed;
       g_lifted_cpu.x[0] = (uint32_t)flags;
       int64_t chk = (prof == MALI_EMU_PROFILE_HUSKY_R54)
          ? lifted_husky_r54p1_kbase_check_flags(&g_lifted_cpu)
@@ -1455,13 +1637,20 @@ int open(const char *pathname, int flags, ...)
       struct stat st;
       memset(&st, 0, sizeof(st));
       fstat(fd, &st);
-      memset(&g_kfile, 0, sizeof(g_kfile));
-      g_kfile.fd = fd;
-      g_kfile.dev = st.st_dev;
-      g_kfile.ino = st.st_ino;
-      g_kfile.state = EMU_KFILE_OPENED_NEED_VSN;
-      g_kfile.kbase_ver_major = 1U;
-      g_kfile.kbase_ver_minor = (prof == MALI_EMU_PROFILE_HUSKY_R54) ? 38U : 21U;
+      int saved_slot = kf->slot_index;
+      memset(kf, 0, sizeof(*kf));
+      kf->slot_index = saved_slot;
+      kf->fd = fd;
+      kf->refcnt = 1;
+      kf->dev = st.st_dev;
+      kf->ino = st.st_ino;
+      kf->state = EMU_KFILE_OPENED_NEED_VSN;
+      kf->kbase_ver_major = 1U;
+      kf->kbase_ver_minor = (prof == MALI_EMU_PROFILE_HUSKY_R54) ? 38U : 21U;
+      if (fd >= 0 && fd < EMU_MAX_FDS)
+         g_fd_map[fd] = kf;
+      g_stats.total_kfiles_opened++;
+      g_stats.active_kfile_count = count_open_kfiles_locked();
       uint64_t api_ver = ((uint64_t)g_kfile.kbase_ver_major << 20) | ((uint64_t)g_kfile.kbase_ver_minor << 8);
       *(uint64_t *)(g_kfile.sim_kctx + 36968) = api_ver;
       *(uint64_t *)(g_kfile.sim_kctx + 8) = (uint64_t)(uintptr_t)g_kfile.sim_kbdev;
@@ -1508,32 +1697,146 @@ int open(const char *pathname, int flags, ...)
    return orig_open(pathname, flags, mode);
 }
 
+int dup(int oldfd)
+{
+   init_orig_syscalls();
+   int newfd = orig_dup(oldfd);
+   if (newfd >= 0) {
+      pthread_mutex_lock(&g_emu_lock);
+      struct emu_kfile *kf = find_kfile_by_fd_locked(oldfd);
+      if (kf) {
+         if (newfd < EMU_MAX_FDS && g_fd_map[newfd] != kf) {
+            g_fd_map[newfd] = kf;
+            kf->refcnt++;
+         }
+      } else if (oldfd >= 0 && oldfd < EMU_MAX_FDS && newfd < EMU_MAX_FDS) {
+         g_aux_fd_map[newfd] = g_aux_fd_map[oldfd];
+      }
+      pthread_mutex_unlock(&g_emu_lock);
+   }
+   return newfd;
+}
+
+int dup2(int oldfd, int newfd)
+{
+   init_orig_syscalls();
+   if (oldfd == newfd)
+      return newfd;
+   pthread_mutex_lock(&g_emu_lock);
+   struct emu_kfile *old_kf = find_kfile_by_fd_locked(oldfd);
+   struct emu_kfile * replaced_kf = (newfd >= 0 && newfd < EMU_MAX_FDS) ? g_fd_map[newfd] : NULL;
+   if (replaced_kf && replaced_kf != old_kf) {
+      g_fd_map[newfd] = NULL;
+      replaced_kf->refcnt--;
+   }
+   int r = orig_dup2(oldfd, newfd);
+   if (r >= 0 && old_kf && r < EMU_MAX_FDS) {
+      if (g_fd_map[r] != old_kf) {
+         g_fd_map[r] = old_kf;
+         old_kf->refcnt++;
+      }
+   }
+   pthread_mutex_unlock(&g_emu_lock);
+   return r;
+}
+
+int fcntl(int fd, int cmd, ...)
+{
+   init_orig_syscalls();
+   va_list ap;
+   va_start(ap, cmd);
+   unsigned long arg = va_arg(ap, unsigned long);
+   va_end(ap);
+   int r = orig_fcntl(fd, cmd, arg);
+   if (r >= 0 && (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC)) {
+      pthread_mutex_lock(&g_emu_lock);
+      struct emu_kfile *kf = find_kfile_by_fd_locked(fd);
+      if (kf && r < EMU_MAX_FDS && g_fd_map[r] != kf) {
+         g_fd_map[r] = kf;
+         kf->refcnt++;
+      } else if (fd >= 0 && fd < EMU_MAX_FDS && r < EMU_MAX_FDS) {
+         g_aux_fd_map[r] = g_aux_fd_map[fd];
+      }
+      pthread_mutex_unlock(&g_emu_lock);
+   }
+   return r;
+}
+
 int close(int fd)
 {
    init_orig_syscalls();
    if (panthor_kbase_adapter_is_virtual_drm_fd(fd))
       return panthor_kbase_adapter_close(fd);
-   if (fd >= 0 && fd == g_kfile.fd && g_kfile.state != EMU_KFILE_UNOPENED) {
+   if (fd >= 0) {
       pthread_mutex_lock(&g_emu_lock);
-      enum mali_kbase_emu_profile prof = resolve_active_emu_profile();
-      void *rel_kfile = lifted_ko_heap_alloc(&g_lifted_cpu, 160);
-      if (rel_kfile) {
-         memcpy(rel_kfile, g_kfile.sim_kfile_buf, 160);
-         *(uint32_t *)((uint8_t *)rel_kfile + 100) = 0U;
-         *(uint32_t *)((uint8_t *)rel_kfile + 104) = 0U;
-         *(uint64_t *)(g_kfile.sim_filp + 216) = (uint64_t)(uintptr_t)rel_kfile;
-      } else {
-         *(uint64_t *)(g_kfile.sim_filp + 216) = (uint64_t)(uintptr_t)g_kfile.sim_kfile_buf;
-         *(uint32_t *)(g_kfile.sim_kfile_buf + 100) = 0U;
-         *(uint32_t *)(g_kfile.sim_kfile_buf + 104) = 0U;
+      if (fd < EMU_MAX_FDS)
+         g_aux_fd_map[fd] = EMU_AUX_FD_NONE;
+      struct emu_kfile *kf = find_kfile_by_fd_locked(fd);
+      if (kf && kf->state != EMU_KFILE_UNOPENED) {
+         if (fd < EMU_MAX_FDS && g_fd_map[fd] == kf)
+            g_fd_map[fd] = NULL;
+         kf->refcnt--;
+         if (kf->refcnt > 0) {
+            if (kf->fd == fd) {
+               for (int i = 0; i < EMU_MAX_FDS; i++) {
+                  if (g_fd_map[i] == kf) {
+                     kf->fd = i;
+                     break;
+                  }
+               }
+            }
+         } else {
+            g_active_kfile = kf;
+            enum mali_kbase_emu_profile prof = resolve_active_emu_profile();
+            void *rel_kfile = lifted_ko_heap_alloc(&g_lifted_cpu, 160);
+            if (rel_kfile) {
+               memcpy(rel_kfile, g_kfile.sim_kfile_buf, 160);
+               *(uint32_t *)((uint8_t *)rel_kfile + 100) = 0U;
+               *(uint32_t *)((uint8_t *)rel_kfile + 104) = 0U;
+               *(uint64_t *)(g_kfile.sim_filp + 216) = (uint64_t)(uintptr_t)rel_kfile;
+            } else {
+               *(uint64_t *)(g_kfile.sim_filp + 216) = (uint64_t)(uintptr_t)g_kfile.sim_kfile_buf;
+               *(uint32_t *)(g_kfile.sim_kfile_buf + 100) = 0U;
+               *(uint32_t *)(g_kfile.sim_kfile_buf + 104) = 0U;
+            }
+            (void)call_nested_lifted_fn_locked(
+               (prof == MALI_EMU_PROFILE_HUSKY_R54)
+                  ? lifted_husky_r54p1_kbase_release
+                  : lifted_r44p1_kbase_release,
+               (uint64_t)(uintptr_t)g_kfile.sim_inode,
+               (uint64_t)(uintptr_t)g_kfile.sim_filp, 0, 0, 0);
+            *(uint64_t *)(g_kfile.sim_filp + 216) = (uint64_t)(uintptr_t)g_kfile.sim_kfile_buf;
+            if (kf->tracking_page && kf->tracking_page != MAP_FAILED) {
+               orig_munmap(kf->tracking_page, 4096);
+               kf->tracking_page = NULL;
+            }
+            if (kf->user_reg_page && kf->user_reg_page != MAP_FAILED) {
+               orig_munmap(kf->user_reg_page, 4096);
+               kf->user_reg_page = NULL;
+            }
+            for (int g = 0; g < 16; g++) {
+               if (kf->group_user_io_pages[g] && kf->group_user_io_pages[g] != MAP_FAILED) {
+                  orig_munmap(kf->group_user_io_pages[g], 3 * 4096);
+                  kf->group_user_io_pages[g] = NULL;
+               }
+            }
+            kf->fd = -1;
+            kf->dev = 0;
+            kf->ino = 0;
+            kf->state = EMU_KFILE_UNOPENED;
+            if (fd == g_default_direct_fd)
+               g_default_direct_fd = -1;
+            /* Switch g_active_kfile to any remaining open kfile (or &g_default_kfile) */
+            g_active_kfile = &g_default_kfile;
+            for (int i = 0; i < EMU_MAX_KFILES; i++) {
+               if (g_kfiles[i] && g_kfiles[i]->state != EMU_KFILE_UNOPENED && g_kfiles[i]->refcnt > 0) {
+                  g_active_kfile = g_kfiles[i];
+                  break;
+               }
+            }
+         }
+         g_stats.active_kfile_count = count_open_kfiles_locked();
       }
-      (void)call_nested_lifted_fn_locked(
-         (prof == MALI_EMU_PROFILE_HUSKY_R54)
-            ? lifted_husky_r54p1_kbase_release
-            : lifted_r44p1_kbase_release,
-         (uint64_t)(uintptr_t)g_kfile.sim_inode,
-         (uint64_t)(uintptr_t)g_kfile.sim_filp, 0, 0, 0);
-      *(uint64_t *)(g_kfile.sim_filp + 216) = (uint64_t)(uintptr_t)g_kfile.sim_kfile_buf;
       pthread_mutex_unlock(&g_emu_lock);
    }
    return orig_close(fd);
@@ -1562,9 +1865,83 @@ int ioctl(int fd, unsigned long request, ...)
    if (_IOC_TYPE(request) == 'd' && panthor_kbase_adapter_is_virtual_drm_fd(fd))
       return panthor_kbase_adapter_ioctl(fd, request, arg);
 
+   /* Companion Android/Linux kernel UAPI shims (dma_heap, dma-buf, sync_file, ashmem) */
+   if (_IOC_TYPE(request) == 'H' && _IOC_NR(request) == 0 && arg != NULL) {
+      /* DMA_HEAP_IOCTL_ALLOC: struct dma_heap_allocation_data { u64 len; u32 fd; u32 fd_flags; u64 heap_flags; } */
+      struct {
+         uint64_t len;
+         uint32_t fd;
+         uint32_t fd_flags;
+         uint64_t heap_flags;
+      } *alloc_data = arg;
+      int dfd = memfd_create("emulated_dmabuf", MFD_CLOEXEC);
+      if (dfd < 0)
+         return -1;
+      size_t dlen = alloc_data->len ? (size_t)alloc_data->len : 4096U;
+      (void)ftruncate(dfd, (off_t)dlen);
+      if (dfd < EMU_MAX_FDS)
+         g_aux_fd_map[dfd] = EMU_AUX_FD_DMABUF;
+      alloc_data->fd = (uint32_t)dfd;
+      return 0;
+   }
+   if (_IOC_TYPE(request) == 'b') {
+      /* DMA_BUF_IOCTL_SYNC (0), SET_NAME (1), EXPORT_SYNC_FILE (2), IMPORT_SYNC_FILE (3) */
+      unsigned int bnr = _IOC_NR(request);
+      if (bnr == 2 && arg != NULL) {
+         struct { uint32_t flags; int32_t fd; } *es = arg;
+         int sfd = memfd_create("emulated_dmabuf_sync_file", MFD_CLOEXEC);
+         if (sfd >= 0 && sfd < EMU_MAX_FDS)
+            g_aux_fd_map[sfd] = EMU_AUX_FD_SYNC_FENCE;
+         es->fd = sfd;
+         return (sfd >= 0) ? 0 : -1;
+      }
+      return 0;
+   }
+   if (_IOC_TYPE(request) == '>') {
+      /* Linux sync_file UAPI: SYNC_IOC_WAIT, SYNC_IOC_MERGE (nr=3), SYNC_IOC_FILE_INFO (nr=4) */
+      unsigned int snr = _IOC_NR(request);
+      if (snr == 3 && arg != NULL) {
+         /* struct sync_merge_data { char name[32]; s32 fd2; s32 fence; u32 flags; u32 pad; } */
+         int32_t *fence_out = (int32_t *)((uint8_t *)arg + 36);
+         int ffd = memfd_create("emulated_sync_fence", MFD_CLOEXEC);
+         if (ffd >= 0 && ffd < EMU_MAX_FDS)
+            g_aux_fd_map[ffd] = EMU_AUX_FD_SYNC_FENCE;
+         *fence_out = (ffd >= 0) ? ffd : dup(fd);
+         return 0;
+      }
+      if (snr == 4 && arg != NULL) {
+         /* struct sync_file_info { char name[32]; s32 status; u32 flags; u32 num_fences; u32 pad; u64 sync_fence_info; } */
+         int32_t *status_out = (int32_t *)((uint8_t *)arg + 32);
+         uint32_t *nf_out = (uint32_t *)((uint8_t *)arg + 40);
+         *status_out = 1; /* signaled */
+         if (*nf_out > 0)
+            *nf_out = 1;
+         return 0;
+      }
+      return 0;
+   }
+   if (_IOC_TYPE(request) == 0x77) {
+      /* Android ashmem UAPI */
+      unsigned int anr = _IOC_NR(request);
+      if (anr == 3 /* ASHMEM_SET_SIZE */) {
+         (void)ftruncate(fd, (off_t)(uintptr_t)arg);
+         return 0;
+      }
+      if (anr == 4 /* ASHMEM_GET_SIZE */) {
+         struct stat st;
+         if (fstat(fd, &st) == 0)
+            return (int)st.st_size;
+         return 65536;
+      }
+      return 0;
+   }
+
    /* If caller (or adapter) is issuing KBASE_IOCTL_* on emulated /dev/mali0 */
    if (_IOC_TYPE(request) == KBASE_IOCTL_TYPE && is_emulated_mali_fd(fd)) {
       pthread_mutex_lock(&g_emu_lock);
+      struct emu_kfile *kf_cur = find_kfile_by_fd_locked(fd);
+      if (kf_cur)
+         g_active_kfile = kf_cur;
       g_stats.ioctl_count++;
       unsigned int nr = _IOC_NR(request);
       /* Route every /dev/mali0 UAPI ioctl through the lifted .ko top-level entrypoint
@@ -2191,8 +2568,15 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
    }
 
    /* Emulated /dev/mali0 mmap handling */
-   if (g_kfile.state == EMU_KFILE_KCTX_READY && is_emulated_mali_fd(fd)) {
+   if (is_emulated_mali_fd(fd)) {
       pthread_mutex_lock(&g_emu_lock);
+      struct emu_kfile *kf_mmap = find_kfile_by_fd_locked(fd);
+      if (!kf_mmap || kf_mmap->state != EMU_KFILE_KCTX_READY) {
+         pthread_mutex_unlock(&g_emu_lock);
+         errno = EINVAL;
+         return MAP_FAILED;
+      }
+      g_active_kfile = kf_mmap;
       {
          enum mali_kbase_emu_profile prof_m = resolve_active_emu_profile();
          *(uint64_t *)(g_kfile.sim_filp + 216) = (uint64_t)(uintptr_t)g_kfile.sim_kfile_buf;
@@ -2321,19 +2705,23 @@ int munmap(void *addr, size_t length)
 {
    static __thread int in_munmap = 0;
    init_orig_syscalls();
-   if (!in_munmap && g_kfile.state == EMU_KFILE_KCTX_READY) {
+   if (!in_munmap && (g_kfile.state == EMU_KFILE_KCTX_READY || count_open_kfiles_locked() > 0)) {
       in_munmap = 1;
       int r = panthor_kbase_adapter_munmap(addr, length);
       in_munmap = 0;
       return r;
    }
-   if (addr != NULL && g_kfile.state == EMU_KFILE_KCTX_READY) {
+   if (addr != NULL) {
       pthread_mutex_lock(&g_emu_lock);
-      for (size_t i = 0; i < 2048; i++) {
-         if (g_kfile.regions[i].active && g_kfile.regions[i].cpu_ptr == addr) {
-            g_kfile.regions[i].freed_by_munmap = true;
-            g_kfile.regions[i].cpu_ptr = NULL;
-            g_kfile.regions[i].active = false;
+      for (int k = -1; k < EMU_MAX_KFILES; k++) {
+         struct emu_kfile *kf = (k < 0) ? g_active_kfile : g_kfiles[k];
+         if (!kf) continue;
+         for (size_t i = 0; i < 2048; i++) {
+            if (kf->regions[i].active && kf->regions[i].cpu_ptr == addr) {
+               kf->regions[i].freed_by_munmap = true;
+               kf->regions[i].cpu_ptr = NULL;
+               kf->regions[i].active = false;
+            }
          }
       }
       pthread_mutex_unlock(&g_emu_lock);
@@ -2443,30 +2831,43 @@ int mali_kbase_emu_open_direct(const char *pathname, int flags)
 __attribute__((visibility("default")))
 int mali_kbase_emu_close_direct(int fd)
 {
+   if (fd < 0)
+      return -1;
    pthread_mutex_lock(&g_emu_lock);
-   if (fd == g_kfile.fd && g_kfile.fd > 0) {
-      init_orig_syscalls();
-      orig_close(g_kfile.fd);
-      g_kfile.fd = -1;
-      g_kfile.state = EMU_KFILE_UNOPENED;
-   }
+   struct emu_kfile *kf = find_kfile_by_fd_locked(fd);
    pthread_mutex_unlock(&g_emu_lock);
+   if (kf)
+      return close(fd);
    return 0;
 }
 
 __attribute__((visibility("default")))
 int mali_kbase_emu_ioctl_direct(int fd, unsigned long request, void *arg)
 {
-   pthread_mutex_lock(&g_emu_lock);
-   if (g_kfile.state == EMU_KFILE_UNOPENED) {
-      pthread_mutex_unlock(&g_emu_lock);
-      (void)mali_kbase_emu_open_direct("/dev/mali0", O_RDWR | O_CLOEXEC);
-      pthread_mutex_lock(&g_emu_lock);
+   if (_IOC_TYPE(request) != KBASE_IOCTL_TYPE) {
+      return ioctl(fd, request, arg);
    }
-   int eff_fd = g_kfile.fd;
-   (void)fd;
+   pthread_mutex_lock(&g_emu_lock);
+   struct emu_kfile *kf = find_kfile_by_fd_locked(fd);
+   int eff_fd = fd;
+   if (!kf) {
+      if (g_default_direct_fd < 0 || !find_kfile_by_fd_locked(g_default_direct_fd)) {
+         pthread_mutex_unlock(&g_emu_lock);
+         g_default_direct_fd = mali_kbase_emu_open_direct("/dev/mali0", O_RDWR | O_CLOEXEC);
+         pthread_mutex_lock(&g_emu_lock);
+      }
+      eff_fd = g_default_direct_fd;
+      kf = find_kfile_by_fd_locked(eff_fd);
+      if (kf && fd >= 0 && fd < EMU_MAX_FDS && g_fd_map[fd] == NULL) {
+         g_fd_map[fd] = kf;
+         kf->refcnt++;
+         eff_fd = fd;
+      }
+   }
+   if (kf)
+      g_active_kfile = kf;
    uint16_t req_ver_minor = 0;
-   if (_IOC_TYPE(request) == KBASE_IOCTL_TYPE) {
+   if (_IOC_TYPE(request) == KBASE_IOCTL_TYPE && kf) {
       unsigned int nr = _IOC_NR(request);
       if (nr == 52) {
          if (arg) {
@@ -2507,16 +2908,28 @@ __attribute__((visibility("default")))
 void *mali_kbase_emu_mmap_direct(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 {
    pthread_mutex_lock(&g_emu_lock);
-   if (g_kfile.state == EMU_KFILE_UNOPENED) {
+   struct emu_kfile *kf = find_kfile_by_fd_locked(fd);
+   int eff_fd = fd;
+   if (!kf && fd >= 0 && fd < EMU_MAX_FDS && g_aux_fd_map[fd] != EMU_AUX_FD_NONE) {
       pthread_mutex_unlock(&g_emu_lock);
-      (void)mali_kbase_emu_open_direct("/dev/mali0", O_RDWR | O_CLOEXEC);
-      pthread_mutex_lock(&g_emu_lock);
+      return orig_mmap(addr, length, prot, flags, fd, offset);
    }
-   g_kfile.state = EMU_KFILE_KCTX_READY;
-   g_kfile.exec_va_initialized = true;
-   g_kfile.jit_initialized = true;
-   int eff_fd = g_kfile.fd;
-   (void)fd;
+   if (!kf) {
+      if (g_default_direct_fd < 0 || !find_kfile_by_fd_locked(g_default_direct_fd)) {
+         pthread_mutex_unlock(&g_emu_lock);
+         g_default_direct_fd = mali_kbase_emu_open_direct("/dev/mali0", O_RDWR | O_CLOEXEC);
+         pthread_mutex_lock(&g_emu_lock);
+      }
+      eff_fd = g_default_direct_fd;
+      kf = find_kfile_by_fd_locked(eff_fd);
+   }
+   if (kf) {
+      g_active_kfile = kf;
+      g_kfile.state = EMU_KFILE_KCTX_READY;
+      g_kfile.exec_va_initialized = true;
+      g_kfile.jit_initialized = true;
+      eff_fd = kf->fd;
+   }
    pthread_mutex_unlock(&g_emu_lock);
    return mmap(addr, length, prot, flags, eff_fd, offset);
 }

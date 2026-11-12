@@ -467,7 +467,11 @@ __attribute__((visibility("default")))
 int32_t vkInvalidateMappedMemoryRanges(void* /*device*/, uint32_t /*memoryRangeCount*/, const void* /*pMemoryRanges*/) { return 0; }
 
 __attribute__((visibility("default")))
-int32_t vkGetFenceStatus(void* /*device*/, uint64_t fence) {
+int32_t vkGetFenceStatus(void* device, uint64_t fence) {
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && dev->aot_cctx_mem.size() > 0xc1 && dev->aot_cctx_mem[0xc1] != 0) {
+        return -4; /* VK_ERROR_DEVICE_LOST (checked at 0x00964fd0 in libGLES_mali.so) */
+    }
     if (fence && fence != 0xFE000001ULL) {
         return reinterpret_cast<MaliIcdFence*>(fence)->signaled ? 0 : 1 /* VK_NOT_READY */;
     }
@@ -702,12 +706,13 @@ int32_t vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const void* 
             aot_kbase_mem_import(&cpu);
         }
         if (w_gpu_va == 0) {
+            int32_t mfd = (dev && dev->mali_fd >= 0) ? dev->mali_fd : 100;
             KbaseIoctlMemImport imp{};
             imp.in.flags = umm_flags;
             imp.in.phandle = reinterpret_cast<uint64_t>(&dmabuf_fd);
             imp.in.type = BASE_MEM_IMPORT_TYPE_UMM;
-            bionic_mali_kbase_ioctl_stub(100, 0xc0188016U, reinterpret_cast<uint64_t>(&imp));
-            w_gpu_va = bionic_mali_mmap_stub(0, imp.out.va_pages * 4096ULL, PROT_READ | PROT_WRITE, MAP_SHARED, 100, imp.out.gpu_va);
+            bionic_mali_kbase_ioctl_stub(static_cast<uint64_t>(mfd), 0xc0188016U, reinterpret_cast<uint64_t>(&imp));
+            w_gpu_va = bionic_mali_mmap_stub(0, imp.out.va_pages * 4096ULL, PROT_READ | PROT_WRITE, MAP_SHARED, static_cast<uint64_t>(mfd), imp.out.gpu_va);
         }
 
         auto* img = new MaliIcdImage();
@@ -980,29 +985,95 @@ void vkCmdExecuteCommands(void* commandBuffer, uint32_t commandBufferCount, void
 __attribute__((visibility("default")))
 void vkCmdNextSubpass(void* /*commandBuffer*/, uint32_t /*contents*/) {}
 __attribute__((visibility("default")))
-int32_t vkCreateEvent(void* /*device*/, const void* /*pCreateInfo*/, const void* /*pAllocator*/, uint64_t* pEvent) {
+int32_t vkCreateEvent(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pEvent) {
     if (!pEvent) return -3;
+    g_host_vk_allocators.registerCallbacks(pAllocator);
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    struct DefEventCI { uint32_t sType; const void* pNext; uint32_t flags; } def_ci = { 10U, nullptr, 0U };
+    const void* ci_ptr = pCreateInfo ? pCreateInfo : &def_ci;
+    if (dev && aot_vkCreateEvent && !dev->aot_vk_device_mem.empty()) {
+        uint64_t aot_ev = 0;
+        int32_t res = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+            res = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+                g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkCreateEvent,
+                dev->aot_vk_device_mem.data(), ci_ptr, pAllocator, &aot_ev);
+            g_aot_rt.lifted_vk_calls_executed++;
+        }
+        if (res == 0 && aot_ev != 0) {
+            *pEvent = aot_ev;
+            return 0;
+        }
+        if (res != 0) return res;
+    }
     *pEvent = reinterpret_cast<uint64_t>(new MaliIcdEvent());
     return 0;
 }
 __attribute__((visibility("default")))
-void vkDestroyEvent(void* /*device*/, uint64_t event, const void* /*pAllocator*/) {
-    if (event && event != 0xE7000001ULL) delete reinterpret_cast<MaliIcdEvent*>(event);
+void vkDestroyEvent(void* device, uint64_t event, const void* pAllocator) {
+    if (!event || event == 0xE7000001ULL) return;
+    g_host_vk_allocators.registerCallbacks(pAllocator);
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && aot_vkDestroyEvent && !dev->aot_vk_device_mem.empty() &&
+        (*reinterpret_cast<const uint8_t*>(event) == 0x0aU)) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkDestroyEvent,
+            dev->aot_vk_device_mem.data(), event, pAllocator);
+        g_aot_rt.lifted_vk_calls_executed++;
+        return;
+    }
+    delete reinterpret_cast<MaliIcdEvent*>(event);
 }
 __attribute__((visibility("default")))
-int32_t vkGetEventStatus(void* /*device*/, uint64_t event) {
-    if (event && event != 0xE7000001ULL)
-        return reinterpret_cast<MaliIcdEvent*>(event)->signaled ? 3 /* VK_EVENT_SET */ : 4 /* VK_EVENT_RESET */;
+int32_t vkGetEventStatus(void* device, uint64_t event) {
+    if (!event || event == 0xE7000001ULL) return 0;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && aot_vkGetEventStatus && !dev->aot_vk_device_mem.empty() &&
+        (*reinterpret_cast<const uint8_t*>(event) == 0x0aU)) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        int32_t res = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkGetEventStatus,
+            dev->aot_vk_device_mem.data(), event);
+        g_aot_rt.lifted_vk_calls_executed++;
+        return res;
+    }
+    if (dev && dev->aot_cctx_mem.size() > 0xc1 && dev->aot_cctx_mem[0xc1] != 0) {
+        return -4; /* VK_ERROR_DEVICE_LOST */
+    }
+    return reinterpret_cast<MaliIcdEvent*>(event)->signaled ? 3 /* VK_EVENT_SET */ : 4 /* VK_EVENT_RESET */;
+}
+__attribute__((visibility("default")))
+int32_t vkSetEvent(void* device, uint64_t event) {
+    if (!event || event == 0xE7000001ULL) return 0;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && aot_vkSetEvent && !dev->aot_vk_device_mem.empty() &&
+        (*reinterpret_cast<const uint8_t*>(event) == 0x0aU)) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        int32_t res = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkSetEvent,
+            dev->aot_vk_device_mem.data(), event);
+        g_aot_rt.lifted_vk_calls_executed++;
+        return res;
+    }
+    reinterpret_cast<MaliIcdEvent*>(event)->signaled = true;
     return 0;
 }
 __attribute__((visibility("default")))
-int32_t vkSetEvent(void* /*device*/, uint64_t event) {
-    if (event && event != 0xE7000001ULL) reinterpret_cast<MaliIcdEvent*>(event)->signaled = true;
-    return 0;
-}
-__attribute__((visibility("default")))
-int32_t vkResetEvent(void* /*device*/, uint64_t event) {
-    if (event && event != 0xE7000001ULL) reinterpret_cast<MaliIcdEvent*>(event)->signaled = false;
+int32_t vkResetEvent(void* device, uint64_t event) {
+    if (!event || event == 0xE7000001ULL) return 0;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && aot_vkResetEvent && !dev->aot_vk_device_mem.empty() &&
+        (*reinterpret_cast<const uint8_t*>(event) == 0x0aU)) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        int32_t res = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkResetEvent,
+            dev->aot_vk_device_mem.data(), event);
+        g_aot_rt.lifted_vk_calls_executed++;
+        return res;
+    }
+    reinterpret_cast<MaliIcdEvent*>(event)->signaled = false;
     return 0;
 }
 __attribute__((visibility("default")))

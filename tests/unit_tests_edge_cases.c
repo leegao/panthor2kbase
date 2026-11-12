@@ -2320,6 +2320,372 @@ static void test_v32_full_r54p3_icd_deshimming_and_real_draw_pipeline(void)
    printf("  -> PASS: Full r54p3 ICD de-shimming, real sync/layout structs, SPIR-V OpConstantComposite VBO/IBO draw & vkCmdBlitImage verified! (center=0x%08x)\n", center_dst);
 }
 
+
+struct v33_alloc_tracker {
+   uint32_t alloc_calls;
+   uint32_t free_calls;
+   size_t   last_alloc_size;
+};
+
+static void *v33_custom_vk_alloc(void *pUserData, size_t size, size_t alignment, uint32_t scope)
+{
+   (void)scope;
+   struct v33_alloc_tracker *tr = (struct v33_alloc_tracker *)pUserData;
+   if (tr) {
+      tr->alloc_calls++;
+      tr->last_alloc_size = size;
+   }
+   size_t align = alignment >= sizeof(void *) ? alignment : sizeof(void *);
+   void *p = NULL;
+   if (posix_memalign(&p, align, size >= 16 ? size : 16) == 0 && p) {
+      memset(p, 0, size >= 16 ? size : 16);
+   }
+   return p;
+}
+
+static void *v33_custom_vk_realloc(void *pUserData, void *pOriginal, size_t size, size_t alignment, uint32_t scope)
+{
+   (void)pUserData;
+   (void)alignment;
+   (void)scope;
+   return realloc(pOriginal, size);
+}
+
+static void v33_custom_vk_free(void *pUserData, void *pMemory)
+{
+   struct v33_alloc_tracker *tr = (struct v33_alloc_tracker *)pUserData;
+   if (tr) {
+      tr->free_calls++;
+   }
+   free(pMemory);
+}
+
+static void test_v33_multi_fd_mali0_isolation_and_full_r54p3_icd(void)
+{
+   printf("[TEST 23] Verifying Checkpoint v33 Multi-FD /dev/mali0 Context Isolation & Full Lifted libGLES_mali.so (r54p3) ICD + Quirks...\n");
+
+   /* Part 1: Multi-FD /dev/mali0 isolation, dup/fcntl refcounting, and per-context state machines */
+   uint32_t base_open_cnt = mali_kbase_emu_get_open_fd_count();
+   int fd1 = open("/dev/mali0", O_RDWR | O_CLOEXEC);
+   int fd2 = open("/dev/mali0", O_RDWR | O_CLOEXEC);
+   int fd3 = open("/dev/mali0", O_RDWR | O_CLOEXEC);
+   assert(fd1 >= 0 && fd2 >= 0 && fd3 >= 0);
+   assert(fd1 != fd2 && fd2 != fd3 && fd1 != fd3);
+   assert(mali_kbase_emu_get_open_fd_count() == base_open_cnt + 3U);
+
+   /* Initialize fd1 and fd2 independently while leaving fd3 uninitialized */
+   struct kbase_ioctl_version_check v1 = { 11, 21 }, v2 = { 11, 21 };
+   assert(ioctl(fd1, KBASE_IOCTL_VERSION_CHECK, &v1) == 0);
+   assert(ioctl(fd2, KBASE_IOCTL_VERSION_CHECK, &v2) == 0);
+   struct kbase_ioctl_set_flags sf1 = { 0 }, sf2 = { 0 };
+   assert(ioctl(fd1, KBASE_IOCTL_SET_FLAGS, &sf1) == 0);
+   assert(ioctl(fd2, KBASE_IOCTL_SET_FLAGS, &sf2) == 0);
+
+   /* Verify fd3 rejects MEM_ALLOC because fd3 has not run VERSION_CHECK + SET_FLAGS */
+   union kbase_ioctl_mem_alloc bad_alloc;
+   memset(&bad_alloc, 0, sizeof(bad_alloc));
+   bad_alloc.in.va_pages = 1;
+   bad_alloc.in.commit_pages = 1;
+   bad_alloc.in.flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR | BASE_MEM_SAME_VA;
+   assert(ioctl(fd3, KBASE_IOCTL_MEM_ALLOC, &bad_alloc) == -1 && errno == EPERM);
+
+   /* Allocate a SAME_VA BO on fd1 and another on fd2; both start at cookie 0x2000 within their own isolated kfile */
+   union kbase_ioctl_mem_alloc a1 = bad_alloc, a2 = bad_alloc;
+   assert(ioctl(fd1, KBASE_IOCTL_MEM_ALLOC, &a1) == 0);
+   assert(ioctl(fd2, KBASE_IOCTL_MEM_ALLOC, &a2) == 0);
+   uint32_t *map1 = (uint32_t *)mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd1, (off_t)a1.out.gpu_va);
+   uint32_t *map2 = (uint32_t *)mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd2, (off_t)a2.out.gpu_va);
+   assert(map1 != MAP_FAILED && map2 != MAP_FAILED && map1 != map2);
+   map1[0] = 0x1111AAAAU;
+   map2[0] = 0x2222BBBBU;
+   assert(map1[0] == 0x1111AAAAU && map2[0] == 0x2222BBBBU);
+
+   /* Duplicate fd1 via dup() and fcntl(F_DUPFD_CLOEXEC), then close original fd1 */
+   int fd1_dup = dup(fd1);
+   int fd1_fcntl = fcntl(fd1, F_DUPFD_CLOEXEC, 0);
+   assert(fd1_dup >= 0 && fd1_fcntl >= 0);
+   assert(close(fd1) == 0);
+   /* Context 1 must still be alive via fd1_dup and fd1_fcntl! */
+   assert(mali_kbase_emu_get_open_fd_count() == base_open_cnt + 3U);
+
+   union kbase_ioctl_mem_query mq1;
+   memset(&mq1, 0, sizeof(mq1));
+   mq1.in.gpu_addr = (uintptr_t)map1;
+   mq1.in.query = KBASE_MEM_QUERY_COMMIT_SIZE;
+   assert(ioctl(fd1_dup, KBASE_IOCTL_MEM_QUERY, &mq1) == 0 && mq1.out.value == 1ULL);
+   /* Querying map1 VA on fd2 must fail with EINVAL because map1 belongs to fd1_dup, not fd2! */
+   union kbase_ioctl_mem_query mq_cross = mq1;
+   assert(ioctl(fd2, KBASE_IOCTL_MEM_QUERY, &mq_cross) == -1 && errno == EINVAL);
+
+   assert(close(fd1_dup) == 0);
+   assert(close(fd1_fcntl) == 0);
+   assert(mali_kbase_emu_get_open_fd_count() == base_open_cnt + 2U);
+   assert(close(fd2) == 0);
+   assert(close(fd3) == 0);
+   assert(mali_kbase_emu_get_open_fd_count() == base_open_cnt);
+
+   /* Part 2: Load libr54p3_vulkan_icd.so and verify multi-VkDevice /dev/mali0 isolation + lifted entrypoints & quirks */
+   const char *icd_paths[] = {
+      "./build-x86-64/aot/libr54p3_vulkan_icd.so",
+      "../aot/libr54p3_vulkan_icd.so",
+      "aot/libr54p3_vulkan_icd.so"
+   };
+   void *icd_h = NULL;
+   for (size_t i = 0; i < sizeof(icd_paths) / sizeof(icd_paths[0]); i++) {
+      icd_h = dlopen(icd_paths[i], RTLD_NOW | RTLD_LOCAL);
+      if (icd_h) break;
+   }
+   assert(icd_h != NULL);
+
+   typedef uint64_t (*pfn_get_cnt)(void);
+   typedef uint64_t (*pfn_lookup_rva)(const char *);
+   typedef int32_t  (*pfn_get_dev_fd)(void *);
+   typedef void     (*pfn_set_dev_lost)(void *, uint8_t);
+   typedef uint8_t  (*pfn_get_dev_lost)(void *);
+   typedef uint32_t (*pfn_get_lifted_calls)(void);
+
+   pfn_get_cnt get_cnt = (pfn_get_cnt)dlsym(icd_h, "r54p3_icd_get_lifted_entrypoint_count");
+   pfn_lookup_rva lookup_rva = (pfn_lookup_rva)dlsym(icd_h, "r54p3_icd_lookup_dispatch_rva");
+   pfn_get_dev_fd get_dev_fd = (pfn_get_dev_fd)dlsym(icd_h, "r54p3_icd_get_device_mali_fd");
+   pfn_set_dev_lost set_dev_lost = (pfn_set_dev_lost)dlsym(icd_h, "r54p3_icd_set_device_lost");
+   pfn_get_dev_lost get_dev_lost = (pfn_get_dev_lost)dlsym(icd_h, "r54p3_icd_get_device_lost");
+   pfn_get_lifted_calls get_lifted_calls = (pfn_get_lifted_calls)dlsym(icd_h, "r54p3_icd_get_lifted_vk_calls_executed");
+   assert(get_cnt && lookup_rva && get_dev_fd && set_dev_lost && get_dev_lost && get_lifted_calls);
+   assert(get_cnt() == 456ULL);
+   assert(lookup_rva("vkCreateBuffer") == 0x009392f0ULL);
+   assert(lookup_rva("vkDestroyBuffer") == 0x00939560ULL);
+   assert(lookup_rva("vkGetBufferMemoryRequirements") == 0x00939670ULL);
+   assert(lookup_rva("vkGetBufferDeviceAddress") == 0x009398c0ULL);
+   assert(lookup_rva("vkCreateEvent") == 0x009649c0ULL);
+   assert(lookup_rva("vkDestroyEvent") == 0x00964b30ULL);
+   assert(lookup_rva("vkGetEventStatus") == 0x00964bc0ULL);
+   assert(lookup_rva("vkSetEvent") == 0x00964d10ULL);
+   assert(lookup_rva("vkResetEvent") == 0x00964d40ULL);
+
+   typedef void *(*pfn_gipa)(void *, const char *);
+   typedef void *(*pfn_gdpa)(void *, const char *);
+   pfn_gipa gipa = (pfn_gipa)dlsym(icd_h, "vk_icdGetInstanceProcAddr");
+   pfn_gdpa gdpa = (pfn_gdpa)dlsym(icd_h, "vkGetDeviceProcAddr");
+   assert(gipa && gdpa);
+
+   typedef int32_t (*pfn_create_inst)(const void *, const void *, void **);
+   typedef int32_t (*pfn_enum_pd)(void *, uint32_t *, void **);
+   typedef int32_t (*pfn_create_dev)(void *, const void *, const void *, void **);
+   typedef void    (*pfn_get_queue)(void *, uint32_t, uint32_t, void **);
+   typedef void    (*pfn_destroy_dev)(void *, const void *);
+   typedef void    (*pfn_destroy_inst)(void *, const void *);
+
+   pfn_create_inst create_inst = (pfn_create_inst)gipa(NULL, "vkCreateInstance");
+   pfn_enum_pd enum_pd = (pfn_enum_pd)gipa(NULL, "vkEnumeratePhysicalDevices");
+   pfn_create_dev create_dev = (pfn_create_dev)gipa(NULL, "vkCreateDevice");
+   pfn_get_queue get_queue = (pfn_get_queue)gdpa(NULL, "vkGetDeviceQueue");
+   pfn_destroy_dev destroy_dev = (pfn_destroy_dev)gdpa(NULL, "vkDestroyDevice");
+   pfn_destroy_inst destroy_inst = (pfn_destroy_inst)gipa(NULL, "vkDestroyInstance");
+
+   struct { uint32_t sType; const void *pNext; uint32_t flags; const void *pApp; uint32_t lCnt; const void *pL; uint32_t eCnt; const void *pE; } ici = { 1U, NULL, 0, NULL, 0, NULL, 0, NULL };
+   void *inst = NULL;
+   assert(create_inst(&ici, NULL, &inst) == 0 && inst != NULL);
+   uint32_t pd_cnt = 1;
+   void *pdev = NULL;
+   assert(enum_pd(inst, &pd_cnt, &pdev) == 0 && pdev != NULL);
+
+   /* Create two concurrent VkDevices (devA and devB) and verify each owns a distinct /dev/mali0 FD */
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t qciCnt; const void *pQci; uint32_t lCnt; const void *pL; uint32_t eCnt; const void *pE; const void *pFeat; } dci = { 3U, NULL, 0, 0, NULL, 0, NULL, 0, NULL, NULL };
+   void *devA = NULL, *devB = NULL;
+   assert(create_dev(pdev, &dci, NULL, &devA) == 0 && devA != NULL);
+   assert(create_dev(pdev, &dci, NULL, &devB) == 0 && devB != NULL);
+   int32_t mali_fd_A = get_dev_fd(devA);
+   int32_t mali_fd_B = get_dev_fd(devB);
+   assert(mali_fd_A >= 0 && mali_fd_B >= 0 && mali_fd_A != mali_fd_B);
+   assert(mali_kbase_emu_get_open_fd_count() >= 2U);
+
+   void *qA = NULL, *qB = NULL;
+   get_queue(devA, 0, 0, &qA);
+   get_queue(devB, 0, 0, &qB);
+   assert(qA != NULL && qB != NULL && qA != qB);
+
+   typedef int32_t (*pfn_create_obj)(void *, const void *, const void *, uint64_t *);
+   typedef void    (*pfn_destroy_obj)(void *, uint64_t, const void *);
+   typedef void    (*pfn_get_buf_reqs)(void *, uint64_t, void *);
+   typedef int32_t (*pfn_alloc_mem)(void *, const void *, const void *, uint64_t *);
+   typedef void    (*pfn_free_mem)(void *, uint64_t, const void *);
+   typedef int32_t (*pfn_bind_buf)(void *, uint64_t, uint64_t, uint64_t);
+   typedef uint64_t (*pfn_get_bda)(void *, const void *);
+   typedef int32_t (*pfn_ev_op)(void *, uint64_t);
+
+   pfn_create_obj create_buf = (pfn_create_obj)gdpa(devA, "vkCreateBuffer");
+   pfn_destroy_obj destroy_buf = (pfn_destroy_obj)gdpa(devA, "vkDestroyBuffer");
+   pfn_get_buf_reqs get_buf_reqs = (pfn_get_buf_reqs)gdpa(devA, "vkGetBufferMemoryRequirements");
+   pfn_alloc_mem alloc_mem = (pfn_alloc_mem)gdpa(devA, "vkAllocateMemory");
+   pfn_free_mem free_mem = (pfn_free_mem)gdpa(devA, "vkFreeMemory");
+   pfn_bind_buf bind_buf = (pfn_bind_buf)gdpa(devA, "vkBindBufferMemory");
+   pfn_get_bda get_bda = (pfn_get_bda)gdpa(devA, "vkGetBufferDeviceAddress");
+   pfn_create_obj create_dsl = (pfn_create_obj)gdpa(devA, "vkCreateDescriptorSetLayout");
+   pfn_destroy_obj destroy_dsl = (pfn_destroy_obj)gdpa(devA, "vkDestroyDescriptorSetLayout");
+   pfn_create_obj create_pl = (pfn_create_obj)gdpa(devA, "vkCreatePipelineLayout");
+   pfn_destroy_obj destroy_pl = (pfn_destroy_obj)gdpa(devA, "vkDestroyPipelineLayout");
+   pfn_create_obj create_ev = (pfn_create_obj)gdpa(devA, "vkCreateEvent");
+   pfn_destroy_obj destroy_ev = (pfn_destroy_obj)gdpa(devA, "vkDestroyEvent");
+   pfn_ev_op get_ev_status = (pfn_ev_op)gdpa(devA, "vkGetEventStatus");
+   pfn_ev_op set_ev = (pfn_ev_op)gdpa(devA, "vkSetEvent");
+   pfn_ev_op reset_ev = (pfn_ev_op)gdpa(devA, "vkResetEvent");
+   pfn_create_obj create_fence = (pfn_create_obj)gdpa(devA, "vkCreateFence");
+   pfn_destroy_obj destroy_fence = (pfn_destroy_obj)gdpa(devA, "vkDestroyFence");
+   pfn_ev_op get_fence_status = (pfn_ev_op)gdpa(devA, "vkGetFenceStatus");
+
+   /* Quirk 1: aot_vkCreateBuffer (0x009392f0 -> 0x00939440) returns VK_ERROR_INVALID_EXTERNAL_HANDLE (-1000072003)
+    * when VkExternalMemoryBufferCreateInfo (sType=1000072000 = 0x3b9be340) is in pNext with handleTypes outside 0x0680
+    * (e.g. VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT = 0x1)! */
+   struct { uint32_t sType; const void *pNext; uint32_t handleTypes; uint32_t pad; } ext_mem_ci = {
+      1000072000U /* VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO (0x3b9be340) */, NULL,
+      0x1U /* VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT (rejected by tst w8, #-0x681 at 0x0093947c) */, 0U
+   };
+   struct {
+      uint32_t sType; const void *pNext; uint32_t flags; uint64_t size;
+      uint32_t usage; uint32_t sharingMode; uint32_t qfiCnt; const uint32_t *pQfi;
+   } bad_bci = {
+      12U, &ext_mem_ci, 0U, 8192ULL, 0x80U, 0U, 0U, NULL
+   };
+   uint64_t bad_buf = 0;
+   int32_t bad_buf_rc = create_buf(devA, &bad_bci, NULL, &bad_buf);
+   assert(bad_buf_rc == -1000072003 /* VK_ERROR_INVALID_EXTERNAL_HANDLE (0xc4641cbd) */);
+
+   /* Quirk 2: Custom VkAllocationCallbacks honored by vkCreateBuffer/vkDestroyBuffer (0x009392f0/0x00939560)
+    * and vkCreateEvent/vkDestroyEvent (0x009649c0/0x00964b30) via 0x00962970, vs ignored by reference-counted
+    * vkCreateDescriptorSetLayout (0x0095e1f0) and vkCreatePipelineLayout (0x00981a20) */
+   struct v33_alloc_tracker tracker = { 0, 0, 0 };
+   struct {
+      void *pUserData;
+      void *(*pfnAllocation)(void *, size_t, size_t, uint32_t);
+      void *(*pfnReallocation)(void *, void *, size_t, size_t, uint32_t);
+      void  (*pfnFree)(void *, void *);
+      void *pfnInternalAllocation;
+      void *pfnInternalFree;
+   } custom_alloc = {
+      &tracker, v33_custom_vk_alloc, v33_custom_vk_realloc, v33_custom_vk_free, NULL, NULL
+   };
+
+   struct {
+      uint32_t sType; const void *pNext; uint32_t flags; uint64_t size;
+      uint32_t usage; uint32_t sharingMode; uint32_t qfiCnt; const uint32_t *pQfi;
+   } good_bci = { 12U, NULL, 0U, 12288ULL, 0x00020080U /* SHADER_DEVICE_ADDRESS | STORAGE_BUFFER */, 0U, 0U, NULL };
+   uint64_t bufA = 0;
+   assert(create_buf(devA, &good_bci, &custom_alloc, &bufA) == 0 && bufA != 0);
+   /* aot_vkCreateBuffer (0x009392f0) allocates exactly 0x48 (72) bytes via custom_alloc! */
+   assert(tracker.alloc_calls == 1U && tracker.last_alloc_size == 0x48ULL);
+
+   struct { uint64_t size; uint64_t alignment; uint32_t memoryTypeBits; uint32_t pad; } breqs = { 0, 0, 0, 0 };
+   get_buf_reqs(devA, bufA, &breqs);
+   assert(breqs.size == 12288ULL && breqs.alignment == 4096ULL && breqs.memoryTypeBits == 0x03U);
+
+   struct { uint32_t sType; const void *pNext; uint64_t allocSize; uint32_t memTypeIdx; } mai = { 5U, NULL, breqs.size, 0U };
+   uint64_t memA = 0;
+   assert(alloc_mem(devA, &mai, NULL, &memA) == 0 && memA != 0);
+   assert(bind_buf(devA, bufA, memA, 0ULL) == 0);
+
+   struct { uint32_t sType; const void *pNext; uint64_t buffer; } bda_info = { 1000244001U, NULL, bufA };
+   uint64_t bda_va = get_bda(devA, &bda_info);
+   assert(bda_va != 0ULL);
+
+   destroy_buf(devA, bufA, &custom_alloc);
+   assert(tracker.free_calls == 1U);
+   free_mem(devA, memA, NULL);
+
+   /* Verify reference-counted DescriptorSetLayout and PipelineLayout ignore call-site pAllocator */
+   uint32_t prev_allocs = tracker.alloc_calls, prev_frees = tracker.free_calls;
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t count; const void *pB; } dsl_ci = { 32U, NULL, 0U, 0U, NULL };
+   uint64_t dsl = 0;
+   assert(create_dsl(devA, &dsl_ci, &custom_alloc, &dsl) == 0 && dsl != 0);
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t setCnt; const uint64_t *pSets; uint32_t pcCnt; const void *pPc; } pl_ci = {
+      30U, NULL, 0U, 1U, &dsl, 0U, NULL
+   };
+   uint64_t pl = 0;
+   assert(create_pl(devA, &pl_ci, &custom_alloc, &pl) == 0 && pl != 0);
+   destroy_pl(devA, pl, &custom_alloc);
+   destroy_dsl(devA, dsl, &custom_alloc);
+   assert(tracker.alloc_calls == prev_allocs && tracker.free_calls == prev_frees);
+
+   /* Part 3: Lifted CQS Event (0x009649c0 -> 0x01c6c480 KBASE_IOCTL_CS_EVENT_SIGNAL) & Quirk 3 (cctx+0xc1 VK_ERROR_DEVICE_LOST) */
+   struct { uint32_t sType; const void *pNext; uint32_t flags; } ev_ci = { 10U, NULL, 0U };
+   uint64_t evA = 0, evB = 0;
+   assert(create_ev(devA, &ev_ci, &custom_alloc, &evA) == 0 && evA != 0);
+   /* aot_vkCreateEvent (0x009649c0) allocates 0x38 (56) bytes via custom_alloc! */
+   assert(tracker.alloc_calls == prev_allocs + 1U && tracker.last_alloc_size == 0x38ULL);
+   assert(create_ev(devB, &ev_ci, NULL, &evB) == 0 && evB != 0);
+
+   assert(get_ev_status(devA, evA) == 4 /* VK_EVENT_RESET */);
+   struct kbase_emu_stats st_before, st_after;
+   mali_kbase_emu_get_stats(&st_before);
+   assert(set_ev(devA, evA) == 0);
+   mali_kbase_emu_get_stats(&st_after);
+   /* aot_vkSetEvent (0x00964d10 -> 0x01c6c480) issues KBASE_IOCTL_CS_EVENT_SIGNAL (0x802c) to /dev/mali0! */
+   assert(st_after.ioctl_count > st_before.ioctl_count);
+   assert(get_ev_status(devA, evA) == 3 /* VK_EVENT_SET */);
+   assert(reset_ev(devA, evA) == 0);
+   assert(get_ev_status(devA, evA) == 4 /* VK_EVENT_RESET */);
+
+   assert(set_ev(devB, evB) == 0 && get_ev_status(devB, evB) == 3 /* VK_EVENT_SET */);
+
+   /* Trigger Quirk 3: Set cctx->device_lost (+0xc1) on devA; verify devA returns VK_ERROR_DEVICE_LOST (-4)
+    * while devB remains completely unaffected on its isolated context! */
+   struct { uint32_t sType; const void *pNext; uint32_t flags; } f_ci = { 8U, NULL, 1U };
+   uint64_t fenceA = 0;
+   assert(create_fence(devA, &f_ci, NULL, &fenceA) == 0 && fenceA != 0);
+   assert(get_fence_status(devA, fenceA) == 0 /* VK_SUCCESS */);
+
+   set_dev_lost(devA, 1U);
+   assert(get_dev_lost(devA) == 1U && get_dev_lost(devB) == 0U);
+   assert(get_ev_status(devA, evA) == -4 /* VK_ERROR_DEVICE_LOST */);
+   assert(get_fence_status(devA, fenceA) == -4 /* VK_ERROR_DEVICE_LOST */);
+   assert(get_ev_status(devB, evB) == 3 /* VK_EVENT_SET on devB! */);
+
+   set_dev_lost(devA, 0U);
+   assert(get_ev_status(devA, evA) == 4 /* VK_EVENT_RESET restored */);
+   assert(get_fence_status(devA, fenceA) == 0 /* VK_SUCCESS restored */);
+
+   destroy_fence(devA, fenceA, NULL);
+   destroy_ev(devA, evA, &custom_alloc);
+   assert(tracker.free_calls == prev_frees + 1U);
+   destroy_ev(devB, evB, NULL);
+
+   uint32_t total_lifted_calls = get_lifted_calls();
+   assert(total_lifted_calls >= 15U);
+
+   destroy_dev(devA, NULL);
+   destroy_dev(devB, NULL);
+   destroy_inst(inst, NULL);
+   dlclose(icd_h);
+
+   /* Part 4: Verify companion kernel UAPI shims (/dev/dma_heap/system, dma-buf sync/export_sync_file, sync_file, /dev/ashmem, /dev/mali0..63) */
+   assert(access("/dev/mali0", F_OK) == 0);
+   assert(access("/dev/mali1", F_OK) == -1);
+   int heap_fd = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
+   assert(heap_fd >= 0);
+   struct { uint64_t len; uint32_t fd; uint32_t fd_flags; uint64_t heap_flags; } heap_alloc = { 16384ULL, 0U, (uint32_t)O_CLOEXEC, 0ULL };
+   assert(ioctl(heap_fd, 0xc0184800UL /* DMA_HEAP_IOCTL_ALLOC */, &heap_alloc) == 0 && (int)heap_alloc.fd >= 0);
+   int dmabuf_fd = (int)heap_alloc.fd;
+   uint64_t db_sync_flags = 1ULL;
+   assert(ioctl(dmabuf_fd, 0x40086200UL /* DMA_BUF_IOCTL_SYNC */, &db_sync_flags) == 0);
+   struct { uint32_t flags; int32_t fd; } exp_sync = { 1U, -1 };
+   assert(ioctl(dmabuf_fd, 0xc0086202UL /* DMA_BUF_IOCTL_EXPORT_SYNC_FILE */, &exp_sync) == 0 && exp_sync.fd >= 0);
+   int32_t sync_timeout = 0;
+   assert(ioctl(exp_sync.fd, 0x40043e00UL /* SYNC_IOC_WAIT */, &sync_timeout) == 0);
+   struct { char name[32]; int32_t status; uint32_t flags; uint32_t num_fences; uint32_t pad; uint64_t sync_fence_info; } sf_info;
+   memset(&sf_info, 0, sizeof(sf_info));
+   assert(ioctl(exp_sync.fd, 0xc0383e04UL /* SYNC_IOC_FILE_INFO */, &sf_info) == 0 && sf_info.status == 1);
+   close(exp_sync.fd);
+   close(dmabuf_fd);
+   close(heap_fd);
+   int ash_fd = open("/dev/ashmem", O_RDWR);
+   assert(ash_fd >= 0);
+   size_t ash_sz = 8192;
+   assert(ioctl(ash_fd, 0x40087703UL /* ASHMEM_SET_SIZE */, ash_sz) == 0);
+   close(ash_fd);
+
+   printf("  -> PASS: Multi-FD /dev/mali0 isolation (3 FDs + dup/fcntl), dual-VkDevice isolation (fdA=%d, fdB=%d), companion UAPI shims, lifted CQS event ioctl, custom pAllocator & r54p3 quirks verified! (lifted_calls=%u)\n",
+          mali_fd_A, mali_fd_B, total_lifted_calls);
+}
+
 int main(void)
 {
    printf("[Unit Tests] Running edge cases, mali_kbase.ko flag invariants, and RAII logging suite...\n");
@@ -2345,6 +2711,7 @@ int main(void)
    test_v29_wsi_layer_godot_4_7_2_and_host_panvk();
    test_v31_panvk_vkcube_mem_alias_and_v11_csf_opcodes();
    test_v32_full_r54p3_icd_deshimming_and_real_draw_pipeline();
+   test_v33_multi_fd_mali0_isolation_and_full_r54p3_icd();
    printf("[Unit Tests] ALL EDGE CASES PASSED!\n");
    return 0;
 }

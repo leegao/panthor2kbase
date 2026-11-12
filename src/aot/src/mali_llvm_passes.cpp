@@ -964,6 +964,13 @@ private:
                         addr_by_name["kbase_post_term"] = fst;
                     }
                 }
+                // Check for single-instruction MOVZ W1, #0x802c (KBASE_IOCTL_CS_EVENT_SIGNAL = 0x0000802c)
+                if (w == 0x52900581U && !addr_by_name.count("kbase_cs_event_signal")) {
+                    uint64_t fst = findFuncStart(pc);
+                    if (fst != 0 && func_by_addr.count(fst) && func_by_addr[fst].second <= 0x80) {
+                        addr_by_name["kbase_cs_event_signal"] = fst;
+                    }
+                }
                 if ((w & 0x7F80001FU) == 0x52800001U) {
                     unsigned hw = (w >> 21) & 3U;
                     uint32_t imm16 = (w >> 5) & 0xFFFFU;
@@ -1118,6 +1125,7 @@ private:
                  "kbase_mem_flags_change",
                  "kbase_mem_sync",
                  "kbase_cs_get_glb_iface",
+                 "kbase_cs_event_signal",
                  "kbase_cs_queue_register",
                  "kbase_cs_queue_register_ex",
                  "kbase_cs_queue_terminate",
@@ -1201,10 +1209,40 @@ private:
                 }
             }
         }
-        // Also include all discovered Vulkan 1.3 dispatch table entrypoints (all 456 vk* functions in r54p3 / 362 in r44p1)
+        // Also compute the full transitive BL/B closure of all discovered Vulkan 1.3 dispatch table entrypoints
+        // (all 456 vk* functions in r54p3 / 362 in r44p1 / etc.) across the Vulkan ICD, CMPBE, Kbase, and OSU layers.
+        uint64_t min_vk_rva = ~0ULL, max_vk_rva = 0ULL;
+        std::deque<uint64_t> vk_q;
         for (const auto &vk_ent : vk_dispatch_entries) {
             uint64_t faddr = findFuncStart(vk_ent.second);
             if (faddr == 0) faddr = vk_ent.second;
+            if (!isExecAddr(faddr)) continue;
+            if (faddr < min_vk_rva) min_vk_rva = faddr;
+            if (faddr > max_vk_rva) max_vk_rva = faddr;
+            vk_q.push_back(faddr);
+        }
+        uint64_t vk_lo = (min_vk_rva > 0x20000ULL) ? (min_vk_rva - 0x20000ULL) : 0ULL;
+        uint64_t vk_hi = max_vk_rva + 0x120000ULL;
+        uint64_t kbase_anchor = addr_by_name.count("kbase_mem_alloc") ? addr_by_name["kbase_mem_alloc"]
+                              : (addr_by_name.count("mali_gpu_props_get") ? addr_by_name["mali_gpu_props_get"] : 0ULL);
+        uint64_t kb_lo = (kbase_anchor > 0x20000ULL) ? (kbase_anchor - 0x20000ULL) : 0ULL;
+        uint64_t kb_hi = kbase_anchor ? (kbase_anchor + 0x30000ULL) : 0ULL;
+        uint64_t cmpbe_stop = addr_by_name.count("cmpbe_v2_compile_multiple_shaders") ? addr_by_name["cmpbe_v2_compile_multiple_shaders"] : 0x01c9ecb0ULL;
+        const char *env_full = std::getenv("MALI_AOT_FULL_CLOSURE");
+        bool lift_full_closure = (env_full && std::strcmp(env_full, "1") == 0);
+        while (!vk_q.empty()) {
+            uint64_t faddr = vk_q.front();
+            vk_q.pop_front();
+            if (visited.count(faddr)) continue;
+            if (plt_map.count(faddr)) {
+                closure_plts[faddr] = plt_map[faddr];
+                continue;
+            }
+            uint64_t fstart = findFuncStart(faddr);
+            if (fstart != 0 && fstart != faddr) {
+                if (!visited.count(fstart)) vk_q.push_back(fstart);
+                continue;
+            }
             if (!isExecAddr(faddr)) continue;
             visited.insert(faddr);
             uint64_t fsize = func_by_addr.count(faddr) ? func_by_addr[faddr].second : 4;
@@ -1218,6 +1256,13 @@ private:
                     uint64_t target = static_cast<uint64_t>(static_cast<int64_t>(pc) + (imm26 << 2));
                     if (plt_map.count(target)) {
                         closure_plts[target] = plt_map[target];
+                    } else if (top6 == 0x25 || !(target >= faddr && target < faddr + fsize)) {
+                        uint64_t tst = findFuncStart(target);
+                        uint64_t cand = tst ? tst : target;
+                        bool in_vk_or_kb = (cand >= vk_lo && cand <= vk_hi) || (kb_hi > 0 && cand >= kb_lo && cand <= kb_hi) || (cand >= 0x01b50000ULL && cand <= 0x01b70000ULL) || (cand >= 0x01dd0000ULL && cand <= 0x01de0000ULL);
+                        if (!visited.count(cand) && cand != cmpbe_stop && (lift_full_closure || in_vk_or_kb)) {
+                            vk_q.push_back(cand);
+                        }
                     }
                 }
             }
@@ -1450,7 +1495,7 @@ public:
     }
 
     void emitBionicPltCall(const std::string &sym) {
-        for (unsigned r = 0; r < 6; ++r) {
+        for (unsigned r = 0; r < 8; ++r) {
             std::string rv = loadGpr(r, true);
             std::string rp = newTmp("plt_in");
             emit(rp + " = getelementptr inbounds i8, ptr %cpu, i64 " + std::to_string(r * 8));
@@ -1587,12 +1632,39 @@ public:
             }
         }
 
+        bool uses_vec = false;
+        uint32_t used_gpr_mask = (1U << 0) | (1U << 30);
+        for (uint64_t pc = faddr; pc < end_addr; pc += 4) {
+            uint32_t insn = readU32(loader.elf, pc);
+            unsigned op0 = (insn >> 25) & 0xF;
+            if ((op0 & 0x7) == 0x7 || (((op0 & 0x5) == 0x4) && (((insn >> 26) & 1) == 1) && (((insn >> 24) & 0x3FU) != 0x08U))) {
+                uses_vec = true;
+            }
+            unsigned r0 = insn & 0x1F;
+            unsigned r1 = (insn >> 5) & 0x1F;
+            unsigned r2 = (insn >> 10) & 0x1F;
+            unsigned r3 = (insn >> 16) & 0x1F;
+            if (r0 < 31) used_gpr_mask |= (1U << r0);
+            if (r1 < 31) used_gpr_mask |= (1U << r1);
+            if (r2 < 31) used_gpr_mask |= (1U << r2);
+            if (r3 < 31) used_gpr_mask |= (1U << r3);
+            unsigned top6 = (insn >> 26) & 0x3F;
+            if (top6 == 0x25 || top6 == 0x05) {
+                int64_t imm26 = sext64(insn & 0x3FFFFFFU, 26);
+                uint64_t target = static_cast<uint64_t>(static_cast<int64_t>(pc) + (imm26 << 2));
+                if (loader.closure_plts.count(target)) used_gpr_mask |= 0xFFU;
+            }
+        }
         std::vector<uint64_t> sorted_leaders(leaders.begin(), leaders.end());
         emitRaw("define void @aot_sub_" + hex8(faddr) + "(ptr %cpu) #0 {");
         emitRaw("entry:");
-        for (unsigned r = 0; r < 31; ++r) emit("%reg_x" + std::to_string(r) + " = alloca i64, align 8");
+        for (unsigned r = 0; r < 31; ++r) {
+            if ((used_gpr_mask >> r) & 1U) emit("%reg_x" + std::to_string(r) + " = alloca i64, align 8");
+        }
         emit("%reg_sp = alloca i64, align 8");
-        for (unsigned r = 0; r < 32; ++r) emit("%reg_v" + std::to_string(r) + " = alloca i128, align 16");
+        if (uses_vec) {
+            for (unsigned r = 0; r < 32; ++r) emit("%reg_v" + std::to_string(r) + " = alloca i128, align 16");
+        }
         emit("%flag_n = alloca i1, align 1");
         emit("%flag_z = alloca i1, align 1");
         emit("%flag_c = alloca i1, align 1");
@@ -1600,6 +1672,7 @@ public:
 
         auto reloadState = [&](bool include_vec = false) {
             for (unsigned r = 0; r < 31; ++r) {
+                if (!((used_gpr_mask >> r) & 1U)) continue;
                 std::string p = newTmp("rl_x"), v = newTmp("rv_x");
                 emit(p + " = getelementptr inbounds i8, ptr %cpu, i64 " + std::to_string(r * 8));
                 emit(v + " = load i64, ptr " + p + ", align 8");
@@ -1621,6 +1694,7 @@ public:
 
         auto flushState = [&](bool include_vec = false) {
             for (unsigned r = 0; r < 31; ++r) {
+                if (!((used_gpr_mask >> r) & 1U)) continue;
                 std::string p = newTmp("fl_x"), v = newTmp("fv_x");
                 emit(v + " = load i64, ptr %reg_x" + std::to_string(r) + ", align 8");
                 emit(p + " = getelementptr inbounds i8, ptr %cpu, i64 " + std::to_string(r * 8));
@@ -1640,7 +1714,7 @@ public:
             }
         };
 
-        reloadState(true);
+        reloadState(uses_vec);
         emit("store i1 false, ptr %flag_n, align 1");
         emit("store i1 false, ptr %flag_z, align 1");
         emit("store i1 false, ptr %flag_c, align 1");
@@ -1796,9 +1870,9 @@ public:
                             if (loader.closure_plts.count(target)) {
                                 emitCallToTarget(target);
                             } else {
-                                flushState();
+                                flushState(uses_vec);
                                 emitCallToTarget(target);
-                                reloadState();
+                                reloadState(uses_vec);
                             }
                         } else {
                             if (target >= faddr && target < end_addr) {
@@ -1807,9 +1881,9 @@ public:
                                 if (loader.closure_plts.count(target)) {
                                     emitCallToTarget(target);
                                 } else {
-                                    flushState();
+                                    flushState(uses_vec);
                                     emitCallToTarget(target);
-                                    reloadState();
+                                    reloadState(uses_vec);
                                 }
                                 emit("br label %exit_ret");
                             }
@@ -1818,32 +1892,44 @@ public:
                         }
                         continue;
                     }
-                    if (((insn >> 24) & 0xFF) == 0x54) {
-                        uint64_t target = static_cast<uint64_t>(static_cast<int64_t>(pc) + (sext64((insn >> 5) & 0x7FFFFU, 19) << 2));
-                        std::string cval = evalCond(insn & 0xF);
-                        emit("br i1 " + cval + ", label %bb_" + hex8(target) + ", label %bb_" + hex8(pc + 4));
-                        terminated = true;
-                        break;
-                    }
-                    if (((insn >> 25) & 0x3F) == 0x1A) {
-                        unsigned op = (insn >> 24) & 1;
-                        uint64_t target = static_cast<uint64_t>(static_cast<int64_t>(pc) + (sext64((insn >> 5) & 0x7FFFFU, 19) << 2));
-                        std::string v = loadGpr(rd, is64);
-                        std::string cmp_v = newTmp("cbz");
-                        emit(cmp_v + " = icmp " + (op ? "ne " : "eq ") + ty + " " + v + ", 0");
-                        emit("br i1 " + cmp_v + ", label %bb_" + hex8(target) + ", label %bb_" + hex8(pc + 4));
-                        terminated = true;
-                        break;
-                    }
-                    if (((insn >> 25) & 0x3F) == 0x1B) {
-                        unsigned op = (insn >> 24) & 1;
-                        unsigned bpos = ((insn >> 31) << 5) | ((insn >> 19) & 0x1F);
-                        uint64_t target = static_cast<uint64_t>(static_cast<int64_t>(pc) + (sext64((insn >> 5) & 0x3FFFU, 14) << 2));
-                        std::string v = loadGpr(rd, true);
-                        std::string masked = newTmp("tbz_m"), cmp_v = newTmp("tbz_c");
-                        emit(masked + " = and i64 " + v + ", " + std::to_string(1ULL << bpos));
-                        emit(cmp_v + " = icmp " + (op ? "ne " : "eq ") + "i64 " + masked + ", 0");
-                        emit("br i1 " + cmp_v + ", label %bb_" + hex8(target) + ", label %bb_" + hex8(pc + 4));
+                    if (((insn >> 24) & 0xFF) == 0x54 || ((insn >> 25) & 0x3F) == 0x1A || ((insn >> 25) & 0x3F) == 0x1B) {
+                        uint64_t target = 0;
+                        std::string cval;
+                        if (((insn >> 24) & 0xFF) == 0x54) {
+                            target = static_cast<uint64_t>(static_cast<int64_t>(pc) + (sext64((insn >> 5) & 0x7FFFFU, 19) << 2));
+                            cval = evalCond(insn & 0xF);
+                        } else if (((insn >> 25) & 0x3F) == 0x1A) {
+                            unsigned op = (insn >> 24) & 1;
+                            target = static_cast<uint64_t>(static_cast<int64_t>(pc) + (sext64((insn >> 5) & 0x7FFFFU, 19) << 2));
+                            std::string v = loadGpr(rd, is64);
+                            cval = newTmp("cbz");
+                            emit(cval + " = icmp " + (op ? "ne " : "eq ") + ty + " " + v + ", 0");
+                        } else {
+                            unsigned op = (insn >> 24) & 1;
+                            unsigned bpos = ((insn >> 31) << 5) | ((insn >> 19) & 0x1F);
+                            target = static_cast<uint64_t>(static_cast<int64_t>(pc) + (sext64((insn >> 5) & 0x3FFFU, 14) << 2));
+                            std::string v = loadGpr(rd, true);
+                            std::string masked = newTmp("tbz_m");
+                            cval = newTmp("tbz_c");
+                            emit(masked + " = and i64 " + v + ", " + std::to_string(1ULL << bpos));
+                            emit(cval + " = icmp " + (op ? "ne " : "eq ") + "i64 " + masked + ", 0");
+                        }
+                        std::string fallthrough_lbl = (pc + 4 < end_addr) ? ("%bb_" + hex8(pc + 4)) : "%exit_ret";
+                        if (target >= faddr && target < end_addr) {
+                            emit("br i1 " + cval + ", label %bb_" + hex8(target) + ", label " + fallthrough_lbl);
+                        } else {
+                            std::string tc_lbl = "tailcall_" + hex8(pc) + "_" + std::to_string(++tmp_id);
+                            emit("br i1 " + cval + ", label %" + tc_lbl + ", label " + fallthrough_lbl);
+                            emitRaw(tc_lbl + ":");
+                            if (loader.closure_plts.count(target)) {
+                                emitCallToTarget(target);
+                            } else {
+                                flushState(uses_vec);
+                                emitCallToTarget(target);
+                                reloadState(uses_vec);
+                            }
+                            emit("br label %exit_ret");
+                        }
                         terminated = true;
                         break;
                     }
@@ -1859,9 +1945,9 @@ public:
                         } else if (opc == 1) {
                             std::string tgt = loadGpr(rn, true);
                             storeGpr(30, std::to_string(IMAGE_BASE + pc + 4), true);
-                            flushState();
+                            flushState(uses_vec);
                             emit("call void @aot_indirect_dispatch(ptr %cpu, i64 " + tgt + ")");
-                            reloadState();
+                            reloadState(uses_vec);
                             continue;
                         } else if (opc == 0) {
                             if (jtables.count(pc)) {
@@ -1879,9 +1965,9 @@ public:
                                 break;
                             } else {
                                 std::string tgt = loadGpr(rn, true);
-                                flushState();
+                                flushState(uses_vec);
                                 emit("call void @aot_indirect_dispatch(ptr %cpu, i64 " + tgt + ")");
-                                reloadState();
+                                reloadState(uses_vec);
                                 emit("br label %exit_ret");
                                 terminated = true;
                                 break;
@@ -2861,7 +2947,7 @@ public:
         }
 
         emitRaw("exit_ret:");
-        flushState(true);
+        flushState(uses_vec);
         if (instrument_calls) {
             emit("call void @aot_so_trace_fn_exit(ptr %cpu, i64 " + std::to_string(IMAGE_BASE + faddr) + ", ptr @.aot_fn_str_" + hex8(faddr) + ")");
         }
@@ -2889,7 +2975,25 @@ public:
             emitRaw("declare void @llvm.mali.bionic.plt64." + sym + "(ptr)");
         }
         emitRaw("declare ptr @calloc(i64, i64)");
+        emitRaw("declare ptr @realloc(ptr, i64)");
         emitRaw("declare void @free(ptr)");
+        emitRaw("declare i32 @getpid()");
+        emitRaw("declare i32 @access(ptr, i32)");
+        emitRaw("declare i32 @stat(ptr, ptr)");
+        emitRaw("declare i32 @fstat(i32, ptr)");
+        emitRaw("declare i32 @dup(i32)");
+        emitRaw("declare i32 @dup2(i32, i32)");
+        emitRaw("declare i32 @fcntl(i32, i32, ...)");
+        emitRaw("declare i32 @eventfd(i32, i32)");
+        emitRaw("declare i32 @clock_gettime(i32, ptr)");
+        emitRaw("declare ptr @strncpy(ptr, ptr, i64)");
+        emitRaw("declare ptr @strndup(ptr, i64)");
+        emitRaw("declare i64 @strnlen(ptr, i64)");
+        emitRaw("declare i64 @strspn(ptr, ptr)");
+        emitRaw("declare ptr @strstr(ptr, ptr)");
+        emitRaw("declare i64 @strtol(ptr, ptr, i32)");
+        emitRaw("declare i64 @strtoul(ptr, ptr, i32)");
+        emitRaw("declare i64 @strtoull(ptr, ptr, i32)");
         emitRaw("declare i64 @strlen(ptr)");
         emitRaw("declare ptr @strchr(ptr, i32)");
         emitRaw("declare i64 @strcspn(ptr, ptr)");
@@ -3143,6 +3247,109 @@ public:
         emit("  ret void");
         emitRaw("}\n");
 
+        emitRaw("define i64 @__mali_cxa_guard_acquire(i64 %guard_addr) #0 {");
+        emitRaw("entry:");
+        emit("  %is_null = icmp eq i64 %guard_addr, 0");
+        emit("  br i1 %is_null, label %ret_zero, label %check");
+        emitRaw("check:");
+        emit("  %p = inttoptr i64 %guard_addr to ptr");
+        emit("  %v = load i8, ptr %p, align 1");
+        emit("  %uninit = icmp eq i8 %v, 0");
+        emit("  %res = select i1 %uninit, i64 1, i64 0");
+        emit("  ret i64 %res");
+        emitRaw("ret_zero:");
+        emit("  ret i64 0");
+        emitRaw("}\n");
+
+        emitRaw("define void @__mali_cxa_guard_release(i64 %guard_addr) #0 {");
+        emitRaw("entry:");
+        emit("  %is_null = icmp eq i64 %guard_addr, 0");
+        emit("  br i1 %is_null, label %done, label %write");
+        emitRaw("write:");
+        emit("  %p = inttoptr i64 %guard_addr to ptr");
+        emit("  store i8 1, ptr %p, align 1");
+        emit("  br label %done");
+        emitRaw("done:");
+        emit("  ret void");
+        emitRaw("}\n");
+
+        emitRaw("define i64 @__mali_next_prime(i64 %n) #0 {");
+        emitRaw("entry:");
+        emit("  %lt = icmp ult i64 %n, 17");
+        emit("  %cand = select i1 %lt, i64 17, i64 %n");
+        emit("  %or1 = or i64 %cand, 1");
+        emit("  ret i64 %or1");
+        emitRaw("}\n");
+
+        emitRaw("define i64 @__mali_sysconf_bionic(i64 %name) #0 {");
+        emitRaw("entry:");
+        emit("  %is_39 = icmp eq i64 %name, 39");
+        emit("  %is_40 = icmp eq i64 %name, 40");
+        emit("  %is_30 = icmp eq i64 %name, 30");
+        emit("  %is_ps1 = or i1 %is_39, %is_40");
+        emit("  %is_ps = or i1 %is_ps1, %is_30");
+        emit("  %res = select i1 %is_ps, i64 4096, i64 8");
+        emit("  ret i64 %res");
+        emitRaw("}\n");
+
+        emitRaw("define i64 @__mali_ahb_stub(i64 %op, i64 %a0, i64 %a1) #0 {");
+        emitRaw("entry:");
+        emit("  %is_alloc = icmp eq i64 %op, 1");
+        emit("  br i1 %is_alloc, label %do_alloc, label %chk_desc");
+        emitRaw("do_alloc:");
+        emit("  %mem = call ptr @calloc(i64 256, i64 1)");
+        emit("  %mem_i = ptrtoint ptr %mem to i64");
+        emit("  %has_d = icmp ne i64 %a0, 0");
+        emit("  br i1 %has_d, label %copy_d, label %write_nh");
+        emitRaw("copy_d:");
+        emit("  %src_p = inttoptr i64 %a0 to ptr");
+        emit("  call void @llvm.memcpy.p0.p0.i64(ptr %mem, ptr %src_p, i64 40, i1 false)");
+        emit("  br label %write_nh");
+        emitRaw("write_nh:");
+        emit("  %nh_p = getelementptr inbounds i8, ptr %mem, i64 64");
+        emit("  store i32 12, ptr %nh_p, align 4");
+        emit("  %nf_p = getelementptr inbounds i8, ptr %mem, i64 68");
+        emit("  store i32 1, ptr %nf_p, align 4");
+        emit("  %fd_p = getelementptr inbounds i8, ptr %mem, i64 76");
+        emit("  store i32 100, ptr %fd_p, align 4");
+        emit("  %has_out = icmp ne i64 %a1, 0");
+        emit("  br i1 %has_out, label %store_out, label %ret_ok");
+        emitRaw("store_out:");
+        emit("  %out_p = inttoptr i64 %a1 to ptr");
+        emit("  store i64 %mem_i, ptr %out_p, align 8");
+        emit("  br label %ret_ok");
+        emitRaw("chk_desc:");
+        emit("  %is_desc = icmp eq i64 %op, 2");
+        emit("  br i1 %is_desc, label %do_desc, label %chk_nh");
+        emitRaw("do_desc:");
+        emit("  %ok_d1 = icmp ne i64 %a0, 0");
+        emit("  %ok_d2 = icmp ne i64 %a1, 0");
+        emit("  %ok_d = and i1 %ok_d1, %ok_d2");
+        emit("  br i1 %ok_d, label %cp_desc, label %ret_ok");
+        emitRaw("cp_desc:");
+        emit("  %dp0 = inttoptr i64 %a0 to ptr");
+        emit("  %dp1 = inttoptr i64 %a1 to ptr");
+        emit("  call void @llvm.memcpy.p0.p0.i64(ptr %dp1, ptr %dp0, i64 40, i1 false)");
+        emit("  br label %ret_ok");
+        emitRaw("chk_nh:");
+        emit("  %is_nh = icmp eq i64 %op, 3");
+        emit("  br i1 %is_nh, label %do_nh, label %chk_id");
+        emitRaw("do_nh:");
+        emit("  %nh_va = add i64 %a0, 64");
+        emit("  ret i64 %nh_va");
+        emitRaw("chk_id:");
+        emit("  %is_id = icmp eq i64 %op, 4");
+        emit("  %has_id_out = icmp ne i64 %a1, 0");
+        emit("  %do_id_st = and i1 %is_id, %has_id_out");
+        emit("  br i1 %do_id_st, label %st_id, label %ret_ok");
+        emitRaw("st_id:");
+        emit("  %idp = inttoptr i64 %a1 to ptr");
+        emit("  store i64 1095254529, ptr %idp, align 8");
+        emit("  br label %ret_ok");
+        emitRaw("ret_ok:");
+        emit("  ret i64 0");
+        emitRaw("}\n");
+
         emitRaw("attributes #0 = { nounwind \"frame-pointer\"=\"none\" }");
         return out.str();
     }
@@ -3320,7 +3527,8 @@ void runBionicToGlibcLibcLoweringPass(LLVMModuleRef M, PassStats &stats) {
                         LLVMValueRef args[4] = {dst, val8, x2, LLVMConstInt(i1Ty, 0, 0)};
                         LLVMBuildCall2(B, memsetFnTy, fnIntr, args, 4, "");
                         storeReg64(cpu, 0, x0);
-                    } else if (sym == "malloc") {
+                    } else if (sym == "malloc" || sym == "_Znwm" || sym == "_ZnwmRKSt9nothrow_t" ||
+                               sym == "_Znam" || sym == "_ZnamRKSt9nothrow_t" || sym == "_ZnwmSt11align_val_t") {
                         LLVMValueRef x0 = loadReg64(cpu, 0);
                         LLVMValueRef callocFn = getOrCreateFunction(M, "calloc", ptrTy, {i64Ty, i64Ty});
                         LLVMTypeRef calParams[2] = {i64Ty, i64Ty};
@@ -3338,7 +3546,17 @@ void runBionicToGlibcLibcLoweringPass(LLVMModuleRef M, PassStats &stats) {
                         LLVMValueRef args[2] = {x0, x1};
                         LLVMValueRef resPtr = LLVMBuildCall2(B, callocTy, callocFn, args, 2, "");
                         storeReg64(cpu, 0, LLVMBuildPtrToInt(B, resPtr, i64Ty, ""));
-                    } else if (sym == "free") {
+                    } else if (sym == "realloc") {
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef x1 = loadReg64(cpu, 1);
+                        LLVMValueRef reallocFn = getOrCreateFunction(M, "realloc", ptrTy, {ptrTy, i64Ty});
+                        LLVMTypeRef rParams[2] = {ptrTy, i64Ty};
+                        LLVMTypeRef reallocTy = LLVMFunctionType(ptrTy, rParams, 2, 0);
+                        LLVMValueRef args[2] = {p0, x1};
+                        LLVMValueRef resPtr = LLVMBuildCall2(B, reallocTy, reallocFn, args, 2, "");
+                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, resPtr, i64Ty, ""));
+                    } else if (sym == "free" || sym == "_ZdlPv" || sym == "_ZdlPvm" ||
+                               sym == "_ZdaPv" || sym == "_ZdaPvm") {
                         LLVMValueRef x0 = loadReg64(cpu, 0);
                         LLVMValueRef ptr = LLVMBuildIntToPtr(B, x0, ptrTy, "");
                         LLVMValueRef freeFn = getOrCreateFunction(M, "free", voidTy, {ptrTy});
@@ -3488,9 +3706,134 @@ void runBionicToGlibcLibcLoweringPass(LLVMModuleRef M, PassStats &stats) {
                         LLVMValueRef res = LLVMBuildCall2(B, pollTy, pollFn, args, 3, "");
                         storeReg64(cpu, 0, res);
                         stats.kbase_uapi_lowered++;
-                    } else if (sym == "pthread_self") {
-                        storeReg64(cpu, 0, LLVMConstInt(i64Ty, 1, 0));
+                    } else if (sym == "pthread_self" || sym == "getuid") {
+                        storeReg64(cpu, 0, LLVMConstInt(i64Ty, 1000, 0));
                         stats.external_stubs_lowered++;
+                    } else if (sym == "getpid") {
+                        LLVMValueRef fn = getOrCreateFunction(M, "getpid", i32Ty, {});
+                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, nullptr, 0, 0);
+                        LLVMValueRef res32 = LLVMBuildCall2(B, fTy, fn, nullptr, 0, "");
+                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
+                    } else if (sym == "getpagesize") {
+                        storeReg64(cpu, 0, LLVMConstInt(i64Ty, 4096, 0));
+                    } else if (sym == "sysconf") {
+                        LLVMValueRef x0 = loadReg64(cpu, 0);
+                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_sysconf_bionic", i64Ty, {i64Ty});
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, &i64Ty, 1, 0);
+                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, &x0, 1, "");
+                        storeReg64(cpu, 0, res);
+                    } else if (sym == "__cxa_guard_acquire") {
+                        LLVMValueRef x0 = loadReg64(cpu, 0);
+                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_cxa_guard_acquire", i64Ty, {i64Ty});
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, &i64Ty, 1, 0);
+                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, &x0, 1, "");
+                        storeReg64(cpu, 0, res);
+                    } else if (sym == "__cxa_guard_release") {
+                        LLVMValueRef x0 = loadReg64(cpu, 0);
+                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_cxa_guard_release", voidTy, {i64Ty});
+                        LLVMTypeRef fTy = LLVMFunctionType(voidTy, &i64Ty, 1, 0);
+                        LLVMBuildCall2(B, fTy, fn, &x0, 1, "");
+                        storeReg64(cpu, 0, LLVMConstInt(i64Ty, 0, 0));
+                    } else if (sym == "_ZNSt3__112__next_primeEm") {
+                        LLVMValueRef x0 = loadReg64(cpu, 0);
+                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_next_prime", i64Ty, {i64Ty});
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, &i64Ty, 1, 0);
+                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, &x0, 1, "");
+                        storeReg64(cpu, 0, res);
+                    } else if (sym == "access") {
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef w1 = LLVMBuildTrunc(B, loadReg64(cpu, 1), i32Ty, "");
+                        LLVMValueRef fn = getOrCreateFunction(M, "access", i32Ty, {ptrTy, i32Ty});
+                        LLVMTypeRef pTys[2] = {ptrTy, i32Ty};
+                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, pTys, 2, 0);
+                        LLVMValueRef args[2] = {p0, w1};
+                        LLVMValueRef res32 = LLVMBuildCall2(B, fTy, fn, args, 2, "");
+                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
+                        stats.kbase_uapi_lowered++;
+                    } else if (sym == "stat") {
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
+                        LLVMValueRef fn = getOrCreateFunction(M, "stat", i32Ty, {ptrTy, ptrTy});
+                        LLVMTypeRef pTys[2] = {ptrTy, ptrTy};
+                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, pTys, 2, 0);
+                        LLVMValueRef args[2] = {p0, p1};
+                        LLVMValueRef res32 = LLVMBuildCall2(B, fTy, fn, args, 2, "");
+                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
+                        stats.kbase_uapi_lowered++;
+                    } else if (sym == "dup") {
+                        LLVMValueRef w0 = LLVMBuildTrunc(B, loadReg64(cpu, 0), i32Ty, "");
+                        LLVMValueRef fn = getOrCreateFunction(M, "dup", i32Ty, {i32Ty});
+                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, &i32Ty, 1, 0);
+                        LLVMValueRef res32 = LLVMBuildCall2(B, fTy, fn, &w0, 1, "");
+                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
+                        stats.kbase_uapi_lowered++;
+                    } else if (sym == "dup2") {
+                        LLVMValueRef w0 = LLVMBuildTrunc(B, loadReg64(cpu, 0), i32Ty, "");
+                        LLVMValueRef w1 = LLVMBuildTrunc(B, loadReg64(cpu, 1), i32Ty, "");
+                        LLVMValueRef fn = getOrCreateFunction(M, "dup2", i32Ty, {i32Ty, i32Ty});
+                        LLVMTypeRef pTys[2] = {i32Ty, i32Ty};
+                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, pTys, 2, 0);
+                        LLVMValueRef args[2] = {w0, w1};
+                        LLVMValueRef res32 = LLVMBuildCall2(B, fTy, fn, args, 2, "");
+                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
+                        stats.kbase_uapi_lowered++;
+                    } else if (sym == "strncpy" || sym == "__strncpy_chk2") {
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
+                        LLVMValueRef x2 = loadReg64(cpu, 2);
+                        LLVMValueRef fn = getOrCreateFunction(M, "strncpy", ptrTy, {ptrTy, ptrTy, i64Ty});
+                        LLVMTypeRef pTys[3] = {ptrTy, ptrTy, i64Ty};
+                        LLVMTypeRef fTy = LLVMFunctionType(ptrTy, pTys, 3, 0);
+                        LLVMValueRef args[3] = {p0, p1, x2};
+                        LLVMValueRef resPtr = LLVMBuildCall2(B, fTy, fn, args, 3, "");
+                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, resPtr, i64Ty, ""));
+                    } else if (sym == "strndup") {
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef x1 = loadReg64(cpu, 1);
+                        LLVMValueRef fn = getOrCreateFunction(M, "strndup", ptrTy, {ptrTy, i64Ty});
+                        LLVMTypeRef pTys[2] = {ptrTy, i64Ty};
+                        LLVMTypeRef fTy = LLVMFunctionType(ptrTy, pTys, 2, 0);
+                        LLVMValueRef args[2] = {p0, x1};
+                        LLVMValueRef resPtr = LLVMBuildCall2(B, fTy, fn, args, 2, "");
+                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, resPtr, i64Ty, ""));
+                    } else if (sym == "strnlen") {
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef x1 = loadReg64(cpu, 1);
+                        LLVMValueRef fn = getOrCreateFunction(M, "strnlen", i64Ty, {ptrTy, i64Ty});
+                        LLVMTypeRef pTys[2] = {ptrTy, i64Ty};
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 2, 0);
+                        LLVMValueRef args[2] = {p0, x1};
+                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, args, 2, "");
+                        storeReg64(cpu, 0, res);
+                    } else if (sym == "strspn") {
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
+                        LLVMValueRef fn = getOrCreateFunction(M, "strspn", i64Ty, {ptrTy, ptrTy});
+                        LLVMTypeRef pTys[2] = {ptrTy, ptrTy};
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 2, 0);
+                        LLVMValueRef args[2] = {p0, p1};
+                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, args, 2, "");
+                        storeReg64(cpu, 0, res);
+                    } else if (sym == "strstr") {
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
+                        LLVMValueRef fn = getOrCreateFunction(M, "strstr", ptrTy, {ptrTy, ptrTy});
+                        LLVMTypeRef pTys[2] = {ptrTy, ptrTy};
+                        LLVMTypeRef fTy = LLVMFunctionType(ptrTy, pTys, 2, 0);
+                        LLVMValueRef args[2] = {p0, p1};
+                        LLVMValueRef resPtr = LLVMBuildCall2(B, fTy, fn, args, 2, "");
+                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, resPtr, i64Ty, ""));
+                    } else if (sym == "AHardwareBuffer_allocate" || sym == "AHardwareBuffer_describe" ||
+                               sym == "AHardwareBuffer_getNativeHandle" || sym == "AHardwareBuffer_getId") {
+                        uint64_t op = (sym == "AHardwareBuffer_allocate") ? 1ULL
+                                    : (sym == "AHardwareBuffer_describe") ? 2ULL
+                                    : (sym == "AHardwareBuffer_getNativeHandle") ? 3ULL : 4ULL;
+                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_ahb_stub", i64Ty, {i64Ty, i64Ty, i64Ty});
+                        LLVMTypeRef pTys[3] = {i64Ty, i64Ty, i64Ty};
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 3, 0);
+                        LLVMValueRef args[3] = {LLVMConstInt(i64Ty, op, 0), loadReg64(cpu, 0), loadReg64(cpu, 1)};
+                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, args, 3, "");
+                        storeReg64(cpu, 0, res);
                     } else if (sym == "vkCreateXcbSurfaceKHR" || sym == "vkCreateXlibSurfaceKHR" ||
                                sym == "vkCreateWaylandSurfaceKHR") {
                         std::string hookName = "__mali_hook_" + sym;
@@ -3565,11 +3908,14 @@ static int runLoweringAndCodegenOnModule(LLVMModuleRef M, const char *outPath, b
         fprintf(stderr, "Target error: %s\n", errMsg ? errMsg : "");
         return 1;
     }
-    LLVMTargetMachineRef tm = LLVMCreateTargetMachine(target, triple, "x86-64-v3", "", 3, 2, 0);
+    const char *env_o2 = std::getenv("MALI_AOT_FULL_O2");
+    bool full_o2 = (env_o2 && std::strcmp(env_o2, "1") == 0);
+    LLVMTargetMachineRef tm = LLVMCreateTargetMachine(target, triple, "x86-64-v3", "", full_o2 ? 3 : 1, 2, 0);
 
     if (runO2) {
         LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
-        LLVMErrorRef err = LLVMRunPasses(M, "default<O1>", tm, opts);
+        const char *pass_pipeline = full_o2 ? "default<O1>" : "sroa,simplifycfg,adce";
+        LLVMErrorRef err = LLVMRunPasses(M, pass_pipeline, tm, opts);
         if (err) {
             char *emsg = LLVMGetErrorMessage(err);
             fprintf(stderr, "LLVMRunPasses(default<O2>) failed: %s\n", emsg);
@@ -3658,11 +4004,15 @@ int main(int argc, char **argv) {
         std::string unoptPath = outDir + "/mali_mbs2_unopt.ll";
         std::string optPath   = outDir + "/mali_mbs2_opt.ll";
         std::string objPath   = outDir + "/mali_mbs2_aot.o";
-        {
+        const char *keep_ll_env = std::getenv("MALI_AOT_KEEP_LL");
+        bool keep_ll = (keep_ll_env && std::strcmp(keep_ll_env, "1") == 0);
+        if (keep_ll) {
             std::ofstream out(unoptPath);
             out << irText;
+            printf("  Wrote unoptimized IR: %s (%zu bytes)\n", unoptPath.c_str(), irText.size());
+        } else {
+            printf("  Generated in-memory IR: %zu bytes\n", irText.size());
         }
-        printf("  Wrote unoptimized IR: %s (%zu bytes)\n", unoptPath.c_str(), irText.size());
 
         LLVMContextRef C = LLVMContextCreate();
         LLVMMemoryBufferRef memBuf = LLVMCreateMemoryBufferWithMemoryRangeCopy(irText.data(), irText.size(), "mali_mbs2_unopt.ll");
@@ -3672,7 +4022,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "LLVM IR Parse Error: %s\n", errMsg ? errMsg : "unknown");
             return 1;
         }
-        int rc = runLoweringAndCodegenOnModule(M, objPath.c_str(), false, true, optPath.c_str());
+        int rc = runLoweringAndCodegenOnModule(M, objPath.c_str(), false, true, keep_ll ? optPath.c_str() : nullptr);
         LLVMDisposeModule(M);
         LLVMContextDispose(C);
         return rc;
