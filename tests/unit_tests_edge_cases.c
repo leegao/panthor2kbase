@@ -1854,6 +1854,126 @@ static void test_v29_wsi_layer_godot_4_7_2_and_host_panvk(void)
    printf("  -> WSI Layer (VK_KHR_surface), Godot 4.7.2 Forward+ multi-set/maintenance4 fixes & .ko/.so profiler: PASS\n");
 }
 
+
+/* ============================================================================
+ * TEST 21 (Checkpoint v31): PanVK vkcube 2x MEM_ALIAS PROT_READ CPU mmap +
+ * STORE_MULTIPLE (opcode 21) to render_desc_ringbuf & Valhall v11 CSF ALU/Branch
+ * ============================================================================ */
+static void test_v31_panvk_vkcube_mem_alias_and_v11_csf_opcodes(void)
+{
+   printf("[TEST 21] PanVK vkcube 2x MEM_ALIAS render_desc_ringbuf + v11 CSF ALU/BRANCH opcodes...\n");
+   int fd = panthor_kbase_adapter_open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+   assert(fd >= 0);
+
+   struct drm_panthor_vm_create vmc = { .user_va_range = (1ULL << 39) };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_CREATE, &vmc) == 0);
+
+   /* 1. Allocate 256 KiB render_desc_ringbuf BO and bind 2x contiguous alias */
+   struct drm_panthor_bo_create rb_bo = { .size = 262144, .flags = DRM_PANTHOR_BO_WB_MMAP };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_CREATE, &rb_bo) == 0);
+
+   struct drm_panthor_vm_bind_op rb_ops[2] = {
+      {
+         .flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP | DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC,
+         .bo_handle = rb_bo.handle,
+         .bo_offset = 0,
+         .va = 0,
+         .size = 262144,
+      },
+      {
+         .flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP | DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC,
+         .bo_handle = rb_bo.handle,
+         .bo_offset = 0,
+         .va = 0,
+         .size = 262144,
+      },
+   };
+   struct drm_panthor_vm_bind vb_rb = {
+      .vm_id = vmc.id,
+      .flags = 0,
+      .ops = DRM_PANTHOR_OBJ_ARRAY(2, rb_ops),
+   };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_BIND, &vb_rb) == 0);
+   uint64_t alias_va = rb_ops[0].va;
+   assert(alias_va != 0);
+   assert(rb_ops[1].va == alias_va + 262144ULL);
+
+   /* 2. Allocate CS stream BO and emit STORE_MULTIPLE (21), COMPARE_SELECT32 (18),
+    *    LOGIC_OP32 (19), BRANCH (22), NEXT_SB_ENTRY (26), STORE_STATE (40), PROGRESS_LOAD (43) */
+   struct drm_panthor_bo_create cs_bo = { .size = 4096, .flags = DRM_PANTHOR_BO_WB_MMAP };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_CREATE, &cs_bo) == 0);
+   struct drm_panthor_bo_mmap_offset cs_mo = { .handle = cs_bo.handle };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET, &cs_mo) == 0);
+   uint64_t *cs = (uint64_t *)panthor_kbase_adapter_mmap(
+      NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)cs_mo.offset);
+   assert(cs != MAP_FAILED);
+   struct drm_panthor_vm_bind_op bind_cs = {
+      .flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP,
+      .bo_handle = cs_bo.handle,
+      .va = 0,
+      .size = 4096,
+   };
+   struct drm_panthor_vm_bind vb_cs = {
+      .vm_id = vmc.id,
+      .ops = DRM_PANTHOR_OBJ_ARRAY(1, &bind_cs),
+   };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_BIND, &vb_cs) == 0);
+
+   /* Populate registers r68..r71 and store them to alias_va via STORE_MULTIPLE (opcode 21) */
+   cs[0] = (1ULL << 56) | (38ULL << 48) | (alias_va & 0xffffffffffffULL); /* MOVE48 r38:r39 = alias_va */
+   cs[1] = (2ULL << 56) | (68ULL << 48) | 0xCAFEBABEULL;                  /* MOVE32 r68 = 0xCAFEBABE */
+   cs[2] = (2ULL << 56) | (69ULL << 48) | 0x0000FF00ULL;                  /* MOVE32 r69 = 0x0000FF00 */
+   cs[3] = (19ULL << 56) | (70ULL << 48) | (68ULL << 40) | (69ULL << 16) | (1ULL << 11) | (6ULL << 12); /* LOGIC_OP32 OR32 r70 = r68 | r69 */
+   cs[4] = (18ULL << 56) | (71ULL << 48) | (69ULL << 40) | (68ULL << 32) | (69ULL << 24) | (68ULL << 16) | 4ULL; /* UMIN32 r71 */
+   cs[5] = (21ULL << 56) | (68ULL << 48) | (38ULL << 40) | (0x000fULL << 16) | 0ULL; /* STORE_MULTIPLE r68..r71 -> [alias_va + 0] */
+   cs[6] = (22ULL << 56) | (0ULL << 40) | (6ULL << 28) | 1ULL;            /* BRANCH ALWAYS +1 (skips cs[7]) */
+   cs[7] = (2ULL << 56) | (68ULL << 48) | 0xDEADDEADULL;                  /* Skipped by BRANCH */
+   cs[8] = (21ULL << 56) | (68ULL << 48) | (38ULL << 40) | (0x0001ULL << 16) | 16ULL; /* STORE_MULTIPLE r68 -> [alias_va + 16] */
+   cs[9] = (26ULL << 56);                                                 /* NEXT_SB_ENTRY */
+   cs[10] = (43ULL << 56);                                                /* PROGRESS_LOAD */
+
+   struct drm_panthor_queue_create qc = { .priority = 1, .ringbuf_size = 65536 };
+   struct drm_panthor_group_create gc = {
+      .queues = DRM_PANTHOR_OBJ_ARRAY(1, &qc),
+      .max_compute_cores = 8,
+      .max_fragment_cores = 8,
+      .max_tiler_cores = 1,
+      .priority = PANTHOR_GROUP_PRIORITY_MEDIUM,
+      .compute_core_mask = 0xFFULL,
+      .fragment_core_mask = 0xFFULL,
+      .tiler_core_mask = 1ULL,
+      .vm_id = vmc.id,
+   };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_CREATE, &gc) == 0);
+
+   struct drm_panthor_queue_submit qsub = {
+      .queue_index = 0,
+      .stream_size = 11 * sizeof(uint64_t),
+      .stream_addr = bind_cs.va,
+      .latest_flush = 1,
+   };
+   struct drm_panthor_group_submit gsub = {
+      .group_handle = gc.group_handle,
+      .queue_submits = DRM_PANTHOR_OBJ_ARRAY(1, &qsub),
+   };
+   assert(panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &gsub) == 0);
+
+   const uint32_t *alias_words = (const uint32_t *)(uintptr_t)alias_va;
+   assert(alias_words[0] == 0xCAFEBABEU);
+   assert(alias_words[1] == 0x0000FF00U);
+   assert(alias_words[2] == (0xCAFEBABEU | 0x0000FF00U));
+   assert(alias_words[3] == 0x0000FF00U);
+   assert(alias_words[4] == 0xCAFEBABEU); /* Verified cs[7] was skipped by BRANCH */
+
+   panthor_kbase_adapter_munmap(cs, 4096);
+   struct drm_panthor_group_destroy gd = { .group_handle = gc.group_handle };
+   panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_DESTROY, &gd);
+   struct drm_panthor_vm_destroy vmd = { .id = vmc.id };
+   panthor_kbase_adapter_ioctl(fd, DRM_IOCTL_PANTHOR_VM_DESTROY, &vmd);
+   panthor_kbase_adapter_close(fd);
+   printf("  -> PASS: 2x MEM_ALIAS render_desc_ringbuf STORE_MULTIPLE + v11 CSF ALU/BRANCH verified!\n");
+}
+
 int main(void)
 {
    printf("[Unit Tests] Running edge cases, mali_kbase.ko flag invariants, and RAII logging suite...\n");

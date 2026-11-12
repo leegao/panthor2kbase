@@ -285,6 +285,7 @@ target_link_options(vulkan_panfrost_patched PRIVATE -Wl,--no-as-needed)
 set_target_properties(vulkan_panfrost_patched PROPERTIES
    LIBRARY_OUTPUT_DIRECTORY "${ADAPTER_DIR}"
 )
+file(WRITE "${CMAKE_BINARY_DIR}/panfrost_host_icd.x86_64.json" "{\n    \"file_format_version\": \"1.0.0\",\n    \"ICD\": {\n        \"library_path\": \"${CMAKE_BINARY_DIR}/libvulkan_panfrost.so\",\n        \"api_version\": \"1.3.296\"\n    }\n}\n")
 add_custom_command(TARGET vulkan_panfrost_patched POST_BUILD
    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:vulkan_panfrost_patched> "${CMAKE_BINARY_DIR}/libvulkan_panfrost_patched.so"
 )

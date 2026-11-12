@@ -161,6 +161,8 @@ struct emu_mem_region {
    uint64_t extension;
    uint64_t flags;
    int backing_fd;
+   uint64_t aliased_src_va;
+   size_t alias_stride_bytes;
 };
 
 struct emu_cs_queue {
@@ -767,9 +769,44 @@ static bool emu_is_valid_host_range(uint64_t va, size_t len)
    if (va < 0x10000ULL || len == 0 || (va + len) < va)
       return false;
    for (size_t r = 0; r < 2048; r++) {
-      if (g_kfile.regions[r].active && g_kfile.regions[r].cpu_ptr != NULL &&
+      if (g_kfile.regions[r].active && !g_kfile.regions[r].freed_by_munmap &&
+          g_kfile.regions[r].cpu_ptr != NULL &&
           va >= g_kfile.regions[r].gpu_va &&
           (va + len) <= g_kfile.regions[r].gpu_va + g_kfile.regions[r].size) {
+         return true;
+      }
+   }
+   for (size_t h = 0; h < 16; h++) {
+      if (g_kfile.heaps[h].active && g_kfile.heaps[h].heap_mem != NULL &&
+          va >= g_kfile.heaps[h].gpu_heap_va &&
+          (va + len) <= g_kfile.heaps[h].gpu_heap_va + g_kfile.heaps[h].heap_mem_size) {
+         return true;
+      }
+   }
+   uint64_t p0 = va & ~4095ULL;
+   uint64_t p1 = (va + len - 1ULL) & ~4095ULL;
+   return msync((void *)(uintptr_t)p0, (size_t)(p1 - p0 + 4096ULL), MS_ASYNC) == 0;
+}
+
+static bool emu_is_writable_host_range(uint64_t va, size_t len)
+{
+   if (va < 0x10000ULL || len == 0 || (va + len) < va)
+      return false;
+   for (size_t r = 0; r < 2048; r++) {
+      if (g_kfile.regions[r].active && !g_kfile.regions[r].freed_by_munmap &&
+          g_kfile.regions[r].cpu_ptr != NULL &&
+          va >= g_kfile.regions[r].gpu_va &&
+          (va + len) <= g_kfile.regions[r].gpu_va + g_kfile.regions[r].size) {
+         if ((g_kfile.regions[r].flags & (BASE_MEM_PROT_GPU_WR | BASE_MEM_PROT_CPU_WR)) == 0ULL)
+            return false;
+         const char *strict_commit = getenv("PANTHOR_EMU_STRICT_CPU_COMMIT");
+         if (strict_commit && strict_commit[0] == '1' &&
+             (g_kfile.regions[r].flags & BASE_MEM_GROW_ON_GPF) &&
+             g_kfile.regions[r].commit_pages < g_kfile.regions[r].va_pages) {
+            size_t committed_bytes = (size_t)g_kfile.regions[r].commit_pages * 4096U;
+            if ((va + len) > g_kfile.regions[r].gpu_va + committed_bytes)
+               return false;
+         }
          return true;
       }
    }
@@ -806,7 +843,9 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
       return;
 
    uint32_t count = size_bytes / sizeof(uint64_t);
-   for (uint32_t i = 0; i < count; i++) {
+   uint32_t steps = 0;
+   uint32_t max_steps = count * 64U + 4096U;
+   for (uint32_t i = 0; i < count && steps < max_steps; i++, steps++) {
       uint64_t insn = stream[i];
       uint64_t opcode = (insn >> 56) & 0xffULL;
       g_stats.csf_instructions_executed++;
@@ -906,6 +945,115 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
          break;
       }
 
+      case 18: /* MALI_CS_OPCODE_COMPARE_SELECT32 / UMIN32 (0x12) */ {
+         uint8_t dst = (insn >> 48) & 0xffU;
+         uint8_t src0 = (insn >> 40) & 0xffU;
+         uint8_t src1 = (insn >> 32) & 0xffU;
+         if (dst < 128 && src0 < 128 && src1 < 128) {
+            uint32_t a = (uint32_t)cs_regs[src0];
+            uint32_t b = (uint32_t)cs_regs[src1];
+            cs_regs[dst] = (a < b) ? a : b;
+         }
+         break;
+      }
+
+      case 19: /* MALI_CS_OPCODE_LOGIC_OP32 (0x13: MOVE_REG32, AND32, OR32, XOR32, NOT32, BIT_SET32, BIT_CLEAR32) */ {
+         uint8_t dst = (insn >> 48) & 0xffU;
+         uint8_t src0 = (insn >> 40) & 0xffU;
+         uint8_t src1 = (insn >> 32) & 0xffU;
+         uint8_t idx_mode = (uint8_t)((insn >> 4) & 0x1U);
+         uint8_t op_mode = (uint8_t)(insn & 0xfU);
+         if (dst < 128 && src0 < 128) {
+            uint32_t a = (uint32_t)cs_regs[src0];
+            uint32_t b_raw = (src1 < 128) ? (uint32_t)cs_regs[src1] : 0U;
+            uint32_t b = (idx_mode != 0U) ? (1U << (b_raw & 31U)) : b_raw;
+            uint32_t res = 0U;
+            switch (op_mode) {
+            case 0:  res = 0U; break;          /* CLEAR */
+            case 1:  res = a & b; break;       /* AND */
+            case 2:  res = a & ~b; break;      /* AND_A_NB (BIT_CLEAR32 when Index=1) */
+            case 3:  res = a; break;           /* MOV_A (MOVE_REG32) */
+            case 4:  res = ~a & b; break;      /* AND_NA_B */
+            case 5:  res = b; break;           /* MOV_B */
+            case 6:  res = a ^ b; break;       /* XOR */
+            case 7:  res = a | b; break;       /* OR (BIT_SET32 when Index=1) */
+            case 8:  res = ~(a | b); break;    /* NOR */
+            case 9:  res = ~(a ^ b); break;    /* XNOR */
+            case 10: res = ~b; break;          /* NOT_B */
+            case 11: res = a | ~b; break;      /* OR_A_NB */
+            case 12: res = ~a; break;          /* NOT_A (NOT32) */
+            case 13: res = ~a | b; break;      /* OR_NA_B */
+            case 14: res = ~(a & b); break;    /* NAND */
+            case 15: res = 0xffffffffU; break; /* SET */
+            }
+            cs_regs[dst] = res;
+         }
+         break;
+      }
+
+      case 22: /* MALI_CS_OPCODE_BRANCH (0x16: cs_if / cs_else / cs_while / cs_break / cs_continue) */ {
+         uint8_t val_reg = (uint8_t)((insn >> 40) & 0xffU);
+         uint8_t cond = (uint8_t)((insn >> 28) & 0xfU);
+         int16_t imm_off = (int16_t)(insn & 0xffffU);
+         int32_t sval = (val_reg < 128) ? (int32_t)(uint32_t)cs_regs[val_reg] : 0;
+         bool taken = false;
+         switch (cond) {
+         case 0: taken = (sval <= 0); break; /* MALI_CS_CONDITION_LEQUAL */
+         case 1: taken = (sval > 0);  break; /* MALI_CS_CONDITION_GREATER */
+         case 2: taken = (sval == 0); break; /* MALI_CS_CONDITION_EQUAL */
+         case 3: taken = (sval != 0); break; /* MALI_CS_CONDITION_NEQUAL */
+         case 4: taken = (sval < 0);  break; /* MALI_CS_CONDITION_LESS */
+         case 5: taken = (sval >= 0); break; /* MALI_CS_CONDITION_GEQUAL */
+         case 6: taken = true;        break; /* MALI_CS_CONDITION_ALWAYS */
+         default: break;
+         }
+         if (taken) {
+            int64_t next_i = (int64_t)i + 1LL + (int64_t)imm_off;
+            if (next_i >= 0 && next_i <= (int64_t)count) {
+               i = (uint32_t)(next_i - 1LL);
+            } else {
+               return;
+            }
+         }
+         break;
+      }
+
+      case 26: /* MALI_CS_OPCODE_NEXT_SB_ENTRY (0x1a) */ {
+         uint8_t dst = (uint8_t)((insn >> 48) & 0xffU);
+         uint8_t fmt = (uint8_t)((insn >> 36) & 0x1U);
+         if (dst < 128) {
+            cs_regs[dst] = (fmt != 0U) ? (1U << 2U) : 2U;
+         }
+         break;
+      }
+
+      case 40: /* MALI_CS_OPCODE_STORE_STATE (0x28) */ {
+         uint8_t addr_reg = (uint8_t)((insn >> 40) & 0xffU);
+         uint8_t state_ty = (uint8_t)((insn >> 32) & 0xffU);
+         int16_t imm_off = (int16_t)(insn & 0xffffU);
+         if (addr_reg < 127) {
+            uint64_t base_va = (cs_regs[addr_reg + 1] << 32) | cs_regs[addr_reg];
+            uint64_t eff_va = (uint64_t)((int64_t)base_va + (int64_t)imm_off);
+            if (state_ty == 3U /* Error status (32-bit) */) {
+               if (base_va >= 0x10000ULL && emu_is_writable_host_range(eff_va, sizeof(uint32_t)))
+                  *(uint32_t *)(uintptr_t)eff_va = 0U;
+            } else {
+               if (base_va >= 0x10000ULL && emu_is_writable_host_range(eff_va, sizeof(uint64_t)))
+                  *(uint64_t *)(uintptr_t)eff_va = (uint64_t)g_stats.csf_instructions_executed * 100ULL;
+            }
+         }
+         break;
+      }
+
+      case 43: /* MALI_CS_OPCODE_PROGRESS_LOAD (0x2b) */ {
+         uint8_t dst = (uint8_t)((insn >> 48) & 0xffU);
+         if (dst < 127) {
+            cs_regs[dst] = g_stats.csf_instructions_executed;
+            cs_regs[dst + 1] = 0ULL;
+         }
+         break;
+      }
+
       case CSF_OP_CALL:
       case 33: /* HW_CSF_OP_JUMP (0x21) */ {
          uint8_t addr_reg = (insn >> 40) & 0xffU;
@@ -978,7 +1126,7 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
             uint64_t eff_va = (uint64_t)((int64_t)base_va + (int64_t)imm_off);
             uint32_t n_words = (uint32_t)__builtin_popcount((unsigned int)mask);
             if (base_va >= 0x10000ULL && n_words > 0 &&
-                emu_is_valid_host_range(eff_va, (size_t)n_words * sizeof(uint32_t))) {
+                emu_is_writable_host_range(eff_va, (size_t)n_words * sizeof(uint32_t))) {
                uint32_t *dst = (uint32_t *)(uintptr_t)eff_va;
                uint32_t r_off = 0;
                for (uint32_t b = 0; b < 16; b++) {
@@ -1029,7 +1177,7 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
          if (addr_reg < 127 && val_reg < 128) {
             uint64_t sync_va = (cs_regs[addr_reg + 1] << 32) | cs_regs[addr_reg];
             uint32_t val = (uint32_t)cs_regs[val_reg];
-            if (sync_va >= 0x10000ULL && emu_is_valid_host_range(sync_va, sizeof(uint32_t))) {
+            if (sync_va >= 0x10000ULL && emu_is_writable_host_range(sync_va, sizeof(uint32_t))) {
                uint32_t *ptr = (uint32_t *)(uintptr_t)sync_va;
                if (opcode == CSF_OP_SYNC_ADD32)
                   *ptr += val;
@@ -1060,7 +1208,7 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
          if (addr_reg < 127 && val_reg < 127) {
             uint64_t sync_va = (cs_regs[addr_reg + 1] << 32) | cs_regs[addr_reg];
             uint64_t val = (cs_regs[val_reg + 1] << 32) | cs_regs[val_reg];
-            if (sync_va >= 0x10000ULL && emu_is_valid_host_range(sync_va, sizeof(uint64_t))) {
+            if (sync_va >= 0x10000ULL && emu_is_writable_host_range(sync_va, sizeof(uint64_t))) {
                uint64_t *ptr = (uint64_t *)(uintptr_t)sync_va;
                if (opcode == CSF_OP_SYNC_ADD64)
                   *ptr += val;
@@ -1368,6 +1516,9 @@ int close(int fd)
             : lifted_r44p1_kbase_release,
          (uint64_t)(uintptr_t)g_kfile.sim_inode,
          (uint64_t)(uintptr_t)g_kfile.sim_filp, 0, 0, 0);
+      g_kfile.fd = -1;
+      g_kfile.ino = 0;
+      g_kfile.state = EMU_KFILE_UNOPENED;
       *(uint64_t *)(g_kfile.sim_filp + 216) = (uint64_t)(uintptr_t)g_kfile.sim_kfile_buf;
       pthread_mutex_unlock(&g_emu_lock);
    }
@@ -1658,8 +1809,16 @@ int ioctl(int fd, unsigned long request, ...)
                memset(reg, 0, sizeof(*reg));
                reg->active = true;
                reg->size = (size_t)total_pages * 4096U;
+               reg->va_pages = total_pages;
+               reg->commit_pages = total_pages;
                reg->flags = al->in.flags | BASE_MEM_SAME_VA;
                reg->cookie_or_va = (uint64_t)(g_kfile.next_cookie++) << 12;
+               if (al->in.aliasing_info != 0) {
+                  const struct base_mem_aliasing_info *ai0 =
+                     (const struct base_mem_aliasing_info *)(uintptr_t)al->in.aliasing_info;
+                  reg->aliased_src_va = ai0[0].handle;
+                  reg->alias_stride_bytes = (size_t)al->in.stride * 4096U;
+               }
                al->out.flags = reg->flags;
                al->out.gpu_va = reg->cookie_or_va;
                al->out.va_pages = total_pages;
@@ -2098,7 +2257,16 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
                pthread_mutex_unlock(&g_emu_lock);
                return p;
             }
-            void *p = orig_mmap((flags & MAP_FIXED) ? addr : NULL, length, prot,
+            /* On the host CPU-based CSF/Valhall emulator, any BO region with
+             * BASE_MEM_PROT_GPU_WR (including KBASE_IOCTL_MEM_ALIAS 2x ringbuffer
+             * aliases where the CPU VMA requested PROT_READ) must be mapped with
+             * PROT_WRITE on the host so GPU instructions (STORE_MULTIPLE, SYNC_ADD/SET)
+             * do not fault with SIGSEGV (SEGV_ACCERR) when writing to GPU VA! */
+            int host_prot = prot | PROT_READ |
+               ((g_kfile.regions[i].flags & (BASE_MEM_PROT_GPU_WR | BASE_MEM_PROT_CPU_WR))
+                   ? PROT_WRITE
+                   : 0);
+            void *p = orig_mmap((flags & MAP_FIXED) ? addr : NULL, length, host_prot,
                                 MAP_SHARED | MAP_ANONYMOUS | (flags & MAP_FIXED), -1, 0);
             if (p != MAP_FAILED) {
                g_kfile.regions[i].cpu_ptr = p;
@@ -2132,6 +2300,17 @@ int munmap(void *addr, size_t length)
       int r = panthor_kbase_adapter_munmap(addr, length);
       in_munmap = 0;
       return r;
+   }
+   if (addr != NULL && g_kfile.state == EMU_KFILE_KCTX_READY) {
+      pthread_mutex_lock(&g_emu_lock);
+      for (size_t i = 0; i < 2048; i++) {
+         if (g_kfile.regions[i].active && g_kfile.regions[i].cpu_ptr == addr) {
+            g_kfile.regions[i].freed_by_munmap = true;
+            g_kfile.regions[i].cpu_ptr = NULL;
+            g_kfile.regions[i].active = false;
+         }
+      }
+      pthread_mutex_unlock(&g_emu_lock);
    }
    return orig_munmap(addr, length);
 }
