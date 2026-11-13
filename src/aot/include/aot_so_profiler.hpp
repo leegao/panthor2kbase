@@ -45,6 +45,7 @@ struct AotSoFnProfileEntry {
 void aot_so_set_debug_flags(uint32_t flags);
 uint32_t aot_so_get_debug_flags(void);
 uint32_t aot_so_get_stack_depth(void);
+void aot_so_unwind_to_depth(uint32_t target_depth);
 uint32_t aot_so_get_max_stack_depth(void);
 const struct AotSoStackFrame* aot_so_get_stack_frame(uint32_t idx);
 void aot_so_reset_profile(void);
@@ -150,6 +151,35 @@ uint32_t aot_so_get_debug_flags(void) {
 
 uint32_t aot_so_get_stack_depth(void) {
     return aot_so_prof_detail::g_so_call_depth;
+}
+
+void aot_so_unwind_to_depth(uint32_t target_depth) {
+    uint32_t flags = aot_so_prof_detail::g_so_debug_flags;
+    while (aot_so_prof_detail::g_so_call_depth > target_depth) {
+        aot_so_prof_detail::g_so_call_depth--;
+        uint32_t idx = aot_so_prof_detail::g_so_call_depth;
+        const char* fn_name = "<sub_unknown>";
+        uint64_t elapsed_ns = 0ULL;
+        if (idx < AOT_SO_MAX_CALL_FRAMES) {
+            AotSoStackFrame& fr = aot_so_prof_detail::g_so_call_frames[idx];
+            if (fr.fn_name) fn_name = fr.fn_name;
+            if ((flags & (AOT_SO_DEBUG_TRACE_CALLS | AOT_SO_DEBUG_PROFILE_CALLS)) && fr.enter_ns != 0ULL) {
+                uint64_t now_ns = aot_so_prof_detail::monotonic_ns();
+                if (now_ns >= fr.enter_ns) {
+                    elapsed_ns = now_ns - fr.enter_ns;
+                }
+            }
+            if (idx > 0U) {
+                aot_so_prof_detail::g_so_call_frames[idx - 1U].child_ns += elapsed_ns;
+            }
+        }
+        if (flags & AOT_SO_DEBUG_TRACE_CALLS) {
+            std::fprintf(stderr, "[SO_TRACE] %*s<- %s [unwound %llu ns]\n",
+                         static_cast<int>(idx * 2U), "",
+                         fn_name,
+                         static_cast<unsigned long long>(elapsed_ns));
+        }
+    }
 }
 
 uint32_t aot_so_get_max_stack_depth(void) {

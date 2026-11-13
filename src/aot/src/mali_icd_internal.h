@@ -865,6 +865,7 @@ struct MaliAotGlobalRuntime {
             volatile uint64_t ia_ok = 0, ia_skipped = 0;
             for (volatile uint64_t i = 0; i < ia_count; ++i) {
                 resetGuestStackLocked();
+                volatile uint32_t saved_so_depth = aot_so_get_stack_depth();
                 s_ia_guard = 1;
                 if (sigsetjmp(s_ia_jmp, 1) == 0) {
                     aot_run_dt_init_array_entry(&cpu, i);
@@ -872,6 +873,7 @@ struct MaliAotGlobalRuntime {
                     ia_ok++;
                 } else {
                     s_ia_guard = 0;
+                    aot_so_unwind_to_depth(saved_so_depth);
                     ia_skipped++;
                     if (trace_ia) {
                         std::fprintf(stderr, "[MALI_AOT_ICD] DT_INIT_ARRAY[%llu/%llu] skipped (unresolved Android GOT/TLS)\n",
