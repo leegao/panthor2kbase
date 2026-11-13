@@ -1,42 +1,23 @@
 #pragma once
 // ============================================================================
-// mali0_emu_uapi.h
-// Standalone /dev/mali0 (mali_kbase CSF & Job Manager) + /dev/dma_heap UAPI
-// Definitions, Framebuffer (MFBD) & IDVS Draw Descriptors, and C Hook API
+// mali_csf_uapi_types.h
+// Mali /dev/mali0 (kbase CSF & Job Manager) + /dev/dma_heap UAPI extensions
+// and Framebuffer (MFBD) / GPU Profile types for r54p3_vulkan_icd.
+// Authoritative kbase UAPI constants & ioctl structs come from mali_kbase_uapi.h.
 // ============================================================================
 #include <cstdint>
 #include <cstddef>
+#include "mali_kbase_uapi.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 // ============================================================================
-// Section 1: Mali /dev/mali0 (kbase CSF) UAPI Constants & Structures
+// Section 1: Mali /dev/mali0 (kbase CSF) ICD Convenience Aliases & Ring Offsets
 // ============================================================================
 static constexpr uint64_t KBASE_PAGE_SHIFT = 12ULL;
 static constexpr uint64_t KBASE_PAGE_SIZE  = 4096ULL;
-
-// Special mmap handles from mali_base_common_kernel.h & mali_base_csf_kernel.h
-static constexpr uint64_t BASE_MEM_MAP_TRACKING_HANDLE       = (3ULL  << KBASE_PAGE_SHIFT); // 0x3000
-static constexpr uint64_t BASEP_MEM_WRITE_ALLOC_PAGES_HANDLE = (4ULL  << KBASE_PAGE_SHIFT); // 0x4000
-static constexpr uint64_t BASEP_MEM_CSF_USER_REG_PAGE_HANDLE = (47ULL << KBASE_PAGE_SHIFT); // 0x2f000
-static constexpr uint64_t BASEP_MEM_CSF_USER_IO_PAGES_HANDLE = (48ULL << KBASE_PAGE_SHIFT); // 0x30000
-static constexpr uint64_t BASE_MEM_COOKIE_BASE               = (1024ULL << KBASE_PAGE_SHIFT); // 0x400000
-
-// Memory allocation flags from mali_base_common_kernel.h
-static constexpr uint64_t BASE_MEM_PROT_CPU_RD = (1ULL << 0);
-static constexpr uint64_t BASE_MEM_PROT_CPU_WR = (1ULL << 1);
-static constexpr uint64_t BASE_MEM_PROT_GPU_RD = (1ULL << 2);
-static constexpr uint64_t BASE_MEM_PROT_GPU_WR = (1ULL << 3);
-static constexpr uint64_t BASE_MEM_PROT_GPU_EX = (1ULL << 4);
-static constexpr uint64_t BASE_MEM_GROW_ON_GPF = (1ULL << 9);
-static constexpr uint64_t BASE_MEM_COHERENT_SYSTEM = (1ULL << 10);
-static constexpr uint64_t BASE_MEM_COHERENT_LOCAL  = (1ULL << 11);
-static constexpr uint64_t BASE_MEM_CACHED_CPU  = (1ULL << 12);
-static constexpr uint64_t BASE_MEM_SAME_VA     = (1ULL << 13);
-static constexpr uint64_t BASE_MEM_NEED_MMAP   = (1ULL << 14);
-static constexpr uint64_t BASE_MEM_CSF_EVENT   = (1ULL << 19);
 
 // CSF USER_IO register offsets from mali_kbase_csf_registers.h
 static constexpr uint32_t CS_INSERT_LO       = 0x0000;
@@ -86,205 +67,27 @@ enum MaliCsOpcode : uint8_t {
     MALI_CS_OPCODE_SYNC_WAIT64          = 53,
 };
 
-// UAPI ioctl structs matching kbase_uapi.h & kbase_csf_uapi.h
-struct KbaseIoctlVersionCheck {
-    uint16_t major;
-    uint16_t minor;
-};
-
-struct KbaseIoctlSetFlags {
-    uint32_t create_flags;
-};
-
-struct KbaseIoctlGetGpuprops {
-    uint64_t buffer;
-    uint32_t size;
-    uint32_t flags;
-};
-
-union KbaseIoctlMemAlloc {
-    struct {
-        uint64_t va_pages;
-        uint64_t commit_pages;
-        uint64_t extension;
-        uint64_t flags;
-    } in;
-    struct {
-        uint64_t flags;
-        uint64_t gpu_va;
-    } out;
-};
-
-union KbaseIoctlMemAllocEx {
-    struct {
-        uint64_t va_pages;
-        uint64_t commit_pages;
-        uint64_t extension;
-        uint64_t flags;
-        uint64_t fixed_address;
-        uint64_t extra[3];
-    } in;
-    struct {
-        uint64_t flags;
-        uint64_t gpu_va;
-    } out;
-};
-
-union KbaseIoctlMemQuery {
-    struct {
-        uint64_t gpu_addr;
-        uint64_t query;
-    } in;
-    struct {
-        uint64_t value;
-    } out;
-};
-
-struct KbaseIoctlMemFree {
-    uint64_t gpu_addr;
-};
-
-struct KbaseIoctlMemCommit {
-    uint64_t gpu_addr;
-    uint64_t pages;
-};
-
-union KbaseIoctlMemAlias {
-    struct {
-        uint64_t flags;
-        uint64_t stride;
-        uint64_t nents;
-        uint64_t aliasing_info;
-    } in;
-    struct {
-        uint64_t flags;
-        uint64_t gpu_va;
-        uint64_t va_pages;
-    } out;
-};
-
-struct KbaseIoctlMemSync {
-    uint64_t handle;
-    uint64_t user_addr;
-    uint64_t size;
-    uint8_t  type;
-    uint8_t  padding[7];
-};
-
-struct BasepCsStreamControl {
-    uint32_t features;
-    uint32_t padding;
-};
-
-struct BasepCsGroupControl {
-    uint32_t features;
-    uint32_t stream_num;
-    uint32_t suspend_size;
-    uint32_t padding;
-};
-
-union KbaseIoctlCsGetGlbIface {
-    struct {
-        uint32_t max_group_num;
-        uint32_t max_total_stream_num;
-        uint64_t groups_ptr;
-        uint64_t streams_ptr;
-    } in;
-    struct {
-        uint32_t glb_version;
-        uint32_t features;
-        uint32_t group_num;
-        uint32_t max_total_stream_num;
-        uint32_t total_stream_num;
-        uint32_t instr_features;
-    } out;
-};
-
-struct KbaseIoctlCsQueueRegister {
-    uint64_t buffer_gpu_addr;
-    uint32_t buffer_size;
-    uint8_t  priority;
-    uint8_t  padding[3];
-};
-
-struct KbaseIoctlCsQueueKick {
-    uint64_t buffer_gpu_addr;
-};
-
-union KbaseIoctlCsQueueBind {
-    struct {
-        uint64_t buffer_gpu_addr;
-        uint8_t  group_handle;
-        uint8_t  csi_index;
-        uint8_t  padding[6];
-    } in;
-    struct {
-        uint64_t mmap_handle;
-    } out;
-};
-
-union KbaseIoctlCsQueueGroupCreate {
-    struct {
-        uint64_t tiler_mask;
-        uint64_t fragment_mask;
-        uint64_t compute_mask;
-        uint8_t  cs_min;
-        uint8_t  priority;
-        uint8_t  tiler_max;
-        uint8_t  fragment_max;
-        uint8_t  compute_max;
-        uint8_t  csi_handlers;
-        uint8_t  neural_max;
-        uint8_t  padding;
-        uint64_t d_vs_buf;
-        uint64_t neural_mask;
-        uint64_t reserved[8];
-    } in;
-    struct {
-        uint8_t  group_handle;
-        uint8_t  padding[3];
-        uint32_t group_uid;
-        uint64_t user_io_gpu_va;
-    } out;
-    uint8_t raw_storage[128];
-};
-
-union KbaseIoctlCsTilerHeapInit {
-    struct {
-        uint32_t chunk_size;
-        uint32_t initial_chunks;
-        uint32_t max_chunks;
-        uint16_t target_in_flight;
-        uint8_t  group_id;
-        uint8_t  padding;
-        uint64_t buf_desc_va;
-    } in;
-    struct {
-        uint64_t gpu_heap_va;
-        uint64_t first_chunk_va;
-    } out;
-};
-
-struct KbaseIoctlCsTilerHeapTerm {
-    uint64_t gpu_heap_va;
-};
-
-struct KbaseIoctlKcpuQueueNew {
-    uint8_t id;
-    uint8_t padding[7];
-};
-
-struct KbaseIoctlKcpuQueueDelete {
-    uint8_t id;
-    uint8_t padding[7];
-};
-
-struct KbaseIoctlKcpuQueueEnqueue {
-    uint64_t addr;
-    uint32_t nr_commands;
-    uint8_t  id;
-    uint8_t  padding[3];
-};
+// CamelCase aliases onto authoritative include/mali_kbase_uapi.h structs
+typedef struct kbase_ioctl_version_check       KbaseIoctlVersionCheck;
+typedef struct kbase_ioctl_set_flags           KbaseIoctlSetFlags;
+typedef struct kbase_ioctl_get_gpuprops        KbaseIoctlGetGpuprops;
+typedef union  kbase_ioctl_mem_alloc           KbaseIoctlMemAlloc;
+typedef union  kbase_ioctl_mem_alloc_ex        KbaseIoctlMemAllocEx;
+typedef union  kbase_ioctl_mem_query           KbaseIoctlMemQuery;
+typedef struct kbase_ioctl_mem_free            KbaseIoctlMemFree;
+typedef struct kbase_ioctl_mem_commit          KbaseIoctlMemCommit;
+typedef union  kbase_ioctl_mem_alias           KbaseIoctlMemAlias;
+typedef struct kbase_ioctl_mem_sync            KbaseIoctlMemSync;
+typedef union  kbase_ioctl_mem_import          KbaseIoctlMemImport;
+typedef union  kbase_ioctl_cs_get_glb_iface    KbaseIoctlCsGetGlbIface;
+typedef struct kbase_ioctl_cs_queue_register   KbaseIoctlCsQueueRegister;
+typedef struct kbase_ioctl_cs_queue_kick       KbaseIoctlCsQueueKick;
+typedef union  kbase_ioctl_cs_queue_bind       KbaseIoctlCsQueueBind;
+typedef union  kbase_ioctl_cs_tiler_heap_init  KbaseIoctlCsTilerHeapInit;
+typedef struct kbase_ioctl_cs_tiler_heap_term  KbaseIoctlCsTilerHeapTerm;
+typedef struct kbase_ioctl_kcpu_queue_new      KbaseIoctlKcpuQueueNew;
+typedef struct kbase_ioctl_kcpu_queue_delete   KbaseIoctlKcpuQueueDelete;
+typedef struct kbase_ioctl_kcpu_queue_enqueue  KbaseIoctlKcpuQueueEnqueue;
 
 
 // ============================================================================
@@ -387,30 +190,12 @@ struct MaliJmJobHeader {
 // Section 1C: /dev/dma_heap/system WSI Allocation & KBASE_IOCTL_MEM_IMPORT
 // ============================================================================
 static constexpr uint32_t DMA_HEAP_IOCTL_ALLOC              = 0xc0184800U;
-static constexpr uint32_t BASE_MEM_IMPORT_TYPE_UMM          = 2U; // DMA-BUF fd
-static constexpr uint32_t BASE_MEM_IMPORT_TYPE_USER_BUFFER  = 3U;
 
 struct DmaHeapAllocationData {
     uint64_t len;
     uint32_t fd;
     uint32_t fd_flags;
     uint64_t heap_flags;
-};
-
-struct KbaseIoctlMemImport {
-    union {
-        struct {
-            uint64_t flags;
-            uint64_t phandle;
-            uint32_t type;
-            uint32_t padding;
-        } in;
-        struct {
-            uint64_t flags;
-            uint64_t gpu_va;
-            uint64_t va_pages;
-        } out;
-    };
 };
 
 // ============================================================================

@@ -170,15 +170,20 @@ if [ ! -f "$BUILD_HOST_DIR/libmali_kbase_emu.so" ] || [ ! -f "$BUILD_HOST_DIR/li
     "$CMAKE_BIN" --build "$BUILD_HOST_DIR" --target mali_kbase_emu panthor_kbase_adapter mali_kbase_emu_static panthor_kbase_adapter_static
 fi
 
-DYN_EMU="-Wl,--no-as-needed -L$BUILD_HOST_DIR -L$BUILD_HOST_DIR/emulator -L$BUILD_HOST_DIR/adapter -lmali_kbase_emu -lpanthor_kbase_adapter"
+DYN_EMU="-Wl,--no-as-needed -L$BUILD_HOST_DIR -L$BUILD_HOST_DIR/emulator -lmali_kbase_emu"
 AOT_RPATH='$ORIGIN:$ORIGIN/..:$ORIGIN/../..:$ORIGIN/../../..:$ORIGIN/emulator:$ORIGIN/../emulator:$ORIGIN/adapter:$ORIGIN/../adapter:$ORIGIN/../../../../build-x86-64:$ORIGIN/../../../build-x86-64'
 
-echo "[Link] Dynamically linking libmali_kbase_emu.so + libpanthor_kbase_adapter.so into ICD..."
+echo "[Link] Dynamically linking libmali_kbase_emu.so into ICD..."
 g++ -O2 -std=c++17 -fno-strict-aliasing -shared -fPIC \
     -Wl,-Bsymbolic -Wl,-Bsymbolic-functions \
     -I"$REPO_ROOT/src/r54p3_vulkan_icd" -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
     -I"$REPO_ROOT/include" -I"$REPO_ROOT/src/adapter" -I"$REPO_ROOT/src/emulator" \
-    "$REPO_ROOT/src/r54p3_vulkan_icd/mali_vulkan_icd.cpp" "$OUT_DIR/r54p3_lifted.o" "${EXTRA_AOT_OBJS[@]}" \
+    "$REPO_ROOT/src/r54p3_vulkan_icd/mali_icd_internal.cpp" \
+    "$REPO_ROOT/src/r54p3_vulkan_icd/mali_icd_physdev.cpp" \
+    "$REPO_ROOT/src/r54p3_vulkan_icd/mali_icd_wsi.cpp" \
+    "$REPO_ROOT/src/r54p3_vulkan_icd/mali_vulkan_icd.cpp" \
+    "$REPO_ROOT/src/r54p3_vulkan_icd/r54p3_vulkan_icd.cpp" \
+    "$OUT_DIR/r54p3_lifted.o" "${EXTRA_AOT_OBJS[@]}" \
     $DYN_EMU -ldl -lm -lpthread \
     -Wl,-rpath,"$AOT_RPATH" \
     -o "$OUT_DIR/libvulkan_mali_aot_icd.so"

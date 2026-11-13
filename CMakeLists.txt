@@ -368,17 +368,22 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
    set_source_files_properties("${AOT_MBS2_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 
    add_library(r54p3_vulkan_icd SHARED
+      src/r54p3_vulkan_icd/mali_icd_internal.cpp
+      src/r54p3_vulkan_icd/mali_icd_physdev.cpp
+      src/r54p3_vulkan_icd/mali_icd_wsi.cpp
+      src/r54p3_vulkan_icd/mali_vulkan_icd.cpp
       src/r54p3_vulkan_icd/r54p3_vulkan_icd.cpp
       "${AOT_MBS2_OBJ}"
    )
    add_dependencies(r54p3_vulkan_icd aot_targets)
    target_include_directories(r54p3_vulkan_icd PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/include"
       "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd"
       "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/include"
       "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator"
    )
    target_link_options(r54p3_vulkan_icd PRIVATE -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -Wl,--no-as-needed)
-   target_link_libraries(r54p3_vulkan_icd PRIVATE mali_kbase_emu panthor_kbase_adapter ${PLATFORM_LIBS})
+   target_link_libraries(r54p3_vulkan_icd PRIVATE mali_kbase_emu ${PLATFORM_LIBS})
    set_target_properties(r54p3_vulkan_icd PROPERTIES
       LIBRARY_OUTPUT_DIRECTORY "${AOT_DIR}"
    )

@@ -28,7 +28,8 @@ PHYSDEV_COMMANDS = [
     "vkGetPhysicalDeviceExternalFenceProperties",
     "vkGetPhysicalDeviceExternalSemaphoreProperties",
     "vkEnumeratePhysicalDeviceGroups",
-    "vkEnumerateDeviceExtensionProperties",
+    # vkEnumerateDeviceExtensionProperties is implemented in mali_icd_physdev.cpp so it can
+    # append VK_KHR_swapchain when libGLES_mali.so omits it.
 ]
 
 DEVICE_COMMANDS = [

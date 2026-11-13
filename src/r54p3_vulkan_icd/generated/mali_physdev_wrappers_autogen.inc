@@ -262,19 +262,3 @@ VkResult vkEnumeratePhysicalDeviceGroups(VkInstance instance, uint32_t* pPhysica
     }
     return VK_ERROR_INITIALIZATION_FAILED;
 }
-
-__attribute__((visibility("default")))
-VkResult vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice, const char* pLayerName, uint32_t* pPropertyCount, VkExtensionProperties* pProperties) {
-    g_aot_rt.ensureInitialized();
-    auto* pdev = reinterpret_cast<MaliIcdPhysicalDevice*>(physicalDevice);
-    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkEnumerateDeviceExtensionProperties && pdev) {
-        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
-        pdev->initAotInternalLayout();
-        VkResult r = mali_aapcs64::invokeLiftedAapcs64<VkResult>(
-            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkEnumerateDeviceExtensionProperties,
-            pdev->aot_internal, pLayerName, pPropertyCount, pProperties);
-        g_aot_rt.lifted_vk_calls_executed++;
-        return r;
-    }
-    return VK_ERROR_INITIALIZATION_FAILED;
-}

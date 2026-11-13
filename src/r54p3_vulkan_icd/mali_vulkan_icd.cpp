@@ -5,7 +5,8 @@
 // Modularized across mali_icd_internal.h, mali_icd_physdev.cpp, and
 // mali_icd_wsi.cpp.
 // ============================================================================
-#include "mali_icd_physdev.cpp"
+#include "mali_icd_internal.h"
+#include "mali_icd_entrypoints.h"
 #include "generated/mali_device_wrappers_autogen.inc"
 
 static inline bool useNativeAotFor(const char* op) {
@@ -1947,8 +1948,6 @@ VkResult vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* 
 
 
 } // extern "C"
-
-#include "mali_icd_wsi.cpp"
 
 extern "C" {
 

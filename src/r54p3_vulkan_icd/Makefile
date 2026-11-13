@@ -7,19 +7,21 @@ TARGET_SHARED = lib/libr54p3_vulkan_icd.so
 TARGET_STATIC = lib/libr54p3_vulkan_icd.a
 TARGET_JSON   = lib/r54p3_vulkan_icd.json
 
+OBJS = lib/mali_icd_internal.o lib/mali_icd_physdev.o lib/mali_icd_wsi.o lib/mali_vulkan_icd.o lib/r54p3_vulkan_icd.o
+
 all: dirs $(TARGET_SHARED) $(TARGET_STATIC) json
 
 dirs:
 	@mkdir -p lib
 
-lib/r54p3_vulkan_icd.o: r54p3_vulkan_icd.cpp *.h*
+lib/%.o: %.cpp *.h*
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(TARGET_SHARED): lib/r54p3_vulkan_icd.o
-	$(CXX) $(CXXFLAGS) -shared $< -o $@ $(LDFLAGS)
+$(TARGET_SHARED): $(OBJS)
+	$(CXX) $(CXXFLAGS) -shared $^ -o $@ $(LDFLAGS)
 
-$(TARGET_STATIC): lib/r54p3_vulkan_icd.o
-	$(AR) rcs $@ $<
+$(TARGET_STATIC): $(OBJS)
+	$(AR) rcs $@ $^
 
 json: $(TARGET_SHARED)
 	@printf '{\n  "file_format_version": "1.0.0",\n  "ICD": {\n    "library_path": "%s/lib/libr54p3_vulkan_icd.so",\n    "api_version": "1.3.250"\n  }\n}\n' "$(CURDIR)" > lib/r54p3_decompiled_icd.x86_64.json

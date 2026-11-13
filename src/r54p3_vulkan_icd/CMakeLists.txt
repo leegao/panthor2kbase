@@ -12,11 +12,19 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
 )
 
-add_library(r54p3_vulkan_icd_shared SHARED r54p3_vulkan_icd.cpp)
+set(R54P3_ICD_SOURCES
+    mali_icd_internal.cpp
+    mali_icd_physdev.cpp
+    mali_icd_wsi.cpp
+    mali_vulkan_icd.cpp
+    r54p3_vulkan_icd.cpp
+)
+
+add_library(r54p3_vulkan_icd_shared SHARED ${R54P3_ICD_SOURCES})
 set_target_properties(r54p3_vulkan_icd_shared PROPERTIES OUTPUT_NAME "r54p3_vulkan_icd")
 target_link_libraries(r54p3_vulkan_icd_shared PRIVATE dl pthread)
 
-add_library(r54p3_vulkan_icd_static STATIC r54p3_vulkan_icd.cpp)
+add_library(r54p3_vulkan_icd_static STATIC ${R54P3_ICD_SOURCES})
 set_target_properties(r54p3_vulkan_icd_static PROPERTIES OUTPUT_NAME "r54p3_vulkan_icd")
 target_link_libraries(r54p3_vulkan_icd_static PRIVATE dl pthread)
 

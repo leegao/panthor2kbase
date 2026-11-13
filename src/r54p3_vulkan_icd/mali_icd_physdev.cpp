@@ -289,6 +289,70 @@ void vkGetPhysicalDeviceProperties2(void* physicalDevice, void* pProperties2) {
     }
 }
 
+__attribute__((visibility("default")))
+VkResult vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice, const char* pLayerName, uint32_t* pPropertyCount, VkExtensionProperties* pProperties) {
+    if (!pPropertyCount) return VK_ERROR_INITIALIZATION_FAILED;
+    g_aot_rt.ensureInitialized();
+    auto* pdev = reinterpret_cast<MaliIcdPhysicalDevice*>(physicalDevice);
+    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkEnumerateDeviceExtensionProperties && pdev) {
+        if (pLayerName && pLayerName[0] != '\0') {
+            std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+            pdev->initAotInternalLayout();
+            VkResult r = mali_aapcs64::invokeLiftedAapcs64<VkResult>(
+                g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkEnumerateDeviceExtensionProperties,
+                pdev->aot_internal, pLayerName, pPropertyCount, pProperties);
+            g_aot_rt.lifted_vk_calls_executed++;
+            return r;
+        }
+        std::vector<VkExtensionProperties> exts;
+        {
+            std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+            pdev->initAotInternalLayout();
+            uint32_t aot_count = 0;
+            VkResult r = mali_aapcs64::invokeLiftedAapcs64<VkResult>(
+                g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkEnumerateDeviceExtensionProperties,
+                pdev->aot_internal, pLayerName, &aot_count, static_cast<VkExtensionProperties*>(nullptr));
+            g_aot_rt.lifted_vk_calls_executed++;
+            if (r == VK_SUCCESS && aot_count > 0) {
+                exts.resize(aot_count);
+                r = mali_aapcs64::invokeLiftedAapcs64<VkResult>(
+                    g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkEnumerateDeviceExtensionProperties,
+                    pdev->aot_internal, pLayerName, &aot_count, exts.data());
+                g_aot_rt.lifted_vk_calls_executed++;
+                if (r == VK_SUCCESS || r == VK_INCOMPLETE) {
+                    exts.resize(aot_count);
+                } else {
+                    exts.clear();
+                }
+            }
+        }
+        bool has_swapchain = false;
+        for (const auto& e : exts) {
+            if (std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0) {
+                has_swapchain = true;
+                break;
+            }
+        }
+        if (!has_swapchain) {
+            VkExtensionProperties swapchain_ext{};
+            std::snprintf(swapchain_ext.extensionName, sizeof(swapchain_ext.extensionName), "%s", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+            swapchain_ext.specVersion = VK_KHR_SWAPCHAIN_SPEC_VERSION;
+            exts.push_back(swapchain_ext);
+        }
+        if (!pProperties) {
+            *pPropertyCount = static_cast<uint32_t>(exts.size());
+            return VK_SUCCESS;
+        }
+        uint32_t to_copy = std::min(*pPropertyCount, static_cast<uint32_t>(exts.size()));
+        if (to_copy > 0) {
+            std::memcpy(pProperties, exts.data(), to_copy * sizeof(VkExtensionProperties));
+        }
+        *pPropertyCount = to_copy;
+        return (to_copy < exts.size()) ? VK_INCOMPLETE : VK_SUCCESS;
+    }
+    return VK_ERROR_INITIALIZATION_FAILED;
+}
+
 #include "generated/mali_physdev_wrappers_autogen.inc"
 
 } // extern "C"
