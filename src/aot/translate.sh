@@ -87,11 +87,18 @@ print(f"{ver}{bid}")
     fi
 fi
 
-OUT_DIR="${2:-$ROOT_DIR/build/$ELF_TAG}"
-mkdir -p "$OUT_DIR" "$ROOT_DIR/bin"
+OUT_DIR="${2:-${BUILD_DIR:-$REPO_ROOT/build-x86-64}}"
+mkdir -p "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
-PASS_DRIVER="$ROOT_DIR/bin/mali_llvm_pass_driver"
+if [ -x "$OUT_DIR/aot/mali_llvm_pass_driver" ]; then
+    PASS_DRIVER="$OUT_DIR/aot/mali_llvm_pass_driver"
+elif [ -x "$OUT_DIR/mali_llvm_pass_driver" ]; then
+    PASS_DRIVER="$OUT_DIR/mali_llvm_pass_driver"
+else
+    PASS_DRIVER="$OUT_DIR/mali_llvm_pass_driver"
+fi
+
 NEEDS_REBUILD=0
 if [ ! -x "$PASS_DRIVER" ] || [ "$ROOT_DIR/src/mali_llvm_passes.cpp" -nt "$PASS_DRIVER" ]; then
     NEEDS_REBUILD=1
@@ -101,7 +108,8 @@ elif ldd "$PASS_DRIVER" 2>/dev/null | grep -q "not found"; then
 fi
 
 if [ "$NEEDS_REBUILD" -eq 1 ]; then
-    echo "[Build] Compiling 6-Pass C++ LLVM Lifter & Lowerer (src/mali_llvm_passes.cpp -> bin/mali_llvm_pass_driver)..."
+    PASS_DRIVER="$OUT_DIR/mali_llvm_pass_driver"
+    echo "[Build] Compiling 6-Pass C++ LLVM Lifter & Lowerer (src/mali_llvm_passes.cpp -> $PASS_DRIVER)..."
     g++ -O3 "$ROOT_DIR/src/mali_llvm_passes.cpp" -ldl -o "$PASS_DRIVER"
 fi
 
@@ -113,10 +121,23 @@ echo " Host libLLVM   : ${MALI_HOST_LIBLLVM:-dynamic dlopen}"
 echo " Output Dir     : $OUT_DIR"
 echo "================================================================================"
 
-if [ -f "$OUT_DIR/mali_mbs2_aot.o" ] && [ "${MALI_AOT_FORCE_RELIFT:-0}" != "1" ] && [ "$OUT_DIR/mali_mbs2_aot.o" -nt "$PASS_DRIVER" ]; then
+STAMP_FILE="$OUT_DIR/mali_mbs2_aot.o.stamp"
+CUR_STAMP=""
+if command -v sha256sum >/dev/null 2>&1; then
+    CUR_STAMP="$(sha256sum "$ROOT_DIR/src/mali_llvm_passes.cpp" ${SO_PATH:+"$SO_PATH"} | sha256sum | awk '{print $1}')"
+fi
+STAMP_OK=0
+if [ -n "$CUR_STAMP" ] && [ -f "$STAMP_FILE" ] && [ "$(cat "$STAMP_FILE" 2>/dev/null || true)" = "$CUR_STAMP" ]; then
+    STAMP_OK=1
+fi
+
+if [ -f "$OUT_DIR/mali_mbs2_aot.o" ] && [ "${MALI_AOT_FORCE_RELIFT:-0}" != "1" ] && [ "$STAMP_OK" -eq 1 ] && [ "$OUT_DIR/mali_mbs2_aot.o" -nt "$PASS_DRIVER" ] && [ "$OUT_DIR/mali_mbs2_aot.o" -nt "$ROOT_DIR/src/mali_llvm_passes.cpp" ]; then
     echo "[Cache] Reusing up-to-date $OUT_DIR/mali_mbs2_aot.o (set MALI_AOT_FORCE_RELIFT=1 to force full re-lift)"
 elif [ -n "$SO_PATH" ] && [ -f "$SO_PATH" ]; then
     "$PASS_DRIVER" --lift-so "$SO_PATH" "$OUT_DIR" --hook-Vulkan-calls
+    if [ -n "$CUR_STAMP" ]; then
+        echo "$CUR_STAMP" > "$STAMP_FILE"
+    fi
 elif [ ! -f "$OUT_DIR/mali_mbs2_aot.o" ]; then
     echo "[WARN] Input $SO_ARG not present (e.g. clean GitHub Actions CI checkout); synthesizing CI stub mali_mbs2_aot.o..."
     cat << 'STUB_EOF' > "$OUT_DIR/mali_mbs2_aot_stub.c"
@@ -167,7 +188,7 @@ g++ -O2 -std=c++17 -fno-strict-aliasing -shared -fPIC \
     -Wl,-rpath,"$AOT_RPATH" \
     -o "$OUT_DIR/libvulkan_mali_aot_icd.so"
 
-if [ "${MALI_AOT_KEEP_LL:-0}" != "1" ]; then
+if [ "${MALI_AOT_KEEP_LL:-1}" = "0" ]; then
     rm -f "$OUT_DIR/mali_mbs2_unopt.ll" "$OUT_DIR/mali_mbs2_opt.ll"
 fi
 cat << JSON_EOF > "$OUT_DIR/mali_aot_icd.x86_64.json"
@@ -190,12 +211,6 @@ if [ -d "$BUILD_HOST_DIR" ]; then
     cp -f "$OUT_DIR/mali_aot_icd.x86_64.json" "$BUILD_HOST_DIR/aot/mali_aot_icd.x86_64.json" 2>/dev/null || true
     cp -f "$OUT_DIR/mali_mbs2_aot.o" "$BUILD_HOST_DIR/aot/mali_mbs2_aot.o" 2>/dev/null || true
 fi
-
-mkdir -p "$ROOT_DIR/build/$ELF_TAG"
-cp -f "$OUT_DIR/libvulkan_mali_aot_icd.so" "$ROOT_DIR/build/$ELF_TAG/" 2>/dev/null || true
-cp -f "$OUT_DIR/mali_aot_runner" "$ROOT_DIR/build/$ELF_TAG/" 2>/dev/null || true
-cp -f "$OUT_DIR/mali_aot_icd.x86_64.json" "$ROOT_DIR/build/$ELF_TAG/" 2>/dev/null || true
-cp -f "$OUT_DIR/mali_mbs2_aot.o" "$ROOT_DIR/build/$ELF_TAG/" 2>/dev/null || true
 
 echo "================================================================================"
 echo " [SUCCESS] 64-Bit C++ LLVM AOT Translation Complete!"

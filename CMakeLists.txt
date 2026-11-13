@@ -472,6 +472,20 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
    add_custom_target(aot_targets ALL
       DEPENDS "${AOT_ICD_SO}"
    )
+   set_property(DIRECTORY APPEND PROPERTY ADDITIONAL_CLEAN_FILES
+      "${CMAKE_BINARY_DIR}/mali_mbs2_unopt.ll"
+      "${CMAKE_BINARY_DIR}/mali_mbs2_opt.ll"
+      "${CMAKE_BINARY_DIR}/mali_mbs2_aot.o.stamp"
+      "${CMAKE_BINARY_DIR}/mali_mbs2_aot.o"
+      "${CMAKE_BINARY_DIR}/libvulkan_mali_aot_icd.so"
+      "${CMAKE_BINARY_DIR}/mali_aot_runner"
+      "${CMAKE_BINARY_DIR}/mali_aot_icd.x86_64.json"
+      "${CMAKE_BINARY_DIR}/libr54p3_vulkan_icd.so"
+      "${AOT_DIR}/mali_mbs2_aot.o"
+      "${AOT_DIR}/libvulkan_mali_aot_icd.so"
+      "${AOT_DIR}/mali_aot_runner"
+      "${AOT_DIR}/mali_aot_icd.x86_64.json"
+   )
 endif()
 
 # -----------------------------------------------------------------------------

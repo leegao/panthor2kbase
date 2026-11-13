@@ -4102,7 +4102,7 @@ int main(int argc, char **argv) {
         std::string optPath   = outDir + "/mali_mbs2_opt.ll";
         std::string objPath   = outDir + "/mali_mbs2_aot.o";
         const char *keep_ll_env = std::getenv("MALI_AOT_KEEP_LL");
-        bool keep_ll = (keep_ll_env && std::strcmp(keep_ll_env, "1") == 0);
+        bool keep_ll = (!keep_ll_env || std::strcmp(keep_ll_env, "0") != 0);
         if (keep_ll) {
             std::ofstream out(unoptPath);
             out << irText;
