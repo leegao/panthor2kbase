@@ -101,6 +101,141 @@ static inline int mali_stubs_pthread_mutex_trylock_hook(uint64_t mtx_va) {
     pthread_mutex_t* m = mali_hybris_resolve_mutex(mtx_va);
     return m ? pthread_mutex_trylock(m) : 0;
 }
+static inline int mali_stubs_pthread_mutex_init_hook(uint64_t mtx_va, uint64_t attr_va) {
+    (void)attr_va;
+    if (!mtx_va) return 22;
+    auto* slot = reinterpret_cast<BionicHybrisMutexSlot*>(mtx_va);
+    slot->magic = 0;
+    slot->host_mtx = nullptr;
+    return mali_hybris_resolve_mutex(mtx_va) ? 0 : 12;
+}
+static inline int mali_stubs_pthread_mutex_destroy_hook(uint64_t mtx_va) {
+    if (!mtx_va) return 0;
+    auto* slot = reinterpret_cast<BionicHybrisMutexSlot*>(mtx_va);
+    if (slot->magic == BIONIC_HYBRIS_MUTEX_MAGIC && slot->host_mtx) {
+        pthread_mutex_destroy(slot->host_mtx);
+        std::free(slot->host_mtx);
+        slot->host_mtx = nullptr;
+        slot->magic = 0;
+    }
+    return 0;
+}
+
+struct BionicHybrisCondSlot {
+    uint32_t       magic;
+    uint32_t       reserved;
+    pthread_cond_t* host_cond;
+};
+static inline pthread_cond_t* mali_hybris_resolve_cond(uint64_t cond_va) {
+    if (!cond_va) return nullptr;
+    auto* slot = reinterpret_cast<BionicHybrisCondSlot*>(cond_va);
+    if (slot->magic != BIONIC_HYBRIS_COND_MAGIC || !slot->host_cond) {
+        slot->host_cond = static_cast<pthread_cond_t*>(std::calloc(1, sizeof(pthread_cond_t)));
+        pthread_cond_init(slot->host_cond, nullptr);
+        slot->magic = BIONIC_HYBRIS_COND_MAGIC;
+    }
+    return slot->host_cond;
+}
+static inline int mali_stubs_pthread_cond_init_hook(uint64_t cond_va, uint64_t attr_va) {
+    (void)attr_va;
+    if (!cond_va) return 22;
+    auto* slot = reinterpret_cast<BionicHybrisCondSlot*>(cond_va);
+    slot->magic = 0; slot->host_cond = nullptr;
+    return mali_hybris_resolve_cond(cond_va) ? 0 : 12;
+}
+static inline int mali_stubs_pthread_cond_destroy_hook(uint64_t cond_va) {
+    if (!cond_va) return 0;
+    auto* slot = reinterpret_cast<BionicHybrisCondSlot*>(cond_va);
+    if (slot->magic == BIONIC_HYBRIS_COND_MAGIC && slot->host_cond) {
+        pthread_cond_destroy(slot->host_cond);
+        std::free(slot->host_cond);
+        slot->host_cond = nullptr; slot->magic = 0;
+    }
+    return 0;
+}
+static inline int mali_stubs_pthread_cond_wait_hook(uint64_t cond_va, uint64_t mtx_va) {
+    pthread_cond_t* c = mali_hybris_resolve_cond(cond_va);
+    pthread_mutex_t* m = mali_hybris_resolve_mutex(mtx_va);
+    return (c && m) ? pthread_cond_wait(c, m) : 0;
+}
+static inline int mali_stubs_pthread_cond_timedwait_hook(uint64_t cond_va, uint64_t mtx_va, uint64_t abstime_va) {
+    pthread_cond_t* c = mali_hybris_resolve_cond(cond_va);
+    pthread_mutex_t* m = mali_hybris_resolve_mutex(mtx_va);
+    const struct timespec* ts = reinterpret_cast<const struct timespec*>(abstime_va);
+    return (c && m && ts) ? pthread_cond_timedwait(c, m, ts) : 0;
+}
+static inline int mali_stubs_pthread_cond_signal_hook(uint64_t cond_va) {
+    pthread_cond_t* c = mali_hybris_resolve_cond(cond_va);
+    return c ? pthread_cond_signal(c) : 0;
+}
+static inline int mali_stubs_pthread_cond_broadcast_hook(uint64_t cond_va) {
+    pthread_cond_t* c = mali_hybris_resolve_cond(cond_va);
+    return c ? pthread_cond_broadcast(c) : 0;
+}
+
+static constexpr uint32_t BIONIC_HYBRIS_RWLOCK_MAGIC = 0x42695277U;
+struct BionicHybrisRwlockSlot {
+    uint32_t         magic;
+    uint32_t         reserved;
+    pthread_rwlock_t* host_rw;
+};
+static inline pthread_rwlock_t* mali_hybris_resolve_rwlock(uint64_t rw_va) {
+    if (!rw_va) return nullptr;
+    auto* slot = reinterpret_cast<BionicHybrisRwlockSlot*>(rw_va);
+    if (slot->magic != BIONIC_HYBRIS_RWLOCK_MAGIC || !slot->host_rw) {
+        slot->host_rw = static_cast<pthread_rwlock_t*>(std::calloc(1, sizeof(pthread_rwlock_t)));
+        pthread_rwlock_init(slot->host_rw, nullptr);
+        slot->magic = BIONIC_HYBRIS_RWLOCK_MAGIC;
+    }
+    return slot->host_rw;
+}
+static inline int mali_stubs_pthread_rwlock_init_hook(uint64_t rw_va, uint64_t attr_va) {
+    (void)attr_va;
+    if (!rw_va) return 22;
+    auto* slot = reinterpret_cast<BionicHybrisRwlockSlot*>(rw_va);
+    slot->magic = 0; slot->host_rw = nullptr;
+    return mali_hybris_resolve_rwlock(rw_va) ? 0 : 12;
+}
+static inline int mali_stubs_pthread_rwlock_destroy_hook(uint64_t rw_va) {
+    if (!rw_va) return 0;
+    auto* slot = reinterpret_cast<BionicHybrisRwlockSlot*>(rw_va);
+    if (slot->magic == BIONIC_HYBRIS_RWLOCK_MAGIC && slot->host_rw) {
+        pthread_rwlock_destroy(slot->host_rw);
+        std::free(slot->host_rw);
+        slot->host_rw = nullptr; slot->magic = 0;
+    }
+    return 0;
+}
+static inline int mali_stubs_pthread_rwlock_rdlock_hook(uint64_t rw_va) {
+    pthread_rwlock_t* r = mali_hybris_resolve_rwlock(rw_va);
+    return r ? pthread_rwlock_rdlock(r) : 0;
+}
+static inline int mali_stubs_pthread_rwlock_wrlock_hook(uint64_t rw_va) {
+    pthread_rwlock_t* r = mali_hybris_resolve_rwlock(rw_va);
+    return r ? pthread_rwlock_wrlock(r) : 0;
+}
+static inline int mali_stubs_pthread_rwlock_unlock_hook(uint64_t rw_va) {
+    pthread_rwlock_t* r = mali_hybris_resolve_rwlock(rw_va);
+    return r ? pthread_rwlock_unlock(r) : 0;
+}
+
+// Exported Pass 5 PLT symbols for Bionic pthread_*
+__attribute__((visibility("default"), weak, used)) int __mali_bionic_pthread_mutex_init(uint64_t m, uint64_t a) { return mali_stubs_pthread_mutex_init_hook(m, a); }
+__attribute__((visibility("default"), weak, used)) int __mali_bionic_pthread_mutex_destroy(uint64_t m) { return mali_stubs_pthread_mutex_destroy_hook(m); }
+__attribute__((visibility("default"), weak, used)) int __mali_bionic_pthread_mutex_lock(uint64_t m) { return mali_stubs_pthread_mutex_lock_hook(m); }
+__attribute__((visibility("default"), weak, used)) int __mali_bionic_pthread_mutex_unlock(uint64_t m) { return mali_stubs_pthread_mutex_unlock_hook(m); }
+__attribute__((visibility("default"), weak, used)) int __mali_bionic_pthread_mutex_trylock(uint64_t m) { return mali_stubs_pthread_mutex_trylock_hook(m); }
+__attribute__((visibility("default"), weak, used)) int __mali_bionic_pthread_cond_init(uint64_t c, uint64_t a) { return mali_stubs_pthread_cond_init_hook(c, a); }
+__attribute__((visibility("default"), weak, used)) int __mali_bionic_pthread_cond_destroy(uint64_t c) { return mali_stubs_pthread_cond_destroy_hook(c); }
+__attribute__((visibility("default"), weak, used)) int __mali_bionic_pthread_cond_wait(uint64_t c, uint64_t m) { return mali_stubs_pthread_cond_wait_hook(c, m); }
+__attribute__((visibility("default"), weak, used)) int __mali_bionic_pthread_cond_timedwait(uint64_t c, uint64_t m, uint64_t t) { return mali_stubs_pthread_cond_timedwait_hook(c, m, t); }
+__attribute__((visibility("default"), weak, used)) int __mali_bionic_pthread_cond_signal(uint64_t c) { return mali_stubs_pthread_cond_signal_hook(c); }
+__attribute__((visibility("default"), weak, used)) int __mali_bionic_pthread_cond_broadcast(uint64_t c) { return mali_stubs_pthread_cond_broadcast_hook(c); }
+__attribute__((visibility("default"), weak, used)) int __mali_bionic_pthread_rwlock_init(uint64_t r, uint64_t a) { return mali_stubs_pthread_rwlock_init_hook(r, a); }
+__attribute__((visibility("default"), weak, used)) int __mali_bionic_pthread_rwlock_destroy(uint64_t r) { return mali_stubs_pthread_rwlock_destroy_hook(r); }
+__attribute__((visibility("default"), weak, used)) int __mali_bionic_pthread_rwlock_rdlock(uint64_t r) { return mali_stubs_pthread_rwlock_rdlock_hook(r); }
+__attribute__((visibility("default"), weak, used)) int __mali_bionic_pthread_rwlock_wrlock(uint64_t r) { return mali_stubs_pthread_rwlock_wrlock_hook(r); }
+__attribute__((visibility("default"), weak, used)) int __mali_bionic_pthread_rwlock_unlock(uint64_t r) { return mali_stubs_pthread_rwlock_unlock_hook(r); }
 
 // 4. Bionic sysconf(int) -> glibc sysconf(int) constant translation (libhybris sysconf.c)
 static inline long mali_stubs_sysconf_hook(int bionic_name) {

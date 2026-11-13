@@ -1,277 +1,241 @@
 #!/usr/bin/env python3
-"""Auto-generate physical-device Vulkan ICD forwarding wrappers into r54p3_lifted.o."""
+"""Auto-generate Vulkan ICD wrappers from specs/vk.xml into r54p3_lifted.o (aot_vk*)."""
 
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parent.parent
-OUT_PATH = ROOT / "src" / "r54p3_vulkan_icd" / "generated" / "mali_physdev_wrappers_autogen.inc"
+VK_XML = ROOT / "specs" / "vk.xml"
+PHYSDEV_OUT = ROOT / "src" / "r54p3_vulkan_icd" / "generated" / "mali_physdev_wrappers_autogen.inc"
+DEVICE_OUT = ROOT / "src" / "r54p3_vulkan_icd" / "generated" / "mali_device_wrappers_autogen.inc"
 
-# Each entry: (ret_type, name, [(type, arg_name), ...], aot_args, non_null_checks, pre_call, post_check, fallback)
-WRAPPERS = [
-    (
-        "void",
-        "vkGetPhysicalDeviceFeatures",
-        [("void*", "physicalDevice"), ("void*", "pFeatures")],
-        ["pdev->aot_internal", "pFeatures"],
-        ["pdev", "pFeatures"],
-        "",
-        "",
-        "return;",
-    ),
-    (
-        "void",
-        "vkGetPhysicalDeviceFeatures2",
-        [("void*", "physicalDevice"), ("void*", "pFeatures2")],
-        ["pdev->aot_internal", "pFeatures2"],
-        ["pdev", "pFeatures2"],
-        "",
-        "",
-        "return;",
-    ),
-    (
-        "void",
-        "vkGetPhysicalDeviceQueueFamilyProperties",
-        [("void*", "physicalDevice"), ("uint32_t*", "pQueueFamilyPropertyCount"), ("void*", "pQueueFamilyProperties")],
-        ["pdev->aot_internal", "pQueueFamilyPropertyCount", "pQueueFamilyProperties"],
-        ["pdev", "pQueueFamilyPropertyCount"],
-        "if (!pQueueFamilyPropertyCount) return;",
-        "",
-        """if (!pQueueFamilyProperties) {
-        *pQueueFamilyPropertyCount = 1;
-        return;
-    }
-    if (*pQueueFamilyPropertyCount > 0) {
-        auto* qf = static_cast<VkQueueFamilyProperties*>(pQueueFamilyProperties);
-        qf[0].queueFlags                  = 0x17U;
-        qf[0].queueCount                  = 2U;
-        qf[0].timestampValidBits          = 64U;
-        qf[0].minImageTransferGranularity = {1U, 1U, 1U};
-        *pQueueFamilyPropertyCount        = 1;
-    }""",
-    ),
-    (
-        "void",
-        "vkGetPhysicalDeviceQueueFamilyProperties2",
-        [("void*", "physicalDevice"), ("uint32_t*", "pQueueFamilyPropertyCount"), ("void*", "pQueueFamilyProperties2")],
-        ["pdev->aot_internal", "pQueueFamilyPropertyCount", "pQueueFamilyProperties2"],
-        ["pdev", "pQueueFamilyPropertyCount"],
-        "if (!pQueueFamilyPropertyCount) return;",
-        "",
-        """if (!pQueueFamilyProperties2) {
-        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, pQueueFamilyPropertyCount, nullptr);
-        return;
-    }
-    if (*pQueueFamilyPropertyCount > 0) {
-        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, pQueueFamilyPropertyCount, static_cast<uint8_t*>(pQueueFamilyProperties2) + 16);
-    }""",
-    ),
-    (
-        "void",
-        "vkGetPhysicalDeviceMemoryProperties",
-        [("void*", "physicalDevice"), ("void*", "pMemoryProperties")],
-        ["pdev->aot_internal", "pMemoryProperties"],
-        ["pdev", "pMemoryProperties"],
-        "if (!pMemoryProperties) return;",
-        "",
-        """auto* mp = static_cast<VkPhysicalDeviceMemoryProperties*>(pMemoryProperties);
-    std::memset(mp, 0, sizeof(VkPhysicalDeviceMemoryProperties));
-    mp->memoryTypeCount = 3;
-    mp->memoryTypes[0].propertyFlags = 0x07U;
-    mp->memoryTypes[0].heapIndex     = 0;
-    mp->memoryTypes[1].propertyFlags = 0x0BU;
-    mp->memoryTypes[1].heapIndex     = 0;
-    mp->memoryTypes[2].propertyFlags = 0x11U;
-    mp->memoryTypes[2].heapIndex     = 0;
-    mp->memoryHeapCount = 1;
-    mp->memoryHeaps[0].size  = 8ULL << 30;
-    mp->memoryHeaps[0].flags = 0x01U;""",
-    ),
-    (
-        "void",
-        "vkGetPhysicalDeviceMemoryProperties2",
-        [("void*", "physicalDevice"), ("void*", "pMemoryProperties2")],
-        ["pdev->aot_internal", "pMemoryProperties2"],
-        ["pdev", "pMemoryProperties2"],
-        "if (!pMemoryProperties2) return;",
-        "",
-        "vkGetPhysicalDeviceMemoryProperties(physicalDevice, static_cast<uint8_t*>(pMemoryProperties2) + 16);",
-    ),
-    (
-        "void",
-        "vkGetPhysicalDeviceFormatProperties",
-        [("void*", "physicalDevice"), ("uint32_t", "format"), ("void*", "pFormatProperties")],
-        ["pdev->aot_internal", "format", "pFormatProperties"],
-        ["pdev"],
-        """if (!pFormatProperties) return;
-    uint32_t* fp = static_cast<uint32_t*>(pFormatProperties);
-    fp[0] = 0; fp[1] = 0; fp[2] = 0;""",
-        "if ((fp[0] | fp[1] | fp[2]) != 0U || format == 0U) return;",
-        """fp[0] = 0x7FFFFFFFU;
-    fp[1] = 0x7FFFFFFFU;
-    fp[2] = 0x7FFFFFFFU;""",
-    ),
-    (
-        "void",
-        "vkGetPhysicalDeviceFormatProperties2",
-        [("void*", "physicalDevice"), ("uint32_t", "format"), ("void*", "pFormatProperties2")],
-        ["pdev->aot_internal", "format", "pFormatProperties2"],
-        ["pdev"],
-        """if (!pFormatProperties2) return;
-    uint32_t* fp = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(pFormatProperties2) + 16);
-    fp[0] = 0; fp[1] = 0; fp[2] = 0;""",
-        "if ((fp[0] | fp[1] | fp[2]) != 0U || format == 0U) return;",
-        "vkGetPhysicalDeviceFormatProperties(physicalDevice, format, static_cast<uint8_t*>(pFormatProperties2) + 16);",
-    ),
-    (
-        "int32_t",
-        "vkGetPhysicalDeviceImageFormatProperties",
-        [
-            ("void*", "physicalDevice"), ("uint32_t", "format"), ("uint32_t", "type"),
-            ("uint32_t", "tiling"), ("uint32_t", "usage"), ("uint32_t", "flags"),
-            ("void*", "pImageFormatProperties"),
-        ],
-        ["pdev->aot_internal", "format", "type", "tiling", "usage", "flags", "pImageFormatProperties"],
-        ["pdev", "pImageFormatProperties"],
-        "",
-        "",
-        """if (pImageFormatProperties) {
-        uint32_t* ifp = static_cast<uint32_t*>(pImageFormatProperties);
-        ifp[0] = 16384U; ifp[1] = 16384U; ifp[2] = 2048U;
-        ifp[3] = 15U;
-        ifp[4] = 2048U;
-        ifp[5] = 0x0FU;
-        *reinterpret_cast<uint64_t*>(ifp + 6) = (4ULL << 30);
-    }
-    return 0;""",
-    ),
-    (
-        "int32_t",
-        "vkGetPhysicalDeviceImageFormatProperties2",
-        [("void*", "physicalDevice"), ("const void*", "pImageFormatInfo"), ("void*", "pImageFormatProperties2")],
-        ["pdev->aot_internal", "pImageFormatInfo", "pImageFormatProperties2"],
-        ["pdev", "pImageFormatInfo"],
-        "if (!pImageFormatProperties2) return -3;",
-        "",
-        "return vkGetPhysicalDeviceImageFormatProperties(physicalDevice, 37U, 1U, 0U, 0x1FU, 0U, static_cast<uint8_t*>(pImageFormatProperties2) + 16);",
-    ),
-    (
-        "int32_t",
-        "vkEnumerateDeviceLayerProperties",
-        [("void*", "physicalDevice"), ("uint32_t*", "pPropertyCount"), ("void*", "pProperties")],
-        ["pdev->aot_internal", "pPropertyCount", "pProperties"],
-        ["pdev", "pPropertyCount"],
-        "",
-        "",
-        """if (pPropertyCount) *pPropertyCount = 0;
-    return 0;""",
-    ),
-    (
-        "void",
-        "vkGetPhysicalDeviceSparseImageFormatProperties",
-        [
-            ("void*", "physicalDevice"), ("uint32_t", "format"), ("uint32_t", "type"),
-            ("uint32_t", "samples"), ("uint32_t", "usage"), ("uint32_t", "tiling"),
-            ("uint32_t*", "pPropertyCount"), ("void*", "pProperties"),
-        ],
-        ["pdev->aot_internal", "format", "type", "samples", "usage", "tiling", "pPropertyCount", "pProperties"],
-        ["pdev", "pPropertyCount"],
-        "",
-        "",
-        "if (pPropertyCount) *pPropertyCount = 0;",
-    ),
-    (
-        "void",
-        "vkGetPhysicalDeviceSparseImageFormatProperties2",
-        [("void*", "physicalDevice"), ("const void*", "pFormatInfo"), ("uint32_t*", "pPropertyCount"), ("void*", "pProperties")],
-        ["pdev->aot_internal", "pFormatInfo", "pPropertyCount", "pProperties"],
-        ["pdev", "pFormatInfo", "pPropertyCount"],
-        "",
-        "",
-        "if (pPropertyCount) *pPropertyCount = 0;",
-    ),
-    (
-        "void",
-        "vkGetPhysicalDeviceExternalBufferProperties",
-        [("void*", "physicalDevice"), ("const void*", "pExternalBufferInfo"), ("void*", "pExternalBufferProperties")],
-        ["pdev->aot_internal", "pExternalBufferInfo", "pExternalBufferProperties"],
-        ["pdev", "pExternalBufferInfo"],
-        "if (!pExternalBufferProperties) return;",
-        "",
-        """uint32_t* ext = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(pExternalBufferProperties) + 16);
-    ext[0] = 0x03U;
-    ext[1] = 0U;
-    ext[2] = 0U;""",
-    ),
-    (
-        "void",
-        "vkGetPhysicalDeviceExternalFenceProperties",
-        [("void*", "physicalDevice"), ("const void*", "pExternalFenceInfo"), ("void*", "pExternalFenceProperties")],
-        ["pdev->aot_internal", "pExternalFenceInfo", "pExternalFenceProperties"],
-        ["pdev", "pExternalFenceInfo"],
-        "if (!pExternalFenceProperties) return;",
-        "",
-        """uint32_t* ext = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(pExternalFenceProperties) + 16);
-    ext[0] = 0U; ext[1] = 0U; ext[2] = 0U;""",
-    ),
-    (
-        "void",
-        "vkGetPhysicalDeviceExternalSemaphoreProperties",
-        [("void*", "physicalDevice"), ("const void*", "pExternalSemaphoreInfo"), ("void*", "pExternalSemaphoreProperties")],
-        ["pdev->aot_internal", "pExternalSemaphoreInfo", "pExternalSemaphoreProperties"],
-        ["pdev", "pExternalSemaphoreInfo"],
-        "if (!pExternalSemaphoreProperties) return;",
-        "",
-        """uint32_t* ext = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(pExternalSemaphoreProperties) + 16);
-    ext[0] = 0U; ext[1] = 0U; ext[2] = 0U;""",
-    ),
+# Keyed purely by Vulkan command name; signatures come from specs/vk.xml.
+PHYSDEV_COMMANDS = [
+    "vkGetPhysicalDeviceFeatures",
+    "vkGetPhysicalDeviceFeatures2",
+    "vkGetPhysicalDeviceQueueFamilyProperties",
+    "vkGetPhysicalDeviceQueueFamilyProperties2",
+    "vkGetPhysicalDeviceMemoryProperties",
+    "vkGetPhysicalDeviceMemoryProperties2",
+    "vkGetPhysicalDeviceFormatProperties",
+    "vkGetPhysicalDeviceFormatProperties2",
+    "vkGetPhysicalDeviceImageFormatProperties",
+    "vkGetPhysicalDeviceImageFormatProperties2",
+    "vkEnumerateDeviceLayerProperties",
+    "vkGetPhysicalDeviceSparseImageFormatProperties",
+    "vkGetPhysicalDeviceSparseImageFormatProperties2",
+    "vkGetPhysicalDeviceExternalBufferProperties",
+    "vkGetPhysicalDeviceExternalFenceProperties",
+    "vkGetPhysicalDeviceExternalSemaphoreProperties",
+    "vkEnumeratePhysicalDeviceGroups",
+    "vkEnumerateDeviceExtensionProperties",
+]
+
+DEVICE_COMMANDS = [
+    "vkCreateDevice",
+    "vkDestroyDevice",
+    "vkGetDeviceQueue",
+    "vkDeviceWaitIdle",
+    "vkQueueWaitIdle",
+    "vkQueueSubmit",
+    "vkQueueSubmit2",
+    "vkAllocateMemory",
+    "vkFreeMemory",
+    "vkMapMemory",
+    "vkUnmapMemory",
+    "vkMapMemory2",
+    "vkUnmapMemory2",
+    "vkCreateBuffer",
+    "vkDestroyBuffer",
+    "vkGetBufferMemoryRequirements",
+    "vkBindBufferMemory",
+    "vkCreateImage",
+    "vkDestroyImage",
+    "vkGetImageMemoryRequirements",
+    "vkBindImageMemory",
+    "vkCreateImageView",
+    "vkDestroyImageView",
+    "vkCreateSampler",
+    "vkDestroySampler",
+    "vkCreateRenderPass",
+    "vkDestroyRenderPass",
+    "vkCreateFramebuffer",
+    "vkDestroyFramebuffer",
+    "vkCreateGraphicsPipelines",
+    "vkCreateComputePipelines",
+    "vkDestroyPipeline",
+    "vkAllocateCommandBuffers",
+    "vkFreeCommandBuffers",
+    "vkBeginCommandBuffer",
+    "vkEndCommandBuffer",
+    "vkResetCommandBuffer",
+    "vkCmdBindPipeline",
+    "vkCmdBindDescriptorSets",
+    "vkCmdBindVertexBuffers",
+    "vkCmdBindIndexBuffer",
+    "vkCmdDraw",
+    "vkCmdDrawIndexed",
+    "vkCmdDrawIndirect",
+    "vkCmdDrawIndexedIndirect",
+    "vkCmdDispatch",
 ]
 
 
-def main() -> None:
+def load_vk_commands(xml_path: Path) -> dict[str, tuple[str, list[tuple[str, str]]]]:
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    cmds: dict[str, tuple[str, list[tuple[str, str]]]] = {}
+    aliases: list[tuple[str, str]] = []
+
+    for cmd in root.findall(".//commands/command"):
+        api = cmd.get("api")
+        if api is not None and "vulkan" not in api.split(","):
+            continue
+        alias = cmd.get("alias")
+        name_attr = cmd.get("name")
+        if alias and name_attr:
+            aliases.append((name_attr, alias))
+            continue
+        proto = cmd.find("proto")
+        if proto is None:
+            continue
+        name_el = proto.find("name")
+        if name_el is None or not name_el.text:
+            continue
+        cmd_name = name_el.text.strip()
+        proto_text = "".join(proto.itertext()).strip()
+        ret_type = proto_text[: proto_text.rfind(cmd_name)].strip()
+
+        params: list[tuple[str, str]] = []
+        for p in cmd.findall("param"):
+            papi = p.get("api")
+            if papi is not None and "vulkan" not in papi.split(","):
+                continue
+            pname_el = p.find("name")
+            if pname_el is None or not pname_el.text:
+                continue
+            pname = pname_el.text.strip()
+            ptext = " ".join("".join(p.itertext()).split())
+            idx = ptext.rfind(pname)
+            ptype = ptext[:idx].strip() if idx >= 0 else ptext
+            # Preserve array brackets if present after name
+            suffix = ptext[idx + len(pname):].strip() if idx >= 0 else ""
+            if suffix.startswith("["):
+                pname = pname + suffix
+            params.append((ptype, pname))
+        cmds[cmd_name] = (ret_type, params)
+
+    for name_attr, alias in aliases:
+        if alias in cmds and name_attr not in cmds:
+            cmds[name_attr] = cmds[alias]
+    return cmds
+
+
+def emit_physdev_wrappers(cmds: dict[str, tuple[str, list[tuple[str, str]]]]) -> None:
     lines = [
         "// ============================================================================",
-        "// AUTO-GENERATED BY scripts/gen_r54p3_physdev_wrappers.py — DO NOT EDIT.",
-        "// Forwarding physical-device entrypoints into r54p3_lifted.o (aot_vk*).",
+        "// AUTO-GENERATED BY scripts/gen_r54p3_physdev_wrappers.py FROM specs/vk.xml",
+        "// DO NOT EDIT. Direct delegation into r54p3_lifted.o (aot_vk*) with real",
+        "// <vulkan/vulkan.h> types.",
         "// ============================================================================",
         "",
     ]
-    for ret, name, params, aot_args, checks, pre, post_check, fallback in WRAPPERS:
+    for name in PHYSDEV_COMMANDS:
+        ret_type, params = cmds[name]
         sig = ", ".join(f"{t} {a}" for t, a in params)
-        cond = " && ".join([f"!g_aot_rt.mapper.so_path_loaded.empty()", f"aot_{name}"] + checks)
-        args_str = ", ".join(aot_args)
+        first_type, first_arg = params[0]
+        rest_args = [a for _, a in params[1:]]
 
         lines.append('__attribute__((visibility("default")))')
-        lines.append(f"{ret} {name}({sig}) {{")
-        if pre:
-            lines.append(f"    {pre}")
+        lines.append(f"{ret_type} {name}({sig}) {{")
         lines.append("    g_aot_rt.ensureInitialized();")
-        lines.append("    auto* pdev = static_cast<MaliIcdPhysicalDevice*>(physicalDevice);")
-        lines.append(f"    if ({cond}) {{")
-        lines.append("        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);")
-        lines.append("        pdev->initAotInternalLayout();")
-        if ret == "void":
+
+        if first_type == "VkPhysicalDevice":
+            lines.append(f"    auto* pdev = reinterpret_cast<MaliIcdPhysicalDevice*>({first_arg});")
+            lines.append(f"    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_{name} && pdev) {{")
+            lines.append("        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);")
+            lines.append("        pdev->initAotInternalLayout();")
+            aot_first = "pdev->aot_internal"
+        elif first_type == "VkInstance":
+            lines.append(f"    auto* inst = reinterpret_cast<MaliIcdInstance*>({first_arg});")
+            lines.append(f"    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_{name} && inst) {{")
+            lines.append("        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);")
+            lines.append("        inst->phys_dev.initAotInternalLayout();")
+            aot_first = "inst->phys_dev.aot_inst_internal"
+        else:
+            lines.append(f"    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_{name}) {{")
+            lines.append("        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);")
+            aot_first = first_arg
+
+        call_args = ", ".join([aot_first] + rest_args)
+        if ret_type == "void":
             lines.append("        mali_aapcs64::invokeLiftedAapcs64<void>(")
             lines.append(f"            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_{name},")
-            lines.append(f"            {args_str});")
+            lines.append(f"            {call_args});")
             lines.append("        g_aot_rt.lifted_vk_calls_executed++;")
-            if post_check:
-                lines.append(f"        {post_check}")
-            else:
-                lines.append("        return;")
+            lines.append("        return;")
         else:
-            lines.append(f"        {ret} r = mali_aapcs64::invokeLiftedAapcs64<{ret}>(")
+            lines.append(f"        {ret_type} r = mali_aapcs64::invokeLiftedAapcs64<{ret_type}>(")
             lines.append(f"            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_{name},")
-            lines.append(f"            {args_str});")
+            lines.append(f"            {call_args});")
             lines.append("        g_aot_rt.lifted_vk_calls_executed++;")
             lines.append("        return r;")
         lines.append("    }")
-        if fallback:
-            lines.append(f"    {fallback}")
+        if ret_type == "VkResult":
+            lines.append("    return VK_ERROR_INITIALIZATION_FAILED;")
+        elif ret_type != "void":
+            lines.append(f"    return {ret_type}{{}};")
         lines.append("}")
         lines.append("")
 
-    OUT_PATH.write_text("\n".join(lines), encoding="utf-8")
-    print(f"Generated {len(WRAPPERS)} physical-device wrappers -> {OUT_PATH}")
+    PHYSDEV_OUT.write_text("\n".join(lines), encoding="utf-8")
+    print(f"Generated {len(PHYSDEV_COMMANDS)} physical-device wrappers -> {PHYSDEV_OUT}")
+
+
+def emit_device_wrappers(cmds: dict[str, tuple[str, list[tuple[str, str]]]]) -> None:
+    lines = [
+        "// ============================================================================",
+        "// AUTO-GENERATED BY scripts/gen_r54p3_physdev_wrappers.py FROM specs/vk.xml",
+        "// DO NOT EDIT. Typed <vulkan/vulkan.h> forwarding thunks into r54p3_lifted.o.",
+        "// ============================================================================",
+        "",
+    ]
+    for name in DEVICE_COMMANDS:
+        ret_type, params = cmds[name]
+        sig = ", ".join(f"{t} {a}" for t, a in params)
+        arg_names = ", ".join(a.split("[")[0] for _, a in params)
+        lines.append(f"static inline {ret_type} aot_forward_{name}({sig}) {{")
+        lines.append(f"    if (!aot_{name}) {{")
+        if ret_type == "VkResult":
+            lines.append("        return VK_ERROR_EXTENSION_NOT_PRESENT;")
+        elif ret_type == "void":
+            lines.append("        return;")
+        else:
+            lines.append(f"        return {ret_type}{{}};")
+        lines.append("    }")
+        lines.append("    std::lock_guard<std::mutex> lock(g_aot_rt.mtx);")
+        if ret_type == "void":
+            lines.append("    mali_aapcs64::invokeLiftedAapcs64<void>(")
+            lines.append(f"        g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_{name},")
+            lines.append(f"        {arg_names});")
+            lines.append("    g_aot_rt.lifted_vk_calls_executed++;")
+        else:
+            lines.append(f"    {ret_type} r = mali_aapcs64::invokeLiftedAapcs64<{ret_type}>(")
+            lines.append(f"        g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_{name},")
+            lines.append(f"        {arg_names});")
+            lines.append("    g_aot_rt.lifted_vk_calls_executed++;")
+            lines.append("    return r;")
+        lines.append("}")
+        lines.append("")
+
+    DEVICE_OUT.write_text("\n".join(lines), encoding="utf-8")
+    print(f"Generated {len(DEVICE_COMMANDS)} typed device/cmd wrappers -> {DEVICE_OUT}")
+
+
+def main() -> None:
+    cmds = load_vk_commands(VK_XML)
+    emit_physdev_wrappers(cmds)
+    emit_device_wrappers(cmds)
 
 
 if __name__ == "__main__":

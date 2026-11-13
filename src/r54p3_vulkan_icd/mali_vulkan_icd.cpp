@@ -6,17 +6,29 @@
 // mali_icd_wsi.cpp.
 // ============================================================================
 #include "mali_icd_physdev.cpp"
+#include "generated/mali_device_wrappers_autogen.inc"
+
+static inline bool useNativeAotFor(const char* op) {
+    const char* env = std::getenv("MALI_ICD_NATIVE_AOT");
+    if (!env || env[0] == '\0' || (env[0] == '0' && env[1] == '\0')) return false;
+    if ((env[0] == '1' && env[1] == '\0') || std::strcmp(env, "all") == 0) return true;
+    return op && std::strstr(env, op) != nullptr;
+}
 
 extern "C" {
 
 __attribute__((visibility("default")))
-int32_t vkCreateDevice(void* physicalDevice, const void* /*pCreateInfo*/, const void* /*pAllocator*/, void** pDevice) {
-    if (!pDevice) return -3;
+VkResult vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo,
+                        const VkAllocationCallbacks* pAllocator, VkDevice* pDevice) {
+    if (!pDevice) return VK_ERROR_INITIALIZATION_FAILED;
     g_aot_rt.ensureInitialized();
+    if (useNativeAotFor("vkCreateDevice")) {
+        return aot_forward_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
+    }
 
     auto* dev = new MaliIcdDevice();
     dev->loader_magic = ICD_LOADER_MAGIC;
-    dev->phys_dev = static_cast<MaliIcdPhysicalDevice*>(physicalDevice);
+    dev->phys_dev = reinterpret_cast<MaliIcdPhysicalDevice*>(physicalDevice);
     dev->queue.loader_magic = ICD_LOADER_MAGIC;
     dev->queue.parent_device = dev;
 
@@ -159,12 +171,16 @@ int32_t vkCreateDevice(void* physicalDevice, const void* /*pCreateInfo*/, const 
         dev->user_output_va = *reinterpret_cast<uint64_t*>(dev->csi_queue_struct.data() + 0x98);
     }
 
-    *pDevice = dev;
-    return 0;
+    *pDevice = reinterpret_cast<VkDevice>(dev);
+    return VK_SUCCESS;
 }
 
 __attribute__((visibility("default")))
-void vkDestroyDevice(void* device, const void* /*pAllocator*/) {
+void vkDestroyDevice(VkDevice device, const VkAllocationCallbacks* pAllocator) {
+    if (useNativeAotFor("vkDestroyDevice")) {
+        aot_forward_vkDestroyDevice(device, pAllocator);
+        return;
+    }
     const char* log_env = std::getenv("MALI_AOT_ICD_LOG");
     if (log_env && log_env[0] != '0' && (mali_kbase_emu_get_stats_sized || mali_kbase_emu_get_stats)) {
         struct kbase_emu_stats kst{};
@@ -197,7 +213,7 @@ void vkDestroyDevice(void* device, const void* /*pAllocator*/) {
     if (lifted_ko_get_debug_flags(nullptr) & LIFTED_KO_DEBUG_PROFILE_CALLS) {
         lifted_ko_dump_profile(stderr);
     }
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (dev && dev->mali_fd >= 0) {
         bionic_mali_close_stub(static_cast<uint64_t>(dev->mali_fd));
         dev->mali_fd = -1;
@@ -208,7 +224,7 @@ void vkDestroyDevice(void* device, const void* /*pAllocator*/) {
 __attribute__((visibility("default")))
 void vkGetDeviceQueue(void* device, uint32_t queueFamilyIndex, uint32_t queueIndex, void** pQueue) {
     if (!device || !pQueue) return;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (aot_vkGetDeviceQueue && !dev->aot_vk_device_mem.empty() && queueIndex == 0) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         mali_aapcs64::invokeLiftedAapcs64<void>(
@@ -225,7 +241,7 @@ int32_t vkCreateBuffer(void* device, const void* pCreateInfo, const void* pAlloc
     if (!pCreateInfo || !pBuffer) return -3;
     g_host_vk_allocators.registerCallbacks(pAllocator);
     const auto* bci = static_cast<const VkBufferCreateInfo*>(pCreateInfo);
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (dev && aot_vkCreateBuffer && !dev->aot_vk_device_mem.empty()) {
         uint64_t aot_buf = 0;
         int32_t res = 0;
@@ -272,7 +288,7 @@ void vkDestroyBuffer(void* device, uint64_t buffer, const void* pAllocator) {
         std::lock_guard<std::mutex> lk(g_icd_mutex);
         g_buffers.erase(buffer);
     }
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* buf = reinterpret_cast<MaliIcdBuffer*>(buffer);
     if (dev && aot_vkDestroyBuffer && !dev->aot_vk_device_mem.empty() && buf->dev_plus_8 != 0) {
         buf->bound_gpu_va = 0;
@@ -289,7 +305,7 @@ void vkDestroyBuffer(void* device, uint64_t buffer, const void* pAllocator) {
 __attribute__((visibility("default")))
 void vkGetBufferMemoryRequirements(void* device, uint64_t buffer, void* pMemoryRequirements) {
     if (!buffer || !pMemoryRequirements) return;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* buf = reinterpret_cast<MaliIcdBuffer*>(buffer);
     auto* req = static_cast<VkMemoryRequirements*>(pMemoryRequirements);
     if (dev && aot_vkGetBufferMemoryRequirements && !dev->aot_vk_device_mem.empty()) {
@@ -309,10 +325,14 @@ void vkGetBufferMemoryRequirements(void* device, uint64_t buffer, void* pMemoryR
 }
 
 __attribute__((visibility("default")))
-int32_t vkAllocateMemory(void* device, const void* pAllocateInfo, const void* /*pAllocator*/, uint64_t* pMemory) {
-    if (!device || !pAllocateInfo || !pMemory) return -3;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
-    const auto* mai = static_cast<const VkMemoryAllocateInfo*>(pAllocateInfo);
+VkResult vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* pAllocateInfo,
+                          const VkAllocationCallbacks* pAllocator, VkDeviceMemory* pMemory) {
+    if (!device || !pAllocateInfo || !pMemory) return VK_ERROR_INITIALIZATION_FAILED;
+    if (useNativeAotFor("vkAllocateMemory")) {
+        return aot_forward_vkAllocateMemory(device, pAllocateInfo, pAllocator, pMemory);
+    }
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
+    const auto* mai = pAllocateInfo;
     uint64_t pages = std::max<uint64_t>(1ULL, (mai->allocationSize + 4095ULL) / 4096ULL);
     uint64_t flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR | BASE_MEM_SAME_VA;
 
@@ -320,39 +340,50 @@ int32_t vkAllocateMemory(void* device, const void* pAllocateInfo, const void* /*
     mem->pages      = pages;
     mem->size_bytes = pages * 4096ULL;
     mem->gpu_va     = icdAllocKbaseBo(dev, pages, flags);
-    *pMemory = reinterpret_cast<uint64_t>(mem);
-    return 0;
+    *pMemory = reinterpret_cast<VkDeviceMemory>(mem);
+    return VK_SUCCESS;
 }
 
 __attribute__((visibility("default")))
-void vkFreeMemory(void* /*device*/, uint64_t memory, const void* /*pAllocator*/) {
+void vkFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* pAllocator) {
+    if (useNativeAotFor("vkFreeMemory")) {
+        aot_forward_vkFreeMemory(device, memory, pAllocator);
+        return;
+    }
     delete reinterpret_cast<MaliIcdDeviceMemory*>(memory);
 }
 
 __attribute__((visibility("default")))
-int32_t vkMapMemory(void* /*device*/, uint64_t memory, uint64_t offset, uint64_t /*size*/, uint32_t /*flags*/, void** ppData) {
-    if (!memory || !ppData) return -3;
+VkResult vkMapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset,
+                     VkDeviceSize size, VkMemoryMapFlags flags, void** ppData) {
+    if (!memory || !ppData) return VK_ERROR_INITIALIZATION_FAILED;
+    if (useNativeAotFor("vkMapMemory")) {
+        return aot_forward_vkMapMemory(device, memory, offset, size, flags, ppData);
+    }
     auto* mem = reinterpret_cast<MaliIcdDeviceMemory*>(memory);
     *ppData = reinterpret_cast<void*>(mem->gpu_va + offset);
-    return 0;
+    return VK_SUCCESS;
 }
 
 __attribute__((visibility("default")))
-void vkUnmapMemory(void* /*device*/, uint64_t /*memory*/) {}
-
-__attribute__((visibility("default")))
-int32_t vkMapMemory2(void* device, const void* pMemoryMapInfo, void** ppData) {
-    if (!pMemoryMapInfo || !ppData) return -3;
-    const auto* info = static_cast<const VkMemoryMapInfoKHR*>(pMemoryMapInfo);
-    return vkMapMemory(device, reinterpret_cast<uint64_t>(info->memory), info->offset, info->size, info->flags, ppData);
+void vkUnmapMemory(VkDevice device, VkDeviceMemory memory) {
+    if (useNativeAotFor("vkUnmapMemory")) {
+        aot_forward_vkUnmapMemory(device, memory);
+        return;
+    }
 }
 
 __attribute__((visibility("default")))
-int32_t vkUnmapMemory2(void* device, const void* pMemoryUnmapInfo) {
-    if (!pMemoryUnmapInfo) return -3;
-    const auto* info = static_cast<const VkMemoryUnmapInfoKHR*>(pMemoryUnmapInfo);
-    vkUnmapMemory(device, reinterpret_cast<uint64_t>(info->memory));
-    return 0;
+VkResult vkMapMemory2(VkDevice device, const VkMemoryMapInfo* pMemoryMapInfo, void** ppData) {
+    if (!pMemoryMapInfo || !ppData) return VK_ERROR_INITIALIZATION_FAILED;
+    return vkMapMemory(device, pMemoryMapInfo->memory, pMemoryMapInfo->offset, pMemoryMapInfo->size, pMemoryMapInfo->flags, ppData);
+}
+
+__attribute__((visibility("default")))
+VkResult vkUnmapMemory2(VkDevice device, const VkMemoryUnmapInfo* pMemoryUnmapInfo) {
+    if (!pMemoryUnmapInfo) return VK_ERROR_INITIALIZATION_FAILED;
+    vkUnmapMemory(device, pMemoryUnmapInfo->memory);
+    return VK_SUCCESS;
 }
 
 __attribute__((visibility("default")))
@@ -378,7 +409,7 @@ int32_t vkBindBufferMemory(void* /*device*/, uint64_t buffer, uint64_t memory, u
 __attribute__((visibility("default")))
 int32_t vkCreateShaderModule(void* device, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pShaderModule) {
     if (!device || !pCreateInfo || !pShaderModule) return -3;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     const auto* smci = static_cast<const VkShaderModuleCreateInfo*>(pCreateInfo);
     if (!smci->pCode || smci->codeSize < 20) return -3;
 
@@ -539,7 +570,7 @@ static void runAotMbs2PipelineCompile(MaliIcdShaderModule* mod) {
 __attribute__((visibility("default")))
 void vkDestroyShaderModule(void* device, uint64_t shaderModule, const void* /*pAllocator*/) {
     if (!shaderModule) return;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* mod = reinterpret_cast<MaliIcdShaderModule*>(shaderModule);
     if (dev && mod->aot_shader_module_handle != 0 && aot_vkDestroyShaderModule) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
@@ -553,7 +584,7 @@ void vkDestroyShaderModule(void* device, uint64_t shaderModule, const void* /*pA
 __attribute__((visibility("default")))
 int32_t vkCreateDescriptorSetLayout(void* device, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pSetLayout) {
     if (!pSetLayout) return -3;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* dsl = new MaliIcdDescriptorSetLayout();
     dsl->aot_handle_mem.assign(1024, 0); *reinterpret_cast<uint32_t*>(dsl->aot_handle_mem.data() + 0x90) = 2U;
     if (dev && aot_vkCreateDescriptorSetLayout && !dev->aot_vk_device_mem.empty()) {
@@ -588,7 +619,7 @@ int32_t vkCreateDescriptorSetLayout(void* device, const void* pCreateInfo, const
 __attribute__((visibility("default")))
 void vkDestroyDescriptorSetLayout(void* device, uint64_t descriptorSetLayout, const void* /*pAllocator*/) {
     if (!descriptorSetLayout || descriptorSetLayout == 0xD5100001ULL) return;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* dsl = reinterpret_cast<MaliIcdDescriptorSetLayout*>(descriptorSetLayout);
     if (dev && aot_vkDestroyDescriptorSetLayout && !dsl->aot_handle_mem.empty()) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
@@ -603,7 +634,7 @@ void vkDestroyDescriptorSetLayout(void* device, uint64_t descriptorSetLayout, co
 __attribute__((visibility("default")))
 int32_t vkCreatePipelineLayout(void* device, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pPipelineLayout) {
     if (!pPipelineLayout) return -3;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* pl = new MaliIcdPipelineLayout();
     pl->aot_handle_mem.assign(1600, 0); *reinterpret_cast<uint32_t*>(pl->aot_handle_mem.data() + 0x10) = 2U;
     if (dev && aot_vkCreatePipelineLayout && !dev->aot_vk_device_mem.empty()) {
@@ -649,7 +680,7 @@ int32_t vkCreatePipelineLayout(void* device, const void* pCreateInfo, const void
 __attribute__((visibility("default")))
 void vkDestroyPipelineLayout(void* device, uint64_t pipelineLayout, const void* /*pAllocator*/) {
     if (!pipelineLayout || pipelineLayout == 0xB1000001ULL) return;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* pl  = reinterpret_cast<MaliIcdPipelineLayout*>(pipelineLayout);
     if (dev && aot_vkDestroyPipelineLayout && !pl->aot_handle_mem.empty()) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
@@ -665,7 +696,7 @@ __attribute__((visibility("default")))
 int32_t vkCreateComputePipelines(void* device, uint64_t pipelineCache, uint32_t createInfoCount,
                                  const void* pCreateInfos, const void* /*pAllocator*/, uint64_t* pPipelines) {
     if (!pCreateInfos || !pPipelines) return -3;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     const auto* cis = static_cast<const VkComputePipelineCreateInfo*>(pCreateInfos);
     for (uint32_t i = 0; i < createInfoCount; ++i) {
         auto* pipe = new MaliIcdPipeline();
@@ -820,7 +851,7 @@ int32_t vkFreeDescriptorSets(void* /*device*/, uint64_t /*pool*/, uint32_t /*cou
 __attribute__((visibility("default")))
 uint64_t vkGetBufferDeviceAddress(void* device, const void* pInfo) {
     if (!pInfo) return 0;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (dev && aot_vkGetBufferDeviceAddress && !dev->aot_vk_device_mem.empty()) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         uint64_t va = mali_aapcs64::invokeLiftedAapcs64<uint64_t>(
@@ -942,7 +973,7 @@ int32_t vkCreateSampler(void* /*device*/, const void* /*pCreateInfo*/, const voi
 __attribute__((visibility("default")))
 void vkDestroySampler(void* device, uint64_t sampler, const void* pAllocator) {
     if (!sampler) return;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* smp = reinterpret_cast<MaliIcdSampler*>(sampler);
     if (dev && !dev->aot_vk_device_mem.empty() && smp->aot_handle >= 0x10000ULL) {
         g_aot_rt.invokeLiftedVkDirect(
@@ -1001,9 +1032,13 @@ void vkDestroyFramebuffer(void* /*device*/, uint64_t fb, const void* /*pAllocato
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateGraphicsPipelines(void* /*device*/, uint64_t /*cache*/, uint32_t count,
-                                  const void* pCreateInfos, const void* /*pAllocator*/, uint64_t* pPipelines) {
-    if (!pCreateInfos || !pPipelines) return -3;
+VkResult vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_t count,
+                                   const VkGraphicsPipelineCreateInfo* pCreateInfos,
+                                   const VkAllocationCallbacks* pAllocator, VkPipeline* pPipelines) {
+    if (!pCreateInfos || !pPipelines) return VK_ERROR_INITIALIZATION_FAILED;
+    if (useNativeAotFor("vkCreateGraphicsPipelines")) {
+        return aot_forward_vkCreateGraphicsPipelines(device, pipelineCache, count, pCreateInfos, pAllocator, pPipelines);
+    }
     struct VibDesc { uint32_t binding; uint32_t stride; uint32_t inputRate; };
     struct ViaDesc { uint32_t location; uint32_t binding; uint32_t format; uint32_t offset; };
     struct ViState {
@@ -1038,7 +1073,7 @@ int32_t vkCreateGraphicsPipelines(void* /*device*/, uint64_t /*cache*/, uint32_t
         uint64_t basePipelineHandle;
         int32_t  basePipelineIndex;
     };
-    const auto* gis = static_cast<const GfxPipeInfo*>(pCreateInfos);
+    const auto* gis = reinterpret_cast<const GfxPipeInfo*>(pCreateInfos);
     for (uint32_t i = 0; i < count; ++i) {
         auto* pipe = new MaliIcdPipeline();
         pipe->is_compute = false;
@@ -1047,7 +1082,12 @@ int32_t vkCreateGraphicsPipelines(void* /*device*/, uint64_t /*cache*/, uint32_t
                 auto* sm = reinterpret_cast<MaliIcdShaderModule*>(gis[i].pStages[st].module);
                 if (!sm) continue;
                 runAotMbs2PipelineCompile(sm);
-                if (st == 0 || gis[i].pStages[st].stage == 0x01U) {
+                if (!pipe->shader_mod) {
+                    pipe->shader_mod     = sm;
+                    pipe->exec_bo_gpu_va = sm->exec_bo_gpu_va;
+                    pipe->objc_bytes     = sm->objc_words.size() * sizeof(uint64_t);
+                }
+                if (gis[i].pStages[st].stage == 0x01U) {
                     pipe->shader_mod     = sm;
                     pipe->vs_mod         = sm;
                     pipe->exec_bo_gpu_va = sm->exec_bo_gpu_va;
@@ -1087,9 +1127,9 @@ int32_t vkCreateGraphicsPipelines(void* /*device*/, uint64_t /*cache*/, uint32_t
             pipe->depth_write   = gis[i].pDepthStencilState->depthWriteEnable != 0;
             pipe->depth_compare = gis[i].pDepthStencilState->depthCompareOp;
         }
-        pPipelines[i] = reinterpret_cast<uint64_t>(pipe);
+        pPipelines[i] = reinterpret_cast<VkPipeline>(pipe);
     }
-    return 0;
+    return VK_SUCCESS;
 }
 
 __attribute__((visibility("default")))
@@ -1127,7 +1167,7 @@ int32_t vkGetQueryPoolResults(void* /*device*/, uint64_t queryPool, uint32_t fir
 __attribute__((visibility("default")))
 int32_t vkCreateFence(void* device, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pFence) {
     if (!pFence) return -3;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* f = new MaliIcdFence();
     f->aot_fence_mem.assign(1024, 0); *reinterpret_cast<uint32_t*>(f->aot_fence_mem.data() + 0x10) = 2U;
     uint32_t flags = 0U;
@@ -1157,7 +1197,7 @@ int32_t vkCreateFence(void* device, const void* pCreateInfo, const void* /*pAllo
 __attribute__((visibility("default")))
 void vkDestroyFence(void* device, uint64_t fence, const void* /*pAllocator*/) {
     if (!fence || fence == 0xFE000001ULL) return;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* f   = reinterpret_cast<MaliIcdFence*>(fence);
     if (dev && aot_vkDestroyFence && !f->aot_fence_mem.empty()) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
@@ -1171,7 +1211,7 @@ void vkDestroyFence(void* device, uint64_t fence, const void* /*pAllocator*/) {
 __attribute__((visibility("default")))
 int32_t vkWaitForFences(void* device, uint32_t c, const uint64_t* p, uint32_t /*all*/, uint64_t /*t*/) {
     if (mali_kbase_emu_wait_csf_idle) mali_kbase_emu_wait_csf_idle(200000000ULL);
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (dev && dev->aot_cctx_mem.size() > 0xc1 && dev->aot_cctx_mem[0xc1] != 0) {
         return -4; /* VK_ERROR_DEVICE_LOST */
     }
@@ -1188,7 +1228,7 @@ int32_t vkWaitForFences(void* device, uint32_t c, const uint64_t* p, uint32_t /*
 }
 __attribute__((visibility("default")))
 int32_t vkResetFences(void* device, uint32_t c, const uint64_t* p) {
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (p) {
         for (uint32_t i = 0; i < c; ++i) {
             if (p[i] && p[i] != 0xFE000001ULL) {
@@ -1532,10 +1572,14 @@ void vkCmdDispatch(void* commandBuffer, uint32_t groupCountX, uint32_t groupCoun
 }
 
 __attribute__((visibility("default")))
-void vkCmdDrawIndexed(void* commandBuffer, uint32_t indexCount, uint32_t instanceCount,
+void vkCmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32_t instanceCount,
                       uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) {
     if (!commandBuffer) return;
-    auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
+    if (useNativeAotFor("vkCmdDrawIndexed")) {
+        aot_forward_vkCmdDrawIndexed(commandBuffer, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+        return;
+    }
+    auto* cb = reinterpret_cast<MaliIcdCommandBuffer*>(commandBuffer);
     if (!cb->conditional_active) return;
     MaliIcdRecordedCmd cmd{};
     cmd.type             = MaliIcdRecordedCmd::CMD_DRAW_INDEXED;
@@ -1561,10 +1605,14 @@ void vkCmdDrawIndexed(void* commandBuffer, uint32_t indexCount, uint32_t instanc
 }
 
 __attribute__((visibility("default")))
-void vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount,
+void vkCmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t instanceCount,
                uint32_t firstVertex, uint32_t firstInstance) {
     if (!commandBuffer) return;
-    auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
+    if (useNativeAotFor("vkCmdDraw")) {
+        aot_forward_vkCmdDraw(commandBuffer, vertexCount, instanceCount, firstVertex, firstInstance);
+        return;
+    }
+    auto* cb = reinterpret_cast<MaliIcdCommandBuffer*>(commandBuffer);
     if (!cb->conditional_active) return;
     uint32_t draw_idx = cb->rp_draw_counter++;
     MaliIcdRecordedCmd cmd{};
@@ -1659,17 +1707,20 @@ void vkCmdPipelineBarrier(void* commandBuffer, uint32_t /*srcS*/, uint32_t /*dst
 }
 
 __attribute__((visibility("default")))
-int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, uint64_t fence) {
-    if (!queue) return -3;
-    auto* q   = static_cast<MaliIcdQueue*>(queue);
-    auto* dev = static_cast<MaliIcdDevice*>(q->parent_device);
-    if (!dev) return -3;
-    if (dev->aot_cctx_mem.size() > 0xc1 && dev->aot_cctx_mem[0xc1] != 0) {
-        return -4; /* VK_ERROR_DEVICE_LOST (checked at 0x009828b4 in libGLES_mali.so) */
+VkResult vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence) {
+    if (!queue) return VK_ERROR_INITIALIZATION_FAILED;
+    if (useNativeAotFor("vkQueueSubmit")) {
+        return aot_forward_vkQueueSubmit(queue, submitCount, pSubmits, fence);
     }
-    if (fence && fence != 0xFE000001ULL) reinterpret_cast<MaliIcdFence*>(fence)->signaled = true;
+    auto* q   = reinterpret_cast<MaliIcdQueue*>(queue);
+    auto* dev = static_cast<MaliIcdDevice*>(q->parent_device);
+    if (!dev) return VK_ERROR_INITIALIZATION_FAILED;
+    if (dev->aot_cctx_mem.size() > 0xc1 && dev->aot_cctx_mem[0xc1] != 0) {
+        return VK_ERROR_DEVICE_LOST; /* (checked at 0x009828b4 in libGLES_mali.so) */
+    }
+    if (fence && reinterpret_cast<uint64_t>(fence) != 0xFE000001ULL) reinterpret_cast<MaliIcdFence*>(fence)->signaled = true;
 
-    const auto* submits = static_cast<const VkSubmitInfo*>(pSubmits);
+    const auto* submits = pSubmits;
     for (uint32_t s = 0; s < submitCount; ++s) {
         for (uint32_t c = 0; c < submits[s].commandBufferCount; ++c) {
             auto* cb = reinterpret_cast<MaliIcdCommandBuffer*>(submits[s].pCommandBuffers[c]);
@@ -1701,6 +1752,9 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
                     pushCsfWord((uint64_t(MALI_CS_OPCODE_MOVE32) << 56) | (33ULL << 48) | cmd.wg_y);
                     pushCsfWord((uint64_t(MALI_CS_OPCODE_MOVE32) << 56) | (34ULL << 48) | cmd.wg_z);
                     pushCsfWord((uint64_t(MALI_CS_OPCODE_RUN_COMPUTE) << 56));
+                    if (dev->cqs_bo_va) {
+                        *reinterpret_cast<volatile uint64_t*>(dev->cqs_bo_va) = 0ULL;
+                    }
                     pushCsfWord((uint64_t(MALI_CS_OPCODE_MOVE48) << 56) | (40ULL << 48) | (dev->cqs_bo_va & 0xFFFFFFFFFFFFULL));
                     pushCsfWord((uint64_t(MALI_CS_OPCODE_MOVE48) << 56) | (42ULL << 48) | 1ULL);
                     pushCsfWord((uint64_t(MALI_CS_OPCODE_SYNC_ADD64) << 56) | (40ULL << 40) | (42ULL << 32));
@@ -1714,6 +1768,12 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
                     }
                     KbaseIoctlCsQueueKick kick{dev->ring_bo_va};
                     bionic_mali_kbase_ioctl_stub(static_cast<uint64_t>(dev->mali_fd), 0x40088025U, reinterpret_cast<uint64_t>(&kick));
+                    if (dev->cqs_bo_va) {
+                        volatile uint64_t* cqs_ptr = reinterpret_cast<volatile uint64_t*>(dev->cqs_bo_va);
+                        for (int wait_i = 0; wait_i < 20000 && *cqs_ptr == 0ULL; ++wait_i) {
+                            usleep(10);
+                        }
+                    }
                 } else if (cmd.type == MaliIcdRecordedCmd::CMD_COPY_BUFFER) {
                     if (cmd.src_va && cmd.dst_va && cmd.copy_bytes) {
                         std::memcpy(reinterpret_cast<void*>(cmd.dst_va), reinterpret_cast<const void*>(cmd.src_va), cmd.copy_bytes);
@@ -1767,262 +1827,84 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
                     if (cmd.query_pool && cmd.query_index < cmd.query_pool->results.size()) {
                         cmd.query_pool->results[cmd.query_index] = s_ts;
                     }
-                } else if ((cmd.type == MaliIcdRecordedCmd::CMD_DRAW_INDEXED ||
-                            cmd.type == MaliIcdRecordedCmd::CMD_DRAW) &&
-                           cmd.framebuffer && cmd.framebuffer->hw_mfbd.color_rt0_gpu_va != 0 &&
-                           cmd.vertex_bo_va != 0 && cmd.vertex_bo_size >= 12ULL &&
-                           [&]() -> bool {
-                               const float* vf = reinterpret_cast<const float*>(cmd.vertex_bo_va);
-                               for (size_t k = 0; k < std::min<size_t>(cmd.vertex_bo_size / 4, 24); ++k) {
-                                   if (std::isfinite(vf[k]) && std::fabs(vf[k]) > 1e-5f) return true;
-                               }
-                               return false;
-                           }()) {
-                    // Real Application Geometry & Shader Execution Path (Supports vkmark 21,600-vertex horse.3ds,
-                    // [texture], [shading], [cube], and general Vulkan indexed/non-indexed meshes!)
-                    uint32_t W = std::max<uint32_t>(1U, cmd.framebuffer->width);
-                    uint32_t H = std::max<uint32_t>(1U, cmd.framebuffer->height);
-                    uint32_t* px = reinterpret_cast<uint32_t*>(cmd.framebuffer->hw_mfbd.color_rt0_gpu_va);
-                    if (cmd.framebuffer->depth_buffer.size() != static_cast<size_t>(W) * H) {
-                        cmd.framebuffer->depth_buffer.assign(static_cast<size_t>(W) * H, 1.0f);
-                    }
-                    if (cmd.rp_draw_idx == 0) {
-                        uint32_t clear_col = cmd.framebuffer->hw_mfbd.clear_color_rgba8;
-                        for (uint32_t p = 0; p < W * H; ++p) {
-                            px[p] = clear_col;
-                            cmd.framebuffer->depth_buffer[p] = 1.0f;
+                } else if (cmd.type == MaliIcdRecordedCmd::CMD_DRAW_INDEXED ||
+                           cmd.type == MaliIcdRecordedCmd::CMD_DRAW) {
+                    // Submit Valhall CSF IDVS + FRAGMENT job into ring_bo_va -> KBASE_IOCTL_CS_QUEUE_KICK
+                    if (cmd.framebuffer && cmd.framebuffer->hw_mfbd.color_rt0_gpu_va != 0) {
+                        static MaliCsfGraphicsDrawPacket s_gfx_pkt{};
+                        s_gfx_pkt = MaliCsfGraphicsDrawPacket{};
+                        s_gfx_pkt.mfbd_color_va  = cmd.framebuffer->hw_mfbd.color_rt0_gpu_va;
+                        s_gfx_pkt.width          = std::max<uint32_t>(1U, cmd.framebuffer->width);
+                        s_gfx_pkt.height         = std::max<uint32_t>(1U, cmd.framebuffer->height);
+                        s_gfx_pkt.clear_rgba8    = cmd.framebuffer->hw_mfbd.clear_color_rgba8;
+                        s_gfx_pkt.is_indexed     = (cmd.type == MaliIcdRecordedCmd::CMD_DRAW_INDEXED) ? 1U : 0U;
+                        s_gfx_pkt.vertex_bo_va   = cmd.vertex_bo_va;
+                        s_gfx_pkt.vertex_bo_size = cmd.vertex_bo_size;
+                        s_gfx_pkt.index_bo_va    = cmd.index_bo_va;
+                        s_gfx_pkt.index_bo_size  = cmd.index_bo_size;
+                        s_gfx_pkt.index_type     = cmd.index_type;
+                        s_gfx_pkt.count          = cmd.index_count;
+                        s_gfx_pkt.first_vertex   = cmd.first_vertex;
+                        s_gfx_pkt.first_index    = cmd.first_index;
+                        s_gfx_pkt.vertex_offset  = cmd.vertex_offset;
+                        s_gfx_pkt.instance_count = cmd.instance_count;
+                        s_gfx_pkt.stride_bytes   = (cmd.pipeline && cmd.pipeline->vertex_stride >= 8U) ? cmd.pipeline->vertex_stride : 16U;
+                        s_gfx_pkt.topology       = cmd.pipeline ? cmd.pipeline->topology : 3U;
+                        s_gfx_pkt.rp_draw_idx    = cmd.rp_draw_idx;
+                        s_gfx_pkt.ubo_va         = cmd.desc_set ? (cmd.desc_set->bound_buffer_va[0] + cmd.dynamic_offset) : 0ULL;
+                        s_gfx_pkt.ubo_range      = cmd.desc_set ? cmd.desc_set->bound_buffer_range[0] : 0ULL;
+                        if (cmd.pipeline && cmd.pipeline->fs_mod && cmd.pipeline->fs_mod->has_const_color) {
+                            s_gfx_pkt.has_frag_const = 1U;
+                            uint32_t r8 = static_cast<uint32_t>(std::clamp(cmd.pipeline->fs_mod->const_color[0], 0.0f, 1.0f) * 255.0f + 0.5f);
+                            uint32_t g8 = static_cast<uint32_t>(std::clamp(cmd.pipeline->fs_mod->const_color[1], 0.0f, 1.0f) * 255.0f + 0.5f);
+                            uint32_t b8 = static_cast<uint32_t>(std::clamp(cmd.pipeline->fs_mod->const_color[2], 0.0f, 1.0f) * 255.0f + 0.5f);
+                            uint32_t a8 = static_cast<uint32_t>(std::clamp(cmd.pipeline->fs_mod->const_color[3], 0.0f, 1.0f) * 255.0f + 0.5f);
+                            s_gfx_pkt.frag_const_rgba8 = (a8 << 24) | (b8 << 16) | (g8 << 8) | r8;
                         }
-                    }
-                    uint32_t count = cmd.index_count;
-                    uint32_t stride_bytes = (cmd.pipeline && cmd.pipeline->vertex_stride >= 8U) ? cmd.pipeline->vertex_stride : 0U;
-                    if (stride_bytes == 0U) {
-                        if (cmd.vertex_bo_size >= count * 36ULL && (cmd.vertex_bo_size % 36ULL) == 0ULL) stride_bytes = 36U;
-                        else if (cmd.vertex_bo_size >= count * 32ULL) stride_bytes = 32U;
-                        else if (cmd.vertex_bo_size >= count * 24ULL) stride_bytes = 24U;
-                        else if (cmd.vertex_bo_size >= count * 20ULL) stride_bytes = 20U;
-                        else if (cmd.vertex_bo_size >= count * 16ULL) stride_bytes = 16U;
-                        else stride_bytes = 12U;
-                    }
-                    uint32_t pos_off = 0U, col_off = 12U, uv_off = 8U;
-                    bool has_col_attr = (stride_bytes >= 24U);
-                    bool has_uv_attr  = (stride_bytes == 20U || stride_bytes >= 32U);
-                    if (cmd.pipeline && !cmd.pipeline->vertex_attrs.empty()) {
-                        has_col_attr = false;
-                        has_uv_attr  = false;
-                        for (const auto& attr : cmd.pipeline->vertex_attrs) {
-                            if (attr.location == 0) pos_off = attr.offset;
-                            else if (attr.location == 1) {
-                                if (attr.format == 103U /* R32G32_SFLOAT */) { has_uv_attr = true; uv_off = attr.offset; }
-                                else { has_col_attr = true; col_off = attr.offset; }
-                            } else if (attr.location == 2) {
-                                if (attr.format == 103U /* R32G32_SFLOAT */) { has_uv_attr = true; uv_off = attr.offset; }
-                                else { has_col_attr = true; col_off = attr.offset; }
-                            }
+                        if (cmd.pipeline && cmd.pipeline->fs_mod && !cmd.pipeline->fs_mod->spirv_words.empty()) {
+                            s_gfx_pkt.fs_spirv_ptr   = cmd.pipeline->fs_mod->spirv_words.data();
+                            s_gfx_pkt.fs_spirv_words = static_cast<uint32_t>(cmd.pipeline->fs_mod->spirv_words.size());
                         }
+                        if (cmd.pipeline && cmd.pipeline->vs_mod && !cmd.pipeline->vs_mod->spirv_words.empty()) {
+                            s_gfx_pkt.vs_spirv_ptr   = cmd.pipeline->vs_mod->spirv_words.data();
+                            s_gfx_pkt.vs_spirv_words = static_cast<uint32_t>(cmd.pipeline->vs_mod->spirv_words.size());
+                        }
+                        uint64_t* srt_ptr = reinterpret_cast<uint64_t*>(dev->srt_bo_va);
+                        srt_ptr[0] = reinterpret_cast<uint64_t>(&s_gfx_pkt);
+                        srt_ptr[1] = 0ULL;
+                        srt_ptr[2] = sizeof(MaliCsfGraphicsDrawPacket);
                     }
+                    uint64_t* spd_ptr = reinterpret_cast<uint64_t*>(dev->spd_bo_va);
+                    spd_ptr[0] = cmd.pipeline ? cmd.pipeline->exec_bo_gpu_va : 0ULL;
+                    spd_ptr[1] = cmd.pipeline ? cmd.pipeline->objc_bytes : 0ULL;
 
-                    // Resolve UBO pointer (including late vkBindBufferMemory after vkUpdateDescriptorSets)
-                    uint64_t ubo_va = 0ULL;
-                    uint64_t ubo_range = 0ULL;
-                    if (cmd.desc_set) {
-                        ubo_va    = cmd.desc_set->bound_buffer_va[0];
-                        ubo_range = cmd.desc_set->bound_buffer_range[0];
-                        if (ubo_va == 0ULL && cmd.desc_set->bound_buffer_handle[0] != 0ULL) {
-                            const auto* b = reinterpret_cast<const MaliIcdBuffer*>(cmd.desc_set->bound_buffer_handle[0]);
-                            if (b && b->bound_gpu_va != 0ULL) {
-                                ubo_va = b->bound_gpu_va + cmd.desc_set->bound_buffer_offset[0];
-                            }
-                        }
-                        if (ubo_va != 0ULL) ubo_va += cmd.dynamic_offset;
-                    }
-
-                    const float* mvp_mat  = nullptr;
-                    const float* norm_mat = nullptr;
-                    float ubo_mat_col[3]  = {0.70f, 0.70f, 0.70f};
-                    bool  has_ubo_mat_col = false;
-                    if (ubo_va != 0ULL && ubo_range >= 64ULL) {
-                        const float* ubo = reinterpret_cast<const float*>(ubo_va);
-                        auto isMvpCandidate = [](const float* m) -> bool {
-                            if (!std::isfinite(m[0]) || !std::isfinite(m[5]) || !std::isfinite(m[11]) || !std::isfinite(m[15])) return false;
-                            if (std::fabs(m[0]) < 0.02f || std::fabs(m[5]) < 0.02f) return false;
-                            bool is_persp = (std::fabs(std::fabs(m[11]) - 1.0f) < 0.25f && std::fabs(m[15]) < 0.05f);
-                            bool is_ortho = (std::fabs(m[15] - 1.0f) < 0.05f && std::fabs(m[3]) < 1e-3f && std::fabs(m[7]) < 1e-3f && std::fabs(m[10]) > 0.01f);
-                            return is_persp || is_ortho;
-                        };
-                        if (ubo_range >= 128ULL &&
-                            std::fabs(ubo[15] - 1.0f) < 0.05f &&
-                            std::fabs(std::fabs(ubo[16 + 11]) - 1.0f) < 0.25f &&
-                            std::fabs(ubo[16 + 15]) < 0.05f) {
-                            mvp_mat  = ubo + 16;
-                            norm_mat = (ubo_range >= 192ULL) ? (ubo + 32) : (ubo + 0);
-                        } else if (isMvpCandidate(ubo)) {
-                            mvp_mat  = ubo;
-                            norm_mat = (ubo_range >= 128ULL) ? (ubo + 16) : nullptr;
-                            if (ubo_range >= 144ULL && std::isfinite(ubo[32]) && ubo[35] > 0.01f && ubo[35] <= 1.0f) {
-                                ubo_mat_col[0] = std::clamp(ubo[32], 0.0f, 1.0f);
-                                ubo_mat_col[1] = std::clamp(ubo[33], 0.0f, 1.0f);
-                                ubo_mat_col[2] = std::clamp(ubo[34], 0.0f, 1.0f);
-                                has_ubo_mat_col = true;
-                            }
-                        }
-                    }
-
-                    const uint32_t* tex_rgba8 = nullptr;
-                    uint32_t tex_w = 0, tex_h = 0;
-                    if (cmd.desc_set) {
-                        for (int b = 0; b < 8; ++b) {
-                            if (cmd.desc_set->bound_image_view[b] && cmd.desc_set->bound_image_view[b]->image) {
-                                const auto* timg = cmd.desc_set->bound_image_view[b]->image;
-                                if (timg->bound_gpu_va != 0 && timg->width > 0 && timg->height > 0) {
-                                    tex_rgba8 = reinterpret_cast<const uint32_t*>(timg->bound_gpu_va);
-                                    tex_w = timg->width;
-                                    tex_h = timg->height;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    bool indexed = (cmd.type == MaliIcdRecordedCmd::CMD_DRAW_INDEXED && cmd.index_bo_va != 0);
-                    auto fetchIndex = [&](uint32_t k) -> uint32_t {
-                        if (!indexed) return cmd.first_vertex + k;
-                        uint32_t idx_pos = cmd.first_index + k;
-                        if (cmd.index_type == 0U /* VK_INDEX_TYPE_UINT16 */) {
-                            if ((idx_pos + 1ULL) * 2ULL <= cmd.index_bo_size)
-                                return static_cast<uint32_t>(reinterpret_cast<const uint16_t*>(cmd.index_bo_va)[idx_pos]) + cmd.vertex_offset;
-                        } else {
-                            if ((idx_pos + 1ULL) * 4ULL <= cmd.index_bo_size)
-                                return reinterpret_cast<const uint32_t*>(cmd.index_bo_va)[idx_pos] + cmd.vertex_offset;
-                        }
-                        return k;
-                    };
-                    uint32_t topo = cmd.pipeline ? cmd.pipeline->topology : 3U;
-                    uint32_t step = (topo == 4U /* TRIANGLE_STRIP */ || topo == 5U /* TRIANGLE_FAN */) ? 1U : 3U;
-                    float* zbuf = cmd.framebuffer->depth_buffer.data();
-                    auto projectVert = [&](const float* p, float& out_x, float& out_y, float& out_z) -> bool {
-                        float px_in = p[0], py_in = p[1], pz_in = (stride_bytes >= pos_off + 12U) ? p[2] : 0.0f;
-                        if (mvp_mat) {
-                            float cx = mvp_mat[0]*px_in + mvp_mat[4]*py_in + mvp_mat[8]*pz_in  + mvp_mat[12];
-                            float cy = mvp_mat[1]*px_in + mvp_mat[5]*py_in + mvp_mat[9]*pz_in  + mvp_mat[13];
-                            float cz = mvp_mat[2]*px_in + mvp_mat[6]*py_in + mvp_mat[10]*pz_in + mvp_mat[14];
-                            float cw = mvp_mat[3]*px_in + mvp_mat[7]*py_in + mvp_mat[11]*pz_in + mvp_mat[15];
-                            if (cw <= 1e-4f) return false;
-                            float inv_w = 1.0f / cw;
-                            out_x = ((cx * inv_w) * 0.5f + 0.5f) * static_cast<float>(W);
-                            out_y = ((cy * inv_w) * 0.5f + 0.5f) * static_cast<float>(H);
-                            out_z = std::clamp(0.5f * (cz * inv_w + 1.0f), 0.0f, 1.0f);
-                        } else {
-                            out_x = (px_in * 0.5f + 0.5f) * static_cast<float>(W);
-                            out_y = (py_in * 0.5f + 0.5f) * static_cast<float>(H);
-                            out_z = (stride_bytes >= pos_off + 12U) ? std::clamp(pz_in * 0.5f + 0.5f, 0.0f, 1.0f) : 0.5f;
-                        }
-                        return true;
-                    };
-                    auto computeNormalShade = [&](const uint8_t* vb_ptr) -> float {
-                        if (!norm_mat || stride_bytes < 24U) return 1.0f;
-                        const float* n = reinterpret_cast<const float*>(vb_ptr + 12U);
-                        float tnx = norm_mat[0]*n[0] + norm_mat[4]*n[1] + norm_mat[8]*n[2];
-                        float tny = norm_mat[1]*n[0] + norm_mat[5]*n[1] + norm_mat[9]*n[2];
-                        float tnz = norm_mat[2]*n[0] + norm_mat[6]*n[1] + norm_mat[10]*n[2];
-                        float nlen = std::sqrt(tnx*tnx + tny*tny + tnz*tnz);
-                        if (nlen > 1e-6f) { tnx /= nlen; tny /= nlen; tnz /= nlen; }
-                        return 0.20f + 0.80f * std::max(0.0f, std::fabs(tnx * 0.348155f + tny * 0.348155f + tnz * 0.870388f));
-                    };
-                    for (uint32_t t = 0; t + 2 < count; t += step) {
-                        uint32_t i0 = fetchIndex(topo == 5U ? 0U : t);
-                        uint32_t i1 = fetchIndex(t + 1U);
-                        uint32_t i2 = fetchIndex(t + 2U);
-                        if (topo == 4U && (t & 1U)) std::swap(i0, i1);
-                        if ((i0 + 1ULL) * stride_bytes > cmd.vertex_bo_size ||
-                            (i1 + 1ULL) * stride_bytes > cmd.vertex_bo_size ||
-                            (i2 + 1ULL) * stride_bytes > cmd.vertex_bo_size) continue;
-                        const uint8_t* b0 = reinterpret_cast<const uint8_t*>(cmd.vertex_bo_va) + i0 * stride_bytes;
-                        const uint8_t* b1 = reinterpret_cast<const uint8_t*>(cmd.vertex_bo_va) + i1 * stride_bytes;
-                        const uint8_t* b2 = reinterpret_cast<const uint8_t*>(cmd.vertex_bo_va) + i2 * stride_bytes;
-                        const float* p0 = reinterpret_cast<const float*>(b0 + pos_off);
-                        const float* p1 = reinterpret_cast<const float*>(b1 + pos_off);
-                        const float* p2 = reinterpret_cast<const float*>(b2 + pos_off);
-                        float x0 = 0.0f, y0 = 0.0f, z0 = 0.5f;
-                        float x1 = 0.0f, y1 = 0.0f, z1 = 0.5f;
-                        float x2 = 0.0f, y2 = 0.0f, z2 = 0.5f;
-                        if (!projectVert(p0, x0, y0, z0) || !projectVert(p1, x1, y1, z1) || !projectVert(p2, x2, y2, z2)) continue;
-                        float sh0 = computeNormalShade(b0), sh1 = computeNormalShade(b1), sh2 = computeNormalShade(b2);
-                        float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
-                        if (std::fabs(area) < 1e-4f) continue;
-                        float inv_area = 1.0f / area;
-                        int min_x = std::max(0, static_cast<int>(std::floor(std::min({x0, x1, x2}))));
-                        int max_x = std::min(static_cast<int>(W) - 1, static_cast<int>(std::ceil(std::max({x0, x1, x2}))));
-                        int min_y = std::max(0, static_cast<int>(std::floor(std::min({y0, y1, y2}))));
-                        int max_y = std::min(static_cast<int>(H) - 1, static_cast<int>(std::ceil(std::max({y0, y1, y2}))));
-                        for (int py = min_y; py <= max_y; ++py) {
-                            for (int px_i = min_x; px_i <= max_x; ++px_i) {
-                                float sx = static_cast<float>(px_i) + 0.5f;
-                                float sy = static_cast<float>(py) + 0.5f;
-                                float w0 = ((x1 - sx) * (y2 - sy) - (x2 - sx) * (y1 - sy)) * inv_area;
-                                float w1 = ((x2 - sx) * (y0 - sy) - (x0 - sx) * (y2 - sy)) * inv_area;
-                                float w2 = 1.0f - w0 - w1;
-                                if (w0 >= -1e-4f && w1 >= -1e-4f && w2 >= -1e-4f) {
-                                    float z = w0 * z0 + w1 * z1 + w2 * z2;
-                                    size_t pidx = static_cast<size_t>(py) * W + static_cast<size_t>(px_i);
-                                    if (z <= zbuf[pidx]) {
-                                        zbuf[pidx] = z;
-                                        float sh = w0 * sh0 + w1 * sh1 + w2 * sh2;
-                                        float cr = has_ubo_mat_col ? ubo_mat_col[0] : 0.85f;
-                                        float cg = has_ubo_mat_col ? ubo_mat_col[1] : 0.65f;
-                                        float cb_c = has_ubo_mat_col ? ubo_mat_col[2] : 0.35f;
-                                        if (cmd.pipeline && cmd.pipeline->fs_mod && cmd.pipeline->fs_mod->has_const_color) {
-                                            cr   = cmd.pipeline->fs_mod->const_color[0];
-                                            cg   = cmd.pipeline->fs_mod->const_color[1];
-                                            cb_c = cmd.pipeline->fs_mod->const_color[2];
-                                        }
-                                        if (has_col_attr && col_off + 12U <= stride_bytes && (!norm_mat || col_off >= 24U)) {
-                                            const float* c0 = reinterpret_cast<const float*>(b0 + col_off);
-                                            const float* c1 = reinterpret_cast<const float*>(b1 + col_off);
-                                            const float* c2 = reinterpret_cast<const float*>(b2 + col_off);
-                                            cr   = std::clamp(w0 * c0[0] + w1 * c1[0] + w2 * c2[0], 0.0f, 1.0f);
-                                            cg   = std::clamp(w0 * c0[1] + w1 * c1[1] + w2 * c2[1], 0.0f, 1.0f);
-                                            cb_c = std::clamp(w0 * c0[2] + w1 * c1[2] + w2 * c2[2], 0.0f, 1.0f);
-                                        }
-                                        cr   = std::clamp(cr * sh, 0.0f, 1.0f);
-                                        cg   = std::clamp(cg * sh, 0.0f, 1.0f);
-                                        cb_c = std::clamp(cb_c * sh, 0.0f, 1.0f);
-                                        if (tex_rgba8 && tex_w > 0 && tex_h > 0) {
-                                            float u = (sx / static_cast<float>(W)), v = (sy / static_cast<float>(H));
-                                            if (has_uv_attr && uv_off + 8U <= stride_bytes) {
-                                                const float* uv0 = reinterpret_cast<const float*>(b0 + uv_off);
-                                                const float* uv1 = reinterpret_cast<const float*>(b1 + uv_off);
-                                                const float* uv2 = reinterpret_cast<const float*>(b2 + uv_off);
-                                                u = std::clamp(w0 * uv0[0] + w1 * uv1[0] + w2 * uv2[0], 0.0f, 1.0f);
-                                                v = std::clamp(w0 * uv0[1] + w1 * uv1[1] + w2 * uv2[1], 0.0f, 1.0f);
-                                            }
-                                            uint32_t tx = std::min<uint32_t>(tex_w - 1U, static_cast<uint32_t>(u * tex_w));
-                                            uint32_t ty = std::min<uint32_t>(tex_h - 1U, static_cast<uint32_t>(v * tex_h));
-                                            uint32_t texel = tex_rgba8[ty * tex_w + tx];
-                                            cr   = static_cast<float>(texel & 0xFFU) / 255.0f;
-                                            cg   = static_cast<float>((texel >> 8) & 0xFFU) / 255.0f;
-                                            cb_c = static_cast<float>((texel >> 16) & 0xFFU) / 255.0f;
-                                        }
-                                        uint32_t r8 = static_cast<uint32_t>(cr * 255.0f + 0.5f);
-                                        uint32_t g8 = static_cast<uint32_t>(cg * 255.0f + 0.5f);
-                                        uint32_t b8 = static_cast<uint32_t>(cb_c * 255.0f + 0.5f);
-                                        px[pidx] = (0xFFU << 24) | (b8 << 16) | (g8 << 8) | r8;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Emit CSF IDVS + FRAGMENT job and kick queue
                     pushCsfWord((uint64_t(MALI_CS_OPCODE_MOVE48) << 56) | (0ULL << 48)  | (dev->srt_bo_va & 0xFFFFFFFFFFFFULL));
                     pushCsfWord((uint64_t(MALI_CS_OPCODE_MOVE48) << 56) | (8ULL << 48)  | (dev->spd_bo_va & 0xFFFFFFFFFFFFULL));
                     pushCsfWord((uint64_t(MALI_CS_OPCODE_RUN_IDVS) << 56));
                     pushCsfWord((uint64_t(MALI_CS_OPCODE_FINISH_TILING) << 56));
                     pushCsfWord((uint64_t(MALI_CS_OPCODE_RUN_FRAGMENT) << 56));
                     pushCsfWord((uint64_t(MALI_CS_OPCODE_FINISH_FRAGMENT) << 56));
+                    if (dev->cqs_bo_va) {
+                        *reinterpret_cast<volatile uint64_t*>(dev->cqs_bo_va) = 0ULL;
+                    }
+                    pushCsfWord((uint64_t(MALI_CS_OPCODE_MOVE48) << 56) | (40ULL << 48) | (dev->cqs_bo_va & 0xFFFFFFFFFFFFULL));
+                    pushCsfWord((uint64_t(MALI_CS_OPCODE_MOVE48) << 56) | (42ULL << 48) | 1ULL);
+                    pushCsfWord((uint64_t(MALI_CS_OPCODE_SYNC_ADD64) << 56) | (40ULL << 40) | (42ULL << 32));
+
                     *reinterpret_cast<uint64_t*>(dev->user_input_va + CS_INSERT_LO) = dev->ring_write_off;
                     if (aot_kbase_cs_queue_kick) {
                         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
                         g_aot_rt.cpu.x[0] = reinterpret_cast<uint64_t>(dev->csi_queue_struct.data());
                         g_aot_rt.cpu.x[1] = 1;
                         g_aot_rt.resetGuestStackLocked(); aot_kbase_cs_queue_kick(&g_aot_rt.cpu);
+                    }
+                    KbaseIoctlCsQueueKick kick{dev->ring_bo_va};
+                    bionic_mali_kbase_ioctl_stub(static_cast<uint64_t>(dev->mali_fd), 0x40088025U, reinterpret_cast<uint64_t>(&kick));
+                    if (dev->cqs_bo_va) {
+                        volatile uint64_t* cqs_ptr = reinterpret_cast<volatile uint64_t*>(dev->cqs_bo_va);
+                        for (int wait_i = 0; wait_i < 20000 && *cqs_ptr == 0ULL; ++wait_i) {
+                            usleep(10);
+                        }
                     }
                 }
             }
@@ -2056,10 +1938,10 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
             }
         }
     }
-    if (fence && fence != 0xFE000001ULL) {
+    if (fence && reinterpret_cast<uint64_t>(fence) != 0xFE000001ULL) {
         reinterpret_cast<MaliIcdFence*>(fence)->signaled = true;
     }
-    return 0;
+    return VK_SUCCESS;
 }
 
 
@@ -2108,7 +1990,7 @@ void vkTrimCommandPool(void* device, uint64_t commandPool, uint32_t flags) {
 __attribute__((visibility("default")))
 void vkGetDeviceQueue2(void* device, const void* pQueueInfo, void** pQueue) {
     if (!pQueue) return;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (dev && !dev->aot_vk_device_mem.empty() && aot_vkGetDeviceQueue2 && pQueueInfo) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         mali_aapcs64::invokeLiftedAapcs64<void>(
@@ -2173,7 +2055,7 @@ void vkGetImageMemoryRequirements2(void* device, const void* pInfo, void* pMemor
 __attribute__((visibility("default")))
 void vkGetDeviceBufferMemoryRequirements(void* device, const void* pInfo, void* pMemoryRequirements) {
     if (!pInfo || !pMemoryRequirements) return;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (dev && !dev->aot_vk_device_mem.empty() && aot_vkGetDeviceBufferMemoryRequirements) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         mali_aapcs64::invokeLiftedAapcs64<void>(
@@ -2194,7 +2076,7 @@ void vkGetDeviceBufferMemoryRequirements(void* device, const void* pInfo, void* 
 __attribute__((visibility("default")))
 void vkGetDeviceImageMemoryRequirements(void* device, const void* pInfo, void* pMemoryRequirements) {
     if (!pInfo || !pMemoryRequirements) return;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (dev && !dev->aot_vk_device_mem.empty() && aot_vkGetDeviceImageMemoryRequirements) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         mali_aapcs64::invokeLiftedAapcs64<void>(
@@ -2222,7 +2104,7 @@ void vkGetDeviceImageMemoryRequirements(void* device, const void* pInfo, void* p
 
 __attribute__((visibility("default")))
 void vkGetDeviceImageSparseMemoryRequirements(void* device, const void* pInfo, uint32_t* pCount, void* pReqs) {
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (dev && !dev->aot_vk_device_mem.empty() && aot_vkGetDeviceImageSparseMemoryRequirements && pInfo && pCount) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         mali_aapcs64::invokeLiftedAapcs64<void>(
@@ -2270,7 +2152,7 @@ void vkDestroySamplerYcbcrConversion(void* /*device*/, uint64_t /*ycbcrConversio
 __attribute__((visibility("default")))
 int32_t vkCreatePrivateDataSlot(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pSlot) {
     if (!pSlot) return -3;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (dev && !dev->aot_vk_device_mem.empty() && aot_vkCreatePrivateDataSlot && pCreateInfo) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         int32_t r = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
@@ -2286,7 +2168,7 @@ int32_t vkCreatePrivateDataSlot(void* device, const void* pCreateInfo, const voi
 
 __attribute__((visibility("default")))
 void vkDestroyPrivateDataSlot(void* device, uint64_t slot, const void* pAllocator) {
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (dev && !dev->aot_vk_device_mem.empty() && aot_vkDestroyPrivateDataSlot && slot != 0 && (slot < 0x9D000000ULL || slot > 0x9E000000ULL)) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         mali_aapcs64::invokeLiftedAapcs64<void>(
@@ -2298,7 +2180,7 @@ void vkDestroyPrivateDataSlot(void* device, uint64_t slot, const void* pAllocato
 
 __attribute__((visibility("default")))
 int32_t vkSetPrivateData(void* device, uint32_t objType, uint64_t objHandle, uint64_t slot, uint64_t data) {
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (dev && !dev->aot_vk_device_mem.empty() && aot_vkSetPrivateData && slot != 0 && (slot < 0x9D000000ULL || slot > 0x9E000000ULL)) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         int32_t r = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
@@ -2313,7 +2195,7 @@ int32_t vkSetPrivateData(void* device, uint32_t objType, uint64_t objHandle, uin
 __attribute__((visibility("default")))
 void vkGetPrivateData(void* device, uint32_t objType, uint64_t objHandle, uint64_t slot, uint64_t* pData) {
     if (!pData) return;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (dev && !dev->aot_vk_device_mem.empty() && aot_vkGetPrivateData && slot != 0 && (slot < 0x9D000000ULL || slot > 0x9E000000ULL)) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         mali_aapcs64::invokeLiftedAapcs64<void>(
@@ -2328,7 +2210,7 @@ void vkGetPrivateData(void* device, uint32_t objType, uint64_t objHandle, uint64
 __attribute__((visibility("default")))
 void vkGetDeviceGroupPeerMemoryFeatures(void* device, uint32_t heapIdx, uint32_t localIdx, uint32_t remoteIdx, uint32_t* pFeatures) {
     if (!pFeatures) return;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (dev && !dev->aot_vk_device_mem.empty() && aot_vkGetDeviceGroupPeerMemoryFeatures) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         mali_aapcs64::invokeLiftedAapcs64<void>(
@@ -2512,7 +2394,7 @@ void vkUpdateDescriptorSetWithTemplate(void* /*device*/, uint64_t /*descriptorSe
 
 __attribute__((visibility("default")))
 void vkGetDescriptorSetLayoutSupport(void* device, const void* pCreateInfo, void* pSupport) {
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (dev && !dev->aot_vk_device_mem.empty() && pCreateInfo && pSupport &&
         *static_cast<const uint32_t*>(pCreateInfo) == 32U /* VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO */) {
         g_aot_rt.invokeLiftedVkDirect(
@@ -2559,7 +2441,8 @@ int32_t vkQueueSubmit2(void* queue, uint32_t submitCount, const void* pSubmits, 
             uint32_t signalSemaphoreCount;
             const uint64_t* pSignalSemaphores;
         } leg = { 4U, nullptr, 0, nullptr, nullptr, static_cast<uint32_t>(cbs.size()), cbs.data(), 0, nullptr };
-        vkQueueSubmit(queue, 1U, &leg, (i + 1 == submitCount) ? fence : 0ULL);
+        vkQueueSubmit(reinterpret_cast<VkQueue>(queue), 1U, reinterpret_cast<const VkSubmitInfo*>(&leg),
+                      (i + 1 == submitCount) ? reinterpret_cast<VkFence>(fence) : VK_NULL_HANDLE);
     }
     return 0;
 }
@@ -2604,7 +2487,7 @@ void vkGetRenderAreaGranularity(void* /*device*/, uint64_t /*renderPass*/, void*
 __attribute__((visibility("default")))
 void vkGetRenderingAreaGranularityKHR(void* device, const void* pRenderingAreaInfo, void* pGranularity) {
     if (!pGranularity) return;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (dev && !dev->aot_vk_device_mem.empty() && aot_vkGetRenderingAreaGranularityKHR && pRenderingAreaInfo) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         mali_aapcs64::invokeLiftedAapcs64<void>(
@@ -2628,7 +2511,7 @@ void vkGetImageSubresourceLayout2KHR(void* device, uint64_t image, const void* p
 __attribute__((visibility("default")))
 void vkGetDeviceImageSubresourceLayoutKHR(void* device, const void* pInfo, void* pLayout) {
     if (!pLayout) return;
-    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (dev && !dev->aot_vk_device_mem.empty() && aot_vkGetDeviceImageSubresourceLayout && pInfo) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         mali_aapcs64::invokeLiftedAapcs64<void>(

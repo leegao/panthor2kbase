@@ -4050,6 +4050,41 @@ void runBionicToGlibcLibcLoweringPass(LLVMModuleRef M, PassStats &stats) {
                         LLVMValueRef abortFn = getOrCreateFunction(M, "__mali_stack_chk_fail_diag", voidTy, {ptrTy});
                         LLVMTypeRef dTy = LLVMFunctionType(voidTy, &ptrTy, 1, 0);
                         LLVMBuildCall2(B, dTy, abortFn, &cpu, 1, "");
+                    } else if (sym == "pthread_mutex_init" || sym == "pthread_cond_init" || sym == "pthread_rwlock_init" ||
+                               sym == "pthread_cond_wait" || sym == "pthread_join") {
+                        std::string hookName = "__mali_bionic_" + sym;
+                        LLVMValueRef hookFn = getOrCreateFunction(M, hookName.c_str(), i32Ty, {i64Ty, i64Ty});
+                        LLVMTypeRef hSig[2] = {i64Ty, i64Ty};
+                        LLVMTypeRef hTy = LLVMFunctionType(i32Ty, hSig, 2, 0);
+                        LLVMValueRef args[2] = {loadReg64(cpu, 0), loadReg64(cpu, 1)};
+                        LLVMValueRef res32 = LLVMBuildCall2(B, hTy, hookFn, args, 2, "");
+                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
+                    } else if (sym == "pthread_mutex_destroy" || sym == "pthread_mutex_lock" ||
+                               sym == "pthread_mutex_unlock" || sym == "pthread_mutex_trylock" ||
+                               sym == "pthread_cond_destroy" || sym == "pthread_cond_signal" ||
+                               sym == "pthread_cond_broadcast" || sym == "pthread_rwlock_destroy" ||
+                               sym == "pthread_rwlock_rdlock" || sym == "pthread_rwlock_wrlock" ||
+                               sym == "pthread_rwlock_unlock" || sym == "pthread_detach") {
+                        std::string hookName = "__mali_bionic_" + sym;
+                        LLVMValueRef hookFn = getOrCreateFunction(M, hookName.c_str(), i32Ty, {i64Ty});
+                        LLVMTypeRef hTy = LLVMFunctionType(i32Ty, &i64Ty, 1, 0);
+                        LLVMValueRef a0 = loadReg64(cpu, 0);
+                        LLVMValueRef res32 = LLVMBuildCall2(B, hTy, hookFn, &a0, 1, "");
+                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
+                    } else if (sym == "pthread_cond_timedwait") {
+                        LLVMValueRef hookFn = getOrCreateFunction(M, "__mali_bionic_pthread_cond_timedwait", i32Ty, {i64Ty, i64Ty, i64Ty});
+                        LLVMTypeRef hSig[3] = {i64Ty, i64Ty, i64Ty};
+                        LLVMTypeRef hTy = LLVMFunctionType(i32Ty, hSig, 3, 0);
+                        LLVMValueRef args[3] = {loadReg64(cpu, 0), loadReg64(cpu, 1), loadReg64(cpu, 2)};
+                        LLVMValueRef res32 = LLVMBuildCall2(B, hTy, hookFn, args, 3, "");
+                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
+                    } else if (sym == "pthread_create") {
+                        LLVMValueRef hookFn = getOrCreateFunction(M, "__mali_bionic_pthread_create", i32Ty, {i64Ty, i64Ty, i64Ty, i64Ty});
+                        LLVMTypeRef hSig[4] = {i64Ty, i64Ty, i64Ty, i64Ty};
+                        LLVMTypeRef hTy = LLVMFunctionType(i32Ty, hSig, 4, 0);
+                        LLVMValueRef args[4] = {loadReg64(cpu, 0), loadReg64(cpu, 1), loadReg64(cpu, 2), loadReg64(cpu, 3)};
+                        LLVMValueRef res32 = LLVMBuildCall2(B, hTy, hookFn, args, 4, "");
+                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
                     } else {
                         // Unavailable Android / MediaTek vendor library hooks & single-threaded stubs:
                         // __android_log_print, __android_log_write, property_get*, gpud*,
