@@ -4205,7 +4205,7 @@ int main(int argc, char **argv) {
         size_t chunk_limit_bytes = chunk_mb * 1024ULL * 1024ULL;
         const char *keep_ll_env = std::getenv("MALI_AOT_KEEP_LL");
         bool keep_ll = (!keep_ll_env || std::strcmp(keep_ll_env, "0") != 0);
-        std::string objPath = outDir + "/mali_mbs2_aot.o";
+        std::string objPath = outDir + "/r54p3_lifted.o";
 
         // Remove stale monolithic/chunk artifacts before lifting
         std::remove((outDir + "/mali_mbs2_unopt.ll").c_str());

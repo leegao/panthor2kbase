@@ -71,7 +71,7 @@ PLT_HOOK_SPECS = [
 ]
 
 def main():
-    os.makedirs("src/aot/generated", exist_ok=True)
+    os.makedirs("src/r54p3_vulkan_icd/generated", exist_ok=True)
     scanned_headers = [h for h in GLIBC_HEADERS if os.path.exists(h)]
 
     lines = [
@@ -204,7 +204,7 @@ def main():
         "} // extern \"C\"",
     ]
 
-    out_path = "src/aot/generated/mali_bionic_stubs_autogen.h"
+    out_path = "src/r54p3_vulkan_icd/generated/mali_bionic_stubs_autogen.h"
     with open(out_path, "w") as f:
         f.write("\n".join(lines) + "\n")
     print(f"Generated {out_path} ({len(lines)} lines, {len(R54P3_SYSTEM_PROPS) + len(R44P1_MTK_EXTRA_PROPS)} system properties).")

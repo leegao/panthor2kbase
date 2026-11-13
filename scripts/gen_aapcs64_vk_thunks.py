@@ -52,7 +52,7 @@ VULKAN_LIFTED_THUNK_SPECS = [
 
 def generate_dispatch_table_header(
     dispatch_hpp="src/r54p3_vulkan_icd/r54p3_dispatch_table.hpp",
-    out_h="src/aot/generated/mali_vk_dispatch_table_autogen.h",
+    out_h="src/r54p3_vulkan_icd/generated/mali_vk_dispatch_table_autogen.h",
 ):
     import os
     import re

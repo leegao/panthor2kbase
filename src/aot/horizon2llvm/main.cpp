@@ -129,7 +129,7 @@ int main(int argc, char** argv) {
     if (argc >= 4 && std::string(argv[1]) == "--lift-so") {
         std::string so_path = argv[2];
         std::string out_dir = argv[3];
-        std::string cmd = "src/aot/bin/mali_llvm_pass_driver --lift-so \"" + so_path + "\" \"" + out_dir + "\"";
+        std::string cmd = "build-x86-64/aot/mali_llvm_pass_driver --lift-so \"" + so_path + "\" \"" + out_dir + "\"";
         for (int i = 4; i < argc; ++i) {
             cmd += " \"" + std::string(argv[i]) + "\"";
         }

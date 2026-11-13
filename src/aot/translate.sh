@@ -115,13 +115,13 @@ fi
 
 echo "================================================================================"
 echo " Mali 64-Bit AArch64 -> x86-64 Linux C++ LLVM 6-Pass AOT Translation Pipeline"
-echo " Input Binary   : ${SO_PATH:-(prebuilt $OUT_DIR/mali_mbs2_aot.o)}"
+echo " Input Binary   : ${SO_PATH:-(prebuilt $OUT_DIR/r54p3_lifted.o)}"
 echo " Driver Build   : $ELF_TAG (64-bit ELF64 EM_AARCH64)"
 echo " Host libLLVM   : ${MALI_HOST_LIBLLVM:-dynamic dlopen}"
 echo " Output Dir     : $OUT_DIR"
 echo "================================================================================"
 
-STAMP_FILE="$OUT_DIR/mali_mbs2_aot.o.stamp"
+STAMP_FILE="$OUT_DIR/r54p3_lifted.o.stamp"
 CUR_STAMP=""
 if command -v sha256sum >/dev/null 2>&1; then
     CUR_STAMP="$(sha256sum "$ROOT_DIR/src/mali_llvm_passes.cpp" ${SO_PATH:+"$SO_PATH"} | sha256sum | awk '{print $1}')"
@@ -131,8 +131,8 @@ if [ -n "$CUR_STAMP" ] && [ -f "$STAMP_FILE" ] && [ "$(cat "$STAMP_FILE" 2>/dev/
     STAMP_OK=1
 fi
 
-if [ -f "$OUT_DIR/mali_mbs2_aot.o" ] && [ "${MALI_AOT_FORCE_RELIFT:-0}" != "1" ] && [ "$STAMP_OK" -eq 1 ] && [ "$OUT_DIR/mali_mbs2_aot.o" -nt "$PASS_DRIVER" ] && [ "$OUT_DIR/mali_mbs2_aot.o" -nt "$ROOT_DIR/src/mali_llvm_passes.cpp" ]; then
-    echo "[Cache] Reusing up-to-date $OUT_DIR/mali_mbs2_aot.o (set MALI_AOT_FORCE_RELIFT=1 to force full re-lift)"
+if [ -f "$OUT_DIR/r54p3_lifted.o" ] && [ "${MALI_AOT_FORCE_RELIFT:-0}" != "1" ] && [ "$STAMP_OK" -eq 1 ] && [ "$OUT_DIR/r54p3_lifted.o" -nt "$PASS_DRIVER" ] && [ "$OUT_DIR/r54p3_lifted.o" -nt "$ROOT_DIR/src/mali_llvm_passes.cpp" ]; then
+    echo "[Cache] Reusing up-to-date $OUT_DIR/r54p3_lifted.o (set MALI_AOT_FORCE_RELIFT=1 to force full re-lift)"
 elif [ -n "$SO_PATH" ] && [ -f "$SO_PATH" ]; then
     export MALI_AOT_CHUNK_MB=20
     export MALI_AOT_JOBS=8
@@ -140,9 +140,9 @@ elif [ -n "$SO_PATH" ] && [ -f "$SO_PATH" ]; then
     if [ -n "$CUR_STAMP" ]; then
         echo "$CUR_STAMP" > "$STAMP_FILE"
     fi
-elif [ ! -f "$OUT_DIR/mali_mbs2_aot.o" ]; then
-    echo "[WARN] Input $SO_ARG not present (e.g. clean GitHub Actions CI checkout); synthesizing CI stub mali_mbs2_aot.o..."
-    cat << 'STUB_EOF' > "$OUT_DIR/mali_mbs2_aot_stub.c"
+elif [ ! -f "$OUT_DIR/r54p3_lifted.o" ]; then
+    echo "[WARN] Input $SO_ARG not present (e.g. clean GitHub Actions CI checkout); synthesizing CI stub r54p3_lifted.o..."
+    cat << 'STUB_EOF' > "$OUT_DIR/r54p3_lifted_stub.c"
 #include <stdint.h>
 struct AOTCPUState { uint64_t x[31]; uint64_t sp; uint64_t pc; uint64_t tpidr_el0; __uint128_t v[32]; };
 uint64_t aot_get_lifted_vk_entrypoint_count(void) { return 456ULL; }
@@ -152,8 +152,8 @@ void aot_vkQueueSubmit(struct AOTCPUState* cpu) { if (cpu) cpu->x[0] = 0; }
 void aot_vkCmdDraw(struct AOTCPUState* cpu) { if (cpu) cpu->x[0] = 0; }
 void aot_vkCmdDrawIndexed(struct AOTCPUState* cpu) { if (cpu) cpu->x[0] = 0; }
 STUB_EOF
-    gcc -O2 -fPIC -c "$OUT_DIR/mali_mbs2_aot_stub.c" -o "$OUT_DIR/mali_mbs2_aot.o"
-    rm -f "$OUT_DIR/mali_mbs2_aot_stub.c"
+    gcc -O2 -fPIC -c "$OUT_DIR/r54p3_lifted_stub.c" -o "$OUT_DIR/r54p3_lifted.o"
+    rm -f "$OUT_DIR/r54p3_lifted_stub.c"
 fi
 
 EXTRA_AOT_OBJS=()
@@ -178,7 +178,7 @@ g++ -O2 -std=c++17 -fno-strict-aliasing -shared -fPIC \
     -Wl,-Bsymbolic -Wl,-Bsymbolic-functions \
     -I"$REPO_ROOT/src/r54p3_vulkan_icd" -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
     -I"$REPO_ROOT/include" -I"$REPO_ROOT/src/adapter" -I"$REPO_ROOT/src/emulator" \
-    "$REPO_ROOT/src/r54p3_vulkan_icd/mali_vulkan_icd.cpp" "$OUT_DIR/mali_mbs2_aot.o" "${EXTRA_AOT_OBJS[@]}" \
+    "$REPO_ROOT/src/r54p3_vulkan_icd/mali_vulkan_icd.cpp" "$OUT_DIR/r54p3_lifted.o" "${EXTRA_AOT_OBJS[@]}" \
     $DYN_EMU -ldl -lm -lpthread \
     -Wl,-rpath,"$AOT_RPATH" \
     -o "$OUT_DIR/libvulkan_mali_aot_icd.so"
@@ -202,11 +202,11 @@ if [ -d "$BUILD_HOST_DIR" ]; then
     cp -f "$OUT_DIR/libvulkan_mali_aot_icd.so" "$BUILD_HOST_DIR/aot/libvulkan_mali_aot_icd.so" 2>/dev/null || true
     cp -f "$OUT_DIR/mali_aot_icd.x86_64.json" "$BUILD_HOST_DIR/mali_aot_icd.x86_64.json" 2>/dev/null || true
     cp -f "$OUT_DIR/mali_aot_icd.x86_64.json" "$BUILD_HOST_DIR/aot/mali_aot_icd.x86_64.json" 2>/dev/null || true
-    cp -f "$OUT_DIR/mali_mbs2_aot.o" "$BUILD_HOST_DIR/aot/mali_mbs2_aot.o" 2>/dev/null || true
+    cp -f "$OUT_DIR/r54p3_lifted.o" "$BUILD_HOST_DIR/aot/r54p3_lifted.o" 2>/dev/null || true
 fi
 
 echo "================================================================================"
 echo " [SUCCESS] 64-Bit C++ LLVM AOT Translation Complete!"
-echo "   x86-64 Object  : $OUT_DIR/mali_mbs2_aot.o"
+echo "   x86-64 Object  : $OUT_DIR/r54p3_lifted.o"
 echo "   Vulkan ICD     : $OUT_DIR/libvulkan_mali_aot_icd.so"
 echo "================================================================================"

@@ -68,8 +68,6 @@ int main() {
         "../build-x86-64/libvulkan_mali_aot_icd.so",
         "../libvulkan_mali_aot_icd.so",
         "libvulkan_mali_aot_icd.so",
-        "src/aot/build/r54p3-00eac0-6eda07/libvulkan_mali_aot_icd.so",
-        "../src/aot/build/r54p3-00eac0-6eda07/libvulkan_mali_aot_icd.so",
     };
     void* h_icd = nullptr;
     for (const char* s : so_cands) {

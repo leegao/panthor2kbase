@@ -3418,25 +3418,41 @@ int mali_kbase_emu_munmap_direct(void *addr, size_t length)
 __attribute__((visibility("default")))
 ssize_t mali_kbase_emu_read_direct(int fd, void *buf, size_t count)
 {
-   (void)fd;
-   if (buf && count > 0) {
-      memset(buf, 0, count);
+   pthread_mutex_lock(&g_emu_lock);
+   bool is_mali = (find_kfile_by_fd_locked(fd) != NULL);
+   pthread_mutex_unlock(&g_emu_lock);
+   if (is_mali) {
+      if (buf && count > 0) {
+         memset(buf, 0, count);
+      }
+      return (ssize_t)count;
    }
-   return (ssize_t)count;
+   return read(fd, buf, count);
 }
 
 __attribute__((visibility("default")))
 int mali_kbase_emu_poll_direct(void *fds, unsigned long nfds, int timeout)
 {
-   (void)timeout;
    if (fds && nfds > 0) {
       struct pollfd *p = (struct pollfd *)fds;
+      bool any_mali = false;
+      pthread_mutex_lock(&g_emu_lock);
       for (unsigned long i = 0; i < nfds; ++i) {
-         p[i].revents = POLLIN;
+         if (find_kfile_by_fd_locked(p[i].fd) != NULL) {
+            any_mali = true;
+            break;
+         }
       }
-      return (int)nfds;
+      pthread_mutex_unlock(&g_emu_lock);
+      if (any_mali) {
+         for (unsigned long i = 0; i < nfds; ++i) {
+            p[i].revents = POLLIN;
+         }
+         return (int)nfds;
+      }
+      return poll(p, (nfds_t)nfds, timeout);
    }
-   return 1;
+   return 0;
 }
 
 static const struct kbase_ko_host_abi g_ko_host_abi = {

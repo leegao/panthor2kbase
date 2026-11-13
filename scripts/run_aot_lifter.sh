@@ -79,7 +79,7 @@ resolve_active_icd_json() {
         return 0
     fi
     local latest
-    latest="$(ls -1t "$ROOT_DIR"/src/aot/build/*/mali_aot_icd.x86_64.json 2>/dev/null | head -n 1 || true)"
+    latest="$(ls -1t "$ROOT_DIR"/build-x86-64/aot/mali_aot_icd.x86_64.json "$ROOT_DIR"/build-x86-64/mali_aot_icd.x86_64.json 2>/dev/null | head -n 1 || true)"
     if [ -n "$latest" ]; then
         echo "$latest"
         return 0
@@ -125,7 +125,7 @@ for p in props:
     --vulkaninfo)
         ensure_aot_icd_built
         ICD_JSON="$(resolve_active_icd_json)"
-        VK_DRIVER_FILES="$ICD_JSON" VK_ICD_FILENAMES="$ICD_JSON" ./src/aot/bin/test_vulkan_samples_compliance | grep -E "Active PhysicalDevice|vulkaninfo pNext"
+        VK_DRIVER_FILES="$ICD_JSON" VK_ICD_FILENAMES="$ICD_JSON" ./build-x86-64/aot/test_vulkan_samples_compliance | grep -E "Active PhysicalDevice|vulkaninfo pNext"
         ;;
     --run-app)
         WSI_PREF="auto"
@@ -253,7 +253,7 @@ JSON_EOF
     --run-40-samples)
         ensure_aot_icd_built
         ICD_JSON="$(resolve_active_icd_json)"
-        VK_DRIVER_FILES="$ICD_JSON" VK_ICD_FILENAMES="$ICD_JSON" ./src/aot/bin/test_vulkan_samples_compliance
+        VK_DRIVER_FILES="$ICD_JSON" VK_ICD_FILENAMES="$ICD_JSON" ./build-x86-64/aot/test_vulkan_samples_compliance
         ;;
     --decode-csf)
         python3 scripts/decode_csf_breadcrumbs_and_dump.py "$@"

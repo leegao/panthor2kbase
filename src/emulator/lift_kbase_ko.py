@@ -679,7 +679,7 @@ def lift_instruction(label, fn_name, ins, relas, sym_by_addr, ro_idx, text_idx):
 def main():
     for cand in (
         os.path.join(REPO_ROOT, "build-x86-64/aot/horizon2llvm"),
-        os.path.join(REPO_ROOT, "src/aot/bin/horizon2llvm"),
+        os.path.join(REPO_ROOT, "build-x86-64/horizon2llvm"),
     ):
         if os.path.exists(cand) and os.access(cand, os.X_OK):
             r44_ko = os.path.join(REPO_ROOT, "kernel/mali_kbase_gs201_r47p0_csf_5_10_189.ko")

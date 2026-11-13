@@ -44,7 +44,7 @@ print(f"{ver}{bid}")
 BUILD_DIR="$ROOT_DIR/build/$ELF_TAG"
 mkdir -p "$BUILD_DIR" "$ROOT_DIR/bin"
 
-if [ ! -f "$BUILD_DIR/mali_mbs2_aot.o" ]; then
+if [ ! -f "$BUILD_DIR/r54p3_lifted.o" ]; then
     "$ROOT_DIR/translate.sh" "$SO_PATH" "$BUILD_DIR"
 fi
 
@@ -55,7 +55,7 @@ CLIENT_BIN="$ROOT_DIR/bin/test_vulkan_icd_client"
 echo "[1/3] Building AOT Vulkan ICD ($ICD_SO)..."
 g++ -O3 -std=c++17 -fno-strict-aliasing -shared -fPIC \
     "$ROOT_DIR/../r54p3_vulkan_icd/mali_vulkan_icd.cpp" \
-    "$BUILD_DIR/mali_mbs2_aot.o" \
+    "$BUILD_DIR/r54p3_lifted.o" \
     -o "$ICD_SO" "$ROOT_DIR/../../libmali_kbase_emu.so" -Wl,-rpath,"$ROOT_DIR/../.." -ldl -lm
 
 cat << JSON_EOF > "$ICD_JSON"

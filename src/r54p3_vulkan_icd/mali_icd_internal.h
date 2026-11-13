@@ -54,8 +54,8 @@
 #define AOT_SO_PROFILER_IMPLEMENTATION
 #include "aot_so_profiler.hpp"
 #include "../emulator/lifted_kbase_ko.h"
-#include "../aot/generated/mali_bionic_stubs_autogen.h"
-#include "../aot/generated/mali_vk_dispatch_table_autogen.h"
+#include "generated/mali_bionic_stubs_autogen.h"
+#include "generated/mali_vk_dispatch_table_autogen.h"
 
 static bool mali_icd_log_enabled() {
     static int s_enabled = -1;
@@ -318,16 +318,9 @@ extern "C" uint64_t bionic_aapcs64_vsnprintf_bridge(uint64_t dst_addr, uint64_t 
     return out.size();
 }
 
-static uint32_t                 g_icd_gpu_product_id = MALI_PROFILE_G615_CSF;
-static uint64_t                 g_icd_raw_gpu_id = (static_cast<uint64_t>(MALI_PROFILE_G615_CSF) << 16) | 1ULL;
 static HostLvpipeVulkanExecutor g_icd_lvp_executor;
 static uint32_t                 g_icd_csf_jobs_executed = 0;
 static int                      g_icd_kbase_ioctl_calls = 0;
-
-static inline void icdSetGpuProfile(MaliGpuProfileId prof) {
-    g_icd_gpu_product_id = static_cast<uint32_t>(prof);
-    g_icd_raw_gpu_id     = (static_cast<uint64_t>(g_icd_gpu_product_id) << 16) | 1ULL;
-}
 
 static void onLiftedCsfJobCallback(uint8_t /*opc*/, uint64_t insn, const uint64_t* cs_regs64, void* /*user_data*/) {
     if (!cs_regs64) return;
@@ -858,16 +851,6 @@ struct MaliAotGlobalRuntime {
             std::memcpy(template_mbs2, kSynthMbs2, template_mbs2_len);
         }
 
-        // Configure GPU profile from driver version
-        if (mapper.driver_version.find("r26p0") != std::string::npos) {
-            icdSetGpuProfile(MALI_PROFILE_G76_JM);
-        } else if (mapper.driver_version.find("49d848") != std::string::npos) {
-            icdSetGpuProfile(MALI_PROFILE_G78_JM);
-        } else if (mapper.driver_version.find("c48934") != std::string::npos) {
-            icdSetGpuProfile(MALI_PROFILE_G925_CSF);
-        } else {
-            icdSetGpuProfile(MALI_PROFILE_G615_CSF);
-        }
         mali_kbase_emu_register_csf_job_hook(&onLiftedCsfJobCallback, nullptr);
 
         stack_mem = static_cast<uint8_t*>(mmap(reinterpret_cast<void*>(0x700000000ULL), stack_size,
@@ -1041,10 +1024,37 @@ struct MaliIcdPhysicalDevice {
         std::memset(aot_internal, 0, sizeof(aot_internal));
         std::memset(aot_inst_internal, 0, sizeof(aot_inst_internal));
 
+        uint32_t gpu_product_id = MALI_PROFILE_G615_CSF;
+        {
+            int mfd = mali_kbase_emu_open_direct("/dev/mali0", 2 /* O_RDWR */);
+            if (mfd >= 0) {
+                uint8_t tlv[2048]{};
+                struct { uint64_t buffer; uint32_t size; uint32_t flags; } gp{reinterpret_cast<uint64_t>(tlv), sizeof(tlv), 0};
+                int sz = mali_kbase_emu_ioctl_direct(mfd, 0xc0108003UL /* KBASE_IOCTL_GET_GPUPROPS */, &gp);
+                if (sz > 0 && sz <= static_cast<int>(sizeof(tlv))) {
+                    size_t off = 0;
+                    while (off + 4 <= static_cast<size_t>(sz)) {
+                        uint32_t hdr = 0;
+                        std::memcpy(&hdr, tlv + off, 4);
+                        off += 4;
+                        uint32_t prop_id = hdr >> 2;
+                        uint32_t vlen = 1U << (hdr & 3U);
+                        if (off + vlen > static_cast<size_t>(sz)) break;
+                        if (prop_id == 1U /* PRODUCT_ID */ && vlen == 4U) {
+                            std::memcpy(&gpu_product_id, tlv + off, 4);
+                            break;
+                        }
+                        off += vlen;
+                    }
+                }
+                mali_kbase_emu_close_direct(mfd);
+            }
+        }
+        uint64_t raw_gpu_id = (static_cast<uint64_t>(gpu_product_id) << 16) | 1ULL;
         const char* gpu_model = "Arm Mali-G615";
-        if (g_icd_gpu_product_id == MALI_PROFILE_G76_JM) gpu_model = "Arm Mali-G76";
-        else if (g_icd_gpu_product_id == MALI_PROFILE_G78_JM) gpu_model = "Arm Mali-G78";
-        else if (g_icd_gpu_product_id == MALI_PROFILE_G925_CSF) gpu_model = "Arm Immortalis-G925";
+        if (gpu_product_id == MALI_PROFILE_G76_JM) gpu_model = "Arm Mali-G76";
+        else if (gpu_product_id == MALI_PROFILE_G78_JM) gpu_model = "Arm Mali-G78";
+        else if (gpu_product_id == MALI_PROFILE_G925_CSF) gpu_model = "Arm Immortalis-G925";
 
         // Populate fields relative to aot_internal (x0) so both direct-x0 and (x0+8) AOT functions succeed:
         // Direct-x0 functions (MemoryProperties @ 0x978fe0, QueueFamilyProperties @ 0x97ab30, EnumerateDeviceExtensionProperties @ 0x977140):
@@ -1068,7 +1078,7 @@ struct MaliIcdPhysicalDevice {
         // (x0 + 8) shifted view for aot_vkGetPhysicalDeviceProperties (0x977730 -> 0x977738)
         // We store a second dedicated block at aot_internal + 1024 where base = aot_internal + 1024 + 8:
         uint8_t* pbase = aot_internal + 1024 + 8;
-        *reinterpret_cast<uint32_t*>(pbase + 8)  = static_cast<uint32_t>(g_icd_raw_gpu_id); // deviceID
+        *reinterpret_cast<uint32_t*>(pbase + 8)  = static_cast<uint32_t>(raw_gpu_id); // deviceID
         *reinterpret_cast<uint32_t*>(pbase + 12) = 0x13B5U; // vendorID (Arm Ltd.)
         *reinterpret_cast<uint32_t*>(pbase + 20) = 65536U;  // maxUniformBufferRange
         *reinterpret_cast<uint32_t*>(pbase + 48) = (54U << 22) | (3U << 12); // driverVersion r54p3
@@ -1078,7 +1088,7 @@ struct MaliIcdPhysicalDevice {
         *reinterpret_cast<uint32_t*>(pbase + 0x70) = 32U; // headerSize
         *reinterpret_cast<uint32_t*>(pbase + 0x74) = 1U;  // VK_PIPELINE_CACHE_HEADER_VERSION_ONE
         *reinterpret_cast<uint32_t*>(pbase + 0x78) = 0x13B5U; // vendorID
-        *reinterpret_cast<uint32_t*>(pbase + 0x7c) = static_cast<uint32_t>(g_icd_raw_gpu_id); // deviceID
+        *reinterpret_cast<uint32_t*>(pbase + 0x7c) = static_cast<uint32_t>(raw_gpu_id); // deviceID
         std::memcpy(pbase + 0x80, uuid, 16);
         std::snprintf(reinterpret_cast<char*>(pbase + 192), 256,
                       "%s (AOT %s via mali_kbase_emu [%s])",

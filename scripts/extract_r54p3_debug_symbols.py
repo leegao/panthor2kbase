@@ -14,7 +14,7 @@ from elftools.elf.elffile import ELFFile
 
 def main():
     so_path = "ddk/libGLES_mali.so"
-    out_path = "src/aot/generated/r54p3_debug_symbols.h"
+    out_path = "src/r54p3_vulkan_icd/generated/r54p3_debug_symbols.h"
     if not os.path.exists(so_path):
         raise FileNotFoundError(so_path)
 

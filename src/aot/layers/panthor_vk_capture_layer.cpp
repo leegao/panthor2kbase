@@ -1162,8 +1162,6 @@ int panthor_vk_replay_trace_file(const char *filepath,
          "../build-x86-64/mali_aot_icd.x86_64.json",
          "../mali_aot_icd.x86_64.json",
          "mali_aot_icd.x86_64.json",
-         "src/aot/build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json",
-         "../src/aot/build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json",
       };
       for (const char *jc : json_cands) {
          if (access(jc, R_OK) == 0) {
@@ -1185,8 +1183,6 @@ int panthor_vk_replay_trace_file(const char *filepath,
       "../build-x86-64/libvulkan_mali_aot_icd.so",
       "../libvulkan_mali_aot_icd.so",
       "libvulkan_mali_aot_icd.so",
-      "src/aot/build/r54p3-00eac0-6eda07/libvulkan_mali_aot_icd.so",
-      "../src/aot/build/r54p3-00eac0-6eda07/libvulkan_mali_aot_icd.so",
       "libvulkan.so.1",
       "libvulkan.so"
    };

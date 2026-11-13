@@ -100,10 +100,8 @@ int main(int argc, char** argv) {
         std::vector<std::string> candidates = {
             exe_dir + "/../mali_aot_icd.x86_64.json",
             exe_dir + "/mali_aot_icd.x86_64.json",
-            exe_dir + "/../../src/aot/build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json",
-            exe_dir + "/../build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json",
             "build-x86-64/mali_aot_icd.x86_64.json",
-            "src/aot/build/r54p3-00eac0-6eda07/mali_aot_icd.x86_64.json",
+            "build-x86-64/aot/mali_aot_icd.x86_64.json",
             "src/r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json"
         };
         for (const auto& cand : candidates) {

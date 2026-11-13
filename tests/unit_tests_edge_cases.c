@@ -1783,7 +1783,7 @@ static void test_v29_wsi_layer_godot_4_7_2_and_host_panvk(void)
     */
    void *icd_h = dlopen("aot/libvulkan_mali_aot_icd.so", RTLD_NOW | RTLD_LOCAL);
    if (!icd_h) icd_h = dlopen("build-x86-64/aot/libvulkan_mali_aot_icd.so", RTLD_NOW | RTLD_LOCAL);
-   if (!icd_h) icd_h = dlopen("src/aot/build/r54p3-00eac0-6eda07/libvulkan_mali_aot_icd.so", RTLD_NOW | RTLD_LOCAL);
+   if (!icd_h) icd_h = dlopen("build-x86-64/libvulkan_mali_aot_icd.so", RTLD_NOW | RTLD_LOCAL);
    assert(icd_h != NULL);
    typedef void *(*pfn_gdpa)(void *, const char *);
    pfn_gdpa gdpa = (pfn_gdpa)dlsym(icd_h, "vkGetDeviceProcAddr");

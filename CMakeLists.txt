@@ -156,7 +156,6 @@ endif()
 # 3. User-Space /dev/mali0 Kbase CSF & Valhall ISA Emulator (Shared & Static)
 # -----------------------------------------------------------------------------
 if(NOT ANDROID)
-   file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/bin")
    add_executable(horizon2llvm
       src/aot/horizon2llvm/main.cpp
       src/aot/horizon2llvm/ko_lifter.cpp
@@ -188,7 +187,6 @@ if(NOT ANDROID)
       endif()
    endif()
    target_link_libraries(horizon2llvm PRIVATE dl ${PLATFORM_LIBS})
-   target_copy_to_source_tree(horizon2llvm "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/bin/horizon2llvm")
 
    add_custom_command(
       OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.ll"
@@ -308,7 +306,6 @@ endif()
 # 5. Host AOT Translator, Decompiled r54p3 ICD, DXVK Layers & Replayers
 # -----------------------------------------------------------------------------
 if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
-   file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/bin")
    file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/lib")
    file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/layers")
 
@@ -367,7 +364,7 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
       RUNTIME_OUTPUT_DIRECTORY "${AOT_DIR}"
    )
 
-   set(AOT_MBS2_OBJ "${CMAKE_BINARY_DIR}/mali_mbs2_aot.o")
+   set(AOT_MBS2_OBJ "${CMAKE_BINARY_DIR}/r54p3_lifted.o")
    set_source_files_properties("${AOT_MBS2_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 
    add_library(r54p3_vulkan_icd SHARED
@@ -427,12 +424,12 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
    set_property(DIRECTORY APPEND PROPERTY ADDITIONAL_CLEAN_FILES
       "${CMAKE_BINARY_DIR}/mali_mbs2_unopt.ll"
       "${CMAKE_BINARY_DIR}/mali_mbs2_opt.ll"
-      "${CMAKE_BINARY_DIR}/mali_mbs2_aot.o.stamp"
-      "${CMAKE_BINARY_DIR}/mali_mbs2_aot.o"
+      "${CMAKE_BINARY_DIR}/r54p3_lifted.o.stamp"
+      "${CMAKE_BINARY_DIR}/r54p3_lifted.o"
       "${CMAKE_BINARY_DIR}/libvulkan_mali_aot_icd.so"
       "${CMAKE_BINARY_DIR}/mali_aot_icd.x86_64.json"
       "${CMAKE_BINARY_DIR}/libr54p3_vulkan_icd.so"
-      "${AOT_DIR}/mali_mbs2_aot.o"
+      "${AOT_DIR}/r54p3_lifted.o"
       "${AOT_DIR}/libvulkan_mali_aot_icd.so"
       "${AOT_DIR}/mali_aot_icd.x86_64.json"
    )
