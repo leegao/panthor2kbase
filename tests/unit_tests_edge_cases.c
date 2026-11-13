@@ -1774,31 +1774,9 @@ static void test_v26_csffw_lifting_qemu_and_pruned_indirect_dispatch(void)
 
 static void test_v29_wsi_layer_godot_4_7_2_and_host_panvk(void)
 {
-   printf("[Unit Test 20] Verifying Checkpoint v29 WSI Layer, Godot 4.7.2 Forward+ Fixes, Profiler & Host PanVK...\n");
+   printf("[Unit Test 20] Verifying Checkpoint v29 Godot 4.7.2 Forward+ Fixes, Profiler & Host PanVK...\n");
 
-   /* 1. Verify WSI layer + BCn layer + Compat layer pre-instance vkEnumerateInstanceExtensionProperties */
-   void *wsi_h = dlopen("aot/libVkLayer_WSI_panthor_wsi.so", RTLD_NOW | RTLD_LOCAL);
-   if (!wsi_h) wsi_h = dlopen("build-x86-64/aot/libVkLayer_WSI_panthor_wsi.so", RTLD_NOW | RTLD_LOCAL);
-   if (!wsi_h) wsi_h = dlopen("src/aot/layers/libVkLayer_WSI_panthor_wsi.so", RTLD_NOW | RTLD_LOCAL);
-   assert(wsi_h != NULL);
-   typedef int32_t (*pfn_enum_inst_ext)(const char *, uint32_t *, void *);
-   pfn_enum_inst_ext wsi_enum = (pfn_enum_inst_ext)dlsym(wsi_h, "WsiLayer_EnumerateInstanceExtensionProperties");
-   assert(wsi_enum != NULL);
-   uint32_t ext_cnt = 0;
-   assert(wsi_enum(NULL, &ext_cnt, NULL) == 0 && ext_cnt >= 10);
-   struct { char name[256]; uint32_t ver; } exts[32];
-   uint32_t copy_cnt = 32;
-   assert(wsi_enum(NULL, &copy_cnt, exts) == 0);
-   int found_khr_surface = 0, found_xcb = 0, found_wayland = 0;
-   for (uint32_t i = 0; i < copy_cnt; ++i) {
-      if (strcmp(exts[i].name, "VK_KHR_surface") == 0) found_khr_surface = 1;
-      if (strcmp(exts[i].name, "VK_KHR_xcb_surface") == 0) found_xcb = 1;
-      if (strcmp(exts[i].name, "VK_KHR_wayland_surface") == 0) found_wayland = 1;
-   }
-   assert(found_khr_surface && found_xcb && found_wayland);
-   dlclose(wsi_h);
-
-   /* 3. Verify Godot 4.7.2 Forward+ sequence on libvulkan_mali_aot_icd.so:
+   /* 1. Verify Godot 4.7.2 Forward+ sequence on libvulkan_mali_aot_icd.so:
     *    - vkGetDeviceBufferMemoryRequirements / vkGetDeviceImageMemoryRequirements / vkResetDescriptorPool / vkCreateBufferView non-NULL
     *    - Multi-set vkAllocateDescriptorSets (count = 8) allocates all 8 sets
     *    - vkUpdateDescriptorSets with descriptorType=7 (STORAGE_BUFFER) and garbage pImageInfo does not crash

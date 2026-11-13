@@ -313,36 +313,6 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
    file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/layers")
 
    # Layers
-   add_library(VkLayer_BCN_bcn_layer SHARED
-      src/aot/layers/bcn_layer_host.cpp
-   )
-   target_link_options(VkLayer_BCN_bcn_layer PRIVATE -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -Wl,-soname,libVkLayer_BCN_bcn_layer.so)
-   target_link_libraries(VkLayer_BCN_bcn_layer PRIVATE ${PLATFORM_LIBS})
-   set_target_properties(VkLayer_BCN_bcn_layer PROPERTIES
-      LIBRARY_OUTPUT_DIRECTORY "${AOT_DIR}"
-   )
-   target_copy_to_source_tree(VkLayer_BCN_bcn_layer "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/layers/libVkLayer_BCN_bcn_layer.so")
-
-   add_library(VkLayer_COMPAT_dxvk_mali_compat SHARED
-      src/aot/layers/compat_layer_host.cpp
-   )
-   target_link_options(VkLayer_COMPAT_dxvk_mali_compat PRIVATE -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -Wl,-soname,libVkLayer_COMPAT_dxvk_mali_compat.so)
-   target_link_libraries(VkLayer_COMPAT_dxvk_mali_compat PRIVATE ${PLATFORM_LIBS})
-   set_target_properties(VkLayer_COMPAT_dxvk_mali_compat PROPERTIES
-      LIBRARY_OUTPUT_DIRECTORY "${AOT_DIR}"
-   )
-   target_copy_to_source_tree(VkLayer_COMPAT_dxvk_mali_compat "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/layers/libVkLayer_COMPAT_dxvk_mali_compat.so")
-
-   add_library(VkLayer_WSI_panthor_wsi SHARED
-      src/aot/layers/wsi_layer_host.cpp
-   )
-   target_link_options(VkLayer_WSI_panthor_wsi PRIVATE -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -Wl,-soname,libVkLayer_WSI_panthor_wsi.so)
-   target_link_libraries(VkLayer_WSI_panthor_wsi PRIVATE ${PLATFORM_LIBS})
-   set_target_properties(VkLayer_WSI_panthor_wsi PROPERTIES
-      LIBRARY_OUTPUT_DIRECTORY "${AOT_DIR}"
-   )
-   target_copy_to_source_tree(VkLayer_WSI_panthor_wsi "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/layers/libVkLayer_WSI_panthor_wsi.so")
-
    add_library(VkLayer_PANTHOR_capture SHARED
       src/aot/layers/panthor_vk_capture_layer.cpp
    )
@@ -356,14 +326,6 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
       LIBRARY_OUTPUT_DIRECTORY "${AOT_DIR}"
    )
    target_copy_to_source_tree(VkLayer_PANTHOR_capture "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/layers/libVkLayer_PANTHOR_capture.so")
-
-   # Ensure layer JSON descriptor manifests exist
-   add_custom_target(generate_layer_manifests ALL
-      COMMAND ${CMAKE_COMMAND} -E echo "{\"file_format_version\":\"1.2.0\",\"layer\":{\"name\":\"VK_LAYER_BCN_BCnLayer\",\"type\":\"GLOBAL\",\"library_path\":\"./libVkLayer_BCN_bcn_layer.so\",\"api_version\":\"1.3.0\",\"implementation_version\":\"1\",\"description\":\"BCn Emulation Layer for Mobile GPUs (Host AOT Build)\"}}" > "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/layers/VkLayer_BCN_bcn_layer.json"
-      COMMAND ${CMAKE_COMMAND} -E echo "{\"file_format_version\":\"1.2.0\",\"layer\":{\"name\":\"VK_LAYER_COMPAT_DxvkMaliCompatLayer\",\"type\":\"GLOBAL\",\"library_path\":\"./libVkLayer_COMPAT_dxvk_mali_compat.so\",\"api_version\":\"1.3.0\",\"implementation_version\":\"1\",\"description\":\"DXVK 1.10.3 Feature & Limit Compatibility Layer for Mali r54p3 AOT ICD\"}}" > "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/layers/VkLayer_COMPAT_dxvk_mali_compat.json"
-      COMMENT "Generating DXVK layer JSON descriptors"
-   )
-   add_dependencies(VkLayer_BCN_bcn_layer generate_layer_manifests)
 
    # Replayers
    add_executable(panthor_drm_replayer
