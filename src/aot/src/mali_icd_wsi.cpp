@@ -371,22 +371,85 @@ int32_t vkGetDisplayPlaneCapabilitiesKHR(void* /*physicalDevice*/, uint64_t /*mo
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateDebugUtilsMessengerEXT(void* /*instance*/, const void* /*pCreateInfo*/, const void* /*pAllocator*/, uint64_t* pMessenger) {
-    if (pMessenger) *pMessenger = 0xDEB06001ULL;
+int32_t vkCreateDebugUtilsMessengerEXT(void* instance, const void* pCreateInfo, const void* pAllocator, uint64_t* pMessenger) {
+    if (!pMessenger) return -3;
+    auto* inst = static_cast<MaliIcdInstance*>(instance);
+    if (inst && !g_aot_rt.mapper.so_path_loaded.empty() && aot_vkCreateDebugUtilsMessengerEXT && pCreateInfo) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        uint64_t aot_msg = 0;
+        int32_t r = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkCreateDebugUtilsMessengerEXT,
+            instance, pCreateInfo, pAllocator, &aot_msg);
+        g_aot_rt.lifted_vk_calls_executed++;
+        if (r == 0 && aot_msg != 0) { *pMessenger = aot_msg; return 0; }
+    }
+    *pMessenger = 0xDEB06001ULL;
     return 0;
 }
 
 __attribute__((visibility("default")))
-void vkDestroyDebugUtilsMessengerEXT(void* /*instance*/, uint64_t /*messenger*/, const void* /*pAllocator*/) {}
+void vkDestroyDebugUtilsMessengerEXT(void* instance, uint64_t messenger, const void* pAllocator) {
+    if (messenger != 0 && messenger != 0xDEB06001ULL && !g_aot_rt.mapper.so_path_loaded.empty() && aot_vkDestroyDebugUtilsMessengerEXT) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkDestroyDebugUtilsMessengerEXT,
+            instance, messenger, pAllocator);
+        g_aot_rt.lifted_vk_calls_executed++;
+    }
+}
 
 __attribute__((visibility("default")))
-int32_t vkSetDebugUtilsObjectNameEXT(void* /*device*/, const void* /*pNameInfo*/) { return 0; }
+int32_t vkSetDebugUtilsObjectNameEXT(void* device, const void* pNameInfo) {
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && !dev->aot_vk_device_mem.empty() && aot_vkSetDebugUtilsObjectNameEXT && pNameInfo) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        int32_t r = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkSetDebugUtilsObjectNameEXT,
+            dev->aot_vk_device_mem.data(), pNameInfo);
+        g_aot_rt.lifted_vk_calls_executed++;
+        return r;
+    }
+    return 0;
+}
 
 __attribute__((visibility("default")))
-void vkCmdBeginDebugUtilsLabelEXT(void* /*commandBuffer*/, const void* /*pLabelInfo*/) {}
+void vkCmdBeginDebugUtilsLabelEXT(void* commandBuffer, const void* pLabelInfo) {
+    auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
+    if (cb && cb->aot_cmdbuf_mem.size() >= 256 && *reinterpret_cast<const uint64_t*>(cb->aot_cmdbuf_mem.data() + 0x68) != 0 &&
+        aot_vkCmdBeginDebugUtilsLabelEXT && pLabelInfo) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkCmdBeginDebugUtilsLabelEXT,
+            cb->aot_cmdbuf_mem.data(), pLabelInfo);
+        g_aot_rt.lifted_vk_calls_executed++;
+    }
+}
 
 __attribute__((visibility("default")))
-void vkCmdEndDebugUtilsLabelEXT(void* /*commandBuffer*/) {}
+void vkCmdEndDebugUtilsLabelEXT(void* commandBuffer) {
+    auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
+    if (cb && cb->aot_cmdbuf_mem.size() >= 256 && *reinterpret_cast<const uint64_t*>(cb->aot_cmdbuf_mem.data() + 0x68) != 0 &&
+        aot_vkCmdEndDebugUtilsLabelEXT) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkCmdEndDebugUtilsLabelEXT,
+            cb->aot_cmdbuf_mem.data());
+        g_aot_rt.lifted_vk_calls_executed++;
+    }
+}
+
+__attribute__((visibility("default")))
+void vkCmdInsertDebugUtilsLabelEXT(void* commandBuffer, const void* pLabelInfo) {
+    auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
+    if (cb && cb->aot_cmdbuf_mem.size() >= 256 && *reinterpret_cast<const uint64_t*>(cb->aot_cmdbuf_mem.data() + 0x68) != 0 &&
+        aot_vkCmdInsertDebugUtilsLabelEXT && pLabelInfo) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkCmdInsertDebugUtilsLabelEXT,
+            cb->aot_cmdbuf_mem.data(), pLabelInfo);
+        g_aot_rt.lifted_vk_calls_executed++;
+    }
+}
 
 
 __attribute__((visibility("default")))
@@ -515,10 +578,23 @@ void vkGetImageSubresourceLayout(void* device, uint64_t image, const void* pSubr
 }
 
 __attribute__((visibility("default")))
-int32_t vkFlushMappedMemoryRanges(void* /*device*/, uint32_t /*memoryRangeCount*/, const void* /*pMemoryRanges*/) { return 0; }
+int32_t vkFlushMappedMemoryRanges(void* device, uint32_t memoryRangeCount, const void* pMemoryRanges) {
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && !dev->aot_vk_device_mem.empty() && aot_vkFlushMappedMemoryRanges && memoryRangeCount > 0 && pMemoryRanges) {
+        // Only delegate if memory handles are real lifted objects (not host MaliIcdDeviceMemory*)
+        return 0;
+    }
+    return 0;
+}
 
 __attribute__((visibility("default")))
-int32_t vkInvalidateMappedMemoryRanges(void* /*device*/, uint32_t /*memoryRangeCount*/, const void* /*pMemoryRanges*/) { return 0; }
+int32_t vkInvalidateMappedMemoryRanges(void* device, uint32_t memoryRangeCount, const void* pMemoryRanges) {
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && !dev->aot_vk_device_mem.empty() && aot_vkInvalidateMappedMemoryRanges && memoryRangeCount > 0 && pMemoryRanges) {
+        return 0;
+    }
+    return 0;
+}
 
 __attribute__((visibility("default")))
 int32_t vkGetFenceStatus(void* device, uint64_t fence) {
@@ -998,8 +1074,12 @@ int32_t vkQueueWaitIdle(void* /*queue*/) {
 }
 
 __attribute__((visibility("default")))
-int32_t vkDeviceWaitIdle(void* /*device*/) {
+int32_t vkDeviceWaitIdle(void* device) {
     if (mali_kbase_emu_wait_csf_idle) mali_kbase_emu_wait_csf_idle(200000000ULL);
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && dev->aot_cctx_mem.size() > 0xc1 && dev->aot_cctx_mem[0xc1] != 0) {
+        return -4; /* VK_ERROR_DEVICE_LOST */
+    }
     return 0;
 }
 

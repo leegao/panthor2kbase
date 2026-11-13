@@ -42,8 +42,12 @@ extern "C" {
         uint32_t active_profile;
         uint16_t kbase_ver_major;
         uint16_t kbase_ver_minor;
+        uint32_t active_kfile_count;
+        uint32_t total_kfiles_opened;
+        uint32_t csf_server_kicks_processed;
     };
     __attribute__((weak)) void mali_kbase_emu_get_stats(struct kbase_emu_stats *out);
+    __attribute__((weak)) size_t mali_kbase_emu_get_stats_sized(struct kbase_emu_stats *out, size_t out_size);
     __attribute__((weak)) int mali_kbase_emu_open_direct(const char *pathname, int flags);
     __attribute__((weak)) int mali_kbase_emu_close_direct(int fd);
     __attribute__((weak)) int mali_kbase_emu_ioctl_direct(int fd, unsigned long request, void *arg);

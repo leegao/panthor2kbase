@@ -16,7 +16,6 @@ export LD_LIBRARY_PATH="$BUILD_DIR:$BUILD_DIR/adapter:$BUILD_DIR/emulator:$BUILD
 
 RUN_BIN() {
     local rel_path="$1"
-    echo $rel_path
     shift
     if [ -x "$BUILD_DIR/$rel_path" ]; then
         "$BUILD_DIR/$rel_path" "$@"

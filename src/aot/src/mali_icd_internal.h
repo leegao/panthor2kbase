@@ -24,6 +24,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <csetjmp>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -113,6 +115,9 @@ extern "C" {
     __attribute__((weak)) uint64_t aot_get_vk_dispatch_table_count() { return 456ULL; }
     __attribute__((weak)) uint64_t aot_get_vk_dispatch_table_stride() { return 56ULL; }
     __attribute__((weak)) uint64_t aot_get_lifted_vk_entrypoint_count() { return 456ULL; }
+    __attribute__((weak)) uint64_t aot_get_init_array_count() { return 0ULL; }
+    __attribute__((weak)) void aot_run_dt_init_array_entry(AOTCPUState* /*cpu*/, uint64_t /*idx*/) {}
+    __attribute__((weak)) void aot_run_dt_init_array(AOTCPUState* /*cpu*/) {}
     __attribute__((weak)) void aot_cmpbe_v2_deserialize_MBS2_to_C(AOTCPUState* /*cpu*/) {}
     __attribute__((weak)) void aot_cmpbe_v2_init_options(AOTCPUState* /*cpu*/) {}
     __attribute__((weak)) void aot_cmpbe_v2_set_option_value(AOTCPUState* /*cpu*/) {}
@@ -742,7 +747,7 @@ struct MaliAotGlobalRuntime {
             icd_repo_up_so.empty() ? nullptr : icd_repo_up_so.c_str(),
             icd_root_r44_so.empty() ? nullptr : icd_root_r44_so.c_str()
         };
-        bool mapped_ok = false;
+        volatile bool mapped_ok = false;
         for (const char* cand : candidates) {
             if (cand && mapper.loadAndRelocate(cand)) {
                 mapped_ok = true;
@@ -820,6 +825,49 @@ struct MaliAotGlobalRuntime {
         if (!blobs.empty()) {
             template_mbs2_len = std::min<uint32_t>(sizeof(template_mbs2), blobs[0].second);
             std::memcpy(template_mbs2, blobs[0].first, template_mbs2_len);
+        }
+
+        // 0. Execute lifted Bionic DT_INIT_ARRAY (.init_array) constructors
+        const char* skip_ia = getenv("MALI_AOT_SKIP_INIT_ARRAY");
+        if (mapped_ok && (!skip_ia || skip_ia[0] == '0')) {
+            static sigjmp_buf s_ia_jmp;
+            static volatile sig_atomic_t s_ia_guard = 0;
+            struct sigaction sa_new{}, sa_old{};
+            sa_new.sa_handler = [](int) {
+                if (s_ia_guard) siglongjmp(s_ia_jmp, 1);
+            };
+            sigemptyset(&sa_new.sa_mask);
+            sigaction(SIGSEGV, &sa_new, &sa_old);
+
+            volatile uint64_t ia_count = aot_get_init_array_count();
+            const char* lim_env = getenv("MALI_AOT_INIT_ARRAY_LIMIT");
+            if (lim_env && lim_env[0]) {
+                uint64_t lim = std::strtoull(lim_env, nullptr, 10);
+                if (lim < ia_count) ia_count = lim;
+            }
+            const bool trace_ia = (getenv("MALI_AOT_TRACE_INIT_ARRAY") != nullptr);
+            volatile uint64_t ia_ok = 0, ia_skipped = 0;
+            for (volatile uint64_t i = 0; i < ia_count; ++i) {
+                resetGuestStackLocked();
+                s_ia_guard = 1;
+                if (sigsetjmp(s_ia_jmp, 1) == 0) {
+                    aot_run_dt_init_array_entry(&cpu, i);
+                    s_ia_guard = 0;
+                    ia_ok++;
+                } else {
+                    s_ia_guard = 0;
+                    ia_skipped++;
+                    if (trace_ia) {
+                        std::fprintf(stderr, "[MALI_AOT_ICD] DT_INIT_ARRAY[%llu/%llu] skipped (unresolved Android GOT/TLS)\n",
+                                     (unsigned long long)i, (unsigned long long)ia_count);
+                    }
+                }
+            }
+            sigaction(SIGSEGV, &sa_old, nullptr);
+            if (trace_ia || getenv("MALI_AOT_ICD_LOG")) {
+                std::fprintf(stderr, "[MALI_AOT_ICD] DT_INIT_ARRAY complete: %llu/%llu succeeded, %llu skipped\n",
+                             (unsigned long long)ia_ok, (unsigned long long)ia_count, (unsigned long long)ia_skipped);
+            }
         }
 
         // 1. Open Android Vulkan HAL ("vk0") via AOT-translated vk_hal_open (when ELF image is mapped)

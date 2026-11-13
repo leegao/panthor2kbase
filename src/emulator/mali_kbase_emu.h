@@ -168,6 +168,7 @@ struct kbase_emu_stats {
 };
 
 void mali_kbase_emu_get_stats(struct kbase_emu_stats *out);
+size_t mali_kbase_emu_get_stats_sized(struct kbase_emu_stats *out, size_t out_size);
 int mali_kbase_emu_export_trace_json(const char *path);
 void mali_kbase_emu_reset_stats(void);
 bool mali_kbase_emu_init_lavapipe_bridge(void);

@@ -2768,6 +2768,30 @@ static void test_v34_async_csf_client_server_and_syncobj_fixes(void)
           (unsigned long long)st1.csf_server_kicks_processed);
 }
 
+/* ============================================================================
+ * TEST 25 (Checkpoint v35): kbase_emu_stats Sized ABI Guard (No Stack Smash)
+ * ============================================================================ */
+static void test_v35_kbase_emu_stats_sized_abi_guard(void)
+{
+   printf("[TEST 25] Verifying mali_kbase_emu_get_stats_sized() ABI clamping & stack canary safety...\n");
+   struct {
+      uint8_t buf[64];
+      uint64_t canary;
+   } small_probe;
+   memset(&small_probe, 0xAA, sizeof(small_probe));
+   small_probe.canary = 0xDEADBEEFCAFEBABEULL;
+
+   size_t full_sz = mali_kbase_emu_get_stats_sized((struct kbase_emu_stats *)small_probe.buf, sizeof(small_probe.buf));
+   assert(full_sz == sizeof(struct kbase_emu_stats));
+   assert(small_probe.canary == 0xDEADBEEFCAFEBABEULL);
+
+   struct kbase_emu_stats full_st;
+   memset(&full_st, 0, sizeof(full_st));
+   size_t exact_sz = mali_kbase_emu_get_stats_sized(&full_st, sizeof(full_st));
+   assert(exact_sz == sizeof(struct kbase_emu_stats));
+   printf("  -> PASS: mali_kbase_emu_get_stats_sized clamped 64B probe without touching stack canary (full_sz=%zu)\n", full_sz);
+}
+
 int main(void)
 {
    printf("[Unit Tests] Running edge cases, mali_kbase.ko flag invariants, and RAII logging suite...\n");
@@ -2795,6 +2819,7 @@ int main(void)
    test_v32_full_r54p3_icd_deshimming_and_real_draw_pipeline();
    test_v33_multi_fd_mali0_isolation_and_full_r54p3_icd();
    test_v34_async_csf_client_server_and_syncobj_fixes();
+   test_v35_kbase_emu_stats_sized_abi_guard();
    printf("[Unit Tests] ALL EDGE CASES PASSED!\n");
    return 0;
 }

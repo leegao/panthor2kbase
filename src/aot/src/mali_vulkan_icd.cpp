@@ -166,18 +166,30 @@ int32_t vkCreateDevice(void* physicalDevice, const void* /*pCreateInfo*/, const 
 __attribute__((visibility("default")))
 void vkDestroyDevice(void* device, const void* /*pAllocator*/) {
     const char* log_env = std::getenv("MALI_AOT_ICD_LOG");
-    if (log_env && log_env[0] != '0' && mali_kbase_emu_get_stats) {
+    if (log_env && log_env[0] != '0' && (mali_kbase_emu_get_stats_sized || mali_kbase_emu_get_stats)) {
         struct kbase_emu_stats kst{};
-        mali_kbase_emu_get_stats(&kst);
+        if (mali_kbase_emu_get_stats_sized) {
+            size_t emu_sz = mali_kbase_emu_get_stats_sized(&kst, sizeof(kst));
+            if (emu_sz != sizeof(kst)) {
+                std::fprintf(stderr,
+                       "[MALI_AOT_ICD] WARN: kbase_emu_stats ABI size mismatch (emu=%zu, icd=%zu); clamped safely\n",
+                       emu_sz, sizeof(kst));
+            }
+        } else {
+            mali_kbase_emu_get_stats(&kst);
+        }
         std::fprintf(stderr,
                "[MALI_AOT_ICD] vkDestroyDevice -> Lifted /dev/mali0 Kernel E2E Stats (libmali_kbase_emu: lifted_kbase_ko.ll + lifted_csffw.c): "
-               "ioctls=%llu, mem_allocs=%llu, queue_kicks=%llu, csf_insns=%llu, lifted_ko_calls=%llu, lifted_ko_insns=%llu\n",
+               "ioctls=%llu, mem_allocs=%llu, queue_kicks=%llu, csf_insns=%llu, lifted_ko_calls=%llu, lifted_ko_insns=%llu, "
+               "csf_server_kicks=%u, active_kfiles=%u\n",
                (unsigned long long)kst.ioctl_count,
                (unsigned long long)kst.mem_alloc_count,
                (unsigned long long)kst.queue_kick_count,
                (unsigned long long)kst.csf_instructions_executed,
                (unsigned long long)kst.lifted_ko_calls_executed,
-               (unsigned long long)kst.lifted_ko_insns_executed);
+               (unsigned long long)kst.lifted_ko_insns_executed,
+               kst.csf_server_kicks_processed,
+               kst.active_kfile_count);
     }
     if (aot_so_get_debug_flags() & AOT_SO_DEBUG_PROFILE_CALLS) {
         aot_so_dump_profile(stderr);
@@ -2528,6 +2540,15 @@ void vkTrimCommandPool(void* /*device*/, uint64_t /*commandPool*/, uint32_t /*fl
 __attribute__((visibility("default")))
 void vkGetDeviceQueue2(void* device, const void* pQueueInfo, void** pQueue) {
     if (!pQueue) return;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && !dev->aot_vk_device_mem.empty() && aot_vkGetDeviceQueue2 && pQueueInfo) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkGetDeviceQueue2,
+            dev->aot_vk_device_mem.data(), pQueueInfo, pQueue);
+        g_aot_rt.lifted_vk_calls_executed++;
+        if (*pQueue != nullptr) return;
+    }
     uint32_t qfi = 0, qi = 0;
     if (pQueueInfo) {
         const auto* u32 = static_cast<const uint32_t*>(pQueueInfo);
@@ -2538,7 +2559,16 @@ void vkGetDeviceQueue2(void* device, const void* pQueueInfo, void** pQueue) {
 }
 
 __attribute__((visibility("default")))
-int32_t vkGetPhysicalDeviceToolProperties(void* /*physicalDevice*/, uint32_t* pToolCount, void* /*pToolProperties*/) {
+int32_t vkGetPhysicalDeviceToolProperties(void* physicalDevice, uint32_t* pToolCount, void* pToolProperties) {
+    auto* pdev = static_cast<MaliIcdPhysicalDevice*>(physicalDevice);
+    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkGetPhysicalDeviceToolProperties && pdev && pToolCount) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        int32_t r = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkGetPhysicalDeviceToolProperties,
+            pdev->aot_internal, pToolCount, pToolProperties);
+        g_aot_rt.lifted_vk_calls_executed++;
+        return r;
+    }
     if (pToolCount) *pToolCount = 0;
     return 0;
 }
@@ -2574,8 +2604,17 @@ void vkGetImageMemoryRequirements2(void* device, const void* pInfo, void* pMemor
 }
 
 __attribute__((visibility("default")))
-void vkGetDeviceBufferMemoryRequirements(void* /*device*/, const void* pInfo, void* pMemoryRequirements) {
+void vkGetDeviceBufferMemoryRequirements(void* device, const void* pInfo, void* pMemoryRequirements) {
     if (!pInfo || !pMemoryRequirements) return;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && !dev->aot_vk_device_mem.empty() && aot_vkGetDeviceBufferMemoryRequirements) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkGetDeviceBufferMemoryRequirements,
+            dev->aot_vk_device_mem.data(), pInfo, pMemoryRequirements);
+        g_aot_rt.lifted_vk_calls_executed++;
+        return;
+    }
     const auto* create_info = *reinterpret_cast<const VkBufferCreateInfoIcd* const*>(static_cast<const uint8_t*>(pInfo) + 16);
     auto* req = reinterpret_cast<VkMemoryRequirementsIcd*>(static_cast<uint8_t*>(pMemoryRequirements) + 16);
     uint64_t sz = create_info ? create_info->size : 4096ULL;
@@ -2586,8 +2625,17 @@ void vkGetDeviceBufferMemoryRequirements(void* /*device*/, const void* pInfo, vo
 }
 
 __attribute__((visibility("default")))
-void vkGetDeviceImageMemoryRequirements(void* /*device*/, const void* pInfo, void* pMemoryRequirements) {
+void vkGetDeviceImageMemoryRequirements(void* device, const void* pInfo, void* pMemoryRequirements) {
     if (!pInfo || !pMemoryRequirements) return;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && !dev->aot_vk_device_mem.empty() && aot_vkGetDeviceImageMemoryRequirements) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkGetDeviceImageMemoryRequirements,
+            dev->aot_vk_device_mem.data(), pInfo, pMemoryRequirements);
+        g_aot_rt.lifted_vk_calls_executed++;
+        return;
+    }
     struct ImgInfo {
         uint32_t sType; const void* pNext; uint32_t flags; uint32_t imageType; uint32_t format;
         uint32_t width; uint32_t height; uint32_t depth; uint32_t mipLevels; uint32_t arrayLayers;
@@ -2606,7 +2654,16 @@ void vkGetDeviceImageMemoryRequirements(void* /*device*/, const void* pInfo, voi
 }
 
 __attribute__((visibility("default")))
-void vkGetDeviceImageSparseMemoryRequirements(void* /*device*/, const void* /*pInfo*/, uint32_t* pCount, void* /*pReqs*/) {
+void vkGetDeviceImageSparseMemoryRequirements(void* device, const void* pInfo, uint32_t* pCount, void* pReqs) {
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && !dev->aot_vk_device_mem.empty() && aot_vkGetDeviceImageSparseMemoryRequirements && pInfo && pCount) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkGetDeviceImageSparseMemoryRequirements,
+            dev->aot_vk_device_mem.data(), pInfo, pCount, pReqs);
+        g_aot_rt.lifted_vk_calls_executed++;
+        return;
+    }
     if (pCount) *pCount = 0;
 }
 
@@ -2644,26 +2701,76 @@ __attribute__((visibility("default")))
 void vkDestroySamplerYcbcrConversion(void* /*device*/, uint64_t /*ycbcrConversion*/, const void* /*pAllocator*/) {}
 
 __attribute__((visibility("default")))
-int32_t vkCreatePrivateDataSlot(void* /*device*/, const void* /*pCreateInfo*/, const void* /*pAllocator*/, uint64_t* pSlot) {
+int32_t vkCreatePrivateDataSlot(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pSlot) {
+    if (!pSlot) return -3;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && !dev->aot_vk_device_mem.empty() && aot_vkCreatePrivateDataSlot && pCreateInfo) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        int32_t r = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkCreatePrivateDataSlot,
+            dev->aot_vk_device_mem.data(), pCreateInfo, pAllocator, pSlot);
+        g_aot_rt.lifted_vk_calls_executed++;
+        if (r == 0 && *pSlot != 0) return 0;
+    }
     static uint64_t s_pd = 0x9D000001ULL;
-    if (pSlot) *pSlot = s_pd++;
+    *pSlot = s_pd++;
     return 0;
 }
 
 __attribute__((visibility("default")))
-void vkDestroyPrivateDataSlot(void* /*device*/, uint64_t /*slot*/, const void* /*pAllocator*/) {}
-
-__attribute__((visibility("default")))
-int32_t vkSetPrivateData(void* /*device*/, uint32_t /*objType*/, uint64_t /*objHandle*/, uint64_t /*slot*/, uint64_t /*data*/) { return 0; }
-
-__attribute__((visibility("default")))
-void vkGetPrivateData(void* /*device*/, uint32_t /*objType*/, uint64_t /*objHandle*/, uint64_t /*slot*/, uint64_t* pData) {
-    if (pData) *pData = 0;
+void vkDestroyPrivateDataSlot(void* device, uint64_t slot, const void* pAllocator) {
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && !dev->aot_vk_device_mem.empty() && aot_vkDestroyPrivateDataSlot && slot != 0 && (slot < 0x9D000000ULL || slot > 0x9E000000ULL)) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkDestroyPrivateDataSlot,
+            dev->aot_vk_device_mem.data(), slot, pAllocator);
+        g_aot_rt.lifted_vk_calls_executed++;
+    }
 }
 
 __attribute__((visibility("default")))
-void vkGetDeviceGroupPeerMemoryFeatures(void* /*device*/, uint32_t /*heapIdx*/, uint32_t /*localIdx*/, uint32_t /*remoteIdx*/, uint32_t* pFeatures) {
-    if (pFeatures) *pFeatures = 0xFU;
+int32_t vkSetPrivateData(void* device, uint32_t objType, uint64_t objHandle, uint64_t slot, uint64_t data) {
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && !dev->aot_vk_device_mem.empty() && aot_vkSetPrivateData && slot != 0 && (slot < 0x9D000000ULL || slot > 0x9E000000ULL)) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        int32_t r = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkSetPrivateData,
+            dev->aot_vk_device_mem.data(), objType, objHandle, slot, data);
+        g_aot_rt.lifted_vk_calls_executed++;
+        return r;
+    }
+    return 0;
+}
+
+__attribute__((visibility("default")))
+void vkGetPrivateData(void* device, uint32_t objType, uint64_t objHandle, uint64_t slot, uint64_t* pData) {
+    if (!pData) return;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && !dev->aot_vk_device_mem.empty() && aot_vkGetPrivateData && slot != 0 && (slot < 0x9D000000ULL || slot > 0x9E000000ULL)) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkGetPrivateData,
+            dev->aot_vk_device_mem.data(), objType, objHandle, slot, pData);
+        g_aot_rt.lifted_vk_calls_executed++;
+        return;
+    }
+    *pData = 0;
+}
+
+__attribute__((visibility("default")))
+void vkGetDeviceGroupPeerMemoryFeatures(void* device, uint32_t heapIdx, uint32_t localIdx, uint32_t remoteIdx, uint32_t* pFeatures) {
+    if (!pFeatures) return;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && !dev->aot_vk_device_mem.empty() && aot_vkGetDeviceGroupPeerMemoryFeatures) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkGetDeviceGroupPeerMemoryFeatures,
+            dev->aot_vk_device_mem.data(), heapIdx, localIdx, remoteIdx, pFeatures);
+        g_aot_rt.lifted_vk_calls_executed++;
+        return;
+    }
+    *pFeatures = 0xFU;
 }
 
 
@@ -2919,11 +3026,19 @@ void vkGetRenderAreaGranularity(void* /*device*/, uint64_t /*renderPass*/, void*
 }
 
 __attribute__((visibility("default")))
-void vkGetRenderingAreaGranularityKHR(void* /*device*/, const void* /*pRenderingAreaInfo*/, void* pGranularity) {
-    if (pGranularity) {
-        auto* u32 = static_cast<uint32_t*>(pGranularity);
-        u32[0] = 1U; u32[1] = 1U;
+void vkGetRenderingAreaGranularityKHR(void* device, const void* pRenderingAreaInfo, void* pGranularity) {
+    if (!pGranularity) return;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && !dev->aot_vk_device_mem.empty() && aot_vkGetRenderingAreaGranularityKHR && pRenderingAreaInfo) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkGetRenderingAreaGranularityKHR,
+            dev->aot_vk_device_mem.data(), pRenderingAreaInfo, pGranularity);
+        g_aot_rt.lifted_vk_calls_executed++;
+        return;
     }
+    auto* u32 = static_cast<uint32_t*>(pGranularity);
+    u32[0] = 1U; u32[1] = 1U;
 }
 
 __attribute__((visibility("default")))
@@ -2935,8 +3050,17 @@ void vkGetImageSubresourceLayout2KHR(void* device, uint64_t image, const void* p
 }
 
 __attribute__((visibility("default")))
-void vkGetDeviceImageSubresourceLayoutKHR(void* /*device*/, const void* /*pInfo*/, void* pLayout) {
+void vkGetDeviceImageSubresourceLayoutKHR(void* device, const void* pInfo, void* pLayout) {
     if (!pLayout) return;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && !dev->aot_vk_device_mem.empty() && aot_vkGetDeviceImageSubresourceLayout && pInfo) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkGetDeviceImageSubresourceLayout,
+            dev->aot_vk_device_mem.data(), pInfo, pLayout);
+        g_aot_rt.lifted_vk_calls_executed++;
+        return;
+    }
     auto* u64 = reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(pLayout) + 16);
     u64[0] = 0;
     u64[1] = 262144;
@@ -3068,6 +3192,7 @@ PFN_vkVoidFunction vkGetDeviceProcAddr(void* /*device*/, const char* pName) {
     if (std::strcmp(pName, "vkSetDebugUtilsObjectNameEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkSetDebugUtilsObjectNameEXT);
     if (std::strcmp(pName, "vkCmdBeginDebugUtilsLabelEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdBeginDebugUtilsLabelEXT);
     if (std::strcmp(pName, "vkCmdEndDebugUtilsLabelEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdEndDebugUtilsLabelEXT);
+    if (std::strcmp(pName, "vkCmdInsertDebugUtilsLabelEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdInsertDebugUtilsLabelEXT);
     if (std::strcmp(pName, "vkCreatePipelineCache") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkCreatePipelineCache);
     if (std::strcmp(pName, "vkDestroyPipelineCache") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkDestroyPipelineCache);
     if (std::strcmp(pName, "vkGetPipelineCacheData") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPipelineCacheData);

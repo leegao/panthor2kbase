@@ -501,6 +501,7 @@ public:
     uint64_t vk_dispatch_table_count = 0;
     uint64_t vk_dispatch_table_stride = 0;
     std::vector<std::pair<std::string, uint64_t>> vk_dispatch_entries;
+    std::vector<uint64_t> init_array_funcs;
 
     bool run(const std::string &so_path) {
         std::ifstream in(so_path, std::ios::binary);
@@ -1142,6 +1143,23 @@ private:
             if (addr_by_name.count(sym)) {
                 uint64_t st = findFuncStart(addr_by_name[sym]);
                 q.push_back(st ? st : addr_by_name[sym]);
+            }
+        }
+        // Seed all DT_INIT_ARRAY (.init_array) constructors (e.g. 399 entries in r54p3)
+        if (sections.count(".init_array")) {
+            auto ia_sec = sections[".init_array"];
+            size_t count = static_cast<size_t>(ia_sec.size / 8);
+            init_array_funcs.reserve(count);
+            for (size_t i = 0; i < count; ++i) {
+                uint64_t va = ia_sec.addr + i * 8ULL;
+                if (va + 8 > elf.size()) break;
+                uint64_t raw_ptr = readU64(elf, va);
+                uint64_t rva = (raw_ptr >= IMAGE_BASE) ? (raw_ptr - IMAGE_BASE) : (raw_ptr & 0xFFFFFFFFFFFFULL);
+                if (!isExecAddr(rva)) continue;
+                uint64_t st = findFuncStart(rva);
+                uint64_t cand = st ? st : rva;
+                init_array_funcs.push_back(cand);
+                q.push_back(cand);
             }
         }
         std::set<uint64_t> visited;
@@ -3103,6 +3121,41 @@ public:
 
         emitRaw("define i64 @aot_get_lifted_vk_entrypoint_count() #0 {");
         emit("ret i64 " + std::to_string(loader.vk_dispatch_entries.size()));
+        emitRaw("}\n");
+
+        emitRaw("define i64 @aot_get_init_array_count() #0 {");
+        emit("ret i64 " + std::to_string(loader.init_array_funcs.size()));
+        emitRaw("}\n");
+
+        emitRaw("define void @aot_run_dt_init_array_entry(ptr %cpu, i64 %idx) #0 {");
+        emit("switch i64 %idx, label %ia_done [");
+        for (size_t i = 0; i < loader.init_array_funcs.size(); ++i) {
+            uint64_t rva = loader.init_array_funcs[i];
+            if (func_set.count(rva)) {
+                emit("  i64 " + std::to_string(i) + ", label %ia_" + std::to_string(i));
+            }
+        }
+        emit("]");
+        for (size_t i = 0; i < loader.init_array_funcs.size(); ++i) {
+            uint64_t rva = loader.init_array_funcs[i];
+            if (func_set.count(rva)) {
+                emitRaw("ia_" + std::to_string(i) + ":");
+                emit("call void @aot_sub_" + hex8(rva) + "(ptr %cpu)");
+                emit("br label %ia_done");
+            }
+        }
+        emitRaw("ia_done:");
+        emit("ret void");
+        emitRaw("}\n");
+
+        emitRaw("define void @aot_run_dt_init_array(ptr %cpu) #0 {");
+        for (size_t i = 0; i < loader.init_array_funcs.size(); ++i) {
+            uint64_t rva = loader.init_array_funcs[i];
+            if (func_set.count(rva)) {
+                emit("call void @aot_sub_" + hex8(rva) + "(ptr %cpu)");
+            }
+        }
+        emit("ret void");
         emitRaw("}\n");
 
         std::set<std::string> emitted_aot_wrappers;

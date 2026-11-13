@@ -996,7 +996,7 @@ int mali_kbase_emu_wait_csf_idle(uint64_t timeout_ns)
    }
 }
 
-void mali_kbase_emu_get_stats(struct kbase_emu_stats *out)
+size_t mali_kbase_emu_get_stats_sized(struct kbase_emu_stats *out, size_t out_size)
 {
    mali_kbase_emu_wait_csf_idle(500000000ULL);
    pthread_mutex_lock(&g_emu_lock);
@@ -1005,9 +1005,20 @@ void mali_kbase_emu_get_stats(struct kbase_emu_stats *out)
    g_stats.kbase_ver_minor = g_kfile.kbase_ver_minor ? g_kfile.kbase_ver_minor :
       (g_stats.active_profile == MALI_EMU_PROFILE_HUSKY_R54 ? 38U : 21U);
    g_stats.active_kfile_count = count_open_kfiles_locked();
-   if (out)
-      *out = g_stats;
+   if (out && out_size > 0) {
+      size_t copy_sz = out_size < sizeof(g_stats) ? out_size : sizeof(g_stats);
+      memcpy(out, &g_stats, copy_sz);
+      if (out_size > sizeof(g_stats)) {
+         memset((uint8_t *)out + sizeof(g_stats), 0, out_size - sizeof(g_stats));
+      }
+   }
    pthread_mutex_unlock(&g_emu_lock);
+   return sizeof(g_stats);
+}
+
+void mali_kbase_emu_get_stats(struct kbase_emu_stats *out)
+{
+   (void)mali_kbase_emu_get_stats_sized(out, out ? sizeof(*out) : 0);
 }
 
 void mali_kbase_emu_reset_stats(void)

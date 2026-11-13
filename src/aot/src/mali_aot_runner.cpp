@@ -1895,9 +1895,13 @@ int main(int argc, char** argv) {
 
     assert(*reinterpret_cast<uint64_t*>(cpu.tpidr_el0 + 0x28) == BIONIC_STACK_GUARD_CANARY);
 
-    if (mali_kbase_emu_get_stats) {
+    if (mali_kbase_emu_get_stats_sized || mali_kbase_emu_get_stats) {
         struct kbase_emu_stats kst{};
-        mali_kbase_emu_get_stats(&kst);
+        if (mali_kbase_emu_get_stats_sized) {
+            mali_kbase_emu_get_stats_sized(&kst, sizeof(kst));
+        } else {
+            mali_kbase_emu_get_stats(&kst);
+        }
         std::cout << "[PASS] Test 8.4: Lifted /dev/mali0 Kernel E2E Telemetry (libmali_kbase_emu: lifted_kbase_ko.ll + lifted_csffw.c): "
                   << "ioctls=" << kst.ioctl_count
                   << ", mem_allocs=" << kst.mem_alloc_count
