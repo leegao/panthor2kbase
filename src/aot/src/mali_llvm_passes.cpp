@@ -57,6 +57,8 @@
 
 #include <dlfcn.h>
 #include <glob.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 // Dynamic runtime loader for ANY host libLLVM (LLVM 14..22+ on Arch, Ubuntu, Debian, Fedora)
 // Eliminates hardcoded DT_NEEDED on libLLVM-15.so.1 so prebuilt binaries work across distros.
@@ -4170,6 +4172,11 @@ int main(int argc, char **argv) {
         if (const char *envH2l = std::getenv("HORIZON2LLVM_INSTRUMENT_CALLS")) {
             if (std::strcmp(envH2l, "0") == 0 || std::strcmp(envH2l, "false") == 0) instrumentCalls = false;
         }
+        size_t jobs = 1;
+        if (const char *env_j = std::getenv("MALI_AOT_JOBS")) {
+            size_t parsed = static_cast<size_t>(std::strtoull(env_j, nullptr, 10));
+            if (parsed >= 1) jobs = parsed;
+        }
         for (int i = 4; i < argc; ++i) {
             if (std::strcmp(argv[i], "--instrument-calls") == 0 ||
                 std::strcmp(argv[i], "--record-stackframes") == 0 ||
@@ -4180,6 +4187,15 @@ int main(int argc, char **argv) {
                        std::strcmp(argv[i], "--no-record-stackframes") == 0 ||
                        std::strcmp(argv[i], "--no-profile-functions") == 0) {
                 instrumentCalls = false;
+            } else if ((std::strcmp(argv[i], "-j") == 0 || std::strcmp(argv[i], "--jobs") == 0) && i + 1 < argc) {
+                size_t parsed = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
+                if (parsed >= 1) jobs = parsed;
+            } else if (std::strncmp(argv[i], "-j", 2) == 0 && argv[i][2] >= '0' && argv[i][2] <= '9') {
+                size_t parsed = static_cast<size_t>(std::strtoull(argv[i] + 2, nullptr, 10));
+                if (parsed >= 1) jobs = parsed;
+            } else if (std::strncmp(argv[i], "--jobs=", 7) == 0) {
+                size_t parsed = static_cast<size_t>(std::strtoull(argv[i] + 7, nullptr, 10));
+                if (parsed >= 1) jobs = parsed;
             }
         }
         size_t chunk_mb = 100;
@@ -4195,12 +4211,25 @@ int main(int argc, char **argv) {
         std::remove((outDir + "/mali_mbs2_unopt.ll").c_str());
         std::remove((outDir + "/mali_mbs2_opt.ll").c_str());
 
-        printf("[LLVM Pass 2 & 3] CFGRecoveryAndPicJumpTablePass + AArch64ToLLVMIRLiftingPass (instrument_calls=%d, chunk_mb=%zu)...\n",
-               instrumentCalls ? 1 : 0, chunk_mb);
+        printf("[LLVM Pass 2 & 3] CFGRecoveryAndPicJumpTablePass + AArch64ToLLVMIRLiftingPass (instrument_calls=%d, chunk_mb=%zu, jobs=%zu)...\n",
+               instrumentCalls ? 1 : 0, chunk_mb, jobs);
 
         std::vector<std::string> chunk_objs;
+        std::vector<pid_t> active_pids;
         size_t total_ir_bytes = 0;
         int rc = 0;
+
+        auto reap_one = [&]() {
+            int status = 0;
+            pid_t done = waitpid(-1, &status, 0);
+            if (done > 0) {
+                active_pids.erase(std::remove(active_pids.begin(), active_pids.end(), done), active_pids.end());
+                if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                    rc = 1;
+                }
+            }
+        };
+
         {
             AArch64ToLLVMIRLiftingPass lifter(loader, instrumentCalls);
             lifter.generateChunkedModules(chunk_limit_bytes, [&](const std::string &tag, std::string irText) {
@@ -4212,39 +4241,69 @@ int main(int argc, char **argv) {
                 printf("  [Chunk %s] %zu bytes IR -> optimizing & emitting %s\n",
                        tag.c_str(), irText.size(), chunkObj.c_str());
 
-                LLVMMemoryBufferRef memBuf = nullptr;
-                char *errMsg = nullptr;
                 if (keep_ll) {
-                    {
-                        std::ofstream out(chunkUnopt);
-                        out.write(irText.data(), static_cast<std::streamsize>(irText.size()));
-                    }
-                    std::string().swap(irText);
-                    if (LLVMCreateMemoryBufferWithContentsOfFile(chunkUnopt.c_str(), &memBuf, &errMsg) != 0) {
-                        fprintf(stderr, "Error reading %s: %s\n", chunkUnopt.c_str(), errMsg ? errMsg : "unknown");
-                        rc = 1;
-                        return;
-                    }
-                } else {
-                    memBuf = LLVMCreateMemoryBufferWithMemoryRangeCopy(irText.data(), irText.size(), chunkUnopt.c_str());
+                    std::ofstream out(chunkUnopt);
+                    out.write(irText.data(), static_cast<std::streamsize>(irText.size()));
                     std::string().swap(irText);
                 }
 
-                LLVMContextRef C = LLVMContextCreate();
-                LLVMModuleRef M = nullptr;
-                if (LLVMParseIRInContext(C, memBuf, &M, &errMsg) != 0) {
-                    fprintf(stderr, "LLVM IR Parse Error (%s): %s\n", tag.c_str(), errMsg ? errMsg : "unknown");
+                auto compile_chunk = [&]() -> int {
+                    LLVMMemoryBufferRef memBuf = nullptr;
+                    char *errMsg = nullptr;
+                    if (keep_ll) {
+                        if (LLVMCreateMemoryBufferWithContentsOfFile(chunkUnopt.c_str(), &memBuf, &errMsg) != 0) {
+                            fprintf(stderr, "Error reading %s: %s\n", chunkUnopt.c_str(), errMsg ? errMsg : "unknown");
+                            return 1;
+                        }
+                    } else {
+                        memBuf = LLVMCreateMemoryBufferWithMemoryRangeCopy(irText.data(), irText.size(), chunkUnopt.c_str());
+                        std::string().swap(irText);
+                    }
+
+                    LLVMContextRef C = LLVMContextCreate();
+                    LLVMModuleRef M = nullptr;
+                    if (LLVMParseIRInContext(C, memBuf, &M, &errMsg) != 0) {
+                        fprintf(stderr, "LLVM IR Parse Error (%s): %s\n", tag.c_str(), errMsg ? errMsg : "unknown");
+                        LLVMContextDispose(C);
+                        return 1;
+                    }
+                    int crc = runLoweringAndCodegenOnModule(M, chunkObj.c_str(), false, true, keep_ll ? chunkOpt.c_str() : nullptr);
+                    LLVMDisposeModule(M);
                     LLVMContextDispose(C);
-                    rc = 1;
-                    return;
-                }
-                rc = runLoweringAndCodegenOnModule(M, chunkObj.c_str(), false, true, keep_ll ? chunkOpt.c_str() : nullptr);
-                LLVMDisposeModule(M);
-                LLVMContextDispose(C);
-                if (rc == 0) {
+                    return crc;
+                };
+
+                if (jobs <= 1) {
+                    int crc = compile_chunk();
+                    if (crc != 0) rc = crc;
+                    else chunk_objs.push_back(chunkObj);
+                } else {
+                    while (active_pids.size() >= jobs && rc == 0) {
+                        reap_one();
+                    }
+                    if (rc != 0) return;
+                    std::fflush(stdout);
+                    std::fflush(stderr);
+                    pid_t pid = fork();
+                    if (pid < 0) {
+                        perror("fork");
+                        rc = 1;
+                        return;
+                    }
+                    if (pid == 0) {
+                        int crc = compile_chunk();
+                        std::fflush(stdout);
+                        std::fflush(stderr);
+                        _exit(crc);
+                    }
+                    std::string().swap(irText);
+                    active_pids.push_back(pid);
                     chunk_objs.push_back(chunkObj);
                 }
             });
+            while (!active_pids.empty()) {
+                reap_one();
+            }
             printf("  Lifted instructions : %d (%d PIC jump tables, %d SIMD ops, %d Crypto SHA-1 ops, %d Atomics, total_ir=%zu bytes across %zu chunks)\n",
                    lifter.stats.total_instructions, lifter.stats.jump_tables_lowered, lifter.stats.simd_ops_lifted,
                    lifter.stats.crypto_sha1_lifted, lifter.stats.atomic_ops_lifted, total_ir_bytes, chunk_objs.size());

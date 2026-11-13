@@ -135,7 +135,8 @@ if [ -f "$OUT_DIR/mali_mbs2_aot.o" ] && [ "${MALI_AOT_FORCE_RELIFT:-0}" != "1" ]
     echo "[Cache] Reusing up-to-date $OUT_DIR/mali_mbs2_aot.o (set MALI_AOT_FORCE_RELIFT=1 to force full re-lift)"
 elif [ -n "$SO_PATH" ] && [ -f "$SO_PATH" ]; then
     export MALI_AOT_CHUNK_MB=20
-    "$PASS_DRIVER" --lift-so "$SO_PATH" "$OUT_DIR" --hook-Vulkan-calls
+    export MALI_AOT_JOBS=8
+    "$PASS_DRIVER" --lift-so "$SO_PATH" "$OUT_DIR" --hook-Vulkan-calls -j 8
     if [ -n "$CUR_STAMP" ]; then
         echo "$CUR_STAMP" > "$STAMP_FILE"
     fi
