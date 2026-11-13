@@ -367,6 +367,28 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
    set(AOT_MBS2_OBJ "${CMAKE_BINARY_DIR}/r54p3_lifted.o")
    set_source_files_properties("${AOT_MBS2_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 
+   add_executable(mali_llvm_pass_driver
+      src/aot/src/mali_llvm_passes.cpp
+   )
+   target_link_libraries(mali_llvm_pass_driver PRIVATE dl ${PLATFORM_LIBS})
+   set_target_properties(mali_llvm_pass_driver PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${AOT_DIR}"
+   )
+
+   set(AOT_ICD_SO "${CMAKE_BINARY_DIR}/libvulkan_mali_aot_icd.so")
+   set(AOT_JSON   "${CMAKE_BINARY_DIR}/mali_aot_icd.x86_64.json")
+
+   add_custom_command(
+      OUTPUT "${AOT_MBS2_OBJ}"
+      COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/translate.sh" ddk/libGLES_mali.so "${CMAKE_BINARY_DIR}"
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+      DEPENDS mali_llvm_pass_driver
+              horizon2llvm
+              "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/translate.sh"
+      COMMENT "Lifting ddk/libGLES_mali.so -> r54p3_lifted.o (translate.sh)"
+   )
+   add_custom_target(r54p3_lifted_obj DEPENDS "${AOT_MBS2_OBJ}")
+
    add_library(r54p3_vulkan_icd SHARED
       src/r54p3_vulkan_icd/mali_icd_internal.cpp
       src/r54p3_vulkan_icd/mali_icd_physdev.cpp
@@ -375,7 +397,7 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
       src/r54p3_vulkan_icd/r54p3_vulkan_icd.cpp
       "${AOT_MBS2_OBJ}"
    )
-   add_dependencies(r54p3_vulkan_icd aot_targets)
+   add_dependencies(r54p3_vulkan_icd r54p3_lifted_obj)
    target_include_directories(r54p3_vulkan_icd PRIVATE
       "${CMAKE_CURRENT_SOURCE_DIR}/include"
       "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd"
@@ -389,41 +411,17 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
    )
    file(WRITE "${CMAKE_BINARY_DIR}/r54p3_decompiled_icd.x86_64.json" "{\n    \"file_format_version\": \"1.0.0\",\n    \"ICD\": {\n        \"library_path\": \"./libr54p3_vulkan_icd.so\",\n        \"api_version\": \"1.3.250\"\n    }\n}\n")
    file(WRITE "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json" "{\n    \"file_format_version\": \"1.0.0\",\n    \"ICD\": {\n        \"library_path\": \"./libr54p3_vulkan_icd.so\",\n        \"api_version\": \"1.3.250\"\n    }\n}\n")
+   file(WRITE "${AOT_JSON}" "{\n    \"file_format_version\": \"1.0.0\",\n    \"ICD\": {\n        \"library_path\": \"./libvulkan_mali_aot_icd.so\",\n        \"api_version\": \"1.3.250\"\n    }\n}\n")
+   file(WRITE "${AOT_DIR}/mali_aot_icd.x86_64.json" "{\n    \"file_format_version\": \"1.0.0\",\n    \"ICD\": {\n        \"library_path\": \"./libvulkan_mali_aot_icd.so\",\n        \"api_version\": \"1.3.250\"\n    }\n}\n")
    add_custom_command(TARGET r54p3_vulkan_icd POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:r54p3_vulkan_icd> "${CMAKE_BINARY_DIR}/libr54p3_vulkan_icd.so"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:r54p3_vulkan_icd> "${AOT_ICD_SO}"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:r54p3_vulkan_icd> "${AOT_DIR}/libvulkan_mali_aot_icd.so"
       COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:r54p3_vulkan_icd> "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/lib/libr54p3_vulkan_icd.so"
    )
 
-   add_executable(mali_llvm_pass_driver
-      src/aot/src/mali_llvm_passes.cpp
-   )
-   target_link_libraries(mali_llvm_pass_driver PRIVATE dl ${PLATFORM_LIBS})
-   set_target_properties(mali_llvm_pass_driver PROPERTIES
-      RUNTIME_OUTPUT_DIRECTORY "${AOT_DIR}"
-   )
-
-   set(AOT_ICD_SO "${CMAKE_BINARY_DIR}/libvulkan_mali_aot_icd.so")
-   set(AOT_JSON   "${CMAKE_BINARY_DIR}/mali_aot_icd.x86_64.json")
-
-   add_custom_command(
-      OUTPUT "${AOT_ICD_SO}" "${AOT_JSON}" "${AOT_MBS2_OBJ}"
-      COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/translate.sh" ddk/libGLES_mali.so "${CMAKE_BINARY_DIR}"
-      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-      DEPENDS mali_kbase_emu
-              panthor_kbase_adapter
-              mali_kbase_emu_static
-              panthor_kbase_adapter_static
-              mali_llvm_pass_driver
-              horizon2llvm
-              "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/mali_vulkan_icd.cpp"
-              "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/mali_icd_internal.h"
-              "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/mali_icd_wsi.cpp"
-              "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/mali_icd_physdev.cpp"
-      COMMENT "Running 64-bit Mali AOT translation pipeline (translate.sh)"
-   )
-
    add_custom_target(aot_targets ALL
-      DEPENDS "${AOT_ICD_SO}"
+      DEPENDS r54p3_vulkan_icd
    )
    set_property(DIRECTORY APPEND PROPERTY ADDITIONAL_CLEAN_FILES
       "${CMAKE_BINARY_DIR}/mali_mbs2_unopt.ll"

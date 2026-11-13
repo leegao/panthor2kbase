@@ -201,158 +201,58 @@ void vkGetPhysicalDeviceProperties(void* physicalDevice, void* pProperties) {
     }
 }
 
+#include "generated/mali_physdev_wrappers_autogen.inc"
+
 __attribute__((visibility("default")))
 void vkGetPhysicalDeviceProperties2(void* physicalDevice, void* pProperties2) {
     if (!pProperties2) return;
-    vkGetPhysicalDeviceProperties(physicalDevice, static_cast<uint8_t*>(pProperties2) + 16);
-
-    const uint8_t kDevUuid[16] = {'M','A','L','I','-','G','6','1','5','-','D','E','V','I','C','E'};
-    const uint8_t kDrvUuid[16] = {'A','R','M','-','M','A','L','I','-','R','5','4','P','3','-','0'};
-
-    // Walk pNext chain for vulkaninfo & Vulkan 1.1/1.2/1.3/Extension property queries
-    auto* cur = reinterpret_cast<VkBaseOutStructure*>(pProperties2)->pNext;
-    while (cur) {
-        uint8_t* raw = reinterpret_cast<uint8_t*>(cur);
-        switch (cur->sType) {
-            case 49U: { // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES
-                std::memcpy(raw + 16, kDevUuid, 16);
-                std::memcpy(raw + 32, kDrvUuid, 16);
-                *reinterpret_cast<uint32_t*>(raw + 60) = 0U;   // deviceLUIDValid
-                *reinterpret_cast<uint32_t*>(raw + 64) = 16U;  // subgroupSize (Valhall warp width = 16)
-                *reinterpret_cast<uint32_t*>(raw + 68) = 0x3FU;// subgroupSupportedStages
-                *reinterpret_cast<uint32_t*>(raw + 72) = 0x1FFU;// subgroupSupportedOperations
-                *reinterpret_cast<uint32_t*>(raw + 76) = 1U;   // subgroupQuadOperationsInAllStages
-                *reinterpret_cast<uint32_t*>(raw + 88) = 1U;   // maxMultiviewViewCount = 8
-                *reinterpret_cast<uint32_t*>(raw + 96) = 1024U;// maxPerSetDescriptors
-                *reinterpret_cast<uint64_t*>(raw + 104)= (4ULL << 30); // maxMemoryAllocationSize
-                break;
-            }
-            case 51U: { // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES
-                *reinterpret_cast<uint32_t*>(raw + 16) = 9U; // VK_DRIVER_ID_ARM_PROPRIETARY
-                std::snprintf(reinterpret_cast<char*>(raw + 20), 256, "Arm Proprietary (AOT libGLES_mali.so)");
-                std::snprintf(reinterpret_cast<char*>(raw + 276), 256, "%s", g_aot_rt.mapper.driver_version.c_str());
-                raw[532] = 1; raw[533] = 3; raw[534] = 7; raw[535] = 2; // conformanceVersion 1.3.7.2
-                *reinterpret_cast<uint32_t*>(raw + 536) = 1U; // denormBehaviorIndependence
-                *reinterpret_cast<uint32_t*>(raw + 540) = 1U; // roundingModeIndependence
-                *reinterpret_cast<uint32_t*>(raw + 636) = 0x0FU; // supportedDepthResolveModes
-                *reinterpret_cast<uint32_t*>(raw + 640) = 0x0FU; // supportedStencilResolveModes
-                *reinterpret_cast<uint32_t*>(raw + 652) = 64U;   // maxTimelineSemaphoreValueDifference
-                break;
-            }
-            case 53U: { // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES
-                *reinterpret_cast<uint32_t*>(raw + 16) = 16U;  // minSubgroupSize
-                *reinterpret_cast<uint32_t*>(raw + 20) = 16U;  // maxSubgroupSize
-                *reinterpret_cast<uint32_t*>(raw + 24) = 64U;  // maxComputeWorkgroupSubgroups
-                *reinterpret_cast<uint32_t*>(raw + 28) = 0x3FU;// requiredSubgroupSizeStages
-                *reinterpret_cast<uint32_t*>(raw + 32) = 4096U;// maxInlineUniformBlockSize
-                *reinterpret_cast<uint32_t*>(raw + 36) = 16U;  // maxPerStageDescriptorInlineUniformBlocks
-                *reinterpret_cast<uint64_t*>(raw + 128)= (4ULL << 30); // maxBufferSize
-                break;
-            }
-            case 1000196000U: { // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES
-                *reinterpret_cast<uint32_t*>(raw + 16) = 9U; // VK_DRIVER_ID_ARM_PROPRIETARY
-                std::snprintf(reinterpret_cast<char*>(raw + 20), 256, "Arm Proprietary (AOT libGLES_mali.so)");
-                std::snprintf(reinterpret_cast<char*>(raw + 276), 256, "%s", g_aot_rt.mapper.driver_version.c_str());
-                raw[532] = 1; raw[533] = 3; raw[534] = 7; raw[535] = 2;
-                break;
-            }
-            case 1000071004U: { // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES
-                std::memcpy(raw + 16, kDevUuid, 16);
-                std::memcpy(raw + 32, kDrvUuid, 16);
-                *reinterpret_cast<uint32_t*>(raw + 60) = 0U;
-                break;
-            }
-            case 1000094000U: { // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES
-                *reinterpret_cast<uint32_t*>(raw + 16) = 16U;
-                *reinterpret_cast<uint32_t*>(raw + 20) = 0x3FU;
-                *reinterpret_cast<uint32_t*>(raw + 24) = 0x1FFU;
-                *reinterpret_cast<uint32_t*>(raw + 28) = 1U;
-                break;
-            }
-            case 1000080000U: { // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR
-                *reinterpret_cast<uint32_t*>(raw + 16) = 32U;
-                break;
-            }
-            case 1000168000U: { // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES
-                *reinterpret_cast<uint32_t*>(raw + 16) = 1024U;
-                *reinterpret_cast<uint64_t*>(raw + 24) = (4ULL << 30);
-                break;
-            }
-            case 1000413001U: { // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES
-                *reinterpret_cast<uint64_t*>(raw + 16) = (4ULL << 30);
-                break;
-            }
-            default:
-                break;
-        }
-        cur = cur->pNext;
-    }
+    aot_forward_vkGetPhysicalDeviceProperties2(
+        static_cast<VkPhysicalDevice>(physicalDevice),
+        static_cast<VkPhysicalDeviceProperties2*>(pProperties2));
 }
 
 __attribute__((visibility("default")))
 VkResult vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice, const char* pLayerName, uint32_t* pPropertyCount, VkExtensionProperties* pProperties) {
     if (!pPropertyCount) return VK_ERROR_INITIALIZATION_FAILED;
-    g_aot_rt.ensureInitialized();
-    auto* pdev = reinterpret_cast<MaliIcdPhysicalDevice*>(physicalDevice);
-    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkEnumerateDeviceExtensionProperties && pdev) {
-        if (pLayerName && pLayerName[0] != '\0') {
-            std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
-            pdev->initAotInternalLayout();
-            VkResult r = mali_aapcs64::invokeLiftedAapcs64<VkResult>(
-                g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkEnumerateDeviceExtensionProperties,
-                pdev->aot_internal, pLayerName, pPropertyCount, pProperties);
-            g_aot_rt.lifted_vk_calls_executed++;
-            return r;
-        }
-        std::vector<VkExtensionProperties> exts;
-        {
-            std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
-            pdev->initAotInternalLayout();
-            uint32_t aot_count = 0;
-            VkResult r = mali_aapcs64::invokeLiftedAapcs64<VkResult>(
-                g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkEnumerateDeviceExtensionProperties,
-                pdev->aot_internal, pLayerName, &aot_count, static_cast<VkExtensionProperties*>(nullptr));
-            g_aot_rt.lifted_vk_calls_executed++;
-            if (r == VK_SUCCESS && aot_count > 0) {
-                exts.resize(aot_count);
-                r = mali_aapcs64::invokeLiftedAapcs64<VkResult>(
-                    g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkEnumerateDeviceExtensionProperties,
-                    pdev->aot_internal, pLayerName, &aot_count, exts.data());
-                g_aot_rt.lifted_vk_calls_executed++;
-                if (r == VK_SUCCESS || r == VK_INCOMPLETE) {
-                    exts.resize(aot_count);
-                } else {
-                    exts.clear();
-                }
-            }
-        }
-        bool has_swapchain = false;
-        for (const auto& e : exts) {
-            if (std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0) {
-                has_swapchain = true;
-                break;
-            }
-        }
-        if (!has_swapchain) {
-            VkExtensionProperties swapchain_ext{};
-            std::snprintf(swapchain_ext.extensionName, sizeof(swapchain_ext.extensionName), "%s", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-            swapchain_ext.specVersion = VK_KHR_SWAPCHAIN_SPEC_VERSION;
-            exts.push_back(swapchain_ext);
-        }
-        if (!pProperties) {
-            *pPropertyCount = static_cast<uint32_t>(exts.size());
-            return VK_SUCCESS;
-        }
-        uint32_t to_copy = std::min(*pPropertyCount, static_cast<uint32_t>(exts.size()));
-        if (to_copy > 0) {
-            std::memcpy(pProperties, exts.data(), to_copy * sizeof(VkExtensionProperties));
-        }
-        *pPropertyCount = to_copy;
-        return (to_copy < exts.size()) ? VK_INCOMPLETE : VK_SUCCESS;
+    if (pLayerName && pLayerName[0] != '\0') {
+        return aot_forward_vkEnumerateDeviceExtensionProperties(physicalDevice, pLayerName, pPropertyCount, pProperties);
     }
-    return VK_ERROR_INITIALIZATION_FAILED;
-}
+    uint32_t aot_count = 0;
+    VkResult r = aot_forward_vkEnumerateDeviceExtensionProperties(physicalDevice, pLayerName, &aot_count, nullptr);
+    if (r != VK_SUCCESS) return r;
 
-#include "generated/mali_physdev_wrappers_autogen.inc"
+    std::vector<VkExtensionProperties> exts(aot_count);
+    if (aot_count > 0) {
+        r = aot_forward_vkEnumerateDeviceExtensionProperties(physicalDevice, pLayerName, &aot_count, exts.data());
+        if (r == VK_SUCCESS || r == VK_INCOMPLETE) {
+            exts.resize(aot_count);
+        } else {
+            exts.clear();
+        }
+    }
+    bool has_swapchain = false;
+    for (const auto& e : exts) {
+        if (std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0) {
+            has_swapchain = true;
+            break;
+        }
+    }
+    if (!has_swapchain) {
+        VkExtensionProperties swapchain_ext{};
+        std::snprintf(swapchain_ext.extensionName, sizeof(swapchain_ext.extensionName), "%s", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+        swapchain_ext.specVersion = VK_KHR_SWAPCHAIN_SPEC_VERSION;
+        exts.push_back(swapchain_ext);
+    }
+    if (!pProperties) {
+        *pPropertyCount = static_cast<uint32_t>(exts.size());
+        return VK_SUCCESS;
+    }
+    uint32_t to_copy = std::min(*pPropertyCount, static_cast<uint32_t>(exts.size()));
+    if (to_copy > 0) {
+        std::memcpy(pProperties, exts.data(), to_copy * sizeof(VkExtensionProperties));
+    }
+    *pPropertyCount = to_copy;
+    return (to_copy < exts.size()) ? VK_INCOMPLETE : VK_SUCCESS;
+}
 
 } // extern "C"

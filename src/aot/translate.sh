@@ -141,77 +141,15 @@ elif [ -n "$SO_PATH" ] && [ -f "$SO_PATH" ]; then
         echo "$CUR_STAMP" > "$STAMP_FILE"
     fi
 elif [ ! -f "$OUT_DIR/r54p3_lifted.o" ]; then
-    echo "[WARN] Input $SO_ARG not present (e.g. clean GitHub Actions CI checkout); synthesizing CI stub r54p3_lifted.o..."
-    cat << 'STUB_EOF' > "$OUT_DIR/r54p3_lifted_stub.c"
-#include <stdint.h>
-struct AOTCPUState { uint64_t x[31]; uint64_t sp; uint64_t pc; uint64_t tpidr_el0; __uint128_t v[32]; };
-uint64_t aot_get_lifted_vk_entrypoint_count(void) { return 456ULL; }
-void aot_vkCreateInstance(struct AOTCPUState* cpu) { if (cpu) cpu->x[0] = 0; }
-void aot_vkCreateDevice(struct AOTCPUState* cpu) { if (cpu) cpu->x[0] = 0; }
-void aot_vkQueueSubmit(struct AOTCPUState* cpu) { if (cpu) cpu->x[0] = 0; }
-void aot_vkCmdDraw(struct AOTCPUState* cpu) { if (cpu) cpu->x[0] = 0; }
-void aot_vkCmdDrawIndexed(struct AOTCPUState* cpu) { if (cpu) cpu->x[0] = 0; }
-STUB_EOF
-    gcc -O2 -fPIC -c "$OUT_DIR/r54p3_lifted_stub.c" -o "$OUT_DIR/r54p3_lifted.o"
-    rm -f "$OUT_DIR/r54p3_lifted_stub.c"
+    echo "[ERROR] Input $SO_ARG not found and $OUT_DIR/r54p3_lifted.o does not exist." >&2
+    exit 1
 fi
-
-EXTRA_AOT_OBJS=()
-if [ -f "$OUT_DIR/mali_lifted_16384.o" ]; then
-    EXTRA_AOT_OBJS+=("$OUT_DIR/mali_lifted_16384.o")
-fi
-
-BUILD_HOST_DIR="${2:-${BUILD_DIR:-$REPO_ROOT/build-x86-64}}"
-
-# Ensure shared and static adapter and emulator libraries are compiled in $BUILD_HOST_DIR
-if [ ! -f "$BUILD_HOST_DIR/libmali_kbase_emu.so" ] || [ ! -f "$BUILD_HOST_DIR/libpanthor_kbase_adapter.so" ]; then
-    CMAKE_BIN="$("${REPO_ROOT}/scripts/find_cmake.sh")"
-    "$CMAKE_BIN" -S "$REPO_ROOT" -B "$BUILD_HOST_DIR" -DCMAKE_BUILD_TYPE=Release
-    "$CMAKE_BIN" --build "$BUILD_HOST_DIR" --target mali_kbase_emu panthor_kbase_adapter mali_kbase_emu_static panthor_kbase_adapter_static
-fi
-
-DYN_EMU="-Wl,--no-as-needed -L$BUILD_HOST_DIR -L$BUILD_HOST_DIR/emulator -lmali_kbase_emu"
-AOT_RPATH='$ORIGIN:$ORIGIN/..:$ORIGIN/../..:$ORIGIN/../../..:$ORIGIN/emulator:$ORIGIN/../emulator:$ORIGIN/adapter:$ORIGIN/../adapter:$ORIGIN/../../../../build-x86-64:$ORIGIN/../../../build-x86-64'
-
-echo "[Link] Dynamically linking libmali_kbase_emu.so into ICD..."
-g++ -O2 -std=c++17 -fno-strict-aliasing -shared -fPIC \
-    -Wl,-Bsymbolic -Wl,-Bsymbolic-functions \
-    -I"$REPO_ROOT/src/r54p3_vulkan_icd" -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
-    -I"$REPO_ROOT/include" -I"$REPO_ROOT/src/adapter" -I"$REPO_ROOT/src/emulator" \
-    "$REPO_ROOT/src/r54p3_vulkan_icd/mali_icd_internal.cpp" \
-    "$REPO_ROOT/src/r54p3_vulkan_icd/mali_icd_physdev.cpp" \
-    "$REPO_ROOT/src/r54p3_vulkan_icd/mali_icd_wsi.cpp" \
-    "$REPO_ROOT/src/r54p3_vulkan_icd/mali_vulkan_icd.cpp" \
-    "$REPO_ROOT/src/r54p3_vulkan_icd/r54p3_vulkan_icd.cpp" \
-    "$OUT_DIR/r54p3_lifted.o" "${EXTRA_AOT_OBJS[@]}" \
-    $DYN_EMU -ldl -lm -lpthread \
-    -Wl,-rpath,"$AOT_RPATH" \
-    -o "$OUT_DIR/libvulkan_mali_aot_icd.so"
 
 if [ "${MALI_AOT_KEEP_LL:-1}" = "0" ]; then
     rm -f "$OUT_DIR/mali_mbs2_unopt.ll" "$OUT_DIR/mali_mbs2_opt.ll" "$OUT_DIR"/mali_mbs2_chunk_*.ll "$OUT_DIR"/mali_mbs2_wrappers_*.ll
 fi
-cat << JSON_EOF > "$OUT_DIR/mali_aot_icd.x86_64.json"
-{
-    "file_format_version": "1.0.0",
-    "ICD": {
-        "library_path": "./libvulkan_mali_aot_icd.so",
-        "api_version": "1.3.250"
-    }
-}
-JSON_EOF
-
-if [ -d "$BUILD_HOST_DIR" ]; then
-    mkdir -p "$BUILD_HOST_DIR/aot"
-    cp -f "$OUT_DIR/libvulkan_mali_aot_icd.so" "$BUILD_HOST_DIR/libvulkan_mali_aot_icd.so" 2>/dev/null || true
-    cp -f "$OUT_DIR/libvulkan_mali_aot_icd.so" "$BUILD_HOST_DIR/aot/libvulkan_mali_aot_icd.so" 2>/dev/null || true
-    cp -f "$OUT_DIR/mali_aot_icd.x86_64.json" "$BUILD_HOST_DIR/mali_aot_icd.x86_64.json" 2>/dev/null || true
-    cp -f "$OUT_DIR/mali_aot_icd.x86_64.json" "$BUILD_HOST_DIR/aot/mali_aot_icd.x86_64.json" 2>/dev/null || true
-    cp -f "$OUT_DIR/r54p3_lifted.o" "$BUILD_HOST_DIR/aot/r54p3_lifted.o" 2>/dev/null || true
-fi
 
 echo "================================================================================"
-echo " [SUCCESS] 64-Bit C++ LLVM AOT Translation Complete!"
+echo " [SUCCESS] 64-Bit C++ LLVM AOT Lift Complete!"
 echo "   x86-64 Object  : $OUT_DIR/r54p3_lifted.o"
-echo "   Vulkan ICD     : $OUT_DIR/libvulkan_mali_aot_icd.so"
 echo "================================================================================"

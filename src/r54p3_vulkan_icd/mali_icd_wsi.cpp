@@ -566,7 +566,7 @@ int32_t vkGetFenceStatus(void* device, uint64_t fence) {
     if (dev && dev->aot_cctx_mem.size() > 0xc1 && dev->aot_cctx_mem[0xc1] != 0) {
         return -4; /* VK_ERROR_DEVICE_LOST (checked at 0x00964fd0 in libGLES_mali.so) */
     }
-    if (fence && fence != 0xFE000001ULL) {
+    if (fence) {
         auto* f = reinterpret_cast<MaliIcdFence*>(fence);
         if (dev && aot_vkGetFenceStatus && !dev->aot_vk_device_mem.empty() && f->aot_fence_mem.size() > 593) {
             f->aot_fence_mem[593] = f->signaled ? 1U : 0U;

@@ -28,9 +28,18 @@ PHYSDEV_COMMANDS = [
     "vkGetPhysicalDeviceExternalFenceProperties",
     "vkGetPhysicalDeviceExternalSemaphoreProperties",
     "vkEnumeratePhysicalDeviceGroups",
-    # vkEnumerateDeviceExtensionProperties is implemented in mali_icd_physdev.cpp so it can
-    # append VK_KHR_swapchain when libGLES_mali.so omits it.
 ]
+
+# Manually implemented in src/r54p3_vulkan_icd/mali_icd_physdev.cpp, but we still
+# auto-generate `aot_forward_<Name>(...)` helpers from specs/vk.xml so the manual
+# wrappers don't duplicate runtime init / lock / AAPCS64 thunking boilerplate:
+#   - vkEnumerateDeviceExtensionProperties: appends VK_KHR_swapchain when libGLES_mali.so omits it.
+#   - vkGetPhysicalDeviceProperties2: uses (pdev->aot_internal + 1024 + 8) shifted view.
+#   - vkGetPhysicalDeviceProperties: uses (pdev->aot_internal + 1024) shifted view.
+MANUAL_PHYSDEV_FORWARDERS: dict[str, int] = {
+    "vkEnumerateDeviceExtensionProperties": 0,
+    "vkGetPhysicalDeviceProperties2": 1024 + 8,
+}
 
 DEVICE_COMMANDS = [
     "vkCreateDevice",
@@ -169,6 +178,41 @@ def emit_physdev_wrappers(cmds: dict[str, tuple[str, list[tuple[str, str]]]]) ->
             aot_first = first_arg
 
         call_args = ", ".join([aot_first] + rest_args)
+        if ret_type == "void":
+            lines.append("        mali_aapcs64::invokeLiftedAapcs64<void>(")
+            lines.append(f"            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_{name},")
+            lines.append(f"            {call_args});")
+            lines.append("        g_aot_rt.lifted_vk_calls_executed++;")
+            lines.append("        return;")
+        else:
+            lines.append(f"        {ret_type} r = mali_aapcs64::invokeLiftedAapcs64<{ret_type}>(")
+            lines.append(f"            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_{name},")
+            lines.append(f"            {call_args});")
+            lines.append("        g_aot_rt.lifted_vk_calls_executed++;")
+            lines.append("        return r;")
+        lines.append("    }")
+        if ret_type == "VkResult":
+            lines.append("    return VK_ERROR_INITIALIZATION_FAILED;")
+        elif ret_type != "void":
+            lines.append(f"    return {ret_type}{{}};")
+        lines.append("}")
+        lines.append("")
+
+    for name, aot_offset in MANUAL_PHYSDEV_FORWARDERS.items():
+        ret_type, params = cmds[name]
+        sig = ", ".join(f"{t} {a}" for t, a in params)
+        first_type, first_arg = params[0]
+        rest_args = [a for _, a in params[1:]]
+        assert first_type == "VkPhysicalDevice"
+        aot_first = f"pdev->aot_internal + {aot_offset}" if aot_offset else "pdev->aot_internal"
+        call_args = ", ".join([aot_first] + rest_args)
+
+        lines.append(f"static inline {ret_type} aot_forward_{name}({sig}) {{")
+        lines.append("    g_aot_rt.ensureInitialized();")
+        lines.append(f"    auto* pdev = reinterpret_cast<MaliIcdPhysicalDevice*>({first_arg});")
+        lines.append(f"    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_{name} && pdev) {{")
+        lines.append("        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);")
+        lines.append("        pdev->initAotInternalLayout();")
         if ret_type == "void":
             lines.append("        mali_aapcs64::invokeLiftedAapcs64<void>(")
             lines.append(f"            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_{name},")

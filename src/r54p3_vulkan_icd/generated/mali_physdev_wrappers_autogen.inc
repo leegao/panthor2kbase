@@ -262,3 +262,32 @@ VkResult vkEnumeratePhysicalDeviceGroups(VkInstance instance, uint32_t* pPhysica
     }
     return VK_ERROR_INITIALIZATION_FAILED;
 }
+
+static inline VkResult aot_forward_vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice, const char* pLayerName, uint32_t* pPropertyCount, VkExtensionProperties* pProperties) {
+    g_aot_rt.ensureInitialized();
+    auto* pdev = reinterpret_cast<MaliIcdPhysicalDevice*>(physicalDevice);
+    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkEnumerateDeviceExtensionProperties && pdev) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        pdev->initAotInternalLayout();
+        VkResult r = mali_aapcs64::invokeLiftedAapcs64<VkResult>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkEnumerateDeviceExtensionProperties,
+            pdev->aot_internal, pLayerName, pPropertyCount, pProperties);
+        g_aot_rt.lifted_vk_calls_executed++;
+        return r;
+    }
+    return VK_ERROR_INITIALIZATION_FAILED;
+}
+
+static inline void aot_forward_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2* pProperties) {
+    g_aot_rt.ensureInitialized();
+    auto* pdev = reinterpret_cast<MaliIcdPhysicalDevice*>(physicalDevice);
+    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkGetPhysicalDeviceProperties2 && pdev) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        pdev->initAotInternalLayout();
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkGetPhysicalDeviceProperties2,
+            pdev->aot_internal + 1032, pProperties);
+        g_aot_rt.lifted_vk_calls_executed++;
+        return;
+    }
+}

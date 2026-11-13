@@ -1197,7 +1197,7 @@ int32_t vkCreateFence(void* device, const void* pCreateInfo, const void* /*pAllo
 }
 __attribute__((visibility("default")))
 void vkDestroyFence(void* device, uint64_t fence, const void* /*pAllocator*/) {
-    if (!fence || fence == 0xFE000001ULL) return;
+    if (!fence) return;
     auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* f   = reinterpret_cast<MaliIcdFence*>(fence);
     if (dev && aot_vkDestroyFence && !f->aot_fence_mem.empty()) {
@@ -1218,7 +1218,7 @@ int32_t vkWaitForFences(void* device, uint32_t c, const uint64_t* p, uint32_t /*
     }
     if (p) {
         for (uint32_t i = 0; i < c; ++i) {
-            if (p[i] && p[i] != 0xFE000001ULL) {
+            if (p[i]) {
                 auto* f = reinterpret_cast<MaliIcdFence*>(p[i]);
                 f->signaled = true;
                 if (f->aot_fence_mem.size() > 593) f->aot_fence_mem[593] = 1U;
@@ -1232,7 +1232,7 @@ int32_t vkResetFences(void* device, uint32_t c, const uint64_t* p) {
     auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (p) {
         for (uint32_t i = 0; i < c; ++i) {
-            if (p[i] && p[i] != 0xFE000001ULL) {
+            if (p[i]) {
                 auto* f = reinterpret_cast<MaliIcdFence*>(p[i]);
                 f->signaled = false;
                 if (dev && aot_vkResetFences && !f->aot_fence_mem.empty()) {
@@ -1719,7 +1719,7 @@ VkResult vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* 
     if (dev->aot_cctx_mem.size() > 0xc1 && dev->aot_cctx_mem[0xc1] != 0) {
         return VK_ERROR_DEVICE_LOST; /* (checked at 0x009828b4 in libGLES_mali.so) */
     }
-    if (fence && reinterpret_cast<uint64_t>(fence) != 0xFE000001ULL) reinterpret_cast<MaliIcdFence*>(fence)->signaled = true;
+    if (fence) reinterpret_cast<MaliIcdFence*>(fence)->signaled = true;
 
     const auto* submits = pSubmits;
     for (uint32_t s = 0; s < submitCount; ++s) {
@@ -1939,7 +1939,7 @@ VkResult vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* 
             }
         }
     }
-    if (fence && reinterpret_cast<uint64_t>(fence) != 0xFE000001ULL) {
+    if (fence) {
         reinterpret_cast<MaliIcdFence*>(fence)->signaled = true;
     }
     return VK_SUCCESS;
