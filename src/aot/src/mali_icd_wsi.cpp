@@ -837,23 +837,27 @@ int32_t vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const void* 
             std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
             auto& cpu = g_aot_rt.cpu;
             uint64_t va_pages = 0;
-            uint64_t out_flags = umm_flags;
+            // Exact r54p3 base_mem_import_padded (0x01c6a260) AAPCS64 signature:
+            //   x0 = kctx, w1 = type (BASE_MEM_IMPORT_TYPE_UMM = 2), x2 = &dmabuf_fd (phandle),
+            //   x3 = in_flags, w4 = padding (0), x5 = &va_pages -> returns (gpu_va | (out_flags & 0xFFF)) in x0
+            g_aot_rt.resetGuestStackLocked();
             cpu.x[0] = reinterpret_cast<uint64_t>(dev->kctx_mem.data());
             cpu.x[1] = 2ULL; // BASE_MEM_IMPORT_TYPE_UMM
-            cpu.x[2] = static_cast<uint32_t>(dmabuf_fd);
-            cpu.x[3] = reinterpret_cast<uint64_t>(&va_pages);
-            cpu.x[4] = reinterpret_cast<uint64_t>(&w_gpu_va);
-            cpu.x[5] = reinterpret_cast<uint64_t>(&out_flags);
+            cpu.x[2] = reinterpret_cast<uint64_t>(&dmabuf_fd);
+            cpu.x[3] = umm_flags;
+            cpu.x[4] = 0ULL;
+            cpu.x[5] = reinterpret_cast<uint64_t>(&va_pages);
             aot_kbase_mem_import(&cpu);
         }
-        if (w_gpu_va == 0) {
+        {
             int32_t mfd = (dev && dev->mali_fd >= 0) ? dev->mali_fd : 100;
             KbaseIoctlMemImport imp{};
             imp.in.flags = umm_flags;
             imp.in.phandle = reinterpret_cast<uint64_t>(&dmabuf_fd);
             imp.in.type = BASE_MEM_IMPORT_TYPE_UMM;
             bionic_mali_kbase_ioctl_stub(static_cast<uint64_t>(mfd), 0xc0188016U, reinterpret_cast<uint64_t>(&imp));
-            w_gpu_va = bionic_mali_mmap_stub(0, imp.out.va_pages * 4096ULL, PROT_READ | PROT_WRITE, MAP_SHARED, static_cast<uint64_t>(mfd), imp.out.gpu_va);
+            uint64_t req_pages = std::max<uint64_t>(imp.out.va_pages, (byte_sz + 4095ULL) / 4096ULL);
+            w_gpu_va = bionic_mali_mmap_stub(0, req_pages * 4096ULL, PROT_READ | PROT_WRITE, MAP_SHARED, static_cast<uint64_t>(mfd), imp.out.gpu_va);
         }
 
         auto* img = new MaliIcdImage();

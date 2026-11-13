@@ -1569,17 +1569,27 @@ public:
 
         uint32_t w_ldrb = 0, w_adr = 0;
         uint64_t ldrb_pc = 0, adr_pc = 0;
-        for (uint64_t back = 4; back <= 20 && pc >= faddr + back; back += 4) {
+        uint32_t elem_sz = 0;
+        for (uint64_t back = 4; back <= 24 && pc >= faddr + back; back += 4) {
             uint32_t w = readU32(loader.elf, pc - back);
             if (w_ldrb == 0 && (w & 0xFFE00C00U) == 0x38600800U) {
                 w_ldrb = w;
                 ldrb_pc = pc - back;
+                elem_sz = 1;
+            } else if (w_ldrb == 0 && (w & 0xFFE00C00U) == 0x78600800U) {
+                w_ldrb = w;
+                ldrb_pc = pc - back;
+                elem_sz = 2;
+            } else if (w_ldrb == 0 && ((w & 0xFFE00C00U) == 0xB8600800U || (w & 0xFFE00C00U) == 0xB8A00800U)) {
+                w_ldrb = w;
+                ldrb_pc = pc - back;
+                elem_sz = 4;
             } else if (w_adr == 0 && (w & 0x9F000000U) == 0x10000000U) {
                 w_adr = w;
                 adr_pc = pc - back;
             }
         }
-        if (w_ldrb == 0 || w_adr == 0) return targets;
+        if (w_ldrb == 0 || w_adr == 0 || elem_sz == 0) return targets;
 
         unsigned tbl_reg = (w_ldrb >> 5) & 0x1FU;
         unsigned idx_reg = (w_ldrb >> 16) & 0x1FU;
@@ -1617,7 +1627,7 @@ public:
                 }
             }
         }
-        if (max_idx < 0 || max_idx > 256) return targets;
+        if (max_idx < 0 || max_idx > 4096) return targets;
 
         int64_t imm21 = sext64(((w_adrp >> 5) & 0x7FFFFU) << 2 | ((w_adrp >> 29) & 3U), 21);
         uint64_t page = (adrp_pc & ~0xFFFULL) + static_cast<uint64_t>(imm21 << 12);
@@ -1626,8 +1636,21 @@ public:
         int64_t adr_imm = sext64(((w_adr >> 5) & 0x7FFFFU) << 2 | ((w_adr >> 29) & 3U), 21);
         uint64_t base_addr = static_cast<uint64_t>(static_cast<int64_t>(adr_pc) + adr_imm);
         for (int idx = 0; idx <= max_idx; ++idx) {
-            uint8_t b = loader.elf[tbl_addr + idx];
-            uint64_t t_rva = base_addr + (static_cast<uint64_t>(b) << 2);
+            uint64_t eoff = tbl_addr + static_cast<uint64_t>(idx) * elem_sz;
+            if (eoff + elem_sz > loader.elf.size()) break;
+            int64_t sval = 0;
+            if (elem_sz == 1) {
+                sval = static_cast<int64_t>(loader.elf[eoff]);
+            } else if (elem_sz == 2) {
+                uint16_t h = static_cast<uint16_t>(loader.elf[eoff]) | (static_cast<uint16_t>(loader.elf[eoff + 1]) << 8);
+                sval = static_cast<int64_t>(h);
+            } else {
+                uint32_t v = readU32(loader.elf, eoff);
+                sval = ((w_ldrb & 0xFFE00C00U) == 0xB8A00800U)
+                     ? static_cast<int64_t>(static_cast<int32_t>(v))
+                     : static_cast<int64_t>(v);
+            }
+            uint64_t t_rva = static_cast<uint64_t>(static_cast<int64_t>(base_addr) + (sval << 2));
             if (t_rva >= faddr && t_rva < end_addr) targets.push_back(t_rva);
         }
         return targets;

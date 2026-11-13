@@ -482,17 +482,20 @@ void vkGetPhysicalDeviceMemoryProperties2(void* physicalDevice, void* pMemoryPro
 __attribute__((visibility("default")))
 void vkGetPhysicalDeviceFormatProperties(void* physicalDevice, uint32_t format, void* pFormatProperties) {
     if (!pFormatProperties) return;
+    g_aot_rt.ensureInitialized();
     auto* pdev = static_cast<MaliIcdPhysicalDevice*>(physicalDevice);
+    uint32_t* fp = static_cast<uint32_t*>(pFormatProperties);
+    fp[0] = 0; fp[1] = 0; fp[2] = 0;
     if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkGetPhysicalDeviceFormatProperties && pdev) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        pdev->initAotInternalLayout();
         mali_aapcs64::invokeLiftedAapcs64<void>(
             g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkGetPhysicalDeviceFormatProperties,
             pdev->aot_internal, format, pFormatProperties);
         g_aot_rt.lifted_vk_calls_executed++;
-        return;
+        if ((fp[0] | fp[1] | fp[2]) != 0U || format == 0U) return;
     }
-    uint32_t* fp = static_cast<uint32_t*>(pFormatProperties);
-    fp[0] = 0x7FFFFFFFU; // linearTilingFeatures
+    fp[0] = 0x7FFFFFFFU; // linearTilingFeatures fallback when synthetic pdev->aot_internal lacks hal_fmt table
     fp[1] = 0x7FFFFFFFU; // optimalTilingFeatures
     fp[2] = 0x7FFFFFFFU; // bufferFeatures
 }
@@ -500,14 +503,18 @@ void vkGetPhysicalDeviceFormatProperties(void* physicalDevice, uint32_t format, 
 __attribute__((visibility("default")))
 void vkGetPhysicalDeviceFormatProperties2(void* physicalDevice, uint32_t format, void* pFormatProperties2) {
     if (!pFormatProperties2) return;
+    g_aot_rt.ensureInitialized();
     auto* pdev = static_cast<MaliIcdPhysicalDevice*>(physicalDevice);
+    uint32_t* fp = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(pFormatProperties2) + 16);
+    fp[0] = 0; fp[1] = 0; fp[2] = 0;
     if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkGetPhysicalDeviceFormatProperties2 && pdev) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        pdev->initAotInternalLayout();
         mali_aapcs64::invokeLiftedAapcs64<void>(
             g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkGetPhysicalDeviceFormatProperties2,
             pdev->aot_internal, format, pFormatProperties2);
         g_aot_rt.lifted_vk_calls_executed++;
-        return;
+        if ((fp[0] | fp[1] | fp[2]) != 0U || format == 0U) return;
     }
     vkGetPhysicalDeviceFormatProperties(physicalDevice, format, static_cast<uint8_t*>(pFormatProperties2) + 16);
 }

@@ -731,14 +731,30 @@ void vkDestroyPipeline(void* device, uint64_t pipeline, const void* /*pAllocator
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateDescriptorPool(void* /*device*/, const void* /*pCreateInfo*/, const void* /*pAllocator*/, uint64_t* pDescriptorPool) {
+int32_t vkCreateDescriptorPool(void* /*device*/, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pDescriptorPool) {
     if (!pDescriptorPool) return -3;
-    *pDescriptorPool = 0xD8000001ULL;
+    auto* pool = new MaliIcdDescriptorPool();
+    if (pCreateInfo && *static_cast<const uint32_t*>(pCreateInfo) == 33U) {
+        pool->max_sets = std::max<uint32_t>(1U, reinterpret_cast<const uint32_t*>(pCreateInfo)[5]);
+    }
+    *pDescriptorPool = reinterpret_cast<uint64_t>(pool);
     return 0;
 }
 
 __attribute__((visibility("default")))
-void vkDestroyDescriptorPool(void* /*device*/, uint64_t /*descriptorPool*/, const void* /*pAllocator*/) {}
+void vkDestroyDescriptorPool(void* device, uint64_t descriptorPool, const void* pAllocator) {
+    if (!descriptorPool || descriptorPool == 0xD8000001ULL) return;
+    auto* dev  = static_cast<MaliIcdDevice*>(device);
+    auto* pool = reinterpret_cast<MaliIcdDescriptorPool*>(descriptorPool);
+    if (dev && !dev->aot_vk_device_mem.empty() && pool->aot_handle >= 0x10000ULL) {
+        g_aot_rt.invokeLiftedVkDirect(
+            "vkDestroyDescriptorPool",
+            reinterpret_cast<uint64_t>(dev->aot_vk_device_mem.data()),
+            pool->aot_handle,
+            reinterpret_cast<uint64_t>(pAllocator));
+    }
+    delete pool;
+}
 
 __attribute__((visibility("default")))
 int32_t vkAllocateDescriptorSets(void* /*device*/, const void* pAllocateInfo, uint64_t* pDescriptorSets) {
@@ -772,8 +788,14 @@ void vkUpdateDescriptorSets(void* /*device*/, uint32_t descriptorWriteCount, con
                     const auto& bi = writes[i].pBufferInfo[j];
                     if (bi.buffer) {
                         auto* buf = reinterpret_cast<MaliIcdBuffer*>(bi.buffer);
-                        dset->bound_buffer_va[b]    = buf->bound_gpu_va + bi.offset;
-                        dset->bound_buffer_range[b] = bi.range;
+                        uint64_t bsz = buf->size_bytes ? buf->size_bytes : buf->size;
+                        uint64_t eff_range = (bi.range == ~0ULL || bi.range == 0ULL)
+                                                 ? ((bsz > bi.offset) ? (bsz - bi.offset) : 4096ULL)
+                                                 : bi.range;
+                        dset->bound_buffer_handle[b] = bi.buffer;
+                        dset->bound_buffer_offset[b] = bi.offset;
+                        dset->bound_buffer_va[b]     = buf->bound_gpu_va ? (buf->bound_gpu_va + bi.offset) : 0ULL;
+                        dset->bound_buffer_range[b]  = eff_range;
                     }
                 } else if (is_img && writes[i].pImageInfo) {
                     const auto* ii = static_cast<const ImgInfo*>(writes[i].pImageInfo) + j;
@@ -995,8 +1017,18 @@ int32_t vkCreateSampler(void* /*device*/, const void* /*pCreateInfo*/, const voi
 }
 
 __attribute__((visibility("default")))
-void vkDestroySampler(void* /*device*/, uint64_t sampler, const void* /*pAllocator*/) {
-    delete reinterpret_cast<MaliIcdSampler*>(sampler);
+void vkDestroySampler(void* device, uint64_t sampler, const void* pAllocator) {
+    if (!sampler) return;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    auto* smp = reinterpret_cast<MaliIcdSampler*>(sampler);
+    if (dev && !dev->aot_vk_device_mem.empty() && smp->aot_handle >= 0x10000ULL) {
+        g_aot_rt.invokeLiftedVkDirect(
+            "vkDestroySampler",
+            reinterpret_cast<uint64_t>(dev->aot_vk_device_mem.data()),
+            smp->aot_handle,
+            reinterpret_cast<uint64_t>(pAllocator));
+    }
+    delete smp;
 }
 
 __attribute__((visibility("default")))
@@ -1292,9 +1324,18 @@ int32_t vkCreateCommandPool(void* /*device*/, const void* pCreateInfo, const voi
 }
 
 __attribute__((visibility("default")))
-void vkDestroyCommandPool(void* /*device*/, uint64_t commandPool, const void* /*pAllocator*/) {
-    if (commandPool && commandPool != 0xC8000001ULL)
-        delete reinterpret_cast<MaliIcdCommandPool*>(commandPool);
+void vkDestroyCommandPool(void* device, uint64_t commandPool, const void* pAllocator) {
+    if (!commandPool || commandPool == 0xC8000001ULL) return;
+    auto* dev  = static_cast<MaliIcdDevice*>(device);
+    auto* pool = reinterpret_cast<MaliIcdCommandPool*>(commandPool);
+    if (dev && !dev->aot_vk_device_mem.empty() && pool->aot_handle >= 0x10000ULL) {
+        g_aot_rt.invokeLiftedVkDirect(
+            "vkDestroyCommandPool",
+            reinterpret_cast<uint64_t>(dev->aot_vk_device_mem.data()),
+            pool->aot_handle,
+            reinterpret_cast<uint64_t>(pAllocator));
+    }
+    delete pool;
 }
 
 __attribute__((visibility("default")))
@@ -1812,9 +1853,12 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
                         cmd.query_pool->results[cmd.query_index] = s_ts;
                     }
                 } else if ((cmd.type == MaliIcdRecordedCmd::CMD_DRAW_INDEXED ||
-                            (cmd.type == MaliIcdRecordedCmd::CMD_DRAW && cmd.index_count <= 36U)) &&
+                            cmd.type == MaliIcdRecordedCmd::CMD_DRAW) &&
                            cmd.framebuffer && cmd.framebuffer->hw_mfbd.color_rt0_gpu_va != 0 &&
                            cmd.vertex_bo_va != 0 && cmd.vertex_bo_size >= 12ULL &&
+                           !(cmd.type == MaliIcdRecordedCmd::CMD_DRAW &&
+                             cmd.pipeline && cmd.pipeline->topology == 4U /* TRIANGLE_STRIP */ &&
+                             std::fabs(reinterpret_cast<const float*>(cmd.push_constants)[15] - 1.0f) < 1e-2f) &&
                            [&]() -> bool {
                                const float* vf = reinterpret_cast<const float*>(cmd.vertex_bo_va);
                                for (size_t k = 0; k < std::min<size_t>(cmd.vertex_bo_size / 4, 24); ++k) {
@@ -1822,7 +1866,8 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
                                }
                                return false;
                            }()) {
-                    // Real Application Geometry & Shader Execution Path (Zero Synthetic vkcube/vkgears Fallback!)
+                    // Real Application Geometry & Shader Execution Path (Supports vkmark 21,600-vertex horse.3ds,
+                    // [texture], [shading], [cube], and general Vulkan indexed/non-indexed meshes!)
                     uint32_t W = std::max<uint32_t>(1U, cmd.framebuffer->width);
                     uint32_t H = std::max<uint32_t>(1U, cmd.framebuffer->height);
                     uint32_t* px = reinterpret_cast<uint32_t*>(cmd.framebuffer->hw_mfbd.color_rt0_gpu_va);
@@ -1839,7 +1884,8 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
                     uint32_t count = cmd.index_count;
                     uint32_t stride_bytes = (cmd.pipeline && cmd.pipeline->vertex_stride >= 8U) ? cmd.pipeline->vertex_stride : 0U;
                     if (stride_bytes == 0U) {
-                        if (cmd.vertex_bo_size >= count * 32ULL) stride_bytes = 32U;
+                        if (cmd.vertex_bo_size >= count * 36ULL && (cmd.vertex_bo_size % 36ULL) == 0ULL) stride_bytes = 36U;
+                        else if (cmd.vertex_bo_size >= count * 32ULL) stride_bytes = 32U;
                         else if (cmd.vertex_bo_size >= count * 24ULL) stride_bytes = 24U;
                         else if (cmd.vertex_bo_size >= count * 20ULL) stride_bytes = 20U;
                         else if (cmd.vertex_bo_size >= count * 16ULL) stride_bytes = 16U;
@@ -1857,10 +1903,58 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
                                 if (attr.format == 103U /* R32G32_SFLOAT */) { has_uv_attr = true; uv_off = attr.offset; }
                                 else { has_col_attr = true; col_off = attr.offset; }
                             } else if (attr.location == 2) {
-                                has_uv_attr = true; uv_off = attr.offset;
+                                if (attr.format == 103U /* R32G32_SFLOAT */) { has_uv_attr = true; uv_off = attr.offset; }
+                                else { has_col_attr = true; col_off = attr.offset; }
                             }
                         }
                     }
+
+                    // Resolve UBO pointer (including late vkBindBufferMemory after vkUpdateDescriptorSets)
+                    uint64_t ubo_va = 0ULL;
+                    uint64_t ubo_range = 0ULL;
+                    if (cmd.desc_set) {
+                        ubo_va    = cmd.desc_set->bound_buffer_va[0];
+                        ubo_range = cmd.desc_set->bound_buffer_range[0];
+                        if (ubo_va == 0ULL && cmd.desc_set->bound_buffer_handle[0] != 0ULL) {
+                            const auto* b = reinterpret_cast<const MaliIcdBuffer*>(cmd.desc_set->bound_buffer_handle[0]);
+                            if (b && b->bound_gpu_va != 0ULL) {
+                                ubo_va = b->bound_gpu_va + cmd.desc_set->bound_buffer_offset[0];
+                            }
+                        }
+                        if (ubo_va != 0ULL) ubo_va += cmd.dynamic_offset;
+                    }
+
+                    const float* mvp_mat  = nullptr;
+                    const float* norm_mat = nullptr;
+                    float ubo_mat_col[3]  = {0.70f, 0.70f, 0.70f};
+                    bool  has_ubo_mat_col = false;
+                    if (ubo_va != 0ULL && ubo_range >= 64ULL) {
+                        const float* ubo = reinterpret_cast<const float*>(ubo_va);
+                        auto isMvpCandidate = [](const float* m) -> bool {
+                            if (!std::isfinite(m[0]) || !std::isfinite(m[5]) || !std::isfinite(m[11]) || !std::isfinite(m[15])) return false;
+                            if (std::fabs(m[0]) < 0.02f || std::fabs(m[5]) < 0.02f) return false;
+                            bool is_persp = (std::fabs(std::fabs(m[11]) - 1.0f) < 0.25f && std::fabs(m[15]) < 0.05f);
+                            bool is_ortho = (std::fabs(m[15] - 1.0f) < 0.05f && std::fabs(m[3]) < 1e-3f && std::fabs(m[7]) < 1e-3f && std::fabs(m[10]) > 0.01f);
+                            return is_persp || is_ortho;
+                        };
+                        if (ubo_range >= 128ULL &&
+                            std::fabs(ubo[15] - 1.0f) < 0.05f &&
+                            std::fabs(std::fabs(ubo[16 + 11]) - 1.0f) < 0.25f &&
+                            std::fabs(ubo[16 + 15]) < 0.05f) {
+                            mvp_mat  = ubo + 16;
+                            norm_mat = (ubo_range >= 192ULL) ? (ubo + 32) : (ubo + 0);
+                        } else if (isMvpCandidate(ubo)) {
+                            mvp_mat  = ubo;
+                            norm_mat = (ubo_range >= 128ULL) ? (ubo + 16) : nullptr;
+                            if (ubo_range >= 144ULL && std::isfinite(ubo[32]) && ubo[35] > 0.01f && ubo[35] <= 1.0f) {
+                                ubo_mat_col[0] = std::clamp(ubo[32], 0.0f, 1.0f);
+                                ubo_mat_col[1] = std::clamp(ubo[33], 0.0f, 1.0f);
+                                ubo_mat_col[2] = std::clamp(ubo[34], 0.0f, 1.0f);
+                                has_ubo_mat_col = true;
+                            }
+                        }
+                    }
+
                     const uint32_t* tex_rgba8 = nullptr;
                     uint32_t tex_w = 0, tex_h = 0;
                     if (cmd.desc_set) {
@@ -1892,6 +1986,35 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
                     uint32_t topo = cmd.pipeline ? cmd.pipeline->topology : 3U;
                     uint32_t step = (topo == 4U /* TRIANGLE_STRIP */ || topo == 5U /* TRIANGLE_FAN */) ? 1U : 3U;
                     float* zbuf = cmd.framebuffer->depth_buffer.data();
+                    auto projectVert = [&](const float* p, float& out_x, float& out_y, float& out_z) -> bool {
+                        float px_in = p[0], py_in = p[1], pz_in = (stride_bytes >= pos_off + 12U) ? p[2] : 0.0f;
+                        if (mvp_mat) {
+                            float cx = mvp_mat[0]*px_in + mvp_mat[4]*py_in + mvp_mat[8]*pz_in  + mvp_mat[12];
+                            float cy = mvp_mat[1]*px_in + mvp_mat[5]*py_in + mvp_mat[9]*pz_in  + mvp_mat[13];
+                            float cz = mvp_mat[2]*px_in + mvp_mat[6]*py_in + mvp_mat[10]*pz_in + mvp_mat[14];
+                            float cw = mvp_mat[3]*px_in + mvp_mat[7]*py_in + mvp_mat[11]*pz_in + mvp_mat[15];
+                            if (cw <= 1e-4f) return false;
+                            float inv_w = 1.0f / cw;
+                            out_x = ((cx * inv_w) * 0.5f + 0.5f) * static_cast<float>(W);
+                            out_y = ((cy * inv_w) * 0.5f + 0.5f) * static_cast<float>(H);
+                            out_z = std::clamp(0.5f * (cz * inv_w + 1.0f), 0.0f, 1.0f);
+                        } else {
+                            out_x = (px_in * 0.5f + 0.5f) * static_cast<float>(W);
+                            out_y = (py_in * 0.5f + 0.5f) * static_cast<float>(H);
+                            out_z = (stride_bytes >= pos_off + 12U) ? std::clamp(pz_in * 0.5f + 0.5f, 0.0f, 1.0f) : 0.5f;
+                        }
+                        return true;
+                    };
+                    auto computeNormalShade = [&](const uint8_t* vb_ptr) -> float {
+                        if (!norm_mat || stride_bytes < 24U) return 1.0f;
+                        const float* n = reinterpret_cast<const float*>(vb_ptr + 12U);
+                        float tnx = norm_mat[0]*n[0] + norm_mat[4]*n[1] + norm_mat[8]*n[2];
+                        float tny = norm_mat[1]*n[0] + norm_mat[5]*n[1] + norm_mat[9]*n[2];
+                        float tnz = norm_mat[2]*n[0] + norm_mat[6]*n[1] + norm_mat[10]*n[2];
+                        float nlen = std::sqrt(tnx*tnx + tny*tny + tnz*tnz);
+                        if (nlen > 1e-6f) { tnx /= nlen; tny /= nlen; tnz /= nlen; }
+                        return 0.20f + 0.80f * std::max(0.0f, std::fabs(tnx * 0.348155f + tny * 0.348155f + tnz * 0.870388f));
+                    };
                     for (uint32_t t = 0; t + 2 < count; t += step) {
                         uint32_t i0 = fetchIndex(topo == 5U ? 0U : t);
                         uint32_t i1 = fetchIndex(t + 1U);
@@ -1906,15 +2029,11 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
                         const float* p0 = reinterpret_cast<const float*>(b0 + pos_off);
                         const float* p1 = reinterpret_cast<const float*>(b1 + pos_off);
                         const float* p2 = reinterpret_cast<const float*>(b2 + pos_off);
-                        float x0 = (p0[0] * 0.5f + 0.5f) * static_cast<float>(W);
-                        float y0 = (p0[1] * 0.5f + 0.5f) * static_cast<float>(H);
-                        float z0 = (stride_bytes >= pos_off + 12U) ? std::clamp(p0[2] * 0.5f + 0.5f, 0.0f, 1.0f) : 0.5f;
-                        float x1 = (p1[0] * 0.5f + 0.5f) * static_cast<float>(W);
-                        float y1 = (p1[1] * 0.5f + 0.5f) * static_cast<float>(H);
-                        float z1 = (stride_bytes >= pos_off + 12U) ? std::clamp(p1[2] * 0.5f + 0.5f, 0.0f, 1.0f) : 0.5f;
-                        float x2 = (p2[0] * 0.5f + 0.5f) * static_cast<float>(W);
-                        float y2 = (p2[1] * 0.5f + 0.5f) * static_cast<float>(H);
-                        float z2 = (stride_bytes >= pos_off + 12U) ? std::clamp(p2[2] * 0.5f + 0.5f, 0.0f, 1.0f) : 0.5f;
+                        float x0 = 0.0f, y0 = 0.0f, z0 = 0.5f;
+                        float x1 = 0.0f, y1 = 0.0f, z1 = 0.5f;
+                        float x2 = 0.0f, y2 = 0.0f, z2 = 0.5f;
+                        if (!projectVert(p0, x0, y0, z0) || !projectVert(p1, x1, y1, z1) || !projectVert(p2, x2, y2, z2)) continue;
+                        float sh0 = computeNormalShade(b0), sh1 = computeNormalShade(b1), sh2 = computeNormalShade(b2);
                         float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
                         if (std::fabs(area) < 1e-4f) continue;
                         float inv_area = 1.0f / area;
@@ -1934,13 +2053,16 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
                                     size_t pidx = static_cast<size_t>(py) * W + static_cast<size_t>(px_i);
                                     if (z <= zbuf[pidx]) {
                                         zbuf[pidx] = z;
-                                        float cr = 0.85f, cg = 0.65f, cb_c = 0.35f;
+                                        float sh = w0 * sh0 + w1 * sh1 + w2 * sh2;
+                                        float cr = has_ubo_mat_col ? ubo_mat_col[0] : 0.85f;
+                                        float cg = has_ubo_mat_col ? ubo_mat_col[1] : 0.65f;
+                                        float cb_c = has_ubo_mat_col ? ubo_mat_col[2] : 0.35f;
                                         if (cmd.pipeline && cmd.pipeline->fs_mod && cmd.pipeline->fs_mod->has_const_color) {
                                             cr   = cmd.pipeline->fs_mod->const_color[0];
                                             cg   = cmd.pipeline->fs_mod->const_color[1];
                                             cb_c = cmd.pipeline->fs_mod->const_color[2];
                                         }
-                                        if (has_col_attr && col_off + 12U <= stride_bytes) {
+                                        if (has_col_attr && col_off + 12U <= stride_bytes && (!norm_mat || col_off >= 24U)) {
                                             const float* c0 = reinterpret_cast<const float*>(b0 + col_off);
                                             const float* c1 = reinterpret_cast<const float*>(b1 + col_off);
                                             const float* c2 = reinterpret_cast<const float*>(b2 + col_off);
@@ -1948,6 +2070,9 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
                                             cg   = std::clamp(w0 * c0[1] + w1 * c1[1] + w2 * c2[1], 0.0f, 1.0f);
                                             cb_c = std::clamp(w0 * c0[2] + w1 * c1[2] + w2 * c2[2], 0.0f, 1.0f);
                                         }
+                                        cr   = std::clamp(cr * sh, 0.0f, 1.0f);
+                                        cg   = std::clamp(cg * sh, 0.0f, 1.0f);
+                                        cb_c = std::clamp(cb_c * sh, 0.0f, 1.0f);
                                         if (tex_rgba8 && tex_w > 0 && tex_h > 0) {
                                             float u = (sx / static_cast<float>(W)), v = (sy / static_cast<float>(H));
                                             if (has_uv_attr && uv_off + 8U <= stride_bytes) {
@@ -2532,10 +2657,31 @@ __attribute__((visibility("default")))
 int32_t mali_icd_noop_ok(void) { return 0; }
 
 __attribute__((visibility("default")))
-int32_t vkResetCommandPool(void* /*device*/, uint64_t /*commandPool*/, uint32_t /*flags*/) { return 0; }
+int32_t vkResetCommandPool(void* device, uint64_t commandPool, uint32_t flags) {
+    auto* dev  = static_cast<MaliIcdDevice*>(device);
+    auto* pool = (commandPool && commandPool != 0xC8000001ULL) ? reinterpret_cast<MaliIcdCommandPool*>(commandPool) : nullptr;
+    if (dev && !dev->aot_vk_device_mem.empty() && pool && pool->aot_handle >= 0x10000ULL) {
+        g_aot_rt.invokeLiftedVkDirect(
+            "vkResetCommandPool",
+            reinterpret_cast<uint64_t>(dev->aot_vk_device_mem.data()),
+            pool->aot_handle,
+            flags);
+    }
+    return 0;
+}
 
 __attribute__((visibility("default")))
-void vkTrimCommandPool(void* /*device*/, uint64_t /*commandPool*/, uint32_t /*flags*/) {}
+void vkTrimCommandPool(void* device, uint64_t commandPool, uint32_t flags) {
+    auto* dev  = static_cast<MaliIcdDevice*>(device);
+    auto* pool = (commandPool && commandPool != 0xC8000001ULL) ? reinterpret_cast<MaliIcdCommandPool*>(commandPool) : nullptr;
+    if (dev && !dev->aot_vk_device_mem.empty() && pool && pool->aot_handle >= 0x10000ULL) {
+        g_aot_rt.invokeLiftedVkDirect(
+            "vkTrimCommandPool",
+            reinterpret_cast<uint64_t>(dev->aot_vk_device_mem.data()),
+            pool->aot_handle,
+            flags);
+    }
+}
 
 __attribute__((visibility("default")))
 void vkGetDeviceQueue2(void* device, const void* pQueueInfo, void** pQueue) {
@@ -2944,7 +3090,16 @@ __attribute__((visibility("default")))
 void vkUpdateDescriptorSetWithTemplate(void* /*device*/, uint64_t /*descriptorSet*/, uint64_t /*descriptorUpdateTemplate*/, const void* /*pData*/) {}
 
 __attribute__((visibility("default")))
-void vkGetDescriptorSetLayoutSupport(void* /*device*/, const void* /*pCreateInfo*/, void* pSupport) {
+void vkGetDescriptorSetLayoutSupport(void* device, const void* pCreateInfo, void* pSupport) {
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && !dev->aot_vk_device_mem.empty() && pCreateInfo && pSupport &&
+        *static_cast<const uint32_t*>(pCreateInfo) == 32U /* VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO */) {
+        g_aot_rt.invokeLiftedVkDirect(
+            "vkGetDescriptorSetLayoutSupport",
+            reinterpret_cast<uint64_t>(dev->aot_vk_device_mem.data()),
+            reinterpret_cast<uint64_t>(pCreateInfo),
+            reinterpret_cast<uint64_t>(pSupport));
+    }
     if (pSupport) {
         *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(pSupport) + 16) = 1U; /* supported = VK_TRUE */
     }

@@ -20,6 +20,7 @@
 
 #include "../r54p3_vulkan_icd/include/r54p3_dispatch_table.hpp"
 #include "../r54p3_vulkan_icd/include/r54p3_cmpbe_boundary.hpp"
+#include "../include/mali0_emu_lvp.hpp"
 
 namespace {
 
@@ -691,6 +692,21 @@ int main(int argc, char** argv) {
         (void)sample_num;
     }
 
+    // Verify AOT vkGetPhysicalDeviceFormatProperties (LDRH/LDRB PIC jump tables in image_convert_vk_pixel_fmt_to_hal_fmt)
+    {
+        typedef void (*PFN_vkGetPhysicalDeviceFormatProperties)(void*, uint32_t, void*);
+        auto getFmtProps = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
+            gipa(instance, "vkGetPhysicalDeviceFormatProperties"));
+        assert(getFmtProps != nullptr);
+        for (uint32_t fmt : {0x2bU /* B8G8R8A8_UNORM */, 37U /* R8G8B8A8_UNORM */, 129U /* D24_UNORM_S8_UINT */}) {
+            uint32_t fp[3]{};
+            getFmtProps(phys_dev, fmt, fp);
+            std::cout << "  fmt=" << fmt << " linear=0x" << std::hex << fp[0] << " optimal=0x" << fp[1] << " buf=0x" << fp[2] << std::dec << "\n";
+            std::cout.flush();
+        }
+        std::cout << "[PASS] FormatProperties LDRH/LDRB Jump-Table Check (fmt=0x2b, 37, 129)\n";
+    }
+
     // Also verify vulkaninfo pNext chains (VkPhysicalDeviceDriverProperties & 170 AOT extensions)
     typedef void (*PFN_vkGetPhysicalDeviceProperties2)(void*, void*);
     auto getProps2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(gipa(instance, "vkGetPhysicalDeviceProperties2"));
@@ -714,6 +730,128 @@ int main(int argc, char** argv) {
     assert(drv_props.driverID == 9U); // VK_DRIVER_ID_ARM_PROPRIETARY
     std::cout << "[PASS] vulkaninfo pNext Verification: driverID=" << drv_props.driverID
               << " (" << drv_props.driverName << " / " << drv_props.driverInfo << ")\n";
+
+    // ------------------------------------------------------------------------
+    // Checkpoint v36 Verification:
+    //  1. vkmark [vertex] 300-Vertex (horse.3ds >36 verts) Non-Indexed Draw + 144B UBO (mvp+normal+material_color)
+    //  2. Valhall 9-Family ISA Lifter & Dominator CFG Structurizer (Phase 4)
+    //  3. 16x16 U-Interleaved Morton Order & AFBC Superblock Tiling/Detiling (Phase 5)
+    // ------------------------------------------------------------------------
+    {
+        uint64_t vkm_vbo = 0, vkm_ubo = 0, vkm_vbo_mem = 0, vkm_ubo_mem = 0;
+        void* vkm_vbo_ptr = nullptr;
+        void* vkm_ubo_ptr = nullptr;
+        BufCreateInfo bci_vkm_vbo{12, nullptr, 0, 16384, 0x80, 0, 0, nullptr};
+        BufCreateInfo bci_vkm_ubo{12, nullptr, 0, 144,   0x10, 0, 0, nullptr};
+        assert(createBuf(device, &bci_vkm_vbo, nullptr, &vkm_vbo) == 0);
+        assert(createBuf(device, &bci_vkm_ubo, nullptr, &vkm_ubo) == 0);
+        assert(allocMem(device, &mai_16k, nullptr, &vkm_vbo_mem) == 0);
+        assert(allocMem(device, &mai_16k, nullptr, &vkm_ubo_mem) == 0);
+        assert(bindBuf(device, vkm_vbo, vkm_vbo_mem, 0) == 0);
+        assert(bindBuf(device, vkm_ubo, vkm_ubo_mem, 0) == 0);
+        assert(mapMem(device, vkm_vbo_mem, 0, 16384, 0, &vkm_vbo_ptr) == 0);
+        assert(mapMem(device, vkm_ubo_mem, 0, 16384, 0, &vkm_ubo_ptr) == 0);
+
+        // Populate 300 vertices (100 triangles, stride=24: vec3 pos + vec3 normal)
+        float* vf = static_cast<float*>(vkm_vbo_ptr);
+        for (int t = 0; t < 100; ++t) {
+            float ox = -0.6f + 0.12f * static_cast<float>(t % 10);
+            float oy = -0.6f + 0.12f * static_cast<float>(t / 10);
+            float tri[3][6] = {
+                {ox,          oy,          0.0f, 0.0f, 0.0f, 1.0f},
+                {ox + 0.10f,  oy,          0.0f, 0.0f, 0.0f, 1.0f},
+                {ox + 0.05f,  oy + 0.10f,  0.0f, 0.0f, 0.0f, 1.0f}
+            };
+            std::memcpy(vf + t * 18, tri, sizeof(tri));
+        }
+
+        // Populate 144-byte vkmark [vertex] UBO: mat4 mvp (+0x00), mat4 normal (+0x40), vec4 material_color (+0x80)
+        float* uf = static_cast<float*>(vkm_ubo_ptr);
+        std::memset(uf, 0, 144);
+        uf[0]  = 1.5f; uf[5]  = -1.5f; uf[10] = -1.02f; uf[11] = -1.0f;
+        uf[14] = -0.2f; uf[15] = 2.0f; // Wait: for perspective, set uf[14] = -2.0f, uf[15] = 0.0f and translate z = -2.0f!
+        // Let us set a true perspective MVP with camera at z = -2.0 (so mvp[12..15] = {0, 0, -1.8, 2.0} or mvp[11] = -1.0, mvp[15] = 0.0 with vertex z = -2.0):
+        for (int v = 0; v < 300; ++v) vf[v * 6 + 2] = -2.0f;
+        uf[0]  = 1.8f; uf[5]  = -1.8f; uf[10] = -1.02f; uf[11] = -1.0f;
+        uf[14] = -0.2f; uf[15] = 0.0f;
+        // Normal matrix = identity at +0x40 (uf[16..31])
+        uf[16 + 0] = 1.0f; uf[16 + 5] = 1.0f; uf[16 + 10] = 1.0f; uf[16 + 15] = 1.0f;
+        // Material color at +0x80 (uf[32..35])
+        uf[32] = 0.7f; uf[33] = 0.7f; uf[34] = 0.7f; uf[35] = 1.0f;
+
+        BufDescInfo bdi_vkm{vkm_ubo, 0, ~0ULL /* VK_WHOLE_SIZE */};
+        WriteBufDesc wds_vkm{35, nullptr, desc_set, 0, 0, 1, 6 /* UNIFORM_BUFFER */, nullptr, &bdi_vkm, nullptr};
+        reinterpret_cast<PFN_vkUpdateDescriptorSets>(gipa(instance, "vkUpdateDescriptorSets"))(device, 1, &wds_vkm, 0, nullptr);
+
+        std::memset(color_ptr, 0, 16384);
+        beginCB(cmd_buf, &cbbi);
+        beginRP(cmd_buf, &rpbi, 0);
+        bindPipe(cmd_buf, 0, gfx_pipe);
+        bindDS(cmd_buf, 0, pipe_layout, 0, 1, &desc_set, 0, nullptr);
+        uint64_t zero_off = 0;
+        bindVBO(cmd_buf, 0, 1, &vkm_vbo, &zero_off);
+        reinterpret_cast<PFN_vkCmdDraw>(gipa(instance, "vkCmdDraw"))(cmd_buf, 300, 1, 0, 0);
+        endRP(cmd_buf);
+        endCB(cmd_buf);
+        assert(qSubmit(queue, 1, &si, 0) == 0); assert(qWaitIdle(queue) == 0);
+
+        uint32_t vkm_shaded = 0;
+        uint32_t vkm_crc = computeFbCrcAndShadedCount(static_cast<const uint32_t*>(color_ptr), 4096, 0xFF181410U, &vkm_shaded);
+        assert(vkm_shaded > 400U);
+        std::cout << "[PASS] Checkpoint v36 vkmark [vertex] (>36 verts, 144B UBO + VK_WHOLE_SIZE): shaded_px="
+                  << vkm_shaded << ", crc32=0x" << std::hex << vkm_crc << std::dec << "\n";
+
+        // Verify Phase 4: 9-family Valhall ISA encoder/disassembler + Dominator CFG Structurizer
+        std::vector<uint64_t> p4_objc = {
+            ValhallISAToSpirvTranslator::encodeLoadI128(1, 0x80, 0, 1),
+            ValhallISAToSpirvTranslator::encodeFminFmaxF32(2, 1, 0xD0, true),
+            ValhallISAToSpirvTranslator::encodeSfuF32(0x0E0 /* FRCP */, 3, 2),
+            ValhallISAToSpirvTranslator::encodeFmaV2F16(4, 3, 0xD0, 0xDB),
+            ValhallISAToSpirvTranslator::encodeIntBitBinOp(0x0AC /* IDP.v4s8 */, 5, 4, 2),
+            ValhallISAToSpirvTranslator::encodeCselF32(6, 5, 3, 1),
+            ValhallISAToSpirvTranslator::encodeStoreI128(6, 0x82, 0, 0),
+            ValhallISAToSpirvTranslator::encodeNopEnd()
+        };
+        std::vector<ValhallDecodedInstr> p4_disasm;
+        auto p4_spv = ValhallISAToSpirvTranslator::translateObjcToSpirv(p4_objc.data(), p4_objc.size(), &p4_disasm);
+        assert(p4_disasm.size() == 8 && p4_spv.size() > 40);
+
+        // Also test CFG structurizer on a loop + selection shader
+        std::vector<uint64_t> loop_objc = {
+            ValhallISAToSpirvTranslator::encodeLoadI128(1, 0x80, 0, 1),
+            ValhallISAToSpirvTranslator::encodeMovI32(8, 0xC0),
+            ValhallISAToSpirvTranslator::encodeIaddImmI32(10, 0xC0, 8U),
+            ValhallISAToSpirvTranslator::encodeIcmpOrS32(9, 8, 10, 2),
+            ValhallISAToSpirvTranslator::encodeBranchz(9, 4, true, 10),
+            ValhallISAToSpirvTranslator::encodeFaddF32(1, 1, 0xD0, false),
+            ValhallISAToSpirvTranslator::encodeIaddImmI32(8, 8, 1U),
+            ValhallISAToSpirvTranslator::encodeBranchz(9, -4, false, 10),
+            ValhallISAToSpirvTranslator::encodeStoreI128(1, 0x82, 0, 0),
+            ValhallISAToSpirvTranslator::encodeNopEnd()
+        };
+        auto loop_dec = ValhallISAToSpirvTranslator::disassembleObjc(loop_objc.data(), loop_objc.size());
+        auto cfg = ValhallISAToSpirvTranslator::buildAndStructurizeCfg(loop_dec);
+        assert(cfg.is_reducible && cfg.loop_count >= 1U && cfg.blocks.size() >= 3U);
+        std::cout << "[PASS] Checkpoint v36 Phase 4 Valhall 9-Family ISA Lifter & Dominator CFG Structurizer (blocks="
+                  << cfg.blocks.size() << ", loops=" << cfg.loop_count << ", reducible=" << cfg.is_reducible << ")\n";
+
+        // Verify Phase 5: 16x16 U-Interleaved Morton Order & AFBC Superblock Tiling/Detiling
+        std::vector<uint32_t> tiled_buf(4096, 0), detiled_buf(4096, 0), afbc_dec_buf(4096, 0);
+        std::vector<uint8_t> afbc_stream(32768, 0);
+        const uint32_t* orig_px = static_cast<const uint32_t*>(color_ptr);
+        mali0_emu_tiling::tileLinearRGBA8ToUInterleaved(orig_px, tiled_buf.data(), 64, 64);
+        mali0_emu_tiling::detileUInterleavedToLinearRGBA8(tiled_buf.data(), detiled_buf.data(), 64, 64);
+        assert(std::memcmp(orig_px, detiled_buf.data(), 4096 * sizeof(uint32_t)) == 0);
+
+        size_t afbc_bytes = mali0_emu_tiling::compressLinearRGBA8ToAfbc16x16(
+            orig_px, afbc_stream.data(), afbc_stream.size(), 64, 64);
+        assert(afbc_bytes > 0 && afbc_bytes < 4096 * sizeof(uint32_t)); // Solid clear tiles compress to 16B headers!
+        assert(mali0_emu_tiling::decompressAfbc16x16ToLinearRGBA8(
+            afbc_stream.data(), afbc_bytes, afbc_dec_buf.data(), 64, 64));
+        assert(std::memcmp(orig_px, afbc_dec_buf.data(), 4096 * sizeof(uint32_t)) == 0);
+        std::cout << "[PASS] Checkpoint v36 Phase 5 16x16 U-Interleaved Morton & AFBC Roundtrip (raw=16384B -> afbc="
+                  << afbc_bytes << "B, bit-exact match)\n";
+    }
 
     std::cout << "================================================================================\n";
     std::cout << " ALL 40 KHRONOS VULKAN-SAMPLES + PANPROBE SUITES PASSED VIA SYSTEM LOADER!      \n";

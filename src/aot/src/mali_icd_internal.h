@@ -398,6 +398,21 @@ struct HostVkAllocatorTable {
 static HostVkAllocatorTable g_host_vk_allocators;
 
 extern "C" void aot_unhandled_plt(AOTCPUState* cpu, uint64_t target_va) {
+    if (target_va == IMAGE_BASE + 0x01c650d0ULL) {
+        // cctx hash-table malloc callback (0x01c650d0: bti c; mov x0, x1; b malloc@PLT)
+        size_t sz = static_cast<size_t>(cpu->x[1] ? cpu->x[1] : cpu->x[0]);
+        void* p = std::calloc(1, std::max<size_t>(sz, 64));
+        cpu->x[0] = reinterpret_cast<uint64_t>(p);
+        return;
+    }
+    if (target_va == IMAGE_BASE + 0x01c650e0ULL) {
+        // cctx hash-table free callback (0x01c650e0: bti c; b free@PLT)
+        if (cpu->x[0] >= 0x10000ULL && cpu->x[0] < IMAGE_BASE) {
+            std::free(reinterpret_cast<void*>(cpu->x[0]));
+        }
+        cpu->x[0] = 0;
+        return;
+    }
     if (target_va == IMAGE_BASE + 0x01c9ecb0ULL) {
         // cmpbe_v2_compile_multiple_shaders boundary (not lifted in mali_mbs2_aot.o;
         // MBS2/Valhall compilation is handled by runAotMbs2PipelineCompile).
@@ -735,6 +750,7 @@ struct MaliAotGlobalRuntime {
         }
         const char* candidates[] = {
             (env_so && env_so[0]) ? env_so : nullptr,
+            "ddk/libGLES_mali.so",
             "libGLES_mali.so",
             "libGLES_mali.r44p1.so",
             "libGLES_mali.r44.so",
@@ -905,7 +921,7 @@ struct MaliAotGlobalRuntime {
         // 3b. Initialize libGLES_mali.so .bss global config pointer at IMAGE_BASE + 0x31462a0
         // (read by vkEnumerateDeviceExtensionProperties @ 0x977140 and vkGetPhysicalDeviceFeatures2 @ 0x97ad30)
         if (mapper.base) {
-            uint8_t* cfg_blob = mapper.base + 0x03ffe000ULL;
+            uint8_t* cfg_blob = mapper.base + 0x03fd0000ULL;
             // In libGLES_mali.so (r54p3):
             //   - cfg_blob[704] (0x2c0) is read by vkGetPhysicalDeviceProperties @ 0x9778d4 for
             //     framebufferNoAttachmentsSampleCounts AND bit 3 (0x08) is tested by tbz/tbnz
@@ -1288,12 +1304,14 @@ struct MaliIcdPipelineLayout {
 };
 
 struct MaliIcdDescriptorPool {
-    uint32_t max_sets = 4096;
+    uint32_t max_sets   = 4096;
+    uint64_t aot_handle = 0;
 };
 
 struct MaliIcdCommandPool {
     uint32_t queue_family_index = 0;
     uint32_t flags              = 0;
+    uint64_t aot_handle         = 0;
 };
 
 struct MaliIcdFence {
@@ -1329,8 +1347,9 @@ struct MaliIcdImageView {
 };
 
 struct MaliIcdSampler {
-    float max_anisotropy = 16.0f;
-    float max_lod = 15.0f;
+    float    max_anisotropy = 16.0f;
+    float    max_lod        = 15.0f;
+    uint64_t aot_handle     = 0;
 };
 
 struct MaliIcdRenderPass {
@@ -1354,6 +1373,8 @@ struct MaliIcdQueryPool {
 struct MaliIcdDescriptorSet {
     uint64_t          bound_buffer_va[64]{};
     uint64_t          bound_buffer_range[64]{};
+    uint64_t          bound_buffer_handle[64]{};
+    uint64_t          bound_buffer_offset[64]{};
     MaliIcdImageView* bound_image_view[64]{};
     MaliIcdSampler*   bound_sampler[64]{};
 };

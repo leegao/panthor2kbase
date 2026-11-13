@@ -41,6 +41,165 @@ struct VkCubeFrameStats {
     uint32_t center_pixel_rgba8      = 0;
 };
 
+// ============================================================================
+// Phase 5: Valhall 16x16 U-Interleaved (Morton Order) & AFBC Memory Tiling
+// ============================================================================
+namespace mali0_emu_tiling {
+
+// Exact Valhall 16x16 U-Interleaved intra-tile Morton index:
+// Interleaves (ty[3:0], (ty^tx)[3:0]) -> 0..255 pixel index within a 16x16 tile
+inline uint32_t mortonEncode16x16(uint32_t tx, uint32_t ty) {
+    uint32_t x = (tx ^ ty) & 0xFU;
+    uint32_t y = ty & 0xFU;
+    uint32_t res = 0;
+    res |= ((x >> 0) & 1U) << 0;
+    res |= ((y >> 0) & 1U) << 1;
+    res |= ((x >> 1) & 1U) << 2;
+    res |= ((y >> 1) & 1U) << 3;
+    res |= ((x >> 2) & 1U) << 4;
+    res |= ((y >> 2) & 1U) << 5;
+    res |= ((x >> 3) & 1U) << 6;
+    res |= ((y >> 3) & 1U) << 7;
+    return res;
+}
+
+inline void tileLinearRGBA8ToUInterleaved(const uint32_t* linear_rgba, uint32_t* tiled_out, uint32_t width, uint32_t height) {
+    if (!linear_rgba || !tiled_out || width == 0 || height == 0) return;
+    uint32_t tiles_x = (width + 15U) / 16U;
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            uint32_t tile_idx = (y / 16U) * tiles_x + (x / 16U);
+            uint32_t intra    = mortonEncode16x16(x & 15U, y & 15U);
+            tiled_out[tile_idx * 256U + intra] = linear_rgba[y * width + x];
+        }
+    }
+}
+
+inline void detileUInterleavedToLinearRGBA8(const uint32_t* tiled_in, uint32_t* linear_rgba_out, uint32_t width, uint32_t height) {
+    if (!tiled_in || !linear_rgba_out || width == 0 || height == 0) return;
+    uint32_t tiles_x = (width + 15U) / 16U;
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            uint32_t tile_idx = (y / 16U) * tiles_x + (x / 16U);
+            uint32_t intra    = mortonEncode16x16(x & 15U, y & 15U);
+            linear_rgba_out[y * width + x] = tiled_in[tile_idx * 256U + intra];
+        }
+    }
+}
+
+// AFBC 16x16 Superblock Encoder/Decoder (16-byte header per 16x16 block:
+//   dword[0] == 0 => solid-color fast-clear block with RGBA8 color in dword[2];
+//   dword[0] != 0 => byte offset from start of AFBC buffer to uncompressed 256x4B payload)
+inline size_t compressLinearRGBA8ToAfbc16x16(const uint32_t* linear_rgba, uint8_t* afbc_out, size_t afbc_cap, uint32_t width, uint32_t height) {
+    if (!linear_rgba || !afbc_out || width == 0 || height == 0) return 0;
+    uint32_t tiles_x = (width + 15U) / 16U;
+    uint32_t tiles_y = (height + 15U) / 16U;
+    uint32_t num_tiles = tiles_x * tiles_y;
+    size_t hdr_bytes = ((static_cast<size_t>(num_tiles) * 16ULL) + 63ULL) & ~63ULL;
+    if (afbc_cap < hdr_bytes) return 0;
+    std::memset(afbc_out, 0, hdr_bytes);
+    size_t body_off = hdr_bytes;
+
+    for (uint32_t ty = 0; ty < tiles_y; ++ty) {
+        for (uint32_t tx = 0; tx < tiles_x; ++tx) {
+            uint32_t t_idx = ty * tiles_x + tx;
+            uint32_t* hdr = reinterpret_cast<uint32_t*>(afbc_out + t_idx * 16ULL);
+            uint32_t first_px = linear_rgba[std::min(ty * 16U, height - 1U) * width + std::min(tx * 16U, width - 1U)];
+            bool all_same = true;
+            uint32_t block_px[256]{};
+            for (uint32_t iy = 0; iy < 16U; ++iy) {
+                for (uint32_t ix = 0; ix < 16U; ++ix) {
+                    uint32_t sx = std::min(tx * 16U + ix, width - 1U);
+                    uint32_t sy = std::min(ty * 16U + iy, height - 1U);
+                    uint32_t p = linear_rgba[sy * width + sx];
+                    block_px[iy * 16U + ix] = p;
+                    if (p != first_px) all_same = false;
+                }
+            }
+            if (all_same) {
+                hdr[0] = 0U;        // solid color encoding
+                hdr[1] = 0U;
+                hdr[2] = first_px;  // solid RGBA8 payload in header bytes [8..11]
+                hdr[3] = 0U;
+            } else {
+                if (body_off + 1024ULL > afbc_cap) return 0;
+                hdr[0] = static_cast<uint32_t>(body_off);
+                hdr[1] = 0x10101010U; // uncompressed 4x4 subblocks
+                std::memcpy(afbc_out + body_off, block_px, 1024ULL);
+                body_off += 1024ULL;
+            }
+        }
+    }
+    return body_off;
+}
+
+inline bool decompressAfbc16x16ToLinearRGBA8(const uint8_t* afbc_in, size_t afbc_size, uint32_t* linear_rgba_out, uint32_t width, uint32_t height) {
+    if (!afbc_in || !linear_rgba_out || width == 0 || height == 0) return false;
+    uint32_t tiles_x = (width + 15U) / 16U;
+    uint32_t tiles_y = (height + 15U) / 16U;
+    uint32_t num_tiles = tiles_x * tiles_y;
+    if (afbc_size < static_cast<size_t>(num_tiles) * 16ULL) return false;
+
+    for (uint32_t ty = 0; ty < tiles_y; ++ty) {
+        for (uint32_t tx = 0; tx < tiles_x; ++tx) {
+            uint32_t t_idx = ty * tiles_x + tx;
+            const uint32_t* hdr = reinterpret_cast<const uint32_t*>(afbc_in + t_idx * 16ULL);
+            uint32_t body_ptr = hdr[0];
+            if (body_ptr == 0U) {
+                uint32_t solid_px = hdr[2];
+                for (uint32_t iy = 0; iy < 16U; ++iy) {
+                    uint32_t dy = ty * 16U + iy;
+                    if (dy >= height) continue;
+                    for (uint32_t ix = 0; ix < 16U; ++ix) {
+                        uint32_t dx = tx * 16U + ix;
+                        if (dx < width) linear_rgba_out[dy * width + dx] = solid_px;
+                    }
+                }
+            } else if (static_cast<size_t>(body_ptr) + 1024ULL <= afbc_size) {
+                const uint32_t* block_px = reinterpret_cast<const uint32_t*>(afbc_in + body_ptr);
+                for (uint32_t iy = 0; iy < 16U; ++iy) {
+                    uint32_t dy = ty * 16U + iy;
+                    if (dy >= height) continue;
+                    for (uint32_t ix = 0; ix < 16U; ++ix) {
+                        uint32_t dx = tx * 16U + ix;
+                        if (dx < width) linear_rgba_out[dy * width + dx] = block_px[iy * 16U + ix];
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+} // namespace mali0_emu_tiling
+
+// ============================================================================
+// Phase 2: Generic Graphics Draw Descriptor (Supports vkmark 21,600-vertex
+// horse.3ds, textured/lit meshes, non-indexed & indexed draws, UBO + PushConst)
+// ============================================================================
+struct MaliGenericDrawDescriptor {
+    uint64_t vertex_bo_va     = 0;
+    uint64_t vertex_bo_size   = 0;
+    uint64_t index_bo_va      = 0;
+    uint64_t index_bo_size    = 0;
+    uint32_t index_type       = 1;     // 0 = UINT16, 1 = UINT32
+    bool     is_indexed       = false;
+    uint32_t count            = 0;     // vertexCount or indexCount
+    uint32_t first_vertex     = 0;
+    uint32_t first_index      = 0;
+    int32_t  vertex_offset    = 0;
+    uint32_t stride_bytes     = 0;
+    uint32_t topology         = 3;     // 3 = TRIANGLE_LIST, 4 = TRIANGLE_STRIP, 5 = TRIANGLE_FAN
+    uint64_t ubo_va           = 0;
+    uint64_t ubo_range        = 0;
+    uint64_t tex_va           = 0;
+    uint32_t tex_width        = 0;
+    uint32_t tex_height       = 0;
+    bool     clear_on_entry   = true;
+    float    const_color[4]   = {0.85f, 0.65f, 0.35f, 1.0f};
+    bool     has_const_color  = false;
+};
+
 class HostLvpipeVulkanExecutor {
 public:
     static constexpr size_t kBufferCapacityBytes = 4 * 1024 * 1024; // 4 MiB (supports up to 1024x1024 RGBA8 WSI surfaces)
@@ -879,5 +1038,253 @@ public:
         }
         if (out_stats) *out_stats = stats;
         return stats.vs_spirv_valid_on_lvp && stats.fs_spirv_valid_on_lvp && stats.lvp_fragment_dispatch_ok;
+    }
+
+    // Phase 2: Generic Graphics Pass Executor (Supports vkmark [vertex] 21,600-vertex horse.3ds,
+    // [texture], [shading], [cube], and general indexed/non-indexed Vulkan 3D meshes)
+    bool executeGenericGraphicsPass(const MaliGenericDrawDescriptor& draw,
+                                    MaliMfbdDescriptor& mfbd,
+                                    VkCubeFrameStats* out_stats = nullptr,
+                                    std::vector<float>* inout_depth_buffer = nullptr) {
+        if (mfbd.width == 0 || mfbd.height == 0 || !mfbd.color_rt0_gpu_va || !draw.vertex_bo_va || draw.count < 3U) {
+            return false;
+        }
+        uint32_t W = mfbd.width;
+        uint32_t H = mfbd.height;
+        size_t total_pixels = static_cast<size_t>(W) * static_cast<size_t>(H);
+        uint32_t* px = reinterpret_cast<uint32_t*>(mfbd.color_rt0_gpu_va);
+
+        std::vector<float> local_depth;
+        std::vector<float>& zbuf_vec = inout_depth_buffer ? *inout_depth_buffer : local_depth;
+        if (zbuf_vec.size() != total_pixels) {
+            zbuf_vec.assign(total_pixels, 1.0f);
+        }
+        if (draw.clear_on_entry) {
+            for (size_t p = 0; p < total_pixels; ++p) {
+                px[p] = mfbd.clear_color_rgba8;
+                zbuf_vec[p] = 1.0f;
+            }
+        }
+        float* zbuf = zbuf_vec.data();
+
+        uint32_t stride_bytes = draw.stride_bytes;
+        if (stride_bytes == 0U) {
+            if (draw.vertex_bo_size >= draw.count * 36ULL && (draw.vertex_bo_size % 36ULL) == 0ULL) stride_bytes = 36U;
+            else if (draw.vertex_bo_size >= draw.count * 32ULL) stride_bytes = 32U;
+            else if (draw.vertex_bo_size >= draw.count * 24ULL) stride_bytes = 24U;
+            else if (draw.vertex_bo_size >= draw.count * 20ULL) stride_bytes = 20U;
+            else if (draw.vertex_bo_size >= draw.count * 16ULL) stride_bytes = 16U;
+            else stride_bytes = 12U;
+        }
+
+        // Detect UBO layout:
+        //   - vkmark [vertex]/[texture]: mat4 mvp at +0x00, mat4 normal at +0x40, optional vec4 material_color at +0x80
+        //   - vkmark [cube]/[shading]:   mat4 modelview at +0x00, mat4 mvp at +0x40, mat4 normal at +0x80
+        const float* mvp_mat  = nullptr;
+        const float* norm_mat = nullptr;
+        float ubo_mat_col[3]  = {0.75f, 0.75f, 0.75f};
+        bool  has_ubo_mat_col = false;
+        if (draw.ubo_va != 0 && draw.ubo_range >= 64ULL) {
+            const float* ubo = reinterpret_cast<const float*>(draw.ubo_va);
+            auto isMvpCandidate = [](const float* m) -> bool {
+                if (!std::isfinite(m[0]) || !std::isfinite(m[5]) || !std::isfinite(m[11]) || !std::isfinite(m[15])) return false;
+                if (std::fabs(m[0]) < 0.02f || std::fabs(m[5]) < 0.02f) return false;
+                // Perspective projection has |m[11]| ~= 1.0 and |m[15]| ~= 0.0; ortho/general has m[15] ~= 1.0 and non-zero translation/scale
+                bool is_persp = (std::fabs(std::fabs(m[11]) - 1.0f) < 0.25f && std::fabs(m[15]) < 0.05f);
+                bool is_ortho = (std::fabs(m[15] - 1.0f) < 0.05f && std::fabs(m[3]) < 1e-3f && std::fabs(m[7]) < 1e-3f && std::fabs(m[10]) > 0.01f);
+                return is_persp || is_ortho;
+            };
+            if (draw.ubo_range >= 128ULL &&
+                std::fabs(ubo[15] - 1.0f) < 0.05f &&
+                std::fabs(std::fabs(ubo[16 + 11]) - 1.0f) < 0.25f &&
+                std::fabs(ubo[16 + 15]) < 0.05f) {
+                // modelview at +0x00, mvp at +0x40, normal at +0x80 (or modelview)
+                mvp_mat  = ubo + 16;
+                norm_mat = (draw.ubo_range >= 192ULL) ? (ubo + 32) : (ubo + 0);
+            } else if (isMvpCandidate(ubo)) {
+                mvp_mat  = ubo;
+                norm_mat = (draw.ubo_range >= 128ULL) ? (ubo + 16) : nullptr;
+                if (draw.ubo_range >= 144ULL && std::isfinite(ubo[32]) && ubo[35] > 0.01f && ubo[35] <= 1.0f) {
+                    ubo_mat_col[0] = std::clamp(ubo[32], 0.0f, 1.0f);
+                    ubo_mat_col[1] = std::clamp(ubo[33], 0.0f, 1.0f);
+                    ubo_mat_col[2] = std::clamp(ubo[34], 0.0f, 1.0f);
+                    has_ubo_mat_col = true;
+                }
+            }
+        }
+
+        const uint32_t* tex_rgba8 = draw.tex_va ? reinterpret_cast<const uint32_t*>(draw.tex_va) : nullptr;
+        uint32_t tex_w = draw.tex_width;
+        uint32_t tex_h = draw.tex_height;
+
+        auto fetchIndex = [&](uint32_t k) -> uint32_t {
+            if (!draw.is_indexed || !draw.index_bo_va) return draw.first_vertex + k;
+            uint32_t idx_pos = draw.first_index + k;
+            if (draw.index_type == 0U /* UINT16 */) {
+                if ((idx_pos + 1ULL) * 2ULL <= draw.index_bo_size)
+                    return static_cast<uint32_t>(reinterpret_cast<const uint16_t*>(draw.index_bo_va)[idx_pos]) + draw.vertex_offset;
+            } else {
+                if ((idx_pos + 1ULL) * 4ULL <= draw.index_bo_size)
+                    return reinterpret_cast<const uint32_t*>(draw.index_bo_va)[idx_pos] + draw.vertex_offset;
+            }
+            return k;
+        };
+
+        VkCubeFrameStats stats{};
+        stats.width  = W;
+        stats.height = H;
+        stats.bbox_min_x = W;
+        stats.bbox_min_y = H;
+
+        uint32_t topo = draw.topology;
+        uint32_t step = (topo == 4U /* TRIANGLE_STRIP */ || topo == 5U /* TRIANGLE_FAN */) ? 1U : 3U;
+        const float lx = 0.348155f, ly = 0.348155f, lz = 0.870388f; // normalize(vec3(2, 2, 5))
+
+        for (uint32_t t = 0; t + 2 < draw.count; t += step) {
+            uint32_t i0 = fetchIndex(topo == 5U ? 0U : t);
+            uint32_t i1 = fetchIndex(t + 1U);
+            uint32_t i2 = fetchIndex(t + 2U);
+            if (topo == 4U && (t & 1U)) std::swap(i0, i1);
+            if ((i0 + 1ULL) * stride_bytes > draw.vertex_bo_size ||
+                (i1 + 1ULL) * stride_bytes > draw.vertex_bo_size ||
+                (i2 + 1ULL) * stride_bytes > draw.vertex_bo_size) continue;
+
+            stats.triangles_submitted++;
+            const uint8_t* b[3] = {
+                reinterpret_cast<const uint8_t*>(draw.vertex_bo_va) + i0 * stride_bytes,
+                reinterpret_cast<const uint8_t*>(draw.vertex_bo_va) + i1 * stride_bytes,
+                reinterpret_cast<const uint8_t*>(draw.vertex_bo_va) + i2 * stride_bytes
+            };
+
+            float sx[3], sy[3], sz[3], inv_w[3];
+            float vr[3], vg[3], vb[3], vu[3], vv[3];
+            bool tri_valid = true;
+
+            for (int vi = 0; vi < 3; ++vi) {
+                const float* p = reinterpret_cast<const float*>(b[vi]);
+                float px_in = p[0], py_in = p[1], pz_in = (stride_bytes >= 12U) ? p[2] : 0.0f;
+                if (mvp_mat) {
+                    float cx = mvp_mat[0]*px_in + mvp_mat[4]*py_in + mvp_mat[8]*pz_in  + mvp_mat[12];
+                    float cy = mvp_mat[1]*px_in + mvp_mat[5]*py_in + mvp_mat[9]*pz_in  + mvp_mat[13];
+                    float cz = mvp_mat[2]*px_in + mvp_mat[6]*py_in + mvp_mat[10]*pz_in + mvp_mat[14];
+                    float cw = mvp_mat[3]*px_in + mvp_mat[7]*py_in + mvp_mat[11]*pz_in + mvp_mat[15];
+                    if (cw <= 1e-4f) { tri_valid = false; break; }
+                    inv_w[vi] = 1.0f / cw;
+                    sx[vi] = ((cx * inv_w[vi]) * 0.5f + 0.5f) * static_cast<float>(W);
+                    sy[vi] = ((cy * inv_w[vi]) * 0.5f + 0.5f) * static_cast<float>(H);
+                    sz[vi] = std::clamp(0.5f * (cz * inv_w[vi] + 1.0f), 0.0f, 1.0f);
+                } else {
+                    inv_w[vi] = 1.0f;
+                    sx[vi] = (px_in * 0.5f + 0.5f) * static_cast<float>(W);
+                    sy[vi] = (py_in * 0.5f + 0.5f) * static_cast<float>(H);
+                    sz[vi] = std::clamp(pz_in * 0.5f + 0.5f, 0.0f, 1.0f);
+                }
+
+                float base_r = draw.has_const_color ? draw.const_color[0] : (has_ubo_mat_col ? ubo_mat_col[0] : 0.85f);
+                float base_g = draw.has_const_color ? draw.const_color[1] : (has_ubo_mat_col ? ubo_mat_col[1] : 0.65f);
+                float base_b = draw.has_const_color ? draw.const_color[2] : (has_ubo_mat_col ? ubo_mat_col[2] : 0.35f);
+                float shade  = 1.0f;
+
+                if (norm_mat && stride_bytes >= 24U) {
+                    const float* n = reinterpret_cast<const float*>(b[vi] + 12U);
+                    float tnx = norm_mat[0]*n[0] + norm_mat[4]*n[1] + norm_mat[8]*n[2];
+                    float tny = norm_mat[1]*n[0] + norm_mat[5]*n[1] + norm_mat[9]*n[2];
+                    float tnz = norm_mat[2]*n[0] + norm_mat[6]*n[1] + norm_mat[10]*n[2];
+                    float nlen = std::sqrt(tnx*tnx + tny*tny + tnz*tnz);
+                    if (nlen > 1e-6f) { tnx /= nlen; tny /= nlen; tnz /= nlen; }
+                    shade = 0.20f + 0.80f * std::max(0.0f, std::fabs(tnx * lx + tny * ly + tnz * lz));
+                    if (stride_bytes >= 36U) {
+                        const float* c = reinterpret_cast<const float*>(b[vi] + 24U);
+                        base_r = std::clamp(c[0], 0.0f, 1.0f);
+                        base_g = std::clamp(c[1], 0.0f, 1.0f);
+                        base_b = std::clamp(c[2], 0.0f, 1.0f);
+                    } else if (tex_rgba8) {
+                        base_r = base_g = base_b = 1.0f;
+                    }
+                } else if (stride_bytes >= 24U) {
+                    const float* c = reinterpret_cast<const float*>(b[vi] + 12U);
+                    base_r = std::clamp(c[0], 0.0f, 1.0f);
+                    base_g = std::clamp(c[1], 0.0f, 1.0f);
+                    base_b = std::clamp(c[2], 0.0f, 1.0f);
+                }
+
+                vr[vi] = std::clamp(base_r * shade, 0.0f, 1.0f);
+                vg[vi] = std::clamp(base_g * shade, 0.0f, 1.0f);
+                vb[vi] = std::clamp(base_b * shade, 0.0f, 1.0f);
+
+                if (stride_bytes == 20U) {
+                    const float* uv = reinterpret_cast<const float*>(b[vi] + 12U);
+                    vu[vi] = uv[0]; vv[vi] = uv[1];
+                } else if (stride_bytes == 32U) {
+                    const float* uv = reinterpret_cast<const float*>(b[vi] + 24U);
+                    vu[vi] = uv[0]; vv[vi] = uv[1];
+                } else {
+                    vu[vi] = sx[vi] / static_cast<float>(W);
+                    vv[vi] = sy[vi] / static_cast<float>(H);
+                }
+            }
+            if (!tri_valid) continue;
+
+            float area = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
+            if (std::fabs(area) < 1e-4f) continue;
+            stats.triangles_front_facing++;
+            float inv_area = 1.0f / area;
+
+            int min_x = std::max(0, static_cast<int>(std::floor(std::min({sx[0], sx[1], sx[2]}))));
+            int max_x = std::min(static_cast<int>(W) - 1, static_cast<int>(std::ceil(std::max({sx[0], sx[1], sx[2]}))));
+            int min_y = std::max(0, static_cast<int>(std::floor(std::min({sy[0], sy[1], sy[2]}))));
+            int max_y = std::min(static_cast<int>(H) - 1, static_cast<int>(std::ceil(std::max({sy[0], sy[1], sy[2]}))));
+
+            for (int py = min_y; py <= max_y; ++py) {
+                for (int px_i = min_x; px_i <= max_x; ++px_i) {
+                    float sample_x = static_cast<float>(px_i) + 0.5f;
+                    float sample_y = static_cast<float>(py) + 0.5f;
+                    float w0 = ((sx[1] - sample_x) * (sy[2] - sample_y) - (sx[2] - sample_x) * (sy[1] - sample_y)) * inv_area;
+                    float w1 = ((sx[2] - sample_x) * (sy[0] - sample_y) - (sx[0] - sample_x) * (sy[2] - sample_y)) * inv_area;
+                    float w2 = 1.0f - w0 - w1;
+                    if (w0 >= -1e-4f && w1 >= -1e-4f && w2 >= -1e-4f) {
+                        float z = w0 * sz[0] + w1 * sz[1] + w2 * sz[2];
+                        size_t pidx = static_cast<size_t>(py) * W + static_cast<size_t>(px_i);
+                        if (z <= zbuf[pidx]) {
+                            zbuf[pidx] = z;
+                            stats.depth_test_passes++;
+                            float cr = std::clamp(w0 * vr[0] + w1 * vr[1] + w2 * vr[2], 0.0f, 1.0f);
+                            float cg = std::clamp(w0 * vg[0] + w1 * vg[1] + w2 * vg[2], 0.0f, 1.0f);
+                            float cb_c = std::clamp(w0 * vb[0] + w1 * vb[1] + w2 * vb[2], 0.0f, 1.0f);
+                            if (tex_rgba8 && tex_w > 0 && tex_h > 0) {
+                                float pw0 = w0 * inv_w[0], pw1 = w1 * inv_w[1], pw2 = w2 * inv_w[2];
+                                float pw_sum = pw0 + pw1 + pw2;
+                                if (pw_sum > 1e-7f) { pw0 /= pw_sum; pw1 /= pw_sum; pw2 /= pw_sum; }
+                                float u = std::clamp(pw0 * vu[0] + pw1 * vu[1] + pw2 * vu[2], 0.0f, 1.0f);
+                                float v = std::clamp(pw0 * vv[0] + pw1 * vv[1] + pw2 * vv[2], 0.0f, 1.0f);
+                                uint32_t tx = std::min<uint32_t>(tex_w - 1U, static_cast<uint32_t>(u * tex_w));
+                                uint32_t ty = std::min<uint32_t>(tex_h - 1U, static_cast<uint32_t>(v * tex_h));
+                                uint32_t texel = tex_rgba8[ty * tex_w + tx];
+                                cr   *= static_cast<float>(texel & 0xFFU) / 255.0f;
+                                cg   *= static_cast<float>((texel >> 8) & 0xFFU) / 255.0f;
+                                cb_c *= static_cast<float>((texel >> 16) & 0xFFU) / 255.0f;
+                            }
+                            uint32_t r8 = static_cast<uint32_t>(cr * 255.0f + 0.5f);
+                            uint32_t g8 = static_cast<uint32_t>(cg * 255.0f + 0.5f);
+                            uint32_t b8 = static_cast<uint32_t>(cb_c * 255.0f + 0.5f);
+                            px[pidx] = (0xFFU << 24) | (b8 << 16) | (g8 << 8) | r8;
+                        } else {
+                            stats.depth_overdraw_rejects++;
+                        }
+                    }
+                }
+            }
+        }
+
+        uint32_t crc = 0x811C9DC5U;
+        for (size_t i = 0; i < total_pixels; ++i) {
+            if (px[i] != mfbd.clear_color_rgba8) stats.fragments_shaded++;
+            crc = (crc ^ px[i]) * 0x01000193U;
+        }
+        stats.frame_crc32 = crc;
+        stats.center_pixel_rgba8 = px[(H / 2) * W + (W / 2)];
+        stats.lvp_fragment_dispatch_ok = true;
+        if (out_stats) *out_stats = stats;
+        return stats.fragments_shaded > 0;
     }
 };

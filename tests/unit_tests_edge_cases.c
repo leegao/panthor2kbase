@@ -1,3 +1,4 @@
+#include <sys/syscall.h>
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <pthread.h>
@@ -2792,6 +2793,99 @@ static void test_v35_kbase_emu_stats_sized_abi_guard(void)
    printf("  -> PASS: mali_kbase_emu_get_stats_sized clamped 64B probe without touching stack canary (full_sz=%zu)\n", full_sz);
 }
 
+/* ============================================================================
+ * TEST 26 (Checkpoint v36): Raw syscall(SYS_ioctl/SYS_openat) Interception,
+ * PanVK Hardware MFBD/RTD[0] RUN_FRAGMENT Bridge & Lifted CSFFW Sync
+ * ============================================================================ */
+static void test_v36_raw_syscall_hook_and_panvk_hw_fragment_bridge(void)
+{
+   printf("[TEST 26] Verifying raw syscall(SYS_openat/SYS_ioctl/SYS_mmap) interception & PanVK HW MFBD/RTD[0] RUN_FRAGMENT 3D rendering...\n");
+
+   /* 1. Verify raw syscall(SYS_openat, AT_FDCWD, "/dev/mali0", O_RDWR | O_CLOEXEC, 0) & syscall(SYS_ioctl, ...) */
+   int sfd = (int)syscall(SYS_openat, AT_FDCWD, "/dev/mali0", O_RDWR | O_CLOEXEC, 0);
+   assert(sfd >= 0);
+
+   struct kbase_ioctl_version_check vc = { 1, 38 };
+   assert(syscall(SYS_ioctl, sfd, (unsigned long)KBASE_IOCTL_VERSION_CHECK_RESERVED, &vc) == -1 && errno == EPERM);
+   assert(syscall(SYS_ioctl, sfd, (unsigned long)KBASE_IOCTL_VERSION_CHECK, &vc) == 0);
+   assert(vc.major == 1 && vc.minor >= 21);
+
+   struct kbase_ioctl_set_flags sf = { 0 };
+   assert(syscall(SYS_ioctl, sfd, (unsigned long)KBASE_IOCTL_SET_FLAGS, &sf) == 0);
+
+   /* 2. Allocate 64x64 RGBA8 framebuffer BO, 128B MFBD+RTD[0] BO, and 4KB CSF ringbuffer via raw syscall(SYS_ioctl) */
+   union kbase_ioctl_mem_alloc fb_alloc, desc_alloc, ring_alloc;
+   memset(&fb_alloc, 0, sizeof(fb_alloc));
+   fb_alloc.in.va_pages = 16; /* 64 KB */
+   fb_alloc.in.commit_pages = 16;
+   fb_alloc.in.flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR | BASE_MEM_SAME_VA;
+   assert(syscall(SYS_ioctl, sfd, (unsigned long)KBASE_IOCTL_MEM_ALLOC, &fb_alloc) == 0);
+   uint32_t *fb_px = (uint32_t *)mmap(NULL, 16 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, sfd, (off_t)fb_alloc.out.gpu_va);
+   assert(fb_px != MAP_FAILED);
+   memset(fb_px, 0, 16 * 4096);
+
+   memset(&desc_alloc, 0, sizeof(desc_alloc));
+   desc_alloc.in.va_pages = 1;
+   desc_alloc.in.commit_pages = 1;
+   desc_alloc.in.flags = fb_alloc.in.flags;
+   assert(syscall(SYS_ioctl, sfd, (unsigned long)KBASE_IOCTL_MEM_ALLOC, &desc_alloc) == 0);
+   uint8_t *desc_ptr = (uint8_t *)mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, sfd, (off_t)desc_alloc.out.gpu_va);
+   assert(desc_ptr != MAP_FAILED);
+   memset(desc_ptr, 0, 4096);
+
+   /* Populate Valhall hardware MFBD at desc_ptr+0 and RTD[0] at desc_ptr+64 */
+   uint32_t *mfbd_u32 = (uint32_t *)desc_ptr;
+   mfbd_u32[4] = (63U << 16) | 63U; /* bound_max_x = 63, bound_max_y = 63 -> 64x64 */
+   uint32_t *rtd_u32 = (uint32_t *)(desc_ptr + 64);
+   rtd_u32[4] = 0xFF181410U; /* clear_color_0 */
+   *(uint64_t *)(desc_ptr + 64 + 32) = (uint64_t)(uintptr_t)fb_px; /* writeback_address */
+
+   memset(&ring_alloc, 0, sizeof(ring_alloc));
+   ring_alloc.in.va_pages = 1;
+   ring_alloc.in.commit_pages = 1;
+   ring_alloc.in.flags = fb_alloc.in.flags;
+   assert(syscall(SYS_ioctl, sfd, (unsigned long)KBASE_IOCTL_MEM_ALLOC, &ring_alloc) == 0);
+   uint64_t *ring_cpu = (uint64_t *)mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, sfd, (off_t)ring_alloc.out.gpu_va);
+   assert(ring_cpu != MAP_FAILED);
+
+   struct kbase_ioctl_cs_queue_register qreg = { (uint64_t)(uintptr_t)ring_cpu, 4096U, 1U, {0, 0, 0} };
+   assert(syscall(SYS_ioctl, sfd, (unsigned long)KBASE_IOCTL_CS_QUEUE_REGISTER, &qreg) == 0);
+   union kbase_ioctl_cs_queue_bind qbind;
+   memset(&qbind, 0, sizeof(qbind));
+   qbind.in.buffer_gpu_addr = (uint64_t)(uintptr_t)ring_cpu;
+   qbind.in.group_handle = 1;
+   qbind.in.csi_index = 0;
+   assert(syscall(SYS_ioctl, sfd, (unsigned long)KBASE_IOCTL_CS_QUEUE_BIND, &qbind) == 0);
+   uint8_t *uio = (uint8_t *)mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, sfd, (off_t)qbind.out.mmap_handle);
+   assert(uio != MAP_FAILED);
+
+   /* Temporarily clear g_csf_job_hook to simulate standalone PanVK (vkcube-panvk.sh) */
+   mali_kbase_emu_register_csf_job_hook(NULL, NULL);
+
+   uint64_t mfbd_va = (uint64_t)(uintptr_t)desc_ptr;
+   ring_cpu[0] = (0x01ULL << 56) | (40ULL << 48) | (mfbd_va & 0xFFFFFFFFFFFFULL); /* MOVE48 r40:r41, mfbd_va */
+   ring_cpu[1] = (0x06ULL << 56); /* HW_CSF_OP_RUN_IDVS */
+   ring_cpu[2] = (0x07ULL << 56); /* HW_CSF_OP_RUN_FRAGMENT */
+   *(uint64_t *)(uio + 0x1000) = 24ULL;
+   struct kbase_ioctl_cs_queue_kick kick = { (uint64_t)(uintptr_t)ring_cpu };
+   assert(syscall(SYS_ioctl, sfd, (unsigned long)KBASE_IOCTL_CS_QUEUE_KICK, &kick) == 0);
+   assert(mali_kbase_emu_wait_csf_idle(200000000ULL) == 0);
+
+   uint32_t shaded = 0;
+   for (uint32_t i = 0; i < 64 * 64; i++) {
+      if (fb_px[i] != 0U && fb_px[i] != 0xFF181410U)
+         shaded++;
+   }
+   assert(shaded > 400U);
+
+   munmap(uio, 3 * 4096);
+   munmap(ring_cpu, 4096);
+   munmap(desc_ptr, 4096);
+   munmap(fb_px, 16 * 4096);
+   assert(syscall(SYS_close, sfd) == 0);
+   printf("  -> PASS: Raw syscall(SYS_openat/SYS_ioctl) & PanVK HW MFBD/RTD[0] RUN_FRAGMENT rendered %u non-clear 3D cube pixels!\n", shaded);
+}
+
 int main(void)
 {
    printf("[Unit Tests] Running edge cases, mali_kbase.ko flag invariants, and RAII logging suite...\n");
@@ -2820,6 +2914,7 @@ int main(void)
    test_v33_multi_fd_mali0_isolation_and_full_r54p3_icd();
    test_v34_async_csf_client_server_and_syncobj_fixes();
    test_v35_kbase_emu_stats_sized_abi_guard();
+   test_v36_raw_syscall_hook_and_panvk_hw_fragment_bridge();
    printf("[Unit Tests] ALL EDGE CASES PASSED!\n");
    return 0;
 }

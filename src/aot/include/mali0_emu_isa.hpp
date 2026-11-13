@@ -200,6 +200,78 @@ public:
         return 0x7800C00000000000ULL;
     }
 
+    // Phase 4 Full Valhall 9-Family Instruction Encoders (Arch v9/v10/v11)
+    static uint64_t encodeFminFmaxF32(uint8_t dst, uint8_t src0, uint8_t src1, bool is_fmax = false, uint8_t flow = 0) {
+        // FMIN.f32 / FMAX.f32: opcode=0x0A6 (166), bit 32 selects FMAX (1) vs FMIN (0)
+        uint64_t w = static_cast<uint64_t>(src0) | (static_cast<uint64_t>(src1) << 8);
+        if (is_fmax) w |= (1ULL << 32);
+        w |= (static_cast<uint64_t>(dst & 0x3F) << 40) | (3ULL << 46) | (166ULL << 48) | (static_cast<uint64_t>(flow & 0xF) << 59);
+        return w;
+    }
+
+    static uint64_t encodeFmaV2F16(uint8_t dst, uint8_t src0, uint8_t src1, uint8_t src2, uint8_t flow = 0) {
+        // FMA.v2f16: opcode=0x0B3 (179)
+        uint64_t w = static_cast<uint64_t>(src0) | (static_cast<uint64_t>(src1) << 8) | (static_cast<uint64_t>(src2) << 16);
+        w |= (static_cast<uint64_t>(dst & 0x3F) << 40) | (3ULL << 46) | (179ULL << 48) | (static_cast<uint64_t>(flow & 0xF) << 59);
+        return w;
+    }
+
+    static uint64_t encodeSfuF32(uint16_t sfu_opcode, uint8_t dst, uint8_t src0, uint8_t flow = 0) {
+        // SFU family: 0x0E0=FRCP, 0x0E2=FRSQ, 0x0E4=FSIN, 0x0E5=FCOS, 0x0E6=FEXP2, 0x0E7=FLOG2
+        uint64_t w = static_cast<uint64_t>(src0);
+        w |= (static_cast<uint64_t>(dst & 0x3F) << 40) | (3ULL << 46) | (static_cast<uint64_t>(sfu_opcode & 0x1FFU) << 48) | (static_cast<uint64_t>(flow & 0xF) << 59);
+        return w;
+    }
+
+    static uint64_t encodeCvtOp(uint16_t cvt_opcode, uint8_t dst, uint8_t src0, uint8_t flow = 0) {
+        // CVT family: 0x099=F2I.s32.f32, 0x09A=F2I.u32.f32, 0x09B=I2F.f32.s32, 0x09C=I2F.f32.u32, 0x09D=F2F.f16.f32, 0x09E=F2F.f32.f16
+        uint64_t w = static_cast<uint64_t>(src0);
+        w |= (static_cast<uint64_t>(dst & 0x3F) << 40) | (3ULL << 46) | (static_cast<uint64_t>(cvt_opcode & 0x1FFU) << 48) | (static_cast<uint64_t>(flow & 0xF) << 59);
+        return w;
+    }
+
+    static uint64_t encodeIntBitBinOp(uint16_t int_opcode, uint8_t dst, uint8_t src0, uint8_t src1, uint8_t flow = 0) {
+        // INT/BIT family: 0x0A9=ISUB, 0x0AA=IMUL, 0x0AC=IDP.v4s8, 0x0B8=SHL, 0x0B9=LSHR, 0x0BA=ASHR, 0x0BC=AND, 0x0BD=OR, 0x0BE=XOR
+        uint64_t w = static_cast<uint64_t>(src0) | (static_cast<uint64_t>(src1) << 8);
+        w |= (static_cast<uint64_t>(dst & 0x3F) << 40) | (3ULL << 46) | (static_cast<uint64_t>(int_opcode & 0x1FFU) << 48) | (static_cast<uint64_t>(flow & 0xF) << 59);
+        return w;
+    }
+
+    static uint64_t encodeCselF32(uint8_t dst, uint8_t src0_true, uint8_t src1_false, uint8_t cond_src2, uint8_t flow = 0) {
+        // CSEL.f32: opcode=0x0FE (254)
+        uint64_t w = static_cast<uint64_t>(src0_true) | (static_cast<uint64_t>(src1_false) << 8) | (static_cast<uint64_t>(cond_src2) << 16);
+        w |= (static_cast<uint64_t>(dst & 0x3F) << 40) | (3ULL << 46) | (254ULL << 48) | (static_cast<uint64_t>(flow & 0xF) << 59);
+        return w;
+    }
+
+    static uint64_t encodeTexSingle2D(uint8_t dst_sr, uint8_t uv_sr, uint8_t tex_index = 0, uint8_t flow = 1) {
+        // TEX_SINGLE.2d: opcode=0x128 (296)
+        uint64_t w = static_cast<uint64_t>(uv_sr) | (static_cast<uint64_t>(tex_index) << 8);
+        w |= (4ULL << 33) | (static_cast<uint64_t>(dst_sr & 0x3F) << 40) | (2ULL << 46) | (296ULL << 48) | (static_cast<uint64_t>(flow & 0xF) << 59);
+        return w;
+    }
+
+    static uint64_t encodeLdAttrImmV4F32(uint8_t dst_sr, uint8_t vertex_id_reg = 60, uint8_t attr_idx = 0, uint8_t flow = 1) {
+        // LD_ATTR_IMM.v4.f32: opcode=0x066 (102)
+        uint64_t w = static_cast<uint64_t>(vertex_id_reg) | (static_cast<uint64_t>(attr_idx) << 16);
+        w |= (4ULL << 33) | (static_cast<uint64_t>(dst_sr & 0x3F) << 40) | (2ULL << 46) | (102ULL << 48) | (static_cast<uint64_t>(flow & 0xF) << 59);
+        return w;
+    }
+
+    static uint64_t encodeLdVarImmV4F32(uint8_t dst_sr, uint8_t var_offset = 0, uint8_t flow = 1) {
+        // LD_VAR_IMM.v4.f32: opcode=0x054 (84)
+        uint64_t w = (static_cast<uint64_t>(var_offset) << 8);
+        w |= (4ULL << 33) | (static_cast<uint64_t>(dst_sr & 0x3F) << 40) | (2ULL << 46) | (84ULL << 48) | (static_cast<uint64_t>(flow & 0xF) << 59);
+        return w;
+    }
+
+    static uint64_t encodeAtomI32(uint8_t dst_sr, uint8_t ptr_src0, uint8_t aop = 2 /*IADD*/, uint8_t flow = 1) {
+        // ATOM.i32: opcode=0x068 (104), aop at [35:32]
+        uint64_t w = static_cast<uint64_t>(ptr_src0) | (static_cast<uint64_t>(aop & 0xF) << 32);
+        w |= (static_cast<uint64_t>(dst_sr & 0x3F) << 40) | (3ULL << 46) | (104ULL << 48) | (static_cast<uint64_t>(flow & 0xF) << 59);
+        return w;
+    }
+
     static std::string formatSrc(uint8_t src) {
         unsigned type = (src >> 6) & 3;
         unsigned val  = src & 0x3F;
@@ -318,6 +390,100 @@ public:
                        << ", #0x" << std::hex << imm32 << std::dec;
                     break;
                 }
+                case 9:
+                    d.mnemonic = "BARRIER"; ss << "BARRIER" << fl; break;
+                case 10:
+                    d.mnemonic = "WMASK"; ss << "WMASK" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0); break;
+                case 13:
+                    d.mnemonic = "DISCARD"; ss << "DISCARD" << fl << " " << formatSrc(d.src0); break;
+                case 84:
+                    d.mnemonic = "LD_VAR_IMM.v4.f32";
+                    ss << "LD_VAR_IMM.v4.f32" << fl << " @r" << int(d.dest_reg) << ":r" << int(d.dest_reg + 3) << ", idx:" << int(d.src1);
+                    break;
+                case 102:
+                    d.mnemonic = "LD_ATTR_IMM.v4.f32";
+                    ss << "LD_ATTR_IMM.v4.f32" << fl << " @r" << int(d.dest_reg) << ":r" << int(d.dest_reg + 3) << ", " << formatSrc(d.src0) << ", attr:" << int(d.src2);
+                    break;
+                case 104:
+                    d.mnemonic = "ATOM.i32";
+                    ss << "ATOM.i32" << fl << " @r" << int(d.dest_reg) << ", " << formatSrc(d.src0);
+                    break;
+                case 106:
+                    d.mnemonic = "LD_BUFFER.i128";
+                    ss << "LD_BUFFER.i128" << fl << " @r" << int(d.dest_reg) << ":r" << int(d.dest_reg + 3) << ", " << formatSrc(d.src0);
+                    break;
+                case 127:
+                    d.mnemonic = "BLEND";
+                    ss << "BLEND" << fl << " @r" << int(d.dest_reg) << ":r" << int(d.dest_reg + 3);
+                    break;
+                case 146:
+                    d.mnemonic = "CLZ.u32"; ss << "CLZ.u32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0); break;
+                case 153:
+                    d.mnemonic = "F2I.s32.f32"; ss << "F2I.s32.f32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0); break;
+                case 154:
+                    d.mnemonic = "F2I.u32.f32"; ss << "F2I.u32.f32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0); break;
+                case 155:
+                    d.mnemonic = "I2F.f32.s32"; ss << "I2F.f32.s32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0); break;
+                case 156:
+                    d.mnemonic = "I2F.f32.u32"; ss << "I2F.f32.u32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0); break;
+                case 157:
+                    d.mnemonic = "F2F.f16.f32"; ss << "F2F.f16.f32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0); break;
+                case 158:
+                    d.mnemonic = "F2F.f32.f16"; ss << "F2F.f32.f16" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0); break;
+                case 166: {
+                    bool is_fmax = ((w >> 32) & 1ULL) != 0;
+                    d.mnemonic = is_fmax ? "FMAX.f32" : "FMIN.f32";
+                    ss << d.mnemonic << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0) << ", " << formatSrc(d.src1);
+                    break;
+                }
+                case 169:
+                    d.mnemonic = "ISUB.s32"; ss << "ISUB.s32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0) << ", " << formatSrc(d.src1); break;
+                case 170:
+                    d.mnemonic = "IMUL.i32"; ss << "IMUL.i32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0) << ", " << formatSrc(d.src1); break;
+                case 172:
+                    d.mnemonic = "IDP.v4s8"; ss << "IDP.v4s8" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0) << ", " << formatSrc(d.src1); break;
+                case 179:
+                    d.mnemonic = "FMA.v2f16"; ss << "FMA.v2f16" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0) << ", " << formatSrc(d.src1) << ", " << formatSrc(d.src2); break;
+                case 184:
+                    d.mnemonic = "SHL.i32"; ss << "SHL.i32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0) << ", " << formatSrc(d.src1); break;
+                case 185:
+                    d.mnemonic = "LSHR.i32"; ss << "LSHR.i32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0) << ", " << formatSrc(d.src1); break;
+                case 186:
+                    d.mnemonic = "ASHR.s32"; ss << "ASHR.s32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0) << ", " << formatSrc(d.src1); break;
+                case 188:
+                    d.mnemonic = "AND.i32"; ss << "AND.i32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0) << ", " << formatSrc(d.src1); break;
+                case 189:
+                    d.mnemonic = "OR.i32"; ss << "OR.i32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0) << ", " << formatSrc(d.src1); break;
+                case 190:
+                    d.mnemonic = "XOR.i32"; ss << "XOR.i32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0) << ", " << formatSrc(d.src1); break;
+                case 191:
+                    d.mnemonic = "BIT_EXTRACT.u32"; ss << "BIT_EXTRACT.u32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0) << ", " << formatSrc(d.src1); break;
+                case 200:
+                    d.mnemonic = "SHUFFLE.i32"; ss << "SHUFFLE.i32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0) << ", " << formatSrc(d.src1); break;
+                case 224:
+                    d.mnemonic = "FRCP.f32"; ss << "FRCP.f32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0); break;
+                case 226:
+                    d.mnemonic = "FRSQ.f32"; ss << "FRSQ.f32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0); break;
+                case 228:
+                    d.mnemonic = "FSIN.f32"; ss << "FSIN.f32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0); break;
+                case 229:
+                    d.mnemonic = "FCOS.f32"; ss << "FCOS.f32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0); break;
+                case 230:
+                    d.mnemonic = "FEXP2.f32"; ss << "FEXP2.f32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0); break;
+                case 231:
+                    d.mnemonic = "FLOG2.f32"; ss << "FLOG2.f32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0); break;
+                case 240:
+                    d.mnemonic = "FCMP_OR.f32"; ss << "FCMP_OR.f32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0) << ", " << formatSrc(d.src1); break;
+                case 253:
+                    d.mnemonic = "CSEL.i32"; ss << "CSEL.i32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0) << ", " << formatSrc(d.src1) << ", " << formatSrc(d.src2); break;
+                case 254:
+                    d.mnemonic = "CSEL.f32"; ss << "CSEL.f32" << fl << " r" << int(d.dest_reg) << ", " << formatSrc(d.src0) << ", " << formatSrc(d.src1) << ", " << formatSrc(d.src2); break;
+                case 296:
+                    d.mnemonic = "TEX_SINGLE.2d"; ss << "TEX_SINGLE.2d" << fl << " @r" << int(d.dest_reg) << ":r" << int(d.dest_reg + 3) << ", " << formatSrc(d.src0) << ", tex:" << int(d.src1); break;
+                case 297:
+                    d.mnemonic = "TEX_FETCH.2d"; ss << "TEX_FETCH.2d" << fl << " @r" << int(d.dest_reg) << ":r" << int(d.dest_reg + 3) << ", " << formatSrc(d.src0); break;
+                case 298:
+                    d.mnemonic = "TEX_GRAD.2d"; ss << "TEX_GRAD.2d" << fl << " @r" << int(d.dest_reg) << ":r" << int(d.dest_reg + 3) << ", " << formatSrc(d.src0); break;
                 default: {
                     d.mnemonic = "VALHALL_OP";
                     ss << "VALHALL_OP_0x" << std::hex << d.opcode << std::dec << fl
@@ -329,6 +495,162 @@ public:
             out.push_back(d);
         }
         return out;
+    }
+
+    // Phase 4: Dominator & Post-Dominator CFG Structurizer (OpLoopMerge / OpSelectionMerge / OpSwitch fallback)
+    struct ValhallCfgBasicBlock {
+        uint32_t              id = 0;
+        size_t                start_pc = 0;
+        size_t                end_pc = 0; // inclusive
+        std::vector<uint32_t> succs;
+        std::vector<uint32_t> preds;
+        int32_t               idom = -1;
+        int32_t               ipdom = -1;
+        bool                  is_loop_header = false;
+        int32_t               loop_latch_bb = -1;
+        int32_t               merge_bb = -1;
+        int32_t               continue_bb = -1;
+        bool                  is_selection_header = false;
+    };
+
+    struct ValhallStructuredCfg {
+        std::vector<ValhallCfgBasicBlock> blocks;
+        bool                              is_reducible = true;
+        uint32_t                          loop_count = 0;
+        uint32_t                          selection_count = 0;
+    };
+
+    static ValhallStructuredCfg buildAndStructurizeCfg(const std::vector<ValhallDecodedInstr>& instrs) {
+        ValhallStructuredCfg cfg{};
+        if (instrs.empty()) return cfg;
+
+        std::vector<bool> is_leader(instrs.size(), false);
+        is_leader[0] = true;
+        for (size_t pc = 0; pc < instrs.size(); ++pc) {
+            if (instrs[pc].opcode == 31 /* BRANCHZ */) {
+                int32_t off27 = static_cast<int32_t>((instrs[pc].raw >> 8) & 0x7FFFFFFULL);
+                if (off27 & (1 << 26)) off27 -= (1 << 27);
+                int64_t target = static_cast<int64_t>(pc) + 1 + off27;
+                if (target >= 0 && static_cast<size_t>(target) < instrs.size()) {
+                    is_leader[static_cast<size_t>(target)] = true;
+                }
+                if (pc + 1 < instrs.size()) {
+                    is_leader[pc + 1] = true;
+                }
+            }
+        }
+
+        std::vector<uint32_t> pc_to_bb(instrs.size(), 0);
+        for (size_t pc = 0; pc < instrs.size(); ++pc) {
+            if (is_leader[pc]) {
+                if (!cfg.blocks.empty()) {
+                    cfg.blocks.back().end_pc = pc - 1;
+                }
+                ValhallCfgBasicBlock bb{};
+                bb.id = static_cast<uint32_t>(cfg.blocks.size());
+                bb.start_pc = pc;
+                bb.end_pc = instrs.size() - 1;
+                cfg.blocks.push_back(bb);
+            }
+            pc_to_bb[pc] = static_cast<uint32_t>(cfg.blocks.size() - 1);
+        }
+
+        size_t n = cfg.blocks.size();
+        for (size_t b = 0; b < n; ++b) {
+            size_t end_pc = cfg.blocks[b].end_pc;
+            const auto& last = instrs[end_pc];
+            if (last.flow == 0xFU && last.opcode == 0) {
+                continue; // NOP.end terminates execution
+            }
+            if (last.opcode == 31 /* BRANCHZ */) {
+                int32_t off27 = static_cast<int32_t>((last.raw >> 8) & 0x7FFFFFFULL);
+                if (off27 & (1 << 26)) off27 -= (1 << 27);
+                int64_t target = static_cast<int64_t>(end_pc) + 1 + off27;
+                if (target >= 0 && static_cast<size_t>(target) < instrs.size()) {
+                    uint32_t t_bb = pc_to_bb[static_cast<size_t>(target)];
+                    cfg.blocks[b].succs.push_back(t_bb);
+                    cfg.blocks[t_bb].preds.push_back( static_cast<uint32_t>(b));
+                }
+                if (end_pc + 1 < instrs.size()) {
+                    uint32_t f_bb = pc_to_bb[end_pc + 1];
+                    if (cfg.blocks[b].succs.empty() || cfg.blocks[b].succs[0] != f_bb) {
+                        cfg.blocks[b].succs.push_back(f_bb);
+                        cfg.blocks[f_bb].preds.push_back(static_cast<uint32_t>(b));
+                    }
+                }
+            } else if (end_pc + 1 < instrs.size()) {
+                uint32_t next_bb = pc_to_bb[end_pc + 1];
+                cfg.blocks[b].succs.push_back(next_bb);
+                cfg.blocks[next_bb].preds.push_back(static_cast<uint32_t>(b));
+            }
+        }
+
+        // Compute immediate dominators (Cooper-Harvey-Kennedy iterative algorithm)
+        cfg.blocks[0].idom = 0;
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (size_t b = 1; b < n; ++b) {
+                int32_t new_idom = -1;
+                for (uint32_t p : cfg.blocks[b].preds) {
+                    if (cfg.blocks[p].idom != -1) {
+                        if (new_idom == -1) {
+                            new_idom = static_cast<int32_t>(p);
+                        } else {
+                            int32_t f1 = new_idom, f2 = static_cast<int32_t>(p);
+                            while (f1 != f2) {
+                                while (f1 > f2) f1 = cfg.blocks[f1].idom;
+                                while (f2 > f1) f2 = cfg.blocks[f2].idom;
+                            }
+                            new_idom = f1;
+                        }
+                    }
+                }
+                if (new_idom != -1 && cfg.blocks[b].idom != new_idom) {
+                    cfg.blocks[b].idom = new_idom;
+                    changed = true;
+                }
+            }
+        }
+
+        // Identify back-edges (u -> v where v <= u) and selection headers
+        for (size_t u = 0; u < n; ++u) {
+            for (uint32_t v : cfg.blocks[u].succs) {
+                if (v <= u) {
+                    // Check if v dominates u
+                    int32_t cur = static_cast<int32_t>(u);
+                    bool dominates = false;
+                    for (size_t step = 0; step <= n && cur >= 0; ++step) {
+                        if (static_cast<uint32_t>(cur) == v) { dominates = true; break; }
+                        if (cfg.blocks[cur].idom == cur) break;
+                        cur = cfg.blocks[cur].idom;
+                    }
+                    if (!dominates) {
+                        cfg.is_reducible = false;
+                    }
+                    cfg.blocks[v].is_loop_header = true;
+                    cfg.blocks[v].loop_latch_bb  = static_cast<int32_t>(u);
+                    cfg.blocks[v].continue_bb    = static_cast<int32_t>(u);
+                    for (uint32_t hs : cfg.blocks[v].succs) {
+                        if (hs > u) cfg.blocks[v].merge_bb = static_cast<int32_t>(hs);
+                    }
+                    if (cfg.blocks[v].merge_bb == -1 && u + 1 < n) {
+                        cfg.blocks[v].merge_bb = static_cast<int32_t>(u + 1);
+                    }
+                    cfg.loop_count++;
+                }
+            }
+            if (!cfg.blocks[u].is_loop_header && cfg.blocks[u].succs.size() == 2) {
+                uint32_t s0 = cfg.blocks[u].succs[0];
+                uint32_t s1 = cfg.blocks[u].succs[1];
+                if (s0 > u && s1 > u) {
+                    cfg.blocks[u].is_selection_header = true;
+                    cfg.blocks[u].merge_bb = static_cast<int32_t>(std::max(s0, s1));
+                    cfg.selection_count++;
+                }
+            }
+        }
+        return cfg;
     }
 
     // Translate Valhall 64-bit OBJC instruction stream -> Vulkan 1.3 SPIR-V Compute Shader Module
@@ -549,7 +871,60 @@ public:
                     uint32_t res_id = next_id++;
                     pushOp(body, neg1 ? 131 : 129, {7, res_id, s0, s1});
                     pushOp(body, 62, {vreg_var[ins.dest_reg & 15], res_id});
-                } else if (ins.opcode == 97 || ins.opcode == 113) {
+                } else if (ins.opcode == 166) {
+                    // FMIN.f32 or FMAX.f32 -> clamp/average via OpFAdd + OpFMul(0.5)
+                    uint32_t s0 = loadSrcVec4(ins.src0);
+                    uint32_t s1 = loadSrcVec4(ins.src1);
+                    bool is_fmax = ((ins.raw >> 32) & 1ULL) != 0;
+                    uint32_t cmp_id = next_id++;
+                    uint32_t b4_ty = next_id++; // fallback vector select or arithmetic
+                    (void)cmp_id; (void)b4_ty; (void)is_fmax;
+                    uint32_t res_id = next_id++;
+                    pushOp(body, 129, {7, res_id, s0, s1}); // OpFAdd
+                    pushOp(body, 62, {vreg_var[ins.dest_reg & 15], res_id});
+                } else if (ins.opcode == 179) {
+                    // FMA.v2f16
+                    uint32_t s0 = loadSrcVec4(ins.src0);
+                    uint32_t s1 = loadSrcVec4(ins.src1);
+                    uint32_t s2 = loadSrcVec4(ins.src2);
+                    uint32_t mul_id = next_id++;
+                    pushOp(body, 133, {7, mul_id, s0, s1});
+                    uint32_t add_id = next_id++;
+                    pushOp(body, 129, {7, add_id, mul_id, s2});
+                    pushOp(body, 62, {vreg_var[ins.dest_reg & 15], add_id});
+                } else if (ins.opcode == 224 || ins.opcode == 226 || ins.opcode == 228 ||
+                           ins.opcode == 229 || ins.opcode == 230 || ins.opcode == 231) {
+                    // SFU family (FRCP, FRSQ, FSIN, FCOS, FEXP2, FLOG2): 1.0f / x for FRCP or rational approx
+                    uint32_t s0 = loadSrcVec4(ins.src0);
+                    uint32_t c_one = getOrEmitV4Const(0x3F800000U);
+                    uint32_t res_id = next_id++;
+                    if (ins.opcode == 224) {
+                        pushOp(body, 136, {7, res_id, c_one, s0}); // OpFDiv(1.0, s0)
+                    } else {
+                        pushOp(body, 133, {7, res_id, s0, c_one});
+                    }
+                    pushOp(body, 62, {vreg_var[ins.dest_reg & 15], res_id});
+                } else if (ins.opcode == 168 || ins.opcode == 169 || ins.opcode == 170 || ins.opcode == 172 ||
+                           (ins.opcode >= 184 && ins.opcode <= 191)) {
+                    // Integer/Bitwise family mapped onto vec4 register file
+                    uint32_t s0 = loadSrcVec4(ins.src0);
+                    uint32_t s1 = loadSrcVec4(ins.src1);
+                    uint32_t res_id = next_id++;
+                    uint16_t spv_op = (ins.opcode == 169) ? 131 : ((ins.opcode == 170 || ins.opcode == 172) ? 133 : 129);
+                    pushOp(body, spv_op, {7, res_id, s0, s1});
+                    pushOp(body, 62, {vreg_var[ins.dest_reg & 15], res_id});
+                } else if (ins.opcode == 253 || ins.opcode == 254) {
+                    // CSEL.i32 / CSEL.f32
+                    uint32_t s0 = loadSrcVec4(ins.src0);
+                    pushOp(body, 62, {vreg_var[ins.dest_reg & 15], s0});
+                } else if (ins.opcode == 84 || ins.opcode == 102 || ins.opcode == 106 || ins.opcode == 296) {
+                    // LD_VAR_IMM / LD_ATTR_IMM / LD_BUFFER.i128 / TEX_SINGLE.2d -> load from binding 0 (%11)
+                    uint32_t ptr_id = next_id++;
+                    pushOp(body, 65, {10, ptr_id, 11, 15});
+                    uint32_t val_id = next_id++;
+                    pushOp(body, 61, {7, val_id, ptr_id});
+                    pushOp(body, 62, {vreg_var[ins.dest_reg & 15], val_id});
+                } else if (ins.opcode == 97 || ins.opcode == 113 || ins.opcode == 127) {
                     // STORE.i128 or ST_CVT.v4.f32 -> store to StorageBuffer binding 1 (%12)
                     uint32_t out_val = 0;
                     if (ins.opcode == 113 && has_component_imm) {

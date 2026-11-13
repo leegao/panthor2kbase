@@ -245,6 +245,22 @@ enum csffw_opcode_ret lifted_csffw_dispatch_opcode(
     case 0x03: /* WAIT: scoreboard mask in cmd_lo[15:0] */
         return CSFFW_OP_RET_COMPLETED;
 
+    case 0x04: /* RUN_COMPUTE: CSHWIF compute iterator dispatch */
+        st->iter_states[1] = CSFFW_ITER_ENABLED;
+        st->csi_state = CSFFW_CSI_RUNNABLE;
+        return CSFFW_OP_RET_COMPLETED;
+
+    case 0x05: /* RUN_TILING: CSHWIF tiler iterator dispatch */
+    case 0x06: /* RUN_IDVS: CSHWIF IDVS vertex+tiler iterator dispatch */
+        st->iter_states[0] = CSFFW_ITER_ENABLED;
+        st->csi_state = CSFFW_CSI_RUNNABLE;
+        return CSFFW_OP_RET_COMPLETED;
+
+    case 0x07: /* RUN_FRAGMENT: CSHWIF fragment iterator dispatch */
+        st->iter_states[2] = CSFFW_ITER_ENABLED;
+        st->csi_state = CSFFW_CSI_RUNNABLE;
+        return CSFFW_OP_RET_COMPLETED;
+
     /* --- Firmware-Trapped CSF Opcodes in g_csffw_opcode_table (VA 0x004100BC) --- */
     case 0x0B: /* Handler @ 0x0080796c: SHARED_SB_DEC / SB_INC */ {
         uint32_t src0 = (cmd_hi >> 8) & 0xFFU;
