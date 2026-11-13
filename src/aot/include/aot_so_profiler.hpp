@@ -79,6 +79,7 @@ struct RawAotCpuPrefix {
 
 static uint32_t g_so_debug_flags = 0;
 static bool g_so_env_checked = false;
+static bool g_so_trace_std = false;
 static size_t g_so_profile_top_n = 0;
 static thread_local AotSoStackFrame g_so_call_frames[AOT_SO_MAX_CALL_FRAMES]{};
 static thread_local uint32_t g_so_call_depth = 0;
@@ -126,10 +127,36 @@ static inline void ensure_env_initialized() {
             flags |= (AOT_SO_DEBUG_RECORD_STACKFRAMES | AOT_SO_DEBUG_PROFILE_CALLS);
         }
     }
+    if (env_flag_on("MALI_SO_TRACE_STD") || env_flag_on("AOT_SO_TRACE_STD")) {
+        g_so_trace_std = true;
+    }
     if (flags & (AOT_SO_DEBUG_TRACE_CALLS | AOT_SO_DEBUG_PROFILE_CALLS)) {
         flags |= AOT_SO_DEBUG_RECORD_STACKFRAMES;
     }
     g_so_debug_flags |= flags;
+}
+
+static inline bool is_std_trace_suppressed(const char* fn_name) {
+    if (g_so_trace_std || !fn_name || !fn_name[0]) return false;
+    if (std::strncmp(fn_name, "_ZNSt3__1", 9) == 0 ||
+        std::strncmp(fn_name, "_ZNKSt3__1", 10) == 0) {
+        return true;
+    }
+    if (std::strncmp(fn_name, "std::__1::", 10) == 0 || std::strncmp(fn_name, "void std::__1::", 15) == 0) {
+        // int angle_depth = 0;
+        // for (const char* p = fn_name; *p != '\0'; ++p) {
+        //     if (*p == '<') {
+        //         angle_depth++;
+        //     } else if (*p == '>' && angle_depth > 0) {
+        //         angle_depth--;
+        //     } else if (angle_depth == 0) {
+        //         if (*p == '(') return true;
+        //         if (*p == ' ') return false;
+        //     }
+        // }
+        return true;
+    }
+    return false;
 }
 
 } // namespace aot_so_prof_detail
@@ -173,7 +200,7 @@ void aot_so_unwind_to_depth(uint32_t target_depth) {
                 aot_so_prof_detail::g_so_call_frames[idx - 1U].child_ns += elapsed_ns;
             }
         }
-        if (flags & AOT_SO_DEBUG_TRACE_CALLS) {
+        if ((flags & AOT_SO_DEBUG_TRACE_CALLS) && !aot_so_prof_detail::is_std_trace_suppressed(fn_name)) {
             std::fprintf(stderr, "[SO_TRACE] %*s<- %s [unwound %llu ns]\n",
                          static_cast<int>(idx * 2U), "",
                          fn_name,
@@ -303,7 +330,7 @@ void aot_so_trace_fn_enter(void* cpu_ptr, uint64_t fn_va, const char* fn_name) {
     if (aot_so_prof_detail::g_so_call_depth > aot_so_prof_detail::g_so_max_call_depth) {
         aot_so_prof_detail::g_so_max_call_depth = aot_so_prof_detail::g_so_call_depth;
     }
-    if (flags & AOT_SO_DEBUG_TRACE_CALLS) {
+    if ((flags & AOT_SO_DEBUG_TRACE_CALLS) && !aot_so_prof_detail::is_std_trace_suppressed(fn_name)) {
         std::fprintf(stderr, "[SO_TRACE] %*s-> %s(x0=0x%llx, x1=0x%llx, x2=0x%llx) [va=0x%llx sp=0x%llx lr=0x%llx depth=%u]\n",
                      static_cast<int>(depth * 2U), "",
                      fn_name ? fn_name : "<sub_unknown>",
@@ -366,7 +393,7 @@ void aot_so_trace_fn_exit(void* cpu_ptr, uint64_t fn_va, const char* fn_name) {
         }
     }
 
-    if (flags & AOT_SO_DEBUG_TRACE_CALLS) {
+    if ((flags & AOT_SO_DEBUG_TRACE_CALLS) && !aot_so_prof_detail::is_std_trace_suppressed(fn_name)) {
         uint64_t ret_x0 = cpu ? cpu->x[0] : 0ULL;
         std::fprintf(stderr, "[SO_TRACE] %*s<- %s = 0x%llx [%llu ns]\n",
                      static_cast<int>(aot_so_prof_detail::g_so_call_depth * 2U), "",

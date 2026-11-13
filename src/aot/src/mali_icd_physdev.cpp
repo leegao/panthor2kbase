@@ -82,7 +82,19 @@ int32_t vkEnumerateInstanceExtensionProperties(const char* pLayerName, uint32_t*
         {"VK_EXT_swapchain_colorspace", 4U},
     };
     const char* dis_wl = getenv("MALI_AOT_DISABLE_WAYLAND_EXT");
-    bool disable_wayland = (dis_wl && dis_wl[0] && std::atoi(dis_wl) != 0);
+    bool disable_wayland = false;
+    if (dis_wl && dis_wl[0]) {
+        disable_wayland = (std::atoi(dis_wl) != 0);
+    } else {
+        const char* layers = getenv("VK_INSTANCE_LAYERS");
+        const char* disp = getenv("DISPLAY");
+        const char* preload = getenv("LD_PRELOAD");
+        if (layers && std::strstr(layers, "VK_LAYER_window_system_integration") != nullptr &&
+            disp && disp[0] != '\0' &&
+            preload && std::strstr(preload, "libmali_kbase_emu") != nullptr) {
+            disable_wayland = true;
+        }
+    }
     if (disable_wayland) {
         exts.erase(std::remove_if(exts.begin(), exts.end(), [](const VkExtensionPropertiesIcd& e) {
             return std::strcmp(e.extensionName, "VK_KHR_wayland_surface") == 0;
