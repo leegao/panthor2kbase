@@ -1259,9 +1259,30 @@ private:
                     } else if (top6 == 0x25 || !(target >= faddr && target < faddr + fsize)) {
                         uint64_t tst = findFuncStart(target);
                         uint64_t cand = tst ? tst : target;
-                        bool in_vk_or_kb = (cand >= vk_lo && cand <= vk_hi) || (kb_hi > 0 && cand >= kb_lo && cand <= kb_hi) || (cand >= 0x01b50000ULL && cand <= 0x01b70000ULL) || (cand >= 0x01dd0000ULL && cand <= 0x01de0000ULL);
+                        bool in_vk_or_kb = (cand >= vk_lo && cand <= vk_hi) || (kb_hi > 0 && cand >= kb_lo && cand <= kb_hi) || (cand >= 0x01ad0000ULL && cand < cmpbe_stop) || (cand >= 0x01dd0000ULL && cand <= 0x01e30000ULL);
                         if (!visited.count(cand) && cand != cmpbe_stop && (lift_full_closure || in_vk_or_kb)) {
                             vk_q.push_back(cand);
+                        }
+                    }
+                } else {
+                    uint64_t cond_target = 0;
+                    if ((insn & 0xFF000010U) == 0x54000000U || (insn & 0x7E000000U) == 0x34000000U) {
+                        int64_t imm19 = sext64((insn >> 5) & 0x7FFFFU, 19);
+                        cond_target = static_cast<uint64_t>(static_cast<int64_t>(pc) + (imm19 << 2));
+                    } else if ((insn & 0x7E000000U) == 0x36000000U) {
+                        int64_t imm14 = sext64((insn >> 5) & 0x3FFFU, 14);
+                        cond_target = static_cast<uint64_t>(static_cast<int64_t>(pc) + (imm14 << 2));
+                    }
+                    if (cond_target != 0 && !(cond_target >= faddr && cond_target < faddr + fsize)) {
+                        if (plt_map.count(cond_target)) {
+                            closure_plts[cond_target] = plt_map[cond_target];
+                        } else {
+                            uint64_t tst = findFuncStart(cond_target);
+                            uint64_t cand = tst ? tst : cond_target;
+                            bool in_vk_or_kb = (cand >= vk_lo && cand <= vk_hi) || (kb_hi > 0 && cand >= kb_lo && cand <= kb_hi) || (cand >= 0x01ad0000ULL && cand < cmpbe_stop) || (cand >= 0x01dd0000ULL && cand <= 0x01e30000ULL);
+                            if (!visited.count(cand) && cand != cmpbe_stop && (lift_full_closure || in_vk_or_kb)) {
+                                vk_q.push_back(cand);
+                            }
                         }
                     }
                 }

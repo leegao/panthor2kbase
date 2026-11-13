@@ -621,8 +621,384 @@ bool mali_kbase_emu_init_lavapipe_bridge(void)
    return true;
 }
 
+/* ============================================================================
+ * Asynchronous Client/Server CSF Queue Kick & Doorbell Architecture
+ * (Addressing doco.Omd5ZTc__3MCShqKmdi2cg, doco.CDFStDizREHobZos_HKXEg, doco.XjPh2PoycfoSyDlS8w3_0g)
+ *
+ * - Client (Caller Thread): `KBASE_IOCTL_CS_QUEUE_KICK` atomically enqueues a
+ *   `struct emu_csf_kick_event` onto `g_csf_kick_ring`, signals `g_csf_server_cv`,
+ *   and returns 0 immediately without executing CSF streams or Lavapipe rendering
+ *   on the caller thread.
+ * - Server (`csf_server_thread_fn`): Dedicated background worker thread pops
+ *   events from `g_csf_kick_ring` (and scans bound queues for pure userspace
+ *   `USER_IO` doorbell/CS_INSERT advances), executes `execute_csf_stream`
+ *   outside the client thread, updates `CS_EXTRACT` in the `USER_IO` output
+ *   page (+0x2000 + csi_off), and broadcasts `g_csf_done_cv`.
+ * ============================================================================ */
+#define EMU_CSF_KICK_RING_SIZE 1024U
+#define EMU_CSF_KICK_RING_MASK (EMU_CSF_KICK_RING_SIZE - 1U)
+
+struct emu_csf_kick_event {
+   struct emu_kfile *kf;
+   uint32_t queue_idx;
+   uint64_t target_insert;
+   uint64_t enqueue_ts_ns;
+   uint32_t ready;
+};
+
+static struct emu_csf_kick_event g_csf_kick_ring[EMU_CSF_KICK_RING_SIZE];
+static uint64_t g_csf_kick_write_idx = 0ULL;
+static uint64_t g_csf_kick_read_idx  = 0ULL;
+static uint64_t g_csf_completed_kicks = 0ULL;
+static uint32_t g_csf_server_busy = 0U;
+static uint64_t g_csf_active_stream_va = 0ULL;
+static uint32_t g_csf_active_insn_idx  = 0U;
+static uint8_t  g_csf_active_opcode    = 0U;
+
+static pthread_mutex_t g_csf_server_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_csf_server_cv  = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  g_csf_done_cv    = PTHREAD_COND_INITIALIZER;
+static pthread_t       g_csf_server_thread;
+static bool            g_csf_server_started = false;
+static bool            g_csf_server_stop    = false;
+static pid_t           g_csf_server_pid     = 0;
+
+static uint64_t emu_monotonic_ns(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static bool emu_csf_trace_enabled(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *e = getenv("KBASE_EMU_CSF_TRACE");
+      cached = (e && e[0] && strcmp(e, "0") != 0) ? 1 : 0;
+   }
+   return cached == 1;
+}
+
+static bool emu_sync_csf_enabled(void)
+{
+   const char *e = getenv("KBASE_EMU_SYNC_CSF");
+   return (e && e[0] && strcmp(e, "0") != 0);
+}
+
+static void execute_csf_stream(const uint64_t *stream, uint32_t size_bytes,
+                               uint64_t *cs_regs, struct emu_tiler_heap *heap);
+
+static bool csf_execute_queue_slice_on_server(struct emu_kfile *kf, size_t q_idx)
+{
+   pthread_mutex_lock(&g_emu_lock);
+   if (!kf || kf->state != EMU_KFILE_KCTX_READY || q_idx >= 32 ||
+       !kf->queues[q_idx].bound || !kf->queues[q_idx].user_io_mapped ||
+       !kf->queues[q_idx].user_io_pages) {
+      pthread_mutex_unlock(&g_emu_lock);
+      return false;
+   }
+   uint8_t *uio = (uint8_t *)kf->queues[q_idx].user_io_pages;
+   size_t csi_off = kf->csg_user_io_cap
+      ? ((size_t)kf->queues[q_idx].csi_index * CS_USER_IO_CSI_STRIDE_1_35)
+      : 0U;
+   uint64_t cs_insert = __atomic_load_n(
+      (const uint64_t *)(uio + CS_USER_IO_INPUT_PAGE_OFFSET + csi_off), __ATOMIC_ACQUIRE);
+   uint64_t cs_extract = kf->queues[q_idx].extract_offset;
+   *(volatile uint32_t *)(uio + CS_USER_IO_DOORBELL_OFFSET) = 0U;
+   if (cs_insert <= cs_extract) {
+      pthread_mutex_unlock(&g_emu_lock);
+      return false;
+   }
+
+   /* Mark CS_ACTIVE = 1 in USER_IO output page (+0x2000 + csi_off + 8) while executing */
+   __atomic_store_n((uint64_t *)(uio + CS_USER_IO_OUTPUT_PAGE_OFFSET + csi_off + 8), 1ULL, __ATOMIC_RELEASE);
+   if (emu_csf_trace_enabled()) {
+      fprintf(stderr,
+              "[CSF_SERVER] execute kf_slot=%d q=%zu csi=%u ring_va=0x%llx [extract=%llu -> insert=%llu (+%llu B)]\n",
+              kf->slot_index, q_idx, (unsigned)kf->queues[q_idx].csi_index,
+              (unsigned long long)kf->queues[q_idx].buffer_gpu_addr,
+              (unsigned long long)cs_extract, (unsigned long long)cs_insert,
+              (unsigned long long)(cs_insert - cs_extract));
+   }
+
+   struct emu_kfile *prev_active = g_active_kfile;
+   g_active_kfile = kf;
+   uint32_t buf_sz = kf->queues[q_idx].buffer_size;
+   uint64_t cur = cs_extract;
+   uint64_t *cs_regs = kf->queues[q_idx].cs_regs;
+   struct emu_tiler_heap *heap = kf->heaps[0].active ? &kf->heaps[0] : NULL;
+   uint64_t ring_base_va = kf->queues[q_idx].buffer_gpu_addr;
+
+   while (cur < cs_insert && buf_sz > 0) {
+      uint32_t ring_off = (uint32_t)(cur % buf_sz);
+      uint64_t rem = cs_insert - cur;
+      uint32_t chunk = (ring_off + rem > buf_sz) ? (buf_sz - ring_off) : (uint32_t)rem;
+      execute_csf_stream(
+         (const uint64_t *)((const uint8_t *)(uintptr_t)ring_base_va + ring_off),
+         chunk, cs_regs, heap);
+      g_active_kfile = kf;
+      cur += chunk;
+   }
+
+   kf->queues[q_idx].extract_offset = cs_insert;
+   __atomic_store_n((uint64_t *)(uio + CS_USER_IO_OUTPUT_PAGE_OFFSET + csi_off), cs_insert, __ATOMIC_RELEASE);
+   __atomic_store_n((uint64_t *)(uio + CS_USER_IO_OUTPUT_PAGE_OFFSET + csi_off + 8), 0ULL, __ATOMIC_RELEASE);
+   __atomic_thread_fence(__ATOMIC_SEQ_CST);
+   if (kf->user_reg_page)
+      ((uint32_t *)kf->user_reg_page)[0]++;
+   g_stats.csf_server_kicks_processed++;
+   if (prev_active && prev_active->state != EMU_KFILE_UNOPENED)
+      g_active_kfile = prev_active;
+   pthread_mutex_unlock(&g_emu_lock);
+   return true;
+}
+
+static bool csf_any_bound_queue_has_pending_work_locked(void)
+{
+   for (int k = -1; k < EMU_MAX_KFILES; k++) {
+      struct emu_kfile *kf = (k < 0) ? &g_default_kfile : g_kfiles[k];
+      if (!kf || kf->state != EMU_KFILE_KCTX_READY)
+         continue;
+      for (size_t q = 0; q < 32; q++) {
+         if (kf->queues[q].bound && kf->queues[q].user_io_mapped && kf->queues[q].user_io_pages) {
+            uint8_t *uio = (uint8_t *)kf->queues[q].user_io_pages;
+            size_t csi_off = kf->csg_user_io_cap
+               ? ((size_t)kf->queues[q].csi_index * CS_USER_IO_CSI_STRIDE_1_35)
+               : 0U;
+            uint64_t cs_insert = __atomic_load_n(
+               (const uint64_t *)(uio + CS_USER_IO_INPUT_PAGE_OFFSET + csi_off), __ATOMIC_ACQUIRE);
+            if (cs_insert > kf->queues[q].extract_offset)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
+static void *csf_server_thread_fn(void *arg)
+{
+   (void)arg;
+   while (!__atomic_load_n(&g_csf_server_stop, __ATOMIC_ACQUIRE)) {
+      bool did_work = false;
+      __atomic_store_n(&g_csf_server_busy, 1U, __ATOMIC_RELEASE);
+
+      /* 1. Drain explicit kick events from the lock-free atomic ringbuffer */
+      uint64_t r_idx = __atomic_load_n(&g_csf_kick_read_idx, __ATOMIC_ACQUIRE);
+      uint64_t w_idx = __atomic_load_n(&g_csf_kick_write_idx, __ATOMIC_ACQUIRE);
+      while (r_idx < w_idx) {
+         struct emu_csf_kick_event *ev = &g_csf_kick_ring[r_idx & EMU_CSF_KICK_RING_MASK];
+         uint32_t spin = 0;
+         while (__atomic_load_n(&ev->ready, __ATOMIC_ACQUIRE) == 0U && spin < 10000U) {
+            spin++;
+         }
+         struct emu_kfile *kf = ev->kf;
+         uint32_t q_idx = ev->queue_idx;
+         __atomic_store_n(&ev->ready, 0U, __ATOMIC_RELEASE);
+         r_idx++;
+         __atomic_store_n(&g_csf_kick_read_idx, r_idx, __ATOMIC_RELEASE);
+
+         if (csf_execute_queue_slice_on_server(kf, q_idx))
+            did_work = true;
+         __atomic_fetch_add(&g_csf_completed_kicks, 1ULL, __ATOMIC_ACQ_REL);
+         w_idx = __atomic_load_n(&g_csf_kick_write_idx, __ATOMIC_ACQUIRE);
+      }
+
+      /* 2. Scan bound queues for pure userspace doorbell / CS_INSERT advances under g_emu_lock */
+      for (int k = -1; k < EMU_MAX_KFILES; k++) {
+         pthread_mutex_lock(&g_emu_lock);
+         struct emu_kfile *kf = (k < 0) ? &g_default_kfile : g_kfiles[k];
+         bool kctx_ready = (kf && kf->state == EMU_KFILE_KCTX_READY && kf->refcnt > 0);
+         pthread_mutex_unlock(&g_emu_lock);
+         if (!kctx_ready)
+            continue;
+         for (size_t q = 0; q < 32; q++) {
+            if (csf_execute_queue_slice_on_server(kf, q)) {
+               did_work = true;
+               __atomic_fetch_add(&g_csf_completed_kicks, 1ULL, __ATOMIC_ACQ_REL);
+            }
+         }
+      }
+
+      pthread_mutex_lock(&g_csf_server_mtx);
+      if (did_work)
+         pthread_cond_broadcast(&g_csf_done_cv);
+
+      uint64_t cur_r = __atomic_load_n(&g_csf_kick_read_idx, __ATOMIC_ACQUIRE);
+      uint64_t cur_w = __atomic_load_n(&g_csf_kick_write_idx, __ATOMIC_ACQUIRE);
+      if (cur_r >= cur_w && !__atomic_load_n(&g_csf_server_stop, __ATOMIC_ACQUIRE)) {
+         __atomic_store_n(&g_csf_server_busy, 0U, __ATOMIC_RELEASE);
+         pthread_cond_broadcast(&g_csf_done_cv);
+         struct timespec ts;
+         clock_gettime(CLOCK_REALTIME, &ts);
+         ts.tv_nsec += 1000000L; /* 1 ms poll for pure userspace doorbell writes */
+         if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1000000000L;
+         }
+         pthread_cond_timedwait(&g_csf_server_cv, &g_csf_server_mtx, &ts);
+      }
+      pthread_mutex_unlock(&g_csf_server_mtx);
+   }
+   __atomic_store_n(&g_csf_server_busy, 0U, __ATOMIC_RELEASE);
+   pthread_mutex_lock(&g_csf_server_mtx);
+   pthread_cond_broadcast(&g_csf_done_cv);
+   pthread_mutex_unlock(&g_csf_server_mtx);
+   return NULL;
+}
+
+static void ensure_csf_server_started(void)
+{
+   pid_t cur_pid = getpid();
+   pthread_mutex_lock(&g_csf_server_mtx);
+   if (!g_csf_server_started || g_csf_server_pid != cur_pid) {
+      if (g_csf_server_pid != 0 && g_csf_server_pid != cur_pid) {
+         /* Re-initialize ringbuffer state across fork() in child process */
+         memset(g_csf_kick_ring, 0, sizeof(g_csf_kick_ring));
+         g_csf_kick_write_idx = 0ULL;
+         g_csf_kick_read_idx = 0ULL;
+         g_csf_server_busy = 0U;
+      }
+      __atomic_store_n(&g_csf_server_stop, false, __ATOMIC_RELEASE);
+      if (pthread_create(&g_csf_server_thread, NULL, csf_server_thread_fn, NULL) == 0) {
+         pthread_detach(g_csf_server_thread);
+         g_csf_server_started = true;
+         g_csf_server_pid = cur_pid;
+      }
+   }
+   pthread_mutex_unlock(&g_csf_server_mtx);
+}
+
+static void csf_client_enqueue_kick_locked(struct emu_kfile *kf, size_t q_idx, uint64_t cs_insert)
+{
+   ensure_csf_server_started();
+   uint64_t slot = __atomic_fetch_add(&g_csf_kick_write_idx, 1ULL, __ATOMIC_ACQ_REL);
+   struct emu_csf_kick_event *ev = &g_csf_kick_ring[slot & EMU_CSF_KICK_RING_MASK];
+   ev->kf = kf;
+   ev->queue_idx = (uint32_t)q_idx;
+   ev->target_insert = cs_insert;
+   ev->enqueue_ts_ns = emu_monotonic_ns();
+   __atomic_store_n(&ev->ready, 1U, __ATOMIC_RELEASE);
+   if (emu_csf_trace_enabled()) {
+      fprintf(stderr,
+              "[CSF_CLIENT] enqueue kick slot=%llu kf_slot=%d q=%zu csi=%u extract=%llu -> insert=%llu\n",
+              (unsigned long long)slot, kf->slot_index, q_idx,
+              (unsigned)kf->queues[q_idx].csi_index,
+              (unsigned long long)kf->queues[q_idx].extract_offset,
+              (unsigned long long)cs_insert);
+   }
+   pthread_mutex_lock(&g_csf_server_mtx);
+   pthread_cond_signal(&g_csf_server_cv);
+   pthread_mutex_unlock(&g_csf_server_mtx);
+}
+
+__attribute__((visibility("default")))
+void mali_kbase_emu_dump_csf_state(void)
+{
+   fprintf(stderr, "================================================================================\n");
+   fprintf(stderr, " [mali_kbase_emu] CSF Client/Server Diagnostic Snapshot\n");
+   fprintf(stderr, "  ring_write_idx=%llu ring_read_idx=%llu completed_kicks=%llu server_busy=%u\n",
+           (unsigned long long)__atomic_load_n(&g_csf_kick_write_idx, __ATOMIC_ACQUIRE),
+           (unsigned long long)__atomic_load_n(&g_csf_kick_read_idx, __ATOMIC_ACQUIRE),
+           (unsigned long long)__atomic_load_n(&g_csf_completed_kicks, __ATOMIC_ACQUIRE),
+           __atomic_load_n(&g_csf_server_busy, __ATOMIC_ACQUIRE));
+   fprintf(stderr, "  active_stream_va=0x%llx active_insn_idx=%u active_opcode=0x%02x (%s)\n",
+           (unsigned long long)__atomic_load_n(&g_csf_active_stream_va, __ATOMIC_ACQUIRE),
+           __atomic_load_n(&g_csf_active_insn_idx, __ATOMIC_ACQUIRE),
+           __atomic_load_n(&g_csf_active_opcode, __ATOMIC_ACQUIRE),
+           csf_opcode_name(__atomic_load_n(&g_csf_active_opcode, __ATOMIC_ACQUIRE)));
+   for (int k = -1; k < EMU_MAX_KFILES; k++) {
+      struct emu_kfile *kf = (k < 0) ? &g_default_kfile : g_kfiles[k];
+      if (!kf || kf->state != EMU_KFILE_KCTX_READY)
+         continue;
+      for (size_t q = 0; q < 32; q++) {
+         if (!kf->queues[q].bound)
+            continue;
+         uint64_t u_in = 0, u_out = 0, u_act = 0;
+         uint32_t u_db = 0;
+         if (kf->queues[q].user_io_mapped && kf->queues[q].user_io_pages) {
+            uint8_t *uio = (uint8_t *)kf->queues[q].user_io_pages;
+            size_t csi_off = kf->csg_user_io_cap
+               ? ((size_t)kf->queues[q].csi_index * CS_USER_IO_CSI_STRIDE_1_35)
+               : 0U;
+            u_in  = *(volatile uint64_t *)(uio + CS_USER_IO_INPUT_PAGE_OFFSET + csi_off);
+            u_out = *(volatile uint64_t *)(uio + CS_USER_IO_OUTPUT_PAGE_OFFSET + csi_off);
+            u_act = *(volatile uint64_t *)(uio + CS_USER_IO_OUTPUT_PAGE_OFFSET + csi_off + 8);
+            u_db  = *(volatile uint32_t *)(uio + CS_USER_IO_DOORBELL_OFFSET);
+         }
+         fprintf(stderr,
+                 "  [kfile=%d fd=%d q=%zu grp=%u csi=%u] ring_va=0x%llx sz=%u extract=%llu USER_IO(insert=%llu extract=%llu active=%llu db=%u)\n",
+                 kf->slot_index, kf->fd, q,
+                 (unsigned)kf->queues[q].group_handle,
+                 (unsigned)kf->queues[q].csi_index,
+                 (unsigned long long)kf->queues[q].buffer_gpu_addr,
+                 kf->queues[q].buffer_size,
+                 (unsigned long long)kf->queues[q].extract_offset,
+                 (unsigned long long)u_in, (unsigned long long)u_out,
+                 (unsigned long long)u_act, u_db);
+      }
+   }
+   fprintf(stderr, "================================================================================\n");
+}
+
+__attribute__((visibility("default")))
+int mali_kbase_emu_wait_csf_idle(uint64_t timeout_ns)
+{
+   if (!g_csf_server_started || g_csf_server_pid != getpid())
+      return 0;
+   if (pthread_equal(pthread_self(), g_csf_server_thread))
+      return 0;
+   if (timeout_ns == 0ULL)
+      timeout_ns = 2000000000ULL;
+
+   uint64_t start_ns = emu_monotonic_ns();
+   uint64_t watchdog_ns = 0ULL;
+   const char *wd_env = getenv("KBASE_EMU_WATCHDOG_MS");
+   if (wd_env && wd_env[0] && atoi(wd_env) > 0)
+      watchdog_ns = (uint64_t)atoi(wd_env) * 1000000ULL;
+   bool dumped_wd = false;
+
+   pthread_mutex_lock(&g_csf_server_mtx);
+   pthread_cond_signal(&g_csf_server_cv);
+   while (true) {
+      uint64_t r_idx = __atomic_load_n(&g_csf_kick_read_idx, __ATOMIC_ACQUIRE);
+      uint64_t w_idx = __atomic_load_n(&g_csf_kick_write_idx, __ATOMIC_ACQUIRE);
+      uint32_t busy  = __atomic_load_n(&g_csf_server_busy, __ATOMIC_ACQUIRE);
+      if (r_idx >= w_idx && busy == 0U) {
+         pthread_mutex_unlock(&g_csf_server_mtx);
+         pthread_mutex_lock(&g_emu_lock);
+         bool more = csf_any_bound_queue_has_pending_work_locked();
+         pthread_mutex_unlock(&g_emu_lock);
+         if (!more)
+            return 0;
+         pthread_mutex_lock(&g_csf_server_mtx);
+         pthread_cond_signal(&g_csf_server_cv);
+      }
+      uint64_t elapsed = emu_monotonic_ns() - start_ns;
+      if (watchdog_ns > 0ULL && !dumped_wd && elapsed >= watchdog_ns) {
+         dumped_wd = true;
+         pthread_mutex_unlock(&g_csf_server_mtx);
+         mali_kbase_emu_dump_csf_state();
+         pthread_mutex_lock(&g_csf_server_mtx);
+      }
+      if (elapsed >= timeout_ns) {
+         pthread_mutex_unlock(&g_csf_server_mtx);
+         return -1;
+      }
+      struct timespec ts;
+      clock_gettime(CLOCK_REALTIME, &ts);
+      ts.tv_nsec += 500000L; /* 0.5 ms */
+      if (ts.tv_nsec >= 1000000000L) {
+         ts.tv_sec += 1;
+         ts.tv_nsec -= 1000000000L;
+      }
+      pthread_cond_timedwait(&g_csf_done_cv, &g_csf_server_mtx, &ts);
+   }
+}
+
 void mali_kbase_emu_get_stats(struct kbase_emu_stats *out)
 {
+   mali_kbase_emu_wait_csf_idle(500000000ULL);
    pthread_mutex_lock(&g_emu_lock);
    g_stats.active_profile = (uint32_t)resolve_active_emu_profile();
    g_stats.kbase_ver_major = g_kfile.kbase_ver_major ? g_kfile.kbase_ver_major : 1U;
@@ -636,6 +1012,7 @@ void mali_kbase_emu_get_stats(struct kbase_emu_stats *out)
 
 void mali_kbase_emu_reset_stats(void)
 {
+   mali_kbase_emu_wait_csf_idle(200000000ULL);
    pthread_mutex_lock(&g_emu_lock);
    memset(&g_stats, 0, sizeof(g_stats));
    g_trace_count = 0;
@@ -671,7 +1048,6 @@ static size_t build_valhall_gpuprops_blob(uint8_t *buf, size_t cap)
    memset(kbdev, 0, 16384);
    memset(regdump, 0, sizeof(g_kfile.sim_regdump));
    if (prof == MALI_EMU_PROFILE_HUSKY_R54) {
-      *(uint64_t *)(kbdev + 10576) = (uint64_t)(uintptr_t)regdump;
       *(uint32_t *)(regdump + 40) = 0x07140206U;
       *(uint64_t *)(regdump + 48) = 0x00000809ULL;
       *(uint64_t *)(regdump + 56) = 0x00000101ULL;
@@ -684,6 +1060,13 @@ static size_t build_valhall_gpuprops_blob(uint8_t *buf, size_t cap)
       *(uint32_t *)(regdump + 184) = 1024U;
       *(uint32_t *)(regdump + 188) = (0x0aU << 24) | 1024U;
       *(uint32_t *)(regdump + 196) = 65536U;
+      void *heap_regdump = lifted_ko_heap_alloc(&g_lifted_cpu, 256);
+      if (heap_regdump) {
+         memcpy(heap_regdump, regdump, 256);
+         *(uint64_t *)(kbdev + 10576) = (uint64_t)(uintptr_t)heap_regdump;
+      } else {
+         *(uint64_t *)(kbdev + 10576) = (uint64_t)(uintptr_t)regdump;
+      }
       *(uint64_t *)(kbdev + 10288) = 0x1fcULL;
       *(uint64_t *)(kbdev + 10296) = 0x1ULL;
       *(uint64_t *)(kbdev + 10304) = 0x1ULL;
@@ -964,9 +1347,17 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
    uint32_t count = size_bytes / sizeof(uint64_t);
    uint32_t steps = 0;
    uint32_t max_steps = count * 64U + 4096U;
+   __atomic_store_n(&g_csf_active_stream_va, (uint64_t)(uintptr_t)stream, __ATOMIC_RELAXED);
    for (uint32_t i = 0; i < count && steps < max_steps; i++, steps++) {
       uint64_t insn = stream[i];
       uint64_t opcode = (insn >> 56) & 0xffULL;
+      __atomic_store_n(&g_csf_active_insn_idx, i, __ATOMIC_RELAXED);
+      __atomic_store_n(&g_csf_active_opcode, (uint8_t)opcode, __ATOMIC_RELAXED);
+      if (emu_csf_trace_enabled() && insn != 0ULL) {
+         fprintf(stderr, "[CSF_INSN] depth=%u pc=+0x%03x raw=0x%016llx op=0x%02llx (%s)\n",
+                 call_depth, i * 8U, (unsigned long long)insn,
+                 (unsigned long long)opcode, csf_opcode_name((uint8_t)opcode));
+      }
       g_stats.csf_instructions_executed++;
       if (opcode >= 0x20ULL && opcode <= 0x80ULL && opcode != CSF_OP_CALL && opcode != 33ULL &&
           opcode != 49ULL && opcode != CSF_OP_HEAP_OPERATION &&
@@ -1012,6 +1403,10 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
          if (opcode == 39 && (((insn >> 32) & 0xffULL) == 0ULL || (insn & 0xffffffffULL) == 1ULL)) {
             /* Legacy synthetic CSF_OP_RUN_COMPUTE (0x27) */
             goto handle_run_compute;
+         }
+         if (opcode == 38 && ((insn >> 40) & 0xffULL) >= 64ULL) {
+            /* Hardware SYNC_SET32 (0x26 = 38) when registers bits [47:32] != 0 */
+            goto handle_sync_set32;
          }
          if (opcode == 52 && ((insn >> 40) & 0xffULL) >= 64ULL) {
             /* Hardware SYNC_SET64 (0x34 = 52) when registers bits [47:32] != 0 */
@@ -1356,7 +1751,13 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
             g_stats.fragment_jobs_run++;
 
          if (g_csf_job_hook) {
-            g_csf_job_hook((uint8_t)opcode, insn, cs_regs, g_csf_job_hook_user_data);
+            mali_kbase_emu_csf_job_hook_fn hook_fn = g_csf_job_hook;
+            void *hook_ud = g_csf_job_hook_user_data;
+            uint64_t cs_regs_snap[128];
+            memcpy(cs_regs_snap, cs_regs, sizeof(cs_regs_snap));
+            pthread_mutex_unlock(&g_emu_lock);
+            hook_fn((uint8_t)opcode, insn, cs_regs_snap, hook_ud);
+            pthread_mutex_lock(&g_emu_lock);
          }
 
          uint8_t spd_reg = (insn >> 40) & 0xffU;
@@ -1375,8 +1776,12 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
                         const struct valhall_shader_desc *spd =
                            (const struct valhall_shader_desc *)(uintptr_t)spd_va;
                         if (spd->shader_va >= 0x10000ULL && spd->shader_size >= 8 && spd->shader_size <= 65536 &&
-                            emu_is_valid_host_range(spd->shader_va, spd->shader_size))
-                           execute_valhall_shader(spd);
+                            emu_is_valid_host_range(spd->shader_va, spd->shader_size)) {
+                           struct valhall_shader_desc spd_copy = *spd;
+                           pthread_mutex_unlock(&g_emu_lock);
+                           execute_valhall_shader(&spd_copy);
+                           pthread_mutex_lock(&g_emu_lock);
+                        }
                      }
                      break;
                   }
@@ -1697,11 +2102,22 @@ int open(const char *pathname, int flags, ...)
    return orig_open(pathname, flags, mode);
 }
 
+static inline bool is_tracked_emu_or_aux_fd_fast(int fd)
+{
+   if (fd < 0)
+      return false;
+   if (fd < EMU_MAX_FDS && (g_fd_map[fd] != NULL || g_aux_fd_map[fd] != EMU_AUX_FD_NONE))
+      return true;
+   if (g_default_kfile.state != EMU_KFILE_UNOPENED && g_default_kfile.fd == fd)
+      return true;
+   return false;
+}
+
 int dup(int oldfd)
 {
    init_orig_syscalls();
    int newfd = orig_dup(oldfd);
-   if (newfd >= 0) {
+   if (newfd >= 0 && is_tracked_emu_or_aux_fd_fast(oldfd)) {
       pthread_mutex_lock(&g_emu_lock);
       struct emu_kfile *kf = find_kfile_by_fd_locked(oldfd);
       if (kf) {
@@ -1722,6 +2138,8 @@ int dup2(int oldfd, int newfd)
    init_orig_syscalls();
    if (oldfd == newfd)
       return newfd;
+   if (!is_tracked_emu_or_aux_fd_fast(oldfd) && !is_tracked_emu_or_aux_fd_fast(newfd))
+      return orig_dup2(oldfd, newfd);
    pthread_mutex_lock(&g_emu_lock);
    struct emu_kfile *old_kf = find_kfile_by_fd_locked(oldfd);
    struct emu_kfile * replaced_kf = (newfd >= 0 && newfd < EMU_MAX_FDS) ? g_fd_map[newfd] : NULL;
@@ -1748,7 +2166,7 @@ int fcntl(int fd, int cmd, ...)
    unsigned long arg = va_arg(ap, unsigned long);
    va_end(ap);
    int r = orig_fcntl(fd, cmd, arg);
-   if (r >= 0 && (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC)) {
+   if (r >= 0 && (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) && is_tracked_emu_or_aux_fd_fast(fd)) {
       pthread_mutex_lock(&g_emu_lock);
       struct emu_kfile *kf = find_kfile_by_fd_locked(fd);
       if (kf && r < EMU_MAX_FDS && g_fd_map[r] != kf) {
@@ -1767,7 +2185,9 @@ int close(int fd)
    init_orig_syscalls();
    if (panthor_kbase_adapter_is_virtual_drm_fd(fd))
       return panthor_kbase_adapter_close(fd);
-   if (fd >= 0) {
+   if (fd >= 0 && is_tracked_emu_or_aux_fd_fast(fd)) {
+      if (fd < EMU_MAX_FDS && g_fd_map[fd] != NULL)
+         mali_kbase_emu_wait_csf_idle(500000000ULL);
       pthread_mutex_lock(&g_emu_lock);
       if (fd < EMU_MAX_FDS)
          g_aux_fd_map[fd] = EMU_AUX_FD_NONE;
@@ -1814,6 +2234,8 @@ int close(int fd)
                orig_munmap(kf->user_reg_page, 4096);
                kf->user_reg_page = NULL;
             }
+            kf->state = EMU_KFILE_UNOPENED;
+            memset(kf->queues, 0, sizeof(kf->queues));
             for (int g = 0; g < 16; g++) {
                if (kf->group_user_io_pages[g] && kf->group_user_io_pages[g] != MAP_FAILED) {
                   orig_munmap(kf->group_user_io_pages[g], 3 * 4096);
@@ -1823,7 +2245,6 @@ int close(int fd)
             kf->fd = -1;
             kf->dev = 0;
             kf->ino = 0;
-            kf->state = EMU_KFILE_UNOPENED;
             if (fd == g_default_direct_fd)
                g_default_direct_fd = -1;
             /* Switch g_active_kfile to any remaining open kfile (or &g_default_kfile) */
@@ -1938,6 +2359,10 @@ int ioctl(int fd, unsigned long request, ...)
 
    /* If caller (or adapter) is issuing KBASE_IOCTL_* on emulated /dev/mali0 */
    if (_IOC_TYPE(request) == KBASE_IOCTL_TYPE && is_emulated_mali_fd(fd)) {
+      unsigned int pre_nr = _IOC_NR(request);
+      if (pre_nr == 7 || pre_nr == 41 || pre_nr == 43 || pre_nr == 47 || pre_nr == 49) {
+         mali_kbase_emu_wait_csf_idle(500000000ULL);
+      }
       pthread_mutex_lock(&g_emu_lock);
       struct emu_kfile *kf_cur = find_kfile_by_fd_locked(fd);
       if (kf_cur)
@@ -2362,7 +2787,15 @@ int ioctl(int fd, unsigned long request, ...)
                size_t csi_off = g_kfile.csg_user_io_cap
                   ? ((size_t)g_kfile.queues[i].csi_index * CS_USER_IO_CSI_STRIDE_1_35)
                   : 0U;
-               uint64_t cs_insert = *(volatile uint64_t *)(uio + CS_USER_IO_INPUT_PAGE_OFFSET + csi_off);
+               uint64_t cs_insert = __atomic_load_n(
+                  (const uint64_t *)(uio + CS_USER_IO_INPUT_PAGE_OFFSET + csi_off), __ATOMIC_ACQUIRE);
+               if (!emu_sync_csf_enabled()) {
+                  /* Asynchronous Client/Server CSF architecture (default):
+                   * Enqueue kick onto lock-free ringbuffer for csf_server_thread_fn and return 0 immediately! */
+                  csf_client_enqueue_kick_locked(&g_kfile, i, cs_insert);
+                  pthread_mutex_unlock(&g_emu_lock);
+                  return 0;
+               }
                uint64_t cs_extract = g_kfile.queues[i].extract_offset;
                if (cs_insert > cs_extract) {
                   uint32_t buf_sz = g_kfile.queues[i].buffer_size;
@@ -2383,6 +2816,7 @@ int ioctl(int fd, unsigned long request, ...)
                }
                if (g_kfile.user_reg_page)
                   ((uint32_t *)g_kfile.user_reg_page)[0]++;
+               g_stats.csf_server_kicks_processed++;
                pthread_mutex_unlock(&g_emu_lock);
                return 0;
             }
@@ -2633,6 +3067,7 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
                }
                g_kfile.queues[i].user_io_pages = uio;
                g_kfile.queues[i].user_io_mapped = true;
+               if (!emu_sync_csf_enabled()) ensure_csf_server_started();
                pthread_mutex_unlock(&g_emu_lock);
                return uio;
             }
@@ -2714,8 +3149,21 @@ int munmap(void *addr, size_t length)
    if (addr != NULL) {
       pthread_mutex_lock(&g_emu_lock);
       for (int k = -1; k < EMU_MAX_KFILES; k++) {
-         struct emu_kfile *kf = (k < 0) ? g_active_kfile : g_kfiles[k];
+         struct emu_kfile *kf = (k < 0) ? &g_default_kfile : g_kfiles[k];
          if (!kf) continue;
+         for (size_t q = 0; q < 32; q++) {
+            if (kf->queues[q].user_io_pages == addr ||
+                kf->queues[q].buffer_gpu_addr == (uint64_t)(uintptr_t)addr) {
+               kf->queues[q].bound = false;
+               kf->queues[q].user_io_mapped = false;
+               kf->queues[q].user_io_pages = NULL;
+            }
+         }
+         for (size_t g = 0; g < 16; g++) {
+            if (kf->group_user_io_pages[g] == addr) {
+               kf->group_user_io_pages[g] = NULL;
+            }
+         }
          for (size_t i = 0; i < 2048; i++) {
             if (kf->regions[i].active && kf->regions[i].cpu_ptr == addr) {
                kf->regions[i].freed_by_munmap = true;
@@ -2724,7 +3172,9 @@ int munmap(void *addr, size_t length)
             }
          }
       }
+      int rc = orig_munmap(addr, length);
       pthread_mutex_unlock(&g_emu_lock);
+      return rc;
    }
    return orig_munmap(addr, length);
 }
@@ -2816,7 +3266,8 @@ static void mali_kbase_emu_auto_dump_trace_on_exit(void)
                  g_trace_count, out_path);
       }
    }
-   if ((lifted_ko_get_debug_flags(&g_lifted_cpu) & LIFTED_KO_DEBUG_PROFILE_CALLS) != 0U) {
+   if ((lifted_ko_get_debug_flags(&g_lifted_cpu) & LIFTED_KO_DEBUG_PROFILE_CALLS) != 0U &&
+       lifted_ko_get_profile_entries(NULL, 0) > 0U) {
       lifted_ko_dump_profile(stderr);
    }
 }

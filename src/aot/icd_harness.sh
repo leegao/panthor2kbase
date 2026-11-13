@@ -3,9 +3,9 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$ROOT_DIR/../.." && pwd)"
-DEFAULT_SO="$ROOT_DIR/libGLES_mali.so"
-if [ ! -f "$DEFAULT_SO" ] && [ -f "$REPO_ROOT/libGLES_mali.so" ]; then
-    DEFAULT_SO="$REPO_ROOT/libGLES_mali.so"
+DEFAULT_SO="$ROOT_DIR/ddk/libGLES_mali.so"
+if [ ! -f "$DEFAULT_SO" ] && [ -f "$REPO_ROOT/ddk/libGLES_mali.so" ]; then
+    DEFAULT_SO="$REPO_ROOT/ddk/libGLES_mali.so"
 fi
 
 SO_PATH="${1:-$DEFAULT_SO}"

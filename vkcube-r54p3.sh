@@ -16,4 +16,4 @@ KBASE_EMU_PROFILE=1 \
 LD_PRELOAD=$PWD/build-x86-64/libmali_kbase_emu.so \
 PANTHOR_MALI_PATH=/dev/mali0 \
 VK_ICD_FILENAMES=$PWD/build-x86-64/r54p3_decompiled_icd.x86_64.json \
-timeout 5 vkcube --wsi xcb --c 1
+timeout 10 vkcube --wsi xcb --c 100

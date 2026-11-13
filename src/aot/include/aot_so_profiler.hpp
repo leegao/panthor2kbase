@@ -58,6 +58,16 @@ void aot_so_trace_fn_exit(void* cpu_ptr, uint64_t fn_va, const char* fn_name);
 
 #ifdef AOT_SO_PROFILER_IMPLEMENTATION
 
+#include "../generated/r54p3_debug_symbols.h"
+
+static inline const char* aot_so_resolve_debug_name(uint64_t fn_va, const char* fn_name) {
+    if (!fn_name || std::strncmp(fn_name, "sub_", 4) == 0) {
+        const char* sym = r54p3_lookup_debug_symbol_by_va(fn_va);
+        if (sym && sym[0] != '\0') return sym;
+    }
+    return fn_name ? fn_name : "<sub_unknown>";
+}
+
 namespace aot_so_prof_detail {
 
 struct RawAotCpuPrefix {
@@ -237,6 +247,7 @@ void aot_so_trace_fn_enter(void* cpu_ptr, uint64_t fn_va, const char* fn_name) {
     uint32_t flags = aot_so_prof_detail::g_so_debug_flags;
     if (__builtin_expect(flags == 0U, 1)) return;
 
+    fn_name = aot_so_resolve_debug_name(fn_va, fn_name);
     auto* cpu = static_cast<aot_so_prof_detail::RawAotCpuPrefix*>(cpu_ptr);
     if (cpu) cpu->pc = fn_va;
     uint64_t now_ns = (flags & (AOT_SO_DEBUG_TRACE_CALLS | AOT_SO_DEBUG_PROFILE_CALLS))
@@ -280,6 +291,7 @@ void aot_so_trace_fn_exit(void* cpu_ptr, uint64_t fn_va, const char* fn_name) {
     uint32_t flags = aot_so_prof_detail::g_so_debug_flags;
     if (__builtin_expect(flags == 0U, 1)) return;
 
+    fn_name = aot_so_resolve_debug_name(fn_va, fn_name);
     auto* cpu = static_cast<aot_so_prof_detail::RawAotCpuPrefix*>(cpu_ptr);
     uint64_t now_ns = (flags & (AOT_SO_DEBUG_TRACE_CALLS | AOT_SO_DEBUG_PROFILE_CALLS))
                           ? aot_so_prof_detail::monotonic_ns()

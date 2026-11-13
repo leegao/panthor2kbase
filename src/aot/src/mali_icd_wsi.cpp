@@ -390,22 +390,76 @@ void vkCmdEndDebugUtilsLabelEXT(void* /*commandBuffer*/) {}
 
 
 __attribute__((visibility("default")))
-int32_t vkCreatePipelineCache(void* /*device*/, const void* /*pCreateInfo*/, const void* /*pAllocator*/, uint64_t* pPipelineCache) {
-    if (pPipelineCache) *pPipelineCache = 0xCA000001ULL;
+int32_t vkCreatePipelineCache(void* device, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pPipelineCache) {
+    if (!pPipelineCache) return -3;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && aot_vkCreatePipelineCache && !dev->aot_vk_device_mem.empty()) {
+        struct CleanPcCI {
+            uint32_t sType; const void* pNext; uint32_t flags;
+            size_t initialDataSize; const void* pInitialData;
+        } clean_ci = {17U, nullptr, 0U, 0, nullptr};
+        if (pCreateInfo) {
+            const auto* src_ci = static_cast<const CleanPcCI*>(pCreateInfo);
+            clean_ci.flags = src_ci->flags;
+            clean_ci.initialDataSize = src_ci->initialDataSize;
+            clean_ci.pInitialData = src_ci->pInitialData;
+        }
+        uint64_t aot_pc = 0;
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        int32_t res = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkCreatePipelineCache,
+            dev->aot_vk_device_mem.data(), &clean_ci, uint64_t(0), &aot_pc);
+        g_aot_rt.lifted_vk_calls_executed++;
+        if (res == 0 && aot_pc != 0) {
+            *pPipelineCache = aot_pc;
+            return 0;
+        }
+    }
+    *pPipelineCache = 0xCA000001ULL;
     return 0;
 }
 
 __attribute__((visibility("default")))
-void vkDestroyPipelineCache(void* /*device*/, uint64_t /*pipelineCache*/, const void* /*pAllocator*/) {}
+void vkDestroyPipelineCache(void* device, uint64_t pipelineCache, const void* /*pAllocator*/) {
+    if (!pipelineCache || pipelineCache == 0xCA000001ULL) return;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && aot_vkDestroyPipelineCache && !dev->aot_vk_device_mem.empty()) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkDestroyPipelineCache,
+            dev->aot_vk_device_mem.data(), pipelineCache, uint64_t(0));
+        g_aot_rt.lifted_vk_calls_executed++;
+    }
+}
 
 __attribute__((visibility("default")))
-int32_t vkGetPipelineCacheData(void* /*device*/, uint64_t /*pipelineCache*/, size_t* pDataSize, void* /*pData*/) {
+int32_t vkGetPipelineCacheData(void* device, uint64_t pipelineCache, size_t* pDataSize, void* pData) {
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && pipelineCache && pipelineCache != 0xCA000001ULL &&
+        aot_vkGetPipelineCacheData && !dev->aot_vk_device_mem.empty()) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        int32_t res = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkGetPipelineCacheData,
+            dev->aot_vk_device_mem.data(), pipelineCache, pDataSize, pData);
+        g_aot_rt.lifted_vk_calls_executed++;
+        return res;
+    }
     if (pDataSize) *pDataSize = 0;
     return 0;
 }
 
 __attribute__((visibility("default")))
-int32_t vkMergePipelineCaches(void* /*device*/, uint64_t /*dstCache*/, uint32_t /*srcCacheCount*/, const uint64_t* /*pSrcCaches*/) {
+int32_t vkMergePipelineCaches(void* device, uint64_t dstCache, uint32_t srcCacheCount, const uint64_t* pSrcCaches) {
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && dstCache && dstCache != 0xCA000001ULL &&
+        aot_vkMergePipelineCaches && !dev->aot_vk_device_mem.empty()) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        int32_t res = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkMergePipelineCaches,
+            dev->aot_vk_device_mem.data(), dstCache, srcCacheCount, pSrcCaches);
+        g_aot_rt.lifted_vk_calls_executed++;
+        return res;
+    }
     return 0;
 }
 
@@ -468,12 +522,23 @@ int32_t vkInvalidateMappedMemoryRanges(void* /*device*/, uint32_t /*memoryRangeC
 
 __attribute__((visibility("default")))
 int32_t vkGetFenceStatus(void* device, uint64_t fence) {
+    if (mali_kbase_emu_wait_csf_idle) mali_kbase_emu_wait_csf_idle(200000000ULL);
     auto* dev = static_cast<MaliIcdDevice*>(device);
     if (dev && dev->aot_cctx_mem.size() > 0xc1 && dev->aot_cctx_mem[0xc1] != 0) {
         return -4; /* VK_ERROR_DEVICE_LOST (checked at 0x00964fd0 in libGLES_mali.so) */
     }
     if (fence && fence != 0xFE000001ULL) {
-        return reinterpret_cast<MaliIcdFence*>(fence)->signaled ? 0 : 1 /* VK_NOT_READY */;
+        auto* f = reinterpret_cast<MaliIcdFence*>(fence);
+        if (dev && aot_vkGetFenceStatus && !dev->aot_vk_device_mem.empty() && f->aot_fence_mem.size() > 593) {
+            f->aot_fence_mem[593] = f->signaled ? 1U : 0U;
+            std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+            int32_t res = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+                g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkGetFenceStatus,
+                dev->aot_vk_device_mem.data(), f->aot_fence_mem.data());
+            g_aot_rt.lifted_vk_calls_executed++;
+            return res;
+        }
+        return f->signaled ? 0 : 1 /* VK_NOT_READY */;
     }
     return 0;
 }
@@ -786,6 +851,7 @@ int32_t vkAcquireNextImage2KHR(void* device, const void* pAcquireInfo, uint32_t*
 __attribute__((visibility("default")))
 int32_t vkQueuePresentKHR(void* /*queue*/, const void* pPresentInfo) {
     if (!pPresentInfo) return -3;
+    if (mali_kbase_emu_wait_csf_idle) mali_kbase_emu_wait_csf_idle(200000000ULL);
     struct PresInfo {
         uint32_t sType; const void* pNext;
         uint32_t waitSemCount; const uint64_t* pWaitSems;
@@ -926,10 +992,16 @@ int32_t vkQueuePresentKHR(void* /*queue*/, const void* pPresentInfo) {
 }
 
 __attribute__((visibility("default")))
-int32_t vkQueueWaitIdle(void* /*queue*/) { return 0; }
+int32_t vkQueueWaitIdle(void* /*queue*/) {
+    if (mali_kbase_emu_wait_csf_idle) mali_kbase_emu_wait_csf_idle(200000000ULL);
+    return 0;
+}
 
 __attribute__((visibility("default")))
-int32_t vkDeviceWaitIdle(void* /*device*/) { return 0; }
+int32_t vkDeviceWaitIdle(void* /*device*/) {
+    if (mali_kbase_emu_wait_csf_idle) mali_kbase_emu_wait_csf_idle(200000000ULL);
+    return 0;
+}
 
 
 __attribute__((visibility("default")))

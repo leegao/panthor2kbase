@@ -95,6 +95,8 @@ ensure_aot_icd_built() {
     if [ ! -f "$icd_dir/libr54p3_vulkan_icd.so" ]; then
         echo "[AOT Runner] libr54p3_vulkan_icd.so not found; building via ./src/aot/translate.sh..." >&2
         "$ROOT_DIR/src/aot/translate.sh"
+        CMAKE_BIN="$("$ROOT_DIR/scripts/find_cmake.sh")"
+        "$CMAKE_BIN" --build "$ROOT_DIR/build-x86-64" --target r54p3_vulkan_icd -j"$(nproc)"
     fi
 }
 
@@ -103,7 +105,7 @@ case "$CMD" in
         python3 scripts/gen_bionic_glibc_stubs.py
         ;;
     --inspect-props)
-        SO_PATH="${1:-$ROOT_DIR/libGLES_mali.so}"
+        SO_PATH="${1:-$ROOT_DIR/ddk/libGLES_mali.so}"
         python3 -c "
 import re, sys
 with open('$SO_PATH', 'rb') as f:
@@ -115,7 +117,8 @@ for p in props:
 "
         ;;
     --lift-so)
-        SO_PATH="${1:-src/aot/libGLES_mali.so}"
+        SO_PATH="${1:-$ROOT_DIR/ddk/libGLES_mali.so}"
+        [ ! -f "$SO_PATH" ] && [ -f "$ROOT_DIR/predownloaded/libGLES_mali.so" ] && SO_PATH="$ROOT_DIR/predownloaded/libGLES_mali.so"
         echo "[AOT Lifter] Lifting $SO_PATH in conformance-first mode (--no-opt-passes --hook-Vulkan-calls)..."
         ./src/aot/translate.sh "$SO_PATH"
         ;;

@@ -9,7 +9,11 @@
  *     (`mali_kbase.ko` r44p1 or `mali_kbase_husky.ko` r54p1) in `lifted_kbase_ko.ll`.
  *  2. Supports multiple concurrent /dev/mali0 file descriptors within a single
  *     process (per-FD `struct emu_kfile` isolation + dup/dup2/fcntl refcounting).
- *  3. Redirects lower-level OS kernel primitives, GPU VM/MMU backing, CSF
+ *  3. Implements an asynchronous Client/Server CSF architecture where
+ *     `KBASE_IOCTL_CS_QUEUE_KICK` and `USER_IO` doorbell writes enqueue kick
+ *     events onto a lock-free atomic ringbuffer serviced by a dedicated
+ *     background CSF server thread (`csf_server_thread_fn`).
+ *  4. Redirects lower-level OS kernel primitives, GPU VM/MMU backing, CSF
  *     hardware doorbell/ringbuffer execution, Valhall 64-bit ISA-to-SPIR-V /
  *     Lavapipe Vulkan pipeline execution, and companion Android kernel UAPIs
  *     (/dev/dma_heap/system, dma-buf, sync_file, ashmem) through host shims.
@@ -160,6 +164,7 @@ struct kbase_emu_stats {
    uint16_t kbase_ver_minor;
    uint32_t active_kfile_count;
    uint32_t total_kfiles_opened;
+   uint32_t csf_server_kicks_processed;
 };
 
 void mali_kbase_emu_get_stats(struct kbase_emu_stats *out);
@@ -169,6 +174,8 @@ bool mali_kbase_emu_init_lavapipe_bridge(void);
 void mali_kbase_emu_set_profile(enum mali_kbase_emu_profile profile);
 enum mali_kbase_emu_profile mali_kbase_emu_get_profile(void);
 uint32_t mali_kbase_emu_get_open_fd_count(void);
+int mali_kbase_emu_wait_csf_idle(uint64_t timeout_ns);
+void mali_kbase_emu_dump_csf_state(void);
 
 /* Direct C API for AOT-translated libGLES_mali.so, libvulkan_mali_aot_icd.so, and r54p3_vulkan_icd */
 typedef void (*mali_kbase_emu_csf_job_hook_fn)(uint8_t cs_opcode, uint64_t insn, const uint64_t *cs_regs, void *user_data);

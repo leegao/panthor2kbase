@@ -76,6 +76,13 @@ extern int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prim
 extern int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle);
 
 /* CSF 64-bit instruction builders matching upstream Mesa 26.3.0 panvk_instr.h */
+extern int mali_kbase_emu_wait_csf_idle(uint64_t timeout_ns) __attribute__((weak));
+static void wait_csf_idle_if_async(void) {
+   if (mali_kbase_emu_wait_csf_idle) {
+      mali_kbase_emu_wait_csf_idle(5000000000ULL);
+   }
+}
+
 static inline uint64_t cs_move48(uint8_t dst_reg, uint64_t imm48)
 {
    return ((uint64_t)CSF_OP_MOVE48 << 56) | ((uint64_t)dst_reg << 48) |
@@ -282,6 +289,7 @@ static void run_extended_stress_workloads_7_to_20(int drm_fd, uint32_t vm_id, ui
             .queue_submits = DRM_PANTHOR_OBJ_ARRAY(1, &qsub),
          };
          assert(ioctl(drm_fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &gsub) == 0);
+         wait_csf_idle_if_async();
       }
       assert(ssbo_words[slot] == cases[idx].imm);
       out_results[idx].id = cases[idx].id;
@@ -557,6 +565,7 @@ int main(void)
       .queue_submits = DRM_PANTHOR_OBJ_ARRAY(2, gfx_qsubs),
    };
    assert(ioctl(drm_fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &gfx_gsub) == 0);
+   wait_csf_idle_if_async();
    printf("[Workload 2: Graphics hello_triangle] vt_to_frag_seqno=%" PRIu64 ", FB_RGBA8[0..3]=0x%08x\n",
           *vt_to_frag_seqno, fb_pixels[0]);
    assert(*vt_to_frag_seqno == 1ULL && fb_pixels[0] == 0xFF3380FFU && fb_pixels[3] == 0xFF3380FFU);
@@ -585,6 +594,7 @@ int main(void)
    };
    assert(ioctl(drm_fd, DRM_IOCTL_PANTHOR_BO_SYNC, &bo_sync) == 0);
    assert(ioctl(drm_fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &comp_gsub) == 0);
+   wait_csf_idle_if_async();
    printf("[Workload 3: Compute N-Body Step] SSBO[2]=0x%08x (expected 0x00003024)\n", ssbo_words[2]);
    assert(ssbo_words[2] == 0x00003024U);
 

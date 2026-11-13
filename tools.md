@@ -803,3 +803,22 @@ KBASE_EMU_PROFILE=mt6878 ./build-x86-64/tests/unit_tests_edge_cases
 # Pixel 8 Pro (husky, Tensor G3, Mali-G715 MC7, raw_gpu_id=0xb8a21020, kbase_ver=1.38, shared CSG USER_IO stride)
 KBASE_EMU_PROFILE=husky ./build-x86-64/tests/unit_tests_edge_cases
 ```
+
+---
+
+### Checkpoint v34 Scripts, Generators & Debug Environment Variables
+
+1. **End-to-End `r54p3` `vkcube` Runner (`vkcube-r54p3.sh`)**:
+   - Runs `vkcube --wsi xcb --c 1` against `build-x86-64/r54p3_decompiled_icd.x86_64.json` (`libr54p3_vulkan_icd.so`) with `LD_PRELOAD=$PWD/build-x86-64/libmali_kbase_emu.so`, `VK_LAYER_window_system_integration`, and full `.so`/`.ko` profiling.
+2. **`.gnu_debugdata` Debug Symbol Extractor (`scripts/extract_r54p3_debug_symbols.py`)**:
+   - Decompresses `.gnu_debugdata` from `predownloaded/libGLES_mali.so`, demangles all 64,066 function symbols via `c++filt`, and generates `src/aot/generated/r54p3_debug_symbols.h` for `aot_so_profiler.hpp` (`[SO_TRACE]` and `[Lifted libGLES_mali.so Profiler]`).
+3. **456-Entry Vulkan Dispatch Table Generator (`scripts/gen_aapcs64_vk_thunks.py`)**:
+   - Generates `src/aot/generated/mali_vk_dispatch_table_autogen.h` containing weak `aot_vk*` declarations and the sorted `kMaliLiftedVkDispatchTable[456]` lookup table.
+4. **Updated Runner Scripts (`scripts/run_aot_lifter.sh`, `scripts/run_dxvk_aot.sh`)**:
+   - Both scripts now default to `build-x86-64/r54p3_decompiled_icd.x86_64.json` / `libr54p3_vulkan_icd.so` and fall back to `predownloaded/libGLES_mali.so`.
+5. **New CSF & WSI Environment Variables**:
+   - `KBASE_EMU_CSF_TRACE=1`: Traces every CSF instruction executed by `csf_server_thread_fn`.
+   - `KBASE_EMU_WATCHDOG_MS=<ms>`: Enables periodic CSF/ICD stall watchdog diagnostics (`mali_kbase_emu_dump_csf_state()`).
+   - `WSI_X11_FORCE_DRI3=1`: Forces `dri3_presenter` in `VK_LAYER_window_system_integration` instead of automatic `shm_presenter` fallback under `libmali_kbase_emu.so`.
+6. **New Unit Test**:
+   - `Unit Test 24` (`test_v34_async_csf_client_server_and_syncobj_fixes` in `tests/unit_tests_edge_cases.c`): Verifies `g_csf_kick_ring` / `csf_server_thread_fn` async execution, `munmap` lock safety, and `DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE`.

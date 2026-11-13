@@ -285,9 +285,10 @@ target_link_options(vulkan_panfrost_patched PRIVATE -Wl,-Bsymbolic -Wl,-Bsymboli
 set_target_properties(vulkan_panfrost_patched PROPERTIES
    LIBRARY_OUTPUT_DIRECTORY "${ADAPTER_DIR}"
 )
-file(WRITE "${CMAKE_BINARY_DIR}/panfrost_host_icd.x86_64.json" "{\n    \"file_format_version\": \"1.0.0\",\n    \"ICD\": {\n        \"library_path\": \"${CMAKE_BINARY_DIR}/libvulkan_panfrost.so\",\n        \"api_version\": \"1.3.296\"\n    }\n}\n")
+file(WRITE "${CMAKE_BINARY_DIR}/panfrost_host_icd.x86_64.json" "{\n    \"file_format_version\": \"1.0.0\",\n    \"ICD\": {\n        \"library_path\": \"./libvulkan_panfrost.so\",\n        \"api_version\": \"1.3.296\"\n    }\n}\n")
 add_custom_command(TARGET vulkan_panfrost_patched POST_BUILD
    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:vulkan_panfrost_patched> "${CMAKE_BINARY_DIR}/libvulkan_panfrost_patched.so"
+   COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:vulkan_panfrost_patched> "${CMAKE_BINARY_DIR}/libvulkan_panfrost.so"
 )
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/tools/mali_uapi_tracer_preload.c")
@@ -445,20 +446,13 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
       RUNTIME_OUTPUT_DIRECTORY "${AOT_DIR}"
    )
 
-   # AOT Lifter target
-   # add_custom_target(aot_targets ALL
-   #    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/translate.sh" libGLES_mali.so "${CMAKE_BINARY_DIR}"
-   #    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-   #    DEPENDS mali_kbase_emu_static panthor_kbase_adapter_static mali_llvm_pass_driver horizon2llvm
-   #    COMMENT "Running 64-bit Mali AOT translation pipeline (translate.sh)"
-   # )
    set(AOT_ICD_SO "${CMAKE_BINARY_DIR}/libvulkan_mali_aot_icd.so")
    set(AOT_RUNNER "${CMAKE_BINARY_DIR}/mali_aot_runner")
    set(AOT_JSON   "${CMAKE_BINARY_DIR}/mali_aot_icd.x86_64.json")
 
    add_custom_command(
       OUTPUT "${AOT_ICD_SO}" "${AOT_RUNNER}" "${AOT_JSON}" "${AOT_MBS2_OBJ}"
-      COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/translate.sh" libGLES_mali.so "${CMAKE_BINARY_DIR}"
+      COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/translate.sh" ddk/libGLES_mali.so "${CMAKE_BINARY_DIR}"
       WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
       DEPENDS mali_kbase_emu
               panthor_kbase_adapter

@@ -2686,6 +2686,88 @@ static void test_v33_multi_fd_mali0_isolation_and_full_r54p3_icd(void)
           mali_fd_A, mali_fd_B, total_lifted_calls);
 }
 
+
+static void test_v34_async_csf_client_server_and_syncobj_fixes(void)
+{
+   printf("[Unit Test 24] Testing Async Client/Server CSF Execution (g_csf_kick_ring / csf_server_thread_fn), Syncobj FD Import/Eventfd Fixes & Worklist Closure...\n");
+
+   /* 1. Verify Async Client/Server CSF Queue Kick & Server Thread Execution */
+   int mfd = open("/dev/mali0", O_RDWR | O_CLOEXEC);
+   assert(mfd >= 0);
+   struct kbase_ioctl_version_check ver = { 1, 38 };
+   assert(ioctl(mfd, KBASE_IOCTL_VERSION_CHECK, &ver) == 0);
+   struct kbase_ioctl_set_flags sflags = { 0 };
+   assert(ioctl(mfd, KBASE_IOCTL_SET_FLAGS, &sflags) == 0);
+
+   union kbase_ioctl_mem_alloc ring_alloc;
+   memset(&ring_alloc, 0, sizeof(ring_alloc));
+   ring_alloc.in.va_pages = 1;
+   ring_alloc.in.commit_pages = 1;
+   ring_alloc.in.flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR | BASE_MEM_SAME_VA;
+   assert(ioctl(mfd, KBASE_IOCTL_MEM_ALLOC, &ring_alloc) == 0);
+   uint64_t *ring_cpu = (uint64_t *)mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, (off_t)ring_alloc.out.gpu_va);
+   assert(ring_cpu != MAP_FAILED);
+   uint64_t ring_gpu_va = (uintptr_t)ring_cpu;
+
+   struct kbase_ioctl_cs_queue_register qreg;
+   memset(&qreg, 0, sizeof(qreg));
+   qreg.buffer_gpu_addr = ring_gpu_va;
+   qreg.buffer_size = 4096;
+   qreg.priority = 1;
+   assert(ioctl(mfd, KBASE_IOCTL_CS_QUEUE_REGISTER, &qreg) == 0);
+
+   union kbase_ioctl_cs_queue_bind qbind;
+   memset(&qbind, 0, sizeof(qbind));
+   qbind.in.buffer_gpu_addr = ring_gpu_va;
+   qbind.in.group_handle = 1;
+   qbind.in.csi_index = 0;
+   assert(ioctl(mfd, KBASE_IOCTL_CS_QUEUE_BIND, &qbind) == 0);
+   uint8_t *uio = (uint8_t *)mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, (off_t)qbind.out.mmap_handle);
+   assert(uio != MAP_FAILED);
+
+   struct kbase_emu_stats st0, st1;
+   mali_kbase_emu_get_stats(&st0);
+
+   /* Emit MOVE32 r10, #0x12345678 into the CSF ringbuffer */
+   ring_cpu[0] = (0x02ULL << 56) | (10ULL << 48) | 0x12345678ULL;
+   *(uint64_t *)(uio + 0x1000) = 8ULL; /* CS_INSERT = 8 */
+   struct kbase_ioctl_cs_queue_kick kick = { ring_gpu_va };
+   assert(ioctl(mfd, KBASE_IOCTL_CS_QUEUE_KICK, &kick) == 0);
+   assert(mali_kbase_emu_wait_csf_idle(200000000ULL) == 0);
+   mali_kbase_emu_get_stats(&st1);
+   assert(st1.queue_kick_count > st0.queue_kick_count);
+   assert(st1.csf_server_kicks_processed > st0.csf_server_kicks_processed);
+   assert(*(uint64_t *)(uio + 0x2000) == 8ULL /* CS_EXTRACT advanced by CSF Server Thread! */);
+
+   munmap(uio, 3 * 4096);
+   munmap(ring_cpu, 4096);
+   close(mfd);
+
+   /* 2. Verify DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE (IMPORT_SYNC_FILE) and DRM_IOCTL_SYNCOBJ_EVENTFD */
+   int dfd = open("/dev/dri/renderD128", O_RDWR);
+   assert(dfd >= 0);
+   struct { uint32_t handle; uint32_t flags; } sc = { 0, 0 };
+   assert(ioctl(dfd, 0xc00864bfUL /* DRM_IOCTL_SYNCOBJ_CREATE */, &sc) == 0 && sc.handle != 0);
+   uint32_t orig_handle = sc.handle;
+
+   int dummy_sync_fd = open("/dev/ashmem", O_RDWR);
+   assert(dummy_sync_fd >= 0);
+   struct { uint32_t handle; uint32_t flags; int32_t fd; uint32_t pad; } fd2h = {
+      orig_handle, 1U /* DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE */, dummy_sync_fd, 0U
+   };
+   assert(ioctl(dfd, 0xc01064c2UL /* DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE */, &fd2h) == 0);
+   /* Handle must NOT be overwritten when IMPORT_SYNC_FILE is set! */
+   assert(fd2h.handle == orig_handle);
+   close(dummy_sync_fd);
+
+   struct { uint32_t handle; uint32_t flags; } sd = { orig_handle, 0 };
+   assert(ioctl(dfd, 0xc00864c0UL /* DRM_IOCTL_SYNCOBJ_DESTROY */, &sd) == 0);
+   close(dfd);
+
+   printf("  -> PASS: Async Client/Server CSF thread execution (csf_server_kicks=%llu) & Syncobj IMPORT_SYNC_FILE verified!\n",
+          (unsigned long long)st1.csf_server_kicks_processed);
+}
+
 int main(void)
 {
    printf("[Unit Tests] Running edge cases, mali_kbase.ko flag invariants, and RAII logging suite...\n");
@@ -2712,6 +2794,7 @@ int main(void)
    test_v31_panvk_vkcube_mem_alias_and_v11_csf_opcodes();
    test_v32_full_r54p3_icd_deshimming_and_real_draw_pipeline();
    test_v33_multi_fd_mali0_isolation_and_full_r54p3_icd();
+   test_v34_async_csf_client_server_and_syncobj_fixes();
    printf("[Unit Tests] ALL EDGE CASES PASSED!\n");
    return 0;
 }

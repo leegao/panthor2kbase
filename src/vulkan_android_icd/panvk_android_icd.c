@@ -255,6 +255,16 @@ vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice,
       { "VK_KHR_swapchain", 70 },
       { "VK_KHR_maintenance1", 2 },
       { "VK_KHR_dynamic_rendering", 1 },
+      { "VK_KHR_external_memory", 1 },
+      { "VK_KHR_external_memory_fd", 1 },
+      { "VK_EXT_external_memory_dma_buf", 1 },
+      { "VK_KHR_external_fence", 1 },
+      { "VK_KHR_external_fence_fd", 1 },
+      { "VK_KHR_external_semaphore", 1 },
+      { "VK_KHR_external_semaphore_fd", 1 },
+      { "VK_KHR_bind_memory2", 1 },
+      { "VK_KHR_get_memory_requirements2", 1 },
+      { "VK_EXT_image_drm_format_modifier", 2 },
    };
    uint32_t total = sizeof(exts) / sizeof(exts[0]);
    if (!pProperties) {
@@ -653,6 +663,7 @@ vkUnmapMemory(VkDevice device, VkDeviceMemory memory)
    struct panvk_icd_memory *mem = (struct panvk_icd_memory *)(uintptr_t)memory;
    if (mem && mem->cpu_ptr && mem->cpu_ptr != MAP_FAILED) {
       KMOD_MUNMAP(mem->cpu_ptr, (size_t)mem->size);
+      mem->cpu_ptr = NULL;
    }
 }
 
@@ -973,6 +984,344 @@ vkEndCommandBuffer(VkCommandBuffer commandBuffer)
 
 VKAPI_ATTR void VKAPI_CALL panvk_cmd_noop(void) {}
 
+VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2 *pProperties)
+{
+   if (pProperties)
+      vkGetPhysicalDeviceProperties(physicalDevice, &pProperties->properties);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2 *pFeatures)
+{
+   if (pFeatures)
+      vkGetPhysicalDeviceFeatures(physicalDevice, &pFeatures->features);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties2 *pMemoryProperties)
+{
+   if (pMemoryProperties)
+      vkGetPhysicalDeviceMemoryProperties(physicalDevice, &pMemoryProperties->memoryProperties);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice, uint32_t *pQueueFamilyPropertyCount,
+                                          VkQueueFamilyProperties2 *pQueueFamilyProperties)
+{
+   if (!pQueueFamilyProperties) {
+      vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, pQueueFamilyPropertyCount, NULL);
+      return;
+   }
+   if (*pQueueFamilyPropertyCount > 0) {
+      uint32_t cnt = 1;
+      vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &cnt, &pQueueFamilyProperties[0].queueFamilyProperties);
+      *pQueueFamilyPropertyCount = cnt;
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice physicalDevice, VkFormat format, VkFormatProperties *pFormatProperties)
+{
+   (void)physicalDevice; (void)format;
+   if (pFormatProperties) {
+      VkFormatFeatureFlags feats = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                   VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                                   VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+                                   VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+                                   VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                   VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                   VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                                   VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT |
+                                   VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+      pFormatProperties->linearTilingFeatures = feats;
+      pFormatProperties->optimalTilingFeatures = feats;
+      pFormatProperties->bufferFeatures = feats;
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice, VkFormat format, VkFormatProperties2 *pFormatProperties)
+{
+   if (pFormatProperties)
+      vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &pFormatProperties->formatProperties);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkGetPhysicalDeviceImageFormatProperties(VkPhysicalDevice physicalDevice, VkFormat format, VkImageType type,
+                                         VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags,
+                                         VkImageFormatProperties *pImageFormatProperties)
+{
+   (void)physicalDevice; (void)format; (void)type; (void)tiling; (void)usage; (void)flags;
+   if (pImageFormatProperties) {
+      pImageFormatProperties->maxExtent.width = 4096;
+      pImageFormatProperties->maxExtent.height = 4096;
+      pImageFormatProperties->maxExtent.depth = 256;
+      pImageFormatProperties->maxMipLevels = 12;
+      pImageFormatProperties->maxArrayLayers = 256;
+      pImageFormatProperties->sampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
+      pImageFormatProperties->maxResourceSize = 256ULL * 1024 * 1024;
+   }
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkGetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
+                                          const VkPhysicalDeviceImageFormatInfo2 *pImageFormatInfo,
+                                          VkImageFormatProperties2 *pImageFormatProperties)
+{
+   if (!pImageFormatInfo || !pImageFormatProperties)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   return vkGetPhysicalDeviceImageFormatProperties(
+      physicalDevice, pImageFormatInfo->format, pImageFormatInfo->type,
+      pImageFormatInfo->tiling, pImageFormatInfo->usage, pImageFormatInfo->flags,
+      &pImageFormatProperties->imageFormatProperties);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceExternalFenceProperties(VkPhysicalDevice physicalDevice,
+                                           const VkPhysicalDeviceExternalFenceInfo *pExternalFenceInfo,
+                                           VkExternalFenceProperties *pExternalFenceProperties)
+{
+   (void)physicalDevice; (void)pExternalFenceInfo;
+   if (pExternalFenceProperties) {
+      pExternalFenceProperties->exportFromImportedHandleTypes = 0;
+      pExternalFenceProperties->compatibleHandleTypes = 0;
+      pExternalFenceProperties->externalFenceFeatures = 0;
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceExternalSemaphoreProperties(VkPhysicalDevice physicalDevice,
+                                               const VkPhysicalDeviceExternalSemaphoreInfo *pExternalSemaphoreInfo,
+                                               VkExternalSemaphoreProperties *pExternalSemaphoreProperties)
+{
+   (void)physicalDevice; (void)pExternalSemaphoreInfo;
+   if (pExternalSemaphoreProperties) {
+      pExternalSemaphoreProperties->exportFromImportedHandleTypes = 0;
+      pExternalSemaphoreProperties->compatibleHandleTypes = 0;
+      pExternalSemaphoreProperties->externalSemaphoreFeatures = 0;
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice physicalDevice,
+                                            const VkPhysicalDeviceExternalBufferInfo *pExternalBufferInfo,
+                                            VkExternalBufferProperties *pExternalBufferProperties)
+{
+   (void)physicalDevice; (void)pExternalBufferInfo;
+   if (pExternalBufferProperties)
+      memset(&pExternalBufferProperties->externalMemoryProperties, 0, sizeof(VkExternalMemoryProperties));
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkCreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
+              const VkAllocationCallbacks *pAllocator, VkImage *pImage)
+{
+   (void)device; (void)pAllocator;
+   if (!pImage)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   struct panvk_icd_image *img = calloc(1, sizeof(*img));
+   if (!img)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   img->magic = 0x50414E564B494D47ULL;
+   img->width = (pCreateInfo && pCreateInfo->extent.width) ? pCreateInfo->extent.width : 64;
+   img->height = (pCreateInfo && pCreateInfo->extent.height) ? pCreateInfo->extent.height : 64;
+   img->format = pCreateInfo ? (uint32_t)pCreateInfo->format : 0;
+   img->byte_size = (size_t)img->width * img->height * 4;
+   *pImage = (VkImage)(uintptr_t)img;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkDestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks *pAllocator)
+{
+   (void)device; (void)pAllocator;
+   struct panvk_icd_image *img = (struct panvk_icd_image *)(uintptr_t)image;
+   if (img && img->magic == 0x50414E564B494D47ULL) {
+      img->magic = 0;
+      free(img);
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetImageMemoryRequirements(VkDevice device, VkImage image, VkMemoryRequirements *pMemoryRequirements)
+{
+   (void)device;
+   struct panvk_icd_image *img = (struct panvk_icd_image *)(uintptr_t)image;
+   if (pMemoryRequirements) {
+      size_t sz = (img && img->magic == 0x50414E564B494D47ULL && img->byte_size > 0) ? img->byte_size : 65536;
+      pMemoryRequirements->size = (sz + 4095U) & ~4095ULL;
+      pMemoryRequirements->alignment = 4096;
+      pMemoryRequirements->memoryTypeBits = 1;
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetImageMemoryRequirements2(VkDevice device, const VkImageMemoryRequirementsInfo2 *pInfo,
+                              VkMemoryRequirements2 *pMemoryRequirements)
+{
+   if (pInfo && pMemoryRequirements)
+      vkGetImageMemoryRequirements(device, pInfo->image, &pMemoryRequirements->memoryRequirements);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetBufferMemoryRequirements(VkDevice device, VkBuffer buffer, VkMemoryRequirements *pMemoryRequirements)
+{
+   (void)device; (void)buffer;
+   if (pMemoryRequirements) {
+      pMemoryRequirements->size = 65536;
+      pMemoryRequirements->alignment = 256;
+      pMemoryRequirements->memoryTypeBits = 1;
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetBufferMemoryRequirements2(VkDevice device, const VkBufferMemoryRequirementsInfo2 *pInfo,
+                               VkMemoryRequirements2 *pMemoryRequirements)
+{
+   if (pInfo && pMemoryRequirements)
+      vkGetBufferMemoryRequirements(device, pInfo->buffer, &pMemoryRequirements->memoryRequirements);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkBindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory, VkDeviceSize memoryOffset)
+{
+   struct panvk_icd_device *dev = (struct panvk_icd_device *)device;
+   struct panvk_icd_image *img = (struct panvk_icd_image *)(uintptr_t)image;
+   struct panvk_icd_memory *mem = (struct panvk_icd_memory *)(uintptr_t)memory;
+   if (img && img->magic == 0x50414E564B494D47ULL && mem) {
+      img->bound_gpu_va = mem->gpu_va + memoryOffset;
+      if (!mem->cpu_ptr && dev && dev->instance) {
+         struct drm_panthor_bo_mmap_offset mo = { .handle = mem->bo_handle };
+         if (KMOD_IOCTL(dev->instance->drm_fd, DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET, &mo) == 0) {
+            void *p = KMOD_MMAP(NULL, (size_t)mem->size, PROT_READ | PROT_WRITE,
+                                MAP_SHARED, dev->instance->drm_fd, (off_t)mo.offset);
+            if (p != MAP_FAILED)
+               mem->cpu_ptr = p;
+         }
+      }
+      if (mem->cpu_ptr) {
+         img->pixels = (uint32_t *)((uint8_t *)mem->cpu_ptr + memoryOffset);
+         panvk_shade_swapchain_image(img, dev ? dev->frame_index : 0);
+      }
+   }
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetImageSubresourceLayout(VkDevice device, VkImage image, const VkImageSubresource *pSubresource,
+                            VkSubresourceLayout *pLayout)
+{
+   (void)device; (void)pSubresource;
+   struct panvk_icd_image *img = (struct panvk_icd_image *)(uintptr_t)image;
+   if (pLayout) {
+      uint32_t w = (img && img->magic == 0x50414E564B494D47ULL && img->width) ? img->width : 64;
+      uint32_t h = (img && img->magic == 0x50414E564B494D47ULL && img->height) ? img->height : 64;
+      pLayout->offset = 0;
+      pLayout->rowPitch = (VkDeviceSize)w * 4;
+      pLayout->size = (VkDeviceSize)w * h * 4;
+      pLayout->arrayPitch = pLayout->size;
+      pLayout->depthPitch = pLayout->size;
+   }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkWaitForFences(VkDevice device, uint32_t fenceCount, const VkFence *pFences,
+                VkBool32 waitAll, uint64_t timeout)
+{
+   (void)device; (void)fenceCount; (void)pFences; (void)waitAll; (void)timeout;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkResetFences(VkDevice device, uint32_t fenceCount, const VkFence *pFences)
+{
+   (void)device; (void)fenceCount; (void)pFences;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkGetFenceStatus(VkDevice device, VkFence fence)
+{
+   (void)device; (void)fence;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkAllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo *pAllocateInfo,
+                         VkDescriptorSet *pDescriptorSets)
+{
+   (void)device;
+   if (pAllocateInfo && pDescriptorSets) {
+      for (uint32_t i = 0; i < pAllocateInfo->descriptorSetCount; ++i)
+         pDescriptorSets[i] = (VkDescriptorSet)(uintptr_t)(++g_next_dummy_handle);
+   }
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkFreeDescriptorSets(VkDevice device, VkDescriptorPool descriptorPool,
+                     uint32_t descriptorSetCount, const VkDescriptorSet *pDescriptorSets)
+{
+   (void)device; (void)descriptorPool; (void)descriptorSetCount; (void)pDescriptorSets;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkUpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
+                       const VkWriteDescriptorSet *pDescriptorWrites,
+                       uint32_t descriptorCopyCount, const VkCopyDescriptorSet *pDescriptorCopies)
+{
+   (void)device; (void)descriptorWriteCount; (void)pDescriptorWrites;
+   (void)descriptorCopyCount; (void)pDescriptorCopies;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkFreeCommandBuffers(VkDevice device, VkCommandPool commandPool,
+                     uint32_t commandBufferCount, const VkCommandBuffer *pCommandBuffers)
+{
+   (void)device; (void)commandPool; (void)commandBufferCount; (void)pCommandBuffers;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkResetCommandBuffer(VkCommandBuffer commandBuffer, VkCommandBufferResetFlags flags)
+{
+   (void)commandBuffer; (void)flags;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkResetCommandPool(VkDevice device, VkCommandPool commandPool, VkCommandPoolResetFlags flags)
+{
+   (void)device; (void)commandPool; (void)flags;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkBool32 VKAPI_CALL
+vkGetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex,
+                                              void *connection, uint32_t visual_id)
+{
+   (void)physicalDevice; (void)queueFamilyIndex; (void)connection; (void)visual_id;
+   return VK_TRUE;
+}
+
+VKAPI_ATTR VkBool32 VKAPI_CALL
+vkGetPhysicalDeviceXlibPresentationSupportKHR(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex,
+                                              void *dpy, unsigned long visualID)
+{
+   (void)physicalDevice; (void)queueFamilyIndex; (void)dpy; (void)visualID;
+   return VK_TRUE;
+}
+
+VKAPI_ATTR VkBool32 VKAPI_CALL
+vkGetPhysicalDeviceWaylandPresentationSupportKHR(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex,
+                                                 void *display)
+{
+   (void)physicalDevice; (void)queueFamilyIndex; (void)display;
+   return VK_TRUE;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *pSupportedVersion)
 {
@@ -1054,7 +1403,81 @@ vkGetInstanceProcAddr(VkInstance instance, const char *pName)
        strcmp(pName, "vkDestroySemaphore") == 0 ||
        strcmp(pName, "vkDestroyFence") == 0)
       return (PFN_vkVoidFunction)panvk_destroy_dummy_obj;
-   if (strcmp(pName, "vkCreateGraphicsPipelines") == 0) return (PFN_vkVoidFunction)vkCreateGraphicsPipelines;
+   if (strcmp(pName, "vkGetPhysicalDeviceProperties2") == 0 ||
+       strcmp(pName, "vkGetPhysicalDeviceProperties2KHR") == 0)
+      return (PFN_vkVoidFunction)vkGetPhysicalDeviceProperties2;
+   if (strcmp(pName, "vkGetPhysicalDeviceFeatures2") == 0 ||
+       strcmp(pName, "vkGetPhysicalDeviceFeatures2KHR") == 0)
+      return (PFN_vkVoidFunction)vkGetPhysicalDeviceFeatures2;
+   if (strcmp(pName, "vkGetPhysicalDeviceMemoryProperties2") == 0 ||
+       strcmp(pName, "vkGetPhysicalDeviceMemoryProperties2KHR") == 0)
+      return (PFN_vkVoidFunction)vkGetPhysicalDeviceMemoryProperties2;
+   if (strcmp(pName, "vkGetPhysicalDeviceQueueFamilyProperties2") == 0 ||
+       strcmp(pName, "vkGetPhysicalDeviceQueueFamilyProperties2KHR") == 0)
+      return (PFN_vkVoidFunction)vkGetPhysicalDeviceQueueFamilyProperties2;
+   if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties") == 0)
+      return (PFN_vkVoidFunction)vkGetPhysicalDeviceFormatProperties;
+   if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties2") == 0 ||
+       strcmp(pName, "vkGetPhysicalDeviceFormatProperties2KHR") == 0)
+      return (PFN_vkVoidFunction)vkGetPhysicalDeviceFormatProperties2;
+   if (strcmp(pName, "vkGetPhysicalDeviceImageFormatProperties") == 0)
+      return (PFN_vkVoidFunction)vkGetPhysicalDeviceImageFormatProperties;
+   if (strcmp(pName, "vkGetPhysicalDeviceImageFormatProperties2") == 0 ||
+       strcmp(pName, "vkGetPhysicalDeviceImageFormatProperties2KHR") == 0)
+      return (PFN_vkVoidFunction)vkGetPhysicalDeviceImageFormatProperties2;
+   if (strcmp(pName, "vkGetPhysicalDeviceExternalFenceProperties") == 0 ||
+       strcmp(pName, "vkGetPhysicalDeviceExternalFencePropertiesKHR") == 0)
+      return (PFN_vkVoidFunction)vkGetPhysicalDeviceExternalFenceProperties;
+   if (strcmp(pName, "vkGetPhysicalDeviceExternalSemaphoreProperties") == 0 ||
+       strcmp(pName, "vkGetPhysicalDeviceExternalSemaphorePropertiesKHR") == 0)
+      return (PFN_vkVoidFunction)vkGetPhysicalDeviceExternalSemaphoreProperties;
+   if (strcmp(pName, "vkGetPhysicalDeviceExternalBufferProperties") == 0 ||
+       strcmp(pName, "vkGetPhysicalDeviceExternalBufferPropertiesKHR") == 0)
+      return (PFN_vkVoidFunction)vkGetPhysicalDeviceExternalBufferProperties;
+   if (strcmp(pName, "vkCreateImage") == 0) return (PFN_vkVoidFunction)vkCreateImage;
+   if (strcmp(pName, "vkDestroyImage") == 0) return (PFN_vkVoidFunction)vkDestroyImage;
+   if (strcmp(pName, "vkGetImageMemoryRequirements") == 0) return (PFN_vkVoidFunction)vkGetImageMemoryRequirements;
+   if (strcmp(pName, "vkGetImageMemoryRequirements2") == 0 ||
+       strcmp(pName, "vkGetImageMemoryRequirements2KHR") == 0)
+      return (PFN_vkVoidFunction)vkGetImageMemoryRequirements2;
+   if (strcmp(pName, "vkGetBufferMemoryRequirements") == 0) return (PFN_vkVoidFunction)vkGetBufferMemoryRequirements;
+   if (strcmp(pName, "vkGetBufferMemoryRequirements2") == 0 ||
+       strcmp(pName, "vkGetBufferMemoryRequirements2KHR") == 0)
+      return (PFN_vkVoidFunction)vkGetBufferMemoryRequirements2;
+   if (strcmp(pName, "vkBindImageMemory") == 0) return (PFN_vkVoidFunction)vkBindImageMemory;
+   if (strcmp(pName, "vkGetImageSubresourceLayout") == 0) return (PFN_vkVoidFunction)vkGetImageSubresourceLayout;
+   if (strcmp(pName, "vkWaitForFences") == 0) return (PFN_vkVoidFunction)vkWaitForFences;
+   if (strcmp(pName, "vkResetFences") == 0) return (PFN_vkVoidFunction)vkResetFences;
+   if (strcmp(pName, "vkGetFenceStatus") == 0) return (PFN_vkVoidFunction)vkGetFenceStatus;
+   if (strcmp(pName, "vkAllocateDescriptorSets") == 0) return (PFN_vkVoidFunction)vkAllocateDescriptorSets;
+   if (strcmp(pName, "vkFreeDescriptorSets") == 0) return (PFN_vkVoidFunction)vkFreeDescriptorSets;
+   if (strcmp(pName, "vkUpdateDescriptorSets") == 0) return (PFN_vkVoidFunction)vkUpdateDescriptorSets;
+   if (strcmp(pName, "vkFreeCommandBuffers") == 0) return (PFN_vkVoidFunction)vkFreeCommandBuffers;
+   if (strcmp(pName, "vkResetCommandBuffer") == 0) return (PFN_vkVoidFunction)vkResetCommandBuffer;
+   if (strcmp(pName, "vkResetCommandPool") == 0) return (PFN_vkVoidFunction)vkResetCommandPool;
+   if (strcmp(pName, "vkCreateDescriptorPool") == 0 ||
+       strcmp(pName, "vkCreateSampler") == 0 ||
+       strcmp(pName, "vkCreatePipelineCache") == 0 ||
+       strcmp(pName, "vkCreateEvent") == 0)
+      return (PFN_vkVoidFunction)panvk_create_dummy_obj;
+   if (strcmp(pName, "vkDestroyDescriptorPool") == 0 ||
+       strcmp(pName, "vkDestroySampler") == 0 ||
+       strcmp(pName, "vkDestroyPipelineCache") == 0 ||
+       strcmp(pName, "vkDestroyEvent") == 0)
+      return (PFN_vkVoidFunction)panvk_destroy_dummy_obj;
+   if (strcmp(pName, "vkCreateXcbSurfaceKHR") == 0 ||
+       strcmp(pName, "vkCreateXlibSurfaceKHR") == 0 ||
+       strcmp(pName, "vkCreateWaylandSurfaceKHR") == 0)
+      return (PFN_vkVoidFunction)vkCreateHeadlessSurfaceEXT;
+   if (strcmp(pName, "vkGetPhysicalDeviceXcbPresentationSupportKHR") == 0)
+      return (PFN_vkVoidFunction)vkGetPhysicalDeviceXcbPresentationSupportKHR;
+   if (strcmp(pName, "vkGetPhysicalDeviceXlibPresentationSupportKHR") == 0)
+      return (PFN_vkVoidFunction)vkGetPhysicalDeviceXlibPresentationSupportKHR;
+   if (strcmp(pName, "vkGetPhysicalDeviceWaylandPresentationSupportKHR") == 0)
+      return (PFN_vkVoidFunction)vkGetPhysicalDeviceWaylandPresentationSupportKHR;
+   if (strcmp(pName, "vkCreateGraphicsPipelines") == 0 ||
+       strcmp(pName, "vkCreateComputePipelines") == 0)
+      return (PFN_vkVoidFunction)vkCreateGraphicsPipelines;
    if (strcmp(pName, "vkBindBufferMemory") == 0) return (PFN_vkVoidFunction)vkBindBufferMemory;
    if (strcmp(pName, "vkAllocateCommandBuffers") == 0) return (PFN_vkVoidFunction)vkAllocateCommandBuffers;
    if (strcmp(pName, "vkBeginCommandBuffer") == 0) return (PFN_vkVoidFunction)vkBeginCommandBuffer;

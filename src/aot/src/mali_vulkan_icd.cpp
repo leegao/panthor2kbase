@@ -34,19 +34,19 @@ int32_t vkCreateDevice(void* physicalDevice, const void* /*pCreateInfo*/, const 
     *reinterpret_cast<uint32_t*>(kctx_ptr + 0x278) = 1U;
     *reinterpret_cast<uint32_t*>(kctx_ptr + 0x27c) = 36U;
 
-    dev->aot_cctx_mem.assign(4096, 0);
+    dev->aot_cctx_mem.assign(65536, 0);
     uint8_t* cctx_ptr = dev->aot_cctx_mem.data();
     *reinterpret_cast<uint64_t*>(cctx_ptr + 0x140) = reinterpret_cast<uint64_t>(kctx_ptr);
+    *reinterpret_cast<uint32_t*>(cctx_ptr + 0x2e0) = 4096U;
 
     dev->aot_vk_device_mem.assign(131072, 0);
     *reinterpret_cast<uint32_t*>(dev->aot_vk_device_mem.data() + 0x0c)   = 1U;
     *reinterpret_cast<uint64_t*>(dev->aot_vk_device_mem.data() + 0x10)   = HLE_VK_ALLOC_MAGIC;
     *reinterpret_cast<uint64_t*>(dev->aot_vk_device_mem.data() + 0x20)   = HLE_VK_FREE_MAGIC;
     *reinterpret_cast<uint64_t*>(dev->aot_vk_device_mem.data() + 0x28)   = 0xCAFE0000ULL;
+    *reinterpret_cast<uint64_t*>(dev->aot_vk_device_mem.data() + 0xd0)   = reinterpret_cast<uint64_t>(dev->phys_dev ? (dev->phys_dev->aot_internal + 1024 + 8) : nullptr);
     *reinterpret_cast<uint64_t*>(dev->aot_vk_device_mem.data() + 0xd8)   = reinterpret_cast<uint64_t>(&dev->queue);
-    if (dev->phys_dev) {
-        *reinterpret_cast<uint64_t*>(dev->aot_vk_device_mem.data() + 0x118) = reinterpret_cast<uint64_t>(dev->phys_dev->aot_internal);
-    }
+    *reinterpret_cast<uint64_t*>(dev->aot_vk_device_mem.data() + 0x118)  = reinterpret_cast<uint64_t>(cctx_ptr);
     *reinterpret_cast<uint64_t*>(dev->aot_vk_device_mem.data() + 0x130)  = HLE_VK_ALLOC_MAGIC;
     *reinterpret_cast<uint64_t*>(dev->aot_vk_device_mem.data() + 0x138)  = HLE_VK_FREE_MAGIC;
     *reinterpret_cast<uint64_t*>(dev->aot_vk_device_mem.data() + 0x140)  = 0xCAFE0000ULL;
@@ -102,6 +102,11 @@ int32_t vkCreateDevice(void* physicalDevice, const void* /*pCreateInfo*/, const 
             cpu.x[1] = reinterpret_cast<uint64_t>(&kcpu_id);
             g_aot_rt.resetGuestStackLocked(); aot_kbase_kcpu_queue_create(&cpu);
             dev->kcpu_queue_id = kcpu_id;
+        }
+        if (aot_sub_01c64f90) {
+            cpu.x[0] = reinterpret_cast<uint64_t>(cctx_ptr);
+            cpu.x[1] = reinterpret_cast<uint64_t>(cctx_ptr + 0x408);
+            g_aot_rt.resetGuestStackLocked(); aot_sub_01c64f90(&cpu);
         }
     }
 
@@ -484,7 +489,24 @@ int32_t vkCreateShaderModule(void* device, const void* pCreateInfo, const void* 
         };
     }
 
-    // 3. Run AOT-translated cmpbe_v2_deserialize_MBS2_to_C on the driver's MBS2 container
+    // 3. Upload compiled Valhall OBJC machine code into /dev/mali0 EXEC_VA Shader BO
+    // Note: Per libGLES_mali.so architecture (doco.elQv1RsJ8kzwxGL3gwEKfg), vkCreateShaderModule
+    // only parses/hashes SPIR-V via aot_vkCreateShaderModule (0x0098e4e0); CMPBE v2 MBS2 compilation
+    // runs during vkCreateComputePipelines / vkCreateGraphicsPipelines via runAotMbs2PipelineCompile().
+    uint64_t exec_flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_EX;
+    mod->exec_bo_gpu_va = icdAllocKbaseBo(dev, 1, exec_flags);
+    std::memcpy(reinterpret_cast<void*>(mod->exec_bo_gpu_va),
+                mod->objc_words.data(),
+                mod->objc_words.size() * sizeof(uint64_t));
+
+    g_aot_rt.shader_modules_created++;
+    *pShaderModule = reinterpret_cast<uint64_t>(mod);
+    return 0;
+}
+
+static void runAotMbs2PipelineCompile(MaliIcdShaderModule* mod) {
+    if (!mod || mod->mbs2_compiled) return;
+    mod->mbs2_compiled = true;
     if (g_aot_rt.template_mbs2_len >= 64) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         auto& cpu = g_aot_rt.cpu;
@@ -514,17 +536,6 @@ int32_t vkCreateShaderModule(void* device, const void* pCreateInfo, const void* 
         aot_cmpbe_v2_set_option_value(&cpu);
         g_aot_rt.lifted_vk_calls_executed += 2;
     }
-
-    // 4. Upload compiled Valhall OBJC machine code into /dev/mali0 EXEC_VA Shader BO
-    uint64_t exec_flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_EX;
-    mod->exec_bo_gpu_va = icdAllocKbaseBo(dev, 1, exec_flags);
-    std::memcpy(reinterpret_cast<void*>(mod->exec_bo_gpu_va),
-                mod->objc_words.data(),
-                mod->objc_words.size() * sizeof(uint64_t));
-
-    g_aot_rt.shader_modules_created++;
-    *pShaderModule = reinterpret_cast<uint64_t>(mod);
-    return 0;
 }
 
 __attribute__((visibility("default")))
@@ -542,10 +553,25 @@ void vkDestroyShaderModule(void* device, uint64_t shaderModule, const void* /*pA
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateDescriptorSetLayout(void* /*device*/, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pSetLayout) {
+int32_t vkCreateDescriptorSetLayout(void* device, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pSetLayout) {
     if (!pSetLayout) return -3;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
     auto* dsl = new MaliIcdDescriptorSetLayout();
-    dsl->aot_handle_mem.assign(256, 0); *reinterpret_cast<uint32_t*>(dsl->aot_handle_mem.data() + 0x90) = 2U;
+    dsl->aot_handle_mem.assign(1024, 0); *reinterpret_cast<uint32_t*>(dsl->aot_handle_mem.data() + 0x90) = 2U;
+    if (dev && aot_vkCreateDescriptorSetLayout && !dev->aot_vk_device_mem.empty()) {
+        struct EmptyDslCI { uint32_t sType; const void* pNext; uint32_t flags; uint32_t count; const void* pBindings; } empty_ci = {32U, nullptr, 0U, 0U, nullptr};
+        uint64_t aot_dsl = 0;
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkCreateDescriptorSetLayout,
+            dev->aot_vk_device_mem.data(), &empty_ci, uint64_t(0), &aot_dsl);
+        g_aot_rt.lifted_vk_calls_executed++;
+        if (aot_dsl >= 0x10000ULL) {
+            std::memcpy(dsl->aot_handle_mem.data(), reinterpret_cast<const void*>(aot_dsl), 800);
+            *reinterpret_cast<uint32_t*>(dsl->aot_handle_mem.data() + 0x90) = 2U;
+            std::free(reinterpret_cast<void*>(aot_dsl));
+        }
+    }
     if (pCreateInfo) {
         struct Binding { uint32_t binding; uint32_t type; uint32_t count; uint32_t stages; const void* pImm; };
         struct CreateInfo { uint32_t sType; const void* pNext; uint32_t flags; uint32_t count; const Binding* pBindings; };
@@ -577,10 +603,29 @@ void vkDestroyDescriptorSetLayout(void* device, uint64_t descriptorSetLayout, co
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreatePipelineLayout(void* /*device*/, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pPipelineLayout) {
+int32_t vkCreatePipelineLayout(void* device, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pPipelineLayout) {
     if (!pPipelineLayout) return -3;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
     auto* pl = new MaliIcdPipelineLayout();
-    pl->aot_handle_mem.assign(256, 0); *reinterpret_cast<uint32_t*>(pl->aot_handle_mem.data() + 0x10) = 2U;
+    pl->aot_handle_mem.assign(1600, 0); *reinterpret_cast<uint32_t*>(pl->aot_handle_mem.data() + 0x10) = 2U;
+    if (dev && aot_vkCreatePipelineLayout && !dev->aot_vk_device_mem.empty()) {
+        struct EmptyPlCI {
+            uint32_t sType; const void* pNext; uint32_t flags;
+            uint32_t setLayoutCount; const uint64_t* pSetLayouts;
+            uint32_t pcCount; const void* pPcRanges;
+        } empty_ci = {30U, nullptr, 0U, 0U, nullptr, 0U, nullptr};
+        uint64_t aot_pl = 0;
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkCreatePipelineLayout,
+            dev->aot_vk_device_mem.data(), &empty_ci, uint64_t(0), &aot_pl);
+        g_aot_rt.lifted_vk_calls_executed++;
+        if (aot_pl >= 0x10000ULL) {
+            std::memcpy(pl->aot_handle_mem.data(), reinterpret_cast<const void*>(aot_pl), 1536);
+            *reinterpret_cast<uint32_t*>(pl->aot_handle_mem.data() + 0x10) = 2U;
+            std::free(reinterpret_cast<void*>(aot_pl));
+        }
+    }
     if (pCreateInfo) {
         struct PcRange { uint32_t stages; uint32_t offset; uint32_t size; };
         struct CreateInfo {
@@ -619,16 +664,38 @@ void vkDestroyPipelineLayout(void* device, uint64_t pipelineLayout, const void* 
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateComputePipelines(void* /*device*/, uint64_t /*pipelineCache*/, uint32_t createInfoCount,
+int32_t vkCreateComputePipelines(void* device, uint64_t pipelineCache, uint32_t createInfoCount,
                                  const void* pCreateInfos, const void* /*pAllocator*/, uint64_t* pPipelines) {
     if (!pCreateInfos || !pPipelines) return -3;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
     const auto* cis = static_cast<const VkComputePipelineCreateInfoIcd*>(pCreateInfos);
     for (uint32_t i = 0; i < createInfoCount; ++i) {
         auto* pipe = new MaliIcdPipeline();
         pipe->shader_mod = reinterpret_cast<MaliIcdShaderModule*>(cis[i].stage.module);
         if (pipe->shader_mod) {
+            runAotMbs2PipelineCompile(pipe->shader_mod);
             pipe->exec_bo_gpu_va = pipe->shader_mod->exec_bo_gpu_va;
             pipe->objc_bytes     = pipe->shader_mod->objc_words.size() * sizeof(uint64_t);
+        }
+        auto* pl = reinterpret_cast<MaliIcdPipelineLayout*>(cis[i].layout);
+        if (dev && aot_vkCreateComputePipelines && !dev->aot_vk_device_mem.empty() &&
+            pipe->shader_mod && pipe->shader_mod->aot_shader_module_handle != 0 &&
+            pl && !pl->aot_handle_mem.empty()) {
+            VkComputePipelineCreateInfoIcd clean_ci = cis[i];
+            clean_ci.pNext = nullptr;
+            clean_ci.stage.pNext = nullptr;
+            clean_ci.stage.module = pipe->shader_mod->aot_shader_module_handle;
+            clean_ci.layout = reinterpret_cast<uint64_t>(pl->aot_handle_mem.data());
+            uint64_t aot_cache = (pipelineCache == 0xCA000001ULL) ? 0ULL : pipelineCache;
+            uint64_t aot_pipe = 0;
+            std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+            int32_t res = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+                g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkCreateComputePipelines,
+                dev->aot_vk_device_mem.data(), aot_cache, 1U, &clean_ci, uint64_t(0), &aot_pipe);
+            g_aot_rt.lifted_vk_calls_executed++;
+            if (res == 0 && aot_pipe != 0) {
+                pipe->aot_pipeline_handle = aot_pipe;
+            }
         }
         pipe->is_compute = true;
         pPipelines[i] = reinterpret_cast<uint64_t>(pipe);
@@ -637,8 +704,18 @@ int32_t vkCreateComputePipelines(void* /*device*/, uint64_t /*pipelineCache*/, u
 }
 
 __attribute__((visibility("default")))
-void vkDestroyPipeline(void* /*device*/, uint64_t pipeline, const void* /*pAllocator*/) {
-    delete reinterpret_cast<MaliIcdPipeline*>(pipeline);
+void vkDestroyPipeline(void* device, uint64_t pipeline, const void* /*pAllocator*/) {
+    if (!pipeline) return;
+    auto* dev  = static_cast<MaliIcdDevice*>(device);
+    auto* pipe = reinterpret_cast<MaliIcdPipeline*>(pipeline);
+    if (dev && pipe->aot_pipeline_handle != 0 && aot_vkDestroyPipeline && !dev->aot_vk_device_mem.empty()) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkDestroyPipeline,
+            dev->aot_vk_device_mem.data(), pipe->aot_pipeline_handle, uint64_t(0));
+        g_aot_rt.lifted_vk_calls_executed++;
+    }
+    delete pipe;
 }
 
 __attribute__((visibility("default")))
@@ -1002,6 +1079,7 @@ int32_t vkCreateGraphicsPipelines(void* /*device*/, uint64_t /*cache*/, uint32_t
             for (uint32_t st = 0; st < gis[i].stageCount && st < 8; ++st) {
                 auto* sm = reinterpret_cast<MaliIcdShaderModule*>(gis[i].pStages[st].module);
                 if (!sm) continue;
+                runAotMbs2PipelineCompile(sm);
                 if (st == 0 || gis[i].pStages[st].stage == 0x01U) {
                     pipe->shader_mod     = sm;
                     pipe->vs_mod         = sm;
@@ -1080,14 +1158,31 @@ int32_t vkGetQueryPoolResults(void* /*device*/, uint64_t queryPool, uint32_t fir
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateFence(void* /*device*/, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pFence) {
+int32_t vkCreateFence(void* device, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pFence) {
     if (!pFence) return -3;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
     auto* f = new MaliIcdFence();
     f->aot_fence_mem.assign(1024, 0); *reinterpret_cast<uint32_t*>(f->aot_fence_mem.data() + 0x10) = 2U;
+    uint32_t flags = 0U;
     if (pCreateInfo) {
         struct FenceCI { uint32_t sType; const void* pNext; uint32_t flags; };
         const auto* ci = static_cast<const FenceCI*>(pCreateInfo);
+        flags = ci->flags;
         f->signaled = (ci->flags & 1U /* VK_FENCE_CREATE_SIGNALED_BIT */) != 0;
+    }
+    if (dev && aot_vkCreateFence && !dev->aot_vk_device_mem.empty()) {
+        struct CleanFenceCI { uint32_t sType; const void* pNext; uint32_t flags; } clean_ci = {8U, nullptr, flags & 1U};
+        uint64_t aot_f = 0;
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkCreateFence,
+            dev->aot_vk_device_mem.data(), &clean_ci, uint64_t(0), &aot_f);
+        g_aot_rt.lifted_vk_calls_executed++;
+        if (aot_f >= 0x10000ULL) {
+            std::memcpy(f->aot_fence_mem.data(), reinterpret_cast<const void*>(aot_f), 784);
+            *reinterpret_cast<uint32_t*>(f->aot_fence_mem.data() + 0x10) = 2U;
+            std::free(reinterpret_cast<void*>(aot_f));
+        }
     }
     *pFence = reinterpret_cast<uint64_t>(f);
     return 0;
@@ -1108,14 +1203,18 @@ void vkDestroyFence(void* device, uint64_t fence, const void* /*pAllocator*/) {
 }
 __attribute__((visibility("default")))
 int32_t vkWaitForFences(void* device, uint32_t c, const uint64_t* p, uint32_t /*all*/, uint64_t /*t*/) {
+    if (mali_kbase_emu_wait_csf_idle) mali_kbase_emu_wait_csf_idle(200000000ULL);
     auto* dev = static_cast<MaliIcdDevice*>(device);
     if (dev && dev->aot_cctx_mem.size() > 0xc1 && dev->aot_cctx_mem[0xc1] != 0) {
         return -4; /* VK_ERROR_DEVICE_LOST */
     }
     if (p) {
         for (uint32_t i = 0; i < c; ++i) {
-            if (p[i] && p[i] != 0xFE000001ULL)
-                reinterpret_cast<MaliIcdFence*>(p[i])->signaled = true;
+            if (p[i] && p[i] != 0xFE000001ULL) {
+                auto* f = reinterpret_cast<MaliIcdFence*>(p[i]);
+                f->signaled = true;
+                if (f->aot_fence_mem.size() > 593) f->aot_fence_mem[593] = 1U;
+            }
         }
     }
     return 0;

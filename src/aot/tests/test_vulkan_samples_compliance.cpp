@@ -254,6 +254,7 @@ int main(int argc, char** argv) {
     auto bindIBO   = reinterpret_cast<PFN_vkCmdBindIndexBuffer>(gipa(instance, "vkCmdBindIndexBuffer"));
     auto drawIdx   = reinterpret_cast<PFN_vkCmdDrawIndexed>(gipa(instance, "vkCmdDrawIndexed"));
     auto dispatch  = reinterpret_cast<PFN_vkCmdDispatch>(gipa(instance, "vkCmdDispatch"));
+    auto qWaitIdle = reinterpret_cast<int32_t(*)(void*)>(gipa(instance, "vkQueueWaitIdle"));
     auto qSubmit   = reinterpret_cast<PFN_vkQueueSubmit>(gipa(instance, "vkQueueSubmit"));
 
     struct ImgCreateInfo {
@@ -362,7 +363,7 @@ int main(int argc, char** argv) {
     drawIdx(cmd_buf, 36, 1, 0, 0, 0);
     endRP(cmd_buf);
     endCB(cmd_buf);
-    assert(qSubmit(queue, 1, &si, 0) == 0);
+    assert(qSubmit(queue, 1, &si, 0) == 0); assert(qWaitIdle(queue) == 0);
     uint32_t s1_shaded = 0;
     uint32_t s1_crc = computeFbCrcAndShadedCount(static_cast<const uint32_t*>(color_ptr), 4096, 0xFF181410U, &s1_shaded);
     assert(s1_shaded == 1788);
@@ -398,7 +399,7 @@ int main(int argc, char** argv) {
     drawIdx(cmd_buf, 36, 1, 0, 0, 1);
     endRP(cmd_buf);
     endCB(cmd_buf);
-    assert(qSubmit(queue, 1, &si, 0) == 0);
+    assert(qSubmit(queue, 1, &si, 0) == 0); assert(qWaitIdle(queue) == 0);
     uint32_t s2_shaded = 0;
     uint32_t s2_crc = computeFbCrcAndShadedCount(static_cast<const uint32_t*>(color_ptr), 4096, 0xFF181410U, &s2_shaded);
     assert(s2_shaded > 1500 && s2_crc != s1_crc);
@@ -418,7 +419,7 @@ int main(int argc, char** argv) {
     drawIdx(cmd_buf, 36, 1, 0, 0, 2);
     endRP(cmd_buf);
     endCB(cmd_buf);
-    assert(qSubmit(queue, 1, &si, 0) == 0);
+    assert(qSubmit(queue, 1, &si, 0) == 0); assert(qWaitIdle(queue) == 0);
     uint32_t s4_shaded = 0;
     uint32_t s4_crc = computeFbCrcAndShadedCount(static_cast<const uint32_t*>(color_ptr), 4096, 0xFF181410U, &s4_shaded);
     assert(s4_shaded > 1500 && s4_crc != s2_crc);
@@ -437,7 +438,7 @@ int main(int argc, char** argv) {
         drawIdx(cmd_buf, 36, 1, 0, 0, 0);
         endRP(cmd_buf);
         endCB(cmd_buf);
-        assert(qSubmit(queue, 1, &si, 0) == 0);
+        assert(qSubmit(queue, 1, &si, 0) == 0); assert(qWaitIdle(queue) == 0);
         uint32_t sh_px = 0;
         dyn_crcs[obj] = computeFbCrcAndShadedCount(static_cast<const uint32_t*>(color_ptr), 4096, 0xFF181410U, &sh_px);
         assert(sh_px > 1400);
@@ -455,7 +456,7 @@ int main(int argc, char** argv) {
     drawIdx(cmd_buf, 36, 16, 0, 0, 3);
     endRP(cmd_buf);
     endCB(cmd_buf);
-    assert(qSubmit(queue, 1, &si, 0) == 0);
+    assert(qSubmit(queue, 1, &si, 0) == 0); assert(qWaitIdle(queue) == 0);
     uint32_t s6_shaded = 0;
     uint32_t s6_crc = computeFbCrcAndShadedCount(static_cast<const uint32_t*>(color_ptr), 4096, 0xFF181410U, &s6_shaded);
     assert(s6_shaded > 1400);
@@ -501,7 +502,7 @@ int main(int argc, char** argv) {
     drawIdx(cmd_buf, 36, 1, 0, 0, 4);
     endRP(cmd_buf);
     endCB(cmd_buf);
-    assert(qSubmit(queue, 1, &si, 0) == 0);
+    assert(qSubmit(queue, 1, &si, 0) == 0); assert(qWaitIdle(queue) == 0);
     assert(std::fabs(out_f[0] - 38.250f) < 1e-4f && std::fabs(out_f[3] - 148.500f) < 1e-4f);
     std::cout << "[PASS] Sample 7 (compute_nbody 2-Pass Compute Particle SSBO [" << out_f[0] << ", " << out_f[1] << ", " << out_f[2] << ", " << out_f[3] << "] -> Graphics Render)\n";
 
@@ -517,7 +518,7 @@ int main(int argc, char** argv) {
         reinterpret_cast<PFN_vkCmdPipelineBarrier>(gipa(instance, "vkCmdPipelineBarrier"))(cmd_buf, 0x400, 0x080, 0, 0, nullptr, 0, nullptr, 0, nullptr);
     }
     endCB(cmd_buf);
-    assert(qSubmit(queue, 1, &si, 0) == 0);
+    assert(qSubmit(queue, 1, &si, 0) == 0); assert(qWaitIdle(queue) == 0);
     uint32_t s8_shaded = 0;
     uint32_t s8_crc = computeFbCrcAndShadedCount(static_cast<const uint32_t*>(color_ptr), 4096, 0xFF181410U, &s8_shaded);
     assert(s8_shaded > 1400);
@@ -538,7 +539,7 @@ int main(int argc, char** argv) {
     endRP(cmd_buf);
     reinterpret_cast<PFN_vkCmdWriteTimestamp>(gipa(instance, "vkCmdWriteTimestamp"))(cmd_buf, 0x0400, ts_pool, 1);
     endCB(cmd_buf);
-    assert(qSubmit(queue, 1, &si, 0) == 0);
+    assert(qSubmit(queue, 1, &si, 0) == 0); assert(qWaitIdle(queue) == 0);
 
     uint64_t timestamps[2]{};
     assert(reinterpret_cast<PFN_vkGetQueryPoolResults>(gipa(instance, "vkGetQueryPoolResults"))(
@@ -568,7 +569,7 @@ int main(int argc, char** argv) {
     endRP(cmd_buf);
     reinterpret_cast<PFN_vkCmdEndConditionalRenderingEXT>(gipa(instance, "vkCmdEndConditionalRenderingEXT"))(cmd_buf);
     endCB(cmd_buf);
-    assert(qSubmit(queue, 1, &si, 0) == 0);
+    assert(qSubmit(queue, 1, &si, 0) == 0); assert(qWaitIdle(queue) == 0);
     assert(*static_cast<const uint32_t*>(color_ptr) == 0U);
 
     *static_cast<uint32_t*>(vbo_ptr) = 1U; // Predicate = 1 -> active draw executes!
@@ -580,7 +581,7 @@ int main(int argc, char** argv) {
     endRP(cmd_buf);
     reinterpret_cast<PFN_vkCmdEndConditionalRenderingEXT>(gipa(instance, "vkCmdEndConditionalRenderingEXT"))(cmd_buf);
     endCB(cmd_buf);
-    assert(qSubmit(queue, 1, &si, 0) == 0);
+    assert(qSubmit(queue, 1, &si, 0) == 0); assert(qWaitIdle(queue) == 0);
     uint32_t s10_shaded = 0;
     uint32_t s10_crc = computeFbCrcAndShadedCount(static_cast<const uint32_t*>(color_ptr), 4096, 0xFF181410U, &s10_shaded);
     assert(s10_shaded > 1400);
@@ -679,7 +680,7 @@ int main(int argc, char** argv) {
         drawIdx(cmd_buf, 36, 1 + (idx % 4), 0, 0, 7 + idx);
         endRP(cmd_buf);
         endCB(cmd_buf);
-        assert(qSubmit(queue, 1, &si, 0) == 0);
+        assert(qSubmit(queue, 1, &si, 0) == 0); assert(qWaitIdle(queue) == 0);
         uint32_t sh_px = 0;
         uint32_t crc = computeFbCrcAndShadedCount(static_cast<const uint32_t*>(color_ptr), 4096, 0xFF181410U, &sh_px);
         assert(sh_px > 1400 && out_f[0] > 0.0f);

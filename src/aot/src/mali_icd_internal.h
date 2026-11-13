@@ -47,6 +47,7 @@
 #include "../include/aot_so_profiler.hpp"
 #include "../../emulator/lifted_kbase_ko.h"
 #include "../generated/mali_bionic_stubs_autogen.h"
+#include "../generated/mali_vk_dispatch_table_autogen.h"
 
 static bool mali_icd_log_enabled() {
     static int s_enabled = -1;
@@ -142,8 +143,10 @@ extern "C" {
     void aot_vkGetEventStatus(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkSetEvent(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkResetEvent(AOTCPUState* cpu) __attribute__((weak));
+    void aot_vkCreateFence(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkGetFenceStatus(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkWaitForFences(AOTCPUState* cpu) __attribute__((weak));
+    int mali_kbase_emu_wait_csf_idle(uint64_t timeout_ns) __attribute__((weak));
     void aot_vkCreateDescriptorSetLayout(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkCreatePipelineLayout(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkDeviceWaitIdle(AOTCPUState* cpu) __attribute__((weak));
@@ -170,6 +173,7 @@ extern "C" {
     void aot_vkCmdSetStencilReference(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkCmdSetStencilWriteMask(AOTCPUState* cpu) __attribute__((weak));
     void aot_mali_gpu_props_get(AOTCPUState* cpu) __attribute__((weak));
+    void aot_sub_01c64f90(AOTCPUState* cpu) __attribute__((weak));
 
     void aot_kbase_version_check_csf(AOTCPUState* cpu) __attribute__((weak));
     void aot_kbase_version_check_jm(AOTCPUState* cpu) __attribute__((weak));
@@ -389,6 +393,12 @@ struct HostVkAllocatorTable {
 static HostVkAllocatorTable g_host_vk_allocators;
 
 extern "C" void aot_unhandled_plt(AOTCPUState* cpu, uint64_t target_va) {
+    if (target_va == IMAGE_BASE + 0x01c9ecb0ULL) {
+        // cmpbe_v2_compile_multiple_shaders boundary (not lifted in mali_mbs2_aot.o;
+        // MBS2/Valhall compilation is handled by runAotMbs2PipelineCompile).
+        cpu->x[0] = 2;
+        return;
+    }
     if (g_host_vk_allocators.tryDispatch(cpu, target_va)) {
         return;
     }
@@ -671,6 +681,24 @@ struct MaliAotGlobalRuntime {
         return cpu.x[0];
     }
 
+    uint64_t invokeLiftedVkDirect(const char* name,
+                                  uint64_t x0 = 0, uint64_t x1 = 0,
+                                  uint64_t x2 = 0, uint64_t x3 = 0,
+                                  uint64_t x4 = 0, uint64_t x5 = 0,
+                                  uint64_t x6 = 0, uint64_t x7 = 0) {
+        const auto* e = lookupMaliLiftedVkDispatch(name);
+        if (e && e->aot_fn) {
+            std::lock_guard<std::mutex> lock(mtx);
+            resetGuestStackLocked();
+            cpu.x[0] = x0; cpu.x[1] = x1; cpu.x[2] = x2; cpu.x[3] = x3;
+            cpu.x[4] = x4; cpu.x[5] = x5; cpu.x[6] = x6; cpu.x[7] = x7;
+            lifted_vk_calls_executed++;
+            e->aot_fn(&cpu);
+            return cpu.x[0];
+        }
+        return invokeLiftedVkByName(name, x0, x1, x2, x3, x4, x5, x6, x7);
+    }
+
     uint64_t invokeLiftedVkByName(const char* name,
                                   uint64_t x0 = 0, uint64_t x1 = 0,
                                   uint64_t x2 = 0, uint64_t x3 = 0,
@@ -693,11 +721,11 @@ struct MaliAotGlobalRuntime {
             size_t sl = p.find_last_of('/');
             if (sl != std::string::npos) {
                 std::string d = p.substr(0, sl);
-                icd_dir_so      = d + "/libGLES_mali.so";
-                icd_aot_so      = d + "/../../libGLES_mali.so";
-                icd_repo_so     = d + "/../../../libGLES_mali.so";
-                icd_repo_up_so  = d + "/../../../../libGLES_mali.so";
-                icd_root_r44_so = d + "/../../../libGLES_mali.r44p1.so";
+                icd_dir_so      = d + "/ddk/libGLES_mali.so";
+                icd_aot_so      = d + "/../ddk/libGLES_mali.so";
+                icd_repo_so     = d + "/../../ddk/libGLES_mali.so";
+                icd_repo_up_so  = d + "/../../../ddk/libGLES_mali.so";
+                icd_root_r44_so = d + "/../../../ddk/libGLES_mali.r44p1.so";
             }
         }
         const char* candidates[] = {
@@ -767,6 +795,23 @@ struct MaliAotGlobalRuntime {
             uint64_t ps_addr = aot_get_kbase_page_shift_addr();
             if (ps_addr >= IMAGE_BASE) {
                 *reinterpret_cast<uint32_t*>(ps_addr) = 12U;
+            }
+            if (mapper.base && mapper.image_size >= 0x03150000ULL) {
+                uint8_t* bss_Scratch = mapper.base + mapper.image_size - 0x10000ULL;
+                std::memset(bss_Scratch, 0, 0x8000ULL);
+                uint64_t ddebug_cfg_va = reinterpret_cast<uint64_t>(bss_Scratch);
+                uint64_t gpu_tbl_va    = reinterpret_cast<uint64_t>(bss_Scratch + 0x2000ULL);
+                uint64_t gpu_entry_va  = reinterpret_cast<uint64_t>(bss_Scratch + 0x2100ULL);
+                *reinterpret_cast<uint32_t*>(gpu_entry_va + 144) = 2U; // Valhall arch version
+                for (uint64_t i = 0; i < 8; ++i) {
+                    reinterpret_cast<uint64_t*>(gpu_tbl_va)[i] = gpu_entry_va;
+                }
+                *reinterpret_cast<uint64_t*>(mapper.base + 0x0314d170ULL) = 8ULL;
+                *reinterpret_cast<uint64_t*>(mapper.base + 0x0314d178ULL) = gpu_tbl_va;
+                *reinterpret_cast<uint64_t*>(mapper.base + 0x0314d190ULL) = gpu_entry_va;
+                *reinterpret_cast<uint64_t*>(mapper.base + 0x0314d1c8ULL) = ddebug_cfg_va;
+                *reinterpret_cast<uint64_t*>(mapper.base + 0x0314d1f0ULL) = ddebug_cfg_va;
+                *reinterpret_cast<uint64_t*>(mapper.base + 0x0314d9d0ULL) = gpu_entry_va;
             }
         }
 
@@ -1048,6 +1093,12 @@ struct MaliIcdPhysicalDevice {
         *reinterpret_cast<uint32_t*>(pbase + 48) = (54U << 22) | (3U << 12); // driverVersion r54p3
         const uint8_t uuid[16] = {'M','A','L','I','-','G','6','1','5','-','R','5','4','P','3','0'};
         std::memcpy(pbase + 96, uuid, 16);
+        // VkPipelineCacheHeaderVersionOne at pbase + 0x70..+0x8f (read by aot_vkCreatePipelineCache / aot_vkGetPipelineCacheData)
+        *reinterpret_cast<uint32_t*>(pbase + 0x70) = 32U; // headerSize
+        *reinterpret_cast<uint32_t*>(pbase + 0x74) = 1U;  // VK_PIPELINE_CACHE_HEADER_VERSION_ONE
+        *reinterpret_cast<uint32_t*>(pbase + 0x78) = 0x13B5U; // vendorID
+        *reinterpret_cast<uint32_t*>(pbase + 0x7c) = static_cast<uint32_t>(g_icd_kbase_emu.raw_gpu_id); // deviceID
+        std::memcpy(pbase + 0x80, uuid, 16);
         std::snprintf(reinterpret_cast<char*>(pbase + 192), 256,
                       "%s (AOT %s via mali0_emu [%s])",
                       gpu_model,
@@ -1131,6 +1182,7 @@ struct MaliIcdShaderModule {
     bool                  has_ubo_load             = false;
     bool                  has_push_constant        = false;
     bool                  has_const_color          = false;
+    bool                  mbs2_compiled            = false;
     float                 const_color[4]           = {1.0f, 1.0f, 1.0f, 1.0f};
 };
 
@@ -1156,6 +1208,7 @@ struct MaliIcdPipeline {
     size_t                         objc_bytes     = 0;
     size_t                         fs_objc_bytes  = 0;
     bool                           is_compute     = true;
+    uint64_t                       aot_pipeline_handle = 0;
     uint32_t                       vertex_stride  = 0;
     uint32_t                       topology       = 3; // VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
     uint32_t                       cull_mode      = 0;
@@ -1426,4 +1479,3 @@ static uint64_t icdAllocKbaseBo(MaliIcdDevice* dev, uint64_t pages, uint64_t fla
     }
     return cookie_or_va;
 }
-

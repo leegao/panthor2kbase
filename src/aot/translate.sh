@@ -4,9 +4,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$ROOT_DIR/../.." && pwd)"
 
-DEFAULT_SO="$REPO_ROOT/libGLES_mali.so"
-if [ ! -f "$DEFAULT_SO" ] && [ -f "$ROOT_DIR/libGLES_mali.so" ]; then
-    DEFAULT_SO="$ROOT_DIR/libGLES_mali.so"
+DEFAULT_SO="$REPO_ROOT/ddk/libGLES_mali.so"
+if [ ! -f "$DEFAULT_SO" ] && [ -f "$ROOT_DIR/ddk/libGLES_mali.so" ]; then
+    DEFAULT_SO="$ROOT_DIR/ddk/libGLES_mali.so"
 elif [ ! -f "$DEFAULT_SO" ] && [ -f "$ROOT_DIR/driver/r54p3-00eac0-6eda07/lib64/egl/libGLES_mali.so" ]; then
     DEFAULT_SO="$ROOT_DIR/driver/r54p3-00eac0-6eda07/lib64/egl/libGLES_mali.so"
 fi

@@ -98,7 +98,11 @@ ICD_JSON="${MALI_AOT_ICD_JSON:-$ROOT_DIR/build-x86-64/r54p3_decompiled_icd.x86_6
 ICD_DIR="$(cd "$(dirname "$ICD_JSON")" && pwd)"
 ICD_JSON="$ICD_DIR/$(basename "$ICD_JSON")"
 if [ ! -f "$ICD_DIR/libr54p3_vulkan_icd.so" ]; then
-    "$ROOT_DIR/src/aot/translate.sh" "$ROOT_DIR/libGLES_mali.so"
+    SO_IN="$ROOT_DIR/ddk/libGLES_mali.so"
+    [ ! -f "$SO_IN" ] && [ -f "$ROOT_DIR/predownloaded/libGLES_mali.so" ] && SO_IN="$ROOT_DIR/predownloaded/libGLES_mali.so"
+    "$ROOT_DIR/src/aot/translate.sh" "$SO_IN"
+    CMAKE_BIN="$("$ROOT_DIR/scripts/find_cmake.sh")"
+    "$CMAKE_BIN" --build "$ROOT_DIR/build-x86-64" --target r54p3_vulkan_icd -j"$(nproc)"
 fi
 
 # Ensure mali_aot_icd.x86_64.json contains an absolute library_path pointing to this host's

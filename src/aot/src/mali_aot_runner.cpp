@@ -917,7 +917,7 @@ struct VkAllocationCallbacks {
 };
 
 int main(int argc, char** argv) {
-    const char* so_path = argc > 1 ? argv[1] : "libGLES_mali.so";
+    const char* so_path = argc > 1 ? argv[1] : "ddk/libGLES_mali.so";
     g_kbase_emu.lvp_executor.init();
     MaliImageMapper mapper;
     if (!mapper.loadAndRelocate(so_path)) {
