@@ -15,7 +15,7 @@
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
-#include "mali_kbase_csf_lvp_harness.hpp"
+#include "../aot/include/mali0_emu_device.hpp"
 #define AOT_SO_PROFILER_IMPLEMENTATION
 #include "aot_so_profiler.hpp"
 

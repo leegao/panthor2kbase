@@ -441,15 +441,6 @@ enum MaliGpuProfileId : uint32_t {
     MALI_PROFILE_G925_CSF = 0xD880U  // 5th-Gen Arch 13.8.0 (CSF, r49p1_v5)
 };
 
-// C ABI Hooks for standalone / LD_PRELOAD usage
-uint64_t mali0_emu_open(const char* path, uint64_t flags);
-uint64_t mali0_emu_close(uint64_t fd);
-uint64_t mali0_emu_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg);
-uint64_t mali0_emu_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset);
-uint64_t mali0_emu_munmap(uint64_t addr, uint64_t length);
-uint64_t mali0_emu_read(uint64_t fd, uint64_t buf_addr, uint64_t count);
-uint64_t mali0_emu_poll(uint64_t fds_addr, uint64_t nfds, uint64_t timeout);
-
 #ifdef __cplusplus
 }
 #endif

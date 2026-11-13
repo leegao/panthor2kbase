@@ -47,8 +47,8 @@ RUNNER="$BUILD_DIR/mali_aot_runner"
 
 if [ ! -x "$RUNNER" ] || [ "$ROOT_DIR/src/mali_llvm_passes.cpp" -nt "$RUNNER" ]; then
     "$ROOT_DIR/translate.sh" "$SO_PATH" "$BUILD_DIR"
-elif [ "$ROOT_DIR/../r54p3_vulkan_icd/mali_aot_runner.cpp" -nt "$RUNNER" ] || [ "$ROOT_DIR/../r54p3_vulkan_icd/mali_kbase_csf_lvp_harness.hpp" -nt "$RUNNER" ]; then
-    g++ -O3 -fno-strict-aliasing "$ROOT_DIR/../r54p3_vulkan_icd/mali_aot_runner.cpp" "$BUILD_DIR/mali_mbs2_aot.o" -ldl -o "$RUNNER"
+elif [ "$ROOT_DIR/../r54p3_vulkan_icd/mali_aot_runner.cpp" -nt "$RUNNER" ] || [ "$ROOT_DIR/include/mali0_emu_device.hpp" -nt "$RUNNER" ]; then
+    g++ -O3 -fno-strict-aliasing -I"$ROOT_DIR/../r54p3_vulkan_icd" "$ROOT_DIR/../r54p3_vulkan_icd/mali_aot_runner.cpp" "$BUILD_DIR/mali_mbs2_aot.o" -ldl -o "$RUNNER"
 fi
 
 exec "$RUNNER" "$SO_PATH"
