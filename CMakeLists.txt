@@ -309,7 +309,7 @@ endif()
 # -----------------------------------------------------------------------------
 if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
    file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/bin")
-   file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/r54p3_vulkan_icd/lib")
+   file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/lib")
    file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/layers")
 
    # Layers
@@ -371,14 +371,14 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
    set_source_files_properties("${AOT_MBS2_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 
    add_library(r54p3_vulkan_icd SHARED
-      src/aot/r54p3_vulkan_icd/src/r54p3_vulkan_icd.cpp
+      src/r54p3_vulkan_icd/r54p3_vulkan_icd.cpp
       "${AOT_MBS2_OBJ}"
    )
    add_dependencies(r54p3_vulkan_icd aot_targets)
    target_include_directories(r54p3_vulkan_icd PRIVATE
-      "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/r54p3_vulkan_icd/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd"
       "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/include"
-      "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/src"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator"
    )
    target_link_options(r54p3_vulkan_icd PRIVATE -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -Wl,--no-as-needed)
    target_link_libraries(r54p3_vulkan_icd PRIVATE mali_kbase_emu panthor_kbase_adapter ${PLATFORM_LIBS})
@@ -386,10 +386,10 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
       LIBRARY_OUTPUT_DIRECTORY "${AOT_DIR}"
    )
    file(WRITE "${CMAKE_BINARY_DIR}/r54p3_decompiled_icd.x86_64.json" "{\n    \"file_format_version\": \"1.0.0\",\n    \"ICD\": {\n        \"library_path\": \"./libr54p3_vulkan_icd.so\",\n        \"api_version\": \"1.3.250\"\n    }\n}\n")
-   file(WRITE "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json" "{\n    \"file_format_version\": \"1.0.0\",\n    \"ICD\": {\n        \"library_path\": \"./libr54p3_vulkan_icd.so\",\n        \"api_version\": \"1.3.250\"\n    }\n}\n")
+   file(WRITE "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json" "{\n    \"file_format_version\": \"1.0.0\",\n    \"ICD\": {\n        \"library_path\": \"./libr54p3_vulkan_icd.so\",\n        \"api_version\": \"1.3.250\"\n    }\n}\n")
    add_custom_command(TARGET r54p3_vulkan_icd POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:r54p3_vulkan_icd> "${CMAKE_BINARY_DIR}/libr54p3_vulkan_icd.so"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:r54p3_vulkan_icd> "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/r54p3_vulkan_icd/lib/libr54p3_vulkan_icd.so"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:r54p3_vulkan_icd> "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/lib/libr54p3_vulkan_icd.so"
    )
 
    add_executable(mali_llvm_pass_driver
@@ -414,11 +414,11 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
               panthor_kbase_adapter_static
               mali_llvm_pass_driver
               horizon2llvm
-              "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/src/mali_vulkan_icd.cpp"
-              "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/src/mali_aot_runner.cpp"
-              "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/src/mali_icd_internal.h"
-              "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/src/mali_icd_wsi.cpp"
-              "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/src/mali_icd_physdev.cpp"
+              "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/mali_vulkan_icd.cpp"
+              "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/mali_aot_runner.cpp"
+              "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/mali_icd_internal.h"
+              "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/mali_icd_wsi.cpp"
+              "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/mali_icd_physdev.cpp"
               "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/include/mali0_emu_lvp.hpp"
       COMMENT "Running 64-bit Mali AOT translation pipeline (translate.sh)"
    )

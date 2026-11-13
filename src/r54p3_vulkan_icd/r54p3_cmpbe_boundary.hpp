@@ -9,7 +9,7 @@
 #include <cstddef>
 #include <cstring>
 #include <vector>
-#include "../../include/mali0_emu_device.hpp"
+#include "../aot/include/mali0_emu_device.hpp"
 
 namespace mali_r54p3 {
 namespace cmpbe {

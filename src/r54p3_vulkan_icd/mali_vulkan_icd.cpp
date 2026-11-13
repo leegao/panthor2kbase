@@ -224,7 +224,7 @@ __attribute__((visibility("default")))
 int32_t vkCreateBuffer(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pBuffer) {
     if (!pCreateInfo || !pBuffer) return -3;
     g_host_vk_allocators.registerCallbacks(pAllocator);
-    const auto* bci = static_cast<const VkBufferCreateInfoIcd*>(pCreateInfo);
+    const auto* bci = static_cast<const VkBufferCreateInfo*>(pCreateInfo);
     auto* dev = static_cast<MaliIcdDevice*>(device);
     if (dev && aot_vkCreateBuffer && !dev->aot_vk_device_mem.empty()) {
         uint64_t aot_buf = 0;
@@ -291,7 +291,7 @@ void vkGetBufferMemoryRequirements(void* device, uint64_t buffer, void* pMemoryR
     if (!buffer || !pMemoryRequirements) return;
     auto* dev = static_cast<MaliIcdDevice*>(device);
     auto* buf = reinterpret_cast<MaliIcdBuffer*>(buffer);
-    auto* req = static_cast<VkMemoryRequirementsIcd*>(pMemoryRequirements);
+    auto* req = static_cast<VkMemoryRequirements*>(pMemoryRequirements);
     if (dev && aot_vkGetBufferMemoryRequirements && !dev->aot_vk_device_mem.empty()) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         mali_aapcs64::invokeLiftedAapcs64<void>(
@@ -312,7 +312,7 @@ __attribute__((visibility("default")))
 int32_t vkAllocateMemory(void* device, const void* pAllocateInfo, const void* /*pAllocator*/, uint64_t* pMemory) {
     if (!device || !pAllocateInfo || !pMemory) return -3;
     auto* dev = static_cast<MaliIcdDevice*>(device);
-    const auto* mai = static_cast<const VkMemoryAllocateInfoIcd*>(pAllocateInfo);
+    const auto* mai = static_cast<const VkMemoryAllocateInfo*>(pAllocateInfo);
     uint64_t pages = std::max<uint64_t>(1ULL, (mai->allocationSize + 4095ULL) / 4096ULL);
     uint64_t flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR | BASE_MEM_SAME_VA;
 
@@ -343,29 +343,15 @@ void vkUnmapMemory(void* /*device*/, uint64_t /*memory*/) {}
 __attribute__((visibility("default")))
 int32_t vkMapMemory2(void* device, const void* pMemoryMapInfo, void** ppData) {
     if (!pMemoryMapInfo || !ppData) return -3;
-    struct VkMemoryMapInfoKHR_Icd {
-        uint32_t sType;
-        const void* pNext;
-        uint32_t flags;
-        uint64_t memory;
-        uint64_t offset;
-        uint64_t size;
-    };
-    const auto* info = static_cast<const VkMemoryMapInfoKHR_Icd*>(pMemoryMapInfo);
-    return vkMapMemory(device, info->memory, info->offset, info->size, info->flags, ppData);
+    const auto* info = static_cast<const VkMemoryMapInfoKHR*>(pMemoryMapInfo);
+    return vkMapMemory(device, reinterpret_cast<uint64_t>(info->memory), info->offset, info->size, info->flags, ppData);
 }
 
 __attribute__((visibility("default")))
 int32_t vkUnmapMemory2(void* device, const void* pMemoryUnmapInfo) {
     if (!pMemoryUnmapInfo) return -3;
-    struct VkMemoryUnmapInfoKHR_Icd {
-        uint32_t sType;
-        const void* pNext;
-        uint32_t flags;
-        uint64_t memory;
-    };
-    const auto* info = static_cast<const VkMemoryUnmapInfoKHR_Icd*>(pMemoryUnmapInfo);
-    vkUnmapMemory(device, info->memory);
+    const auto* info = static_cast<const VkMemoryUnmapInfoKHR*>(pMemoryUnmapInfo);
+    vkUnmapMemory(device, reinterpret_cast<uint64_t>(info->memory));
     return 0;
 }
 
@@ -393,7 +379,7 @@ __attribute__((visibility("default")))
 int32_t vkCreateShaderModule(void* device, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pShaderModule) {
     if (!device || !pCreateInfo || !pShaderModule) return -3;
     auto* dev = static_cast<MaliIcdDevice*>(device);
-    const auto* smci = static_cast<const VkShaderModuleCreateInfoIcd*>(pCreateInfo);
+    const auto* smci = static_cast<const VkShaderModuleCreateInfo*>(pCreateInfo);
     if (!smci->pCode || smci->codeSize < 20) return -3;
 
     auto* mod = new MaliIcdShaderModule();
@@ -680,7 +666,7 @@ int32_t vkCreateComputePipelines(void* device, uint64_t pipelineCache, uint32_t 
                                  const void* pCreateInfos, const void* /*pAllocator*/, uint64_t* pPipelines) {
     if (!pCreateInfos || !pPipelines) return -3;
     auto* dev = static_cast<MaliIcdDevice*>(device);
-    const auto* cis = static_cast<const VkComputePipelineCreateInfoIcd*>(pCreateInfos);
+    const auto* cis = static_cast<const VkComputePipelineCreateInfo*>(pCreateInfos);
     for (uint32_t i = 0; i < createInfoCount; ++i) {
         auto* pipe = new MaliIcdPipeline();
         pipe->shader_mod = reinterpret_cast<MaliIcdShaderModule*>(cis[i].stage.module);
@@ -693,11 +679,11 @@ int32_t vkCreateComputePipelines(void* device, uint64_t pipelineCache, uint32_t 
         if (dev && aot_vkCreateComputePipelines && !dev->aot_vk_device_mem.empty() &&
             pipe->shader_mod && pipe->shader_mod->aot_shader_module_handle != 0 &&
             pl && !pl->aot_handle_mem.empty()) {
-            VkComputePipelineCreateInfoIcd clean_ci = cis[i];
+            VkComputePipelineCreateInfo clean_ci = cis[i];
             clean_ci.pNext = nullptr;
             clean_ci.stage.pNext = nullptr;
-            clean_ci.stage.module = pipe->shader_mod->aot_shader_module_handle;
-            clean_ci.layout = reinterpret_cast<uint64_t>(pl->aot_handle_mem.data());
+            clean_ci.stage.module = reinterpret_cast<VkShaderModule>(pipe->shader_mod->aot_shader_module_handle);
+            clean_ci.layout = reinterpret_cast<VkPipelineLayout>(pl->aot_handle_mem.data());
             uint64_t aot_cache = (pipelineCache == 0xCA000001ULL) ? 0ULL : pipelineCache;
             uint64_t aot_pipe = 0;
             std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
@@ -771,9 +757,8 @@ int32_t vkAllocateDescriptorSets(void* /*device*/, const void* pAllocateInfo, ui
 __attribute__((visibility("default")))
 void vkUpdateDescriptorSets(void* /*device*/, uint32_t descriptorWriteCount, const void* pDescriptorWrites,
                             uint32_t descriptorCopyCount, const void* pDescriptorCopies) {
-    struct ImgInfo { uint64_t sampler; uint64_t imageView; uint32_t imageLayout; };
     if (pDescriptorWrites && descriptorWriteCount > 0) {
-        const auto* writes = static_cast<const VkWriteDescriptorSetIcd*>(pDescriptorWrites);
+        const auto* writes = static_cast<const VkWriteDescriptorSet*>(pDescriptorWrites);
         for (uint32_t i = 0; i < descriptorWriteCount; ++i) {
             auto* dset = reinterpret_cast<MaliIcdDescriptorSet*>(writes[i].dstSet);
             if (!dset || writes[i].dstBinding >= 64) continue;
@@ -792,13 +777,13 @@ void vkUpdateDescriptorSets(void* /*device*/, uint32_t descriptorWriteCount, con
                         uint64_t eff_range = (bi.range == ~0ULL || bi.range == 0ULL)
                                                  ? ((bsz > bi.offset) ? (bsz - bi.offset) : 4096ULL)
                                                  : bi.range;
-                        dset->bound_buffer_handle[b] = bi.buffer;
+                        dset->bound_buffer_handle[b] = reinterpret_cast<uint64_t>(bi.buffer);
                         dset->bound_buffer_offset[b] = bi.offset;
                         dset->bound_buffer_va[b]     = buf->bound_gpu_va ? (buf->bound_gpu_va + bi.offset) : 0ULL;
                         dset->bound_buffer_range[b]  = eff_range;
                     }
                 } else if (is_img && writes[i].pImageInfo) {
-                    const auto* ii = static_cast<const ImgInfo*>(writes[i].pImageInfo) + j;
+                    const auto* ii = &writes[i].pImageInfo[j];
                     if (ii->imageView) dset->bound_image_view[b] = reinterpret_cast<MaliIcdImageView*>(ii->imageView);
                     if (ii->sampler)   dset->bound_sampler[b]    = reinterpret_cast<MaliIcdSampler*>(ii->sampler);
                 }
@@ -902,7 +887,7 @@ __attribute__((visibility("default")))
 void vkGetImageMemoryRequirements(void* /*device*/, uint64_t image, void* pMemoryRequirements) {
     if (!image || !pMemoryRequirements) return;
     auto* img = reinterpret_cast<MaliIcdImage*>(image);
-    auto* req = static_cast<VkMemoryRequirementsIcd*>(pMemoryRequirements);
+    auto* req = static_cast<VkMemoryRequirements*>(pMemoryRequirements);
     req->size = std::max<uint64_t>(4096ULL, (img->byte_size + 4095ULL) & ~4095ULL);
     req->alignment = 4096ULL;
     req->memoryTypeBits = 0x3U;
@@ -1037,7 +1022,7 @@ int32_t vkCreateGraphicsPipelines(void* /*device*/, uint64_t /*cache*/, uint32_t
     };
     struct GfxPipeInfo {
         uint32_t sType; const void* pNext; uint32_t flags; uint32_t stageCount;
-        const VkPipelineShaderStageCreateInfoIcd* pStages;
+        const VkPipelineShaderStageCreateInfo* pStages;
         const ViState* pVertexInputState;
         const IaState* pInputAssemblyState;
         const void* pTessellationState;
@@ -1280,7 +1265,7 @@ __attribute__((visibility("default")))
 int32_t vkAllocateCommandBuffers(void* device, const void* pAllocateInfo, void** pCommandBuffers) {
     if (!device || !pAllocateInfo || !pCommandBuffers) return -3;
     auto* dev  = static_cast<MaliIcdDevice*>(device);
-    const auto* cbai = static_cast<const VkCommandBufferAllocateInfoIcd*>(pAllocateInfo);
+    const auto* cbai = static_cast<const VkCommandBufferAllocateInfo*>(pAllocateInfo);
     for (uint32_t i = 0; i < cbai->commandBufferCount; ++i) {
         auto* cb = new MaliIcdCommandBuffer();
         cb->loader_magic = ICD_LOADER_MAGIC;
@@ -1684,10 +1669,10 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
     }
     if (fence && fence != 0xFE000001ULL) reinterpret_cast<MaliIcdFence*>(fence)->signaled = true;
 
-    const auto* submits = static_cast<const VkSubmitInfoIcd*>(pSubmits);
+    const auto* submits = static_cast<const VkSubmitInfo*>(pSubmits);
     for (uint32_t s = 0; s < submitCount; ++s) {
         for (uint32_t c = 0; c < submits[s].commandBufferCount; ++c) {
-            auto* cb = static_cast<MaliIcdCommandBuffer*>(submits[s].pCommandBuffers[c]);
+            auto* cb = reinterpret_cast<MaliIcdCommandBuffer*>(submits[s].pCommandBuffers[c]);
             if (!cb) continue;
 
             for (const auto& cmd : cb->cmds) {
@@ -2062,7 +2047,7 @@ int32_t vkQueueSubmit(void* queue, uint32_t submitCount, const void* pSubmits, u
                 cur = cur->pNext;
             }
             for (uint32_t k = 0; k < submits[s].signalSemaphoreCount; ++k) {
-                uint64_t sh = submits[s].pSignalSemaphores[k];
+                uint64_t sh = reinterpret_cast<uint64_t>(submits[s].pSignalSemaphores[k]);
                 if (sh && sh != 0x5E000001ULL) {
                     auto* sem = reinterpret_cast<MaliIcdSemaphore*>(sh);
                     if (sig_vals && k < sig_val_cnt) sem->counter_value = sig_vals[k];
@@ -2158,8 +2143,7 @@ int32_t vkGetPhysicalDeviceToolProperties(void* physicalDevice, uint32_t* pToolC
 
 static void clearDedicatedReqsChain(void* pMemoryRequirements2) {
     if (!pMemoryRequirements2) return;
-    struct VkBaseOut { uint32_t sType; VkBaseOut* pNext; };
-    auto* cur = static_cast<VkBaseOut*>(pMemoryRequirements2)->pNext;
+    auto* cur = static_cast<VkBaseOutStructure*>(pMemoryRequirements2)->pNext;
     while (cur) {
         if (cur->sType == 1000127000U /* VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS */) {
             auto* flags = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(cur) + 16);
@@ -2198,8 +2182,8 @@ void vkGetDeviceBufferMemoryRequirements(void* device, const void* pInfo, void* 
         g_aot_rt.lifted_vk_calls_executed++;
         return;
     }
-    const auto* create_info = *reinterpret_cast<const VkBufferCreateInfoIcd* const*>(static_cast<const uint8_t*>(pInfo) + 16);
-    auto* req = reinterpret_cast<VkMemoryRequirementsIcd*>(static_cast<uint8_t*>(pMemoryRequirements) + 16);
+    const auto* create_info = *reinterpret_cast<const VkBufferCreateInfo* const*>(static_cast<const uint8_t*>(pInfo) + 16);
+    auto* req = reinterpret_cast<VkMemoryRequirements*>(static_cast<uint8_t*>(pMemoryRequirements) + 16);
     uint64_t sz = create_info ? create_info->size : 4096ULL;
     req->size = std::max<uint64_t>(4096ULL, (sz + 4095ULL) & ~4095ULL);
     req->alignment = 4096ULL;
@@ -2224,7 +2208,7 @@ void vkGetDeviceImageMemoryRequirements(void* device, const void* pInfo, void* p
         uint32_t width; uint32_t height; uint32_t depth; uint32_t mipLevels; uint32_t arrayLayers;
     };
     const auto* ii = *reinterpret_cast<const ImgInfo* const*>(static_cast<const uint8_t*>(pInfo) + 16);
-    auto* req = reinterpret_cast<VkMemoryRequirementsIcd*>(static_cast<uint8_t*>(pMemoryRequirements) + 16);
+    auto* req = reinterpret_cast<VkMemoryRequirements*>(static_cast<uint8_t*>(pMemoryRequirements) + 16);
     uint64_t w = ii ? std::max<uint32_t>(1U, ii->width) : 64ULL;
     uint64_t h = ii ? std::max<uint32_t>(1U, ii->height) : 64ULL;
     uint64_t d = ii ? std::max<uint32_t>(1U, ii->depth) : 1ULL;

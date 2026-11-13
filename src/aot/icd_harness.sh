@@ -54,7 +54,7 @@ CLIENT_BIN="$ROOT_DIR/bin/test_vulkan_icd_client"
 
 echo "[1/3] Building AOT Vulkan ICD ($ICD_SO)..."
 g++ -O3 -std=c++17 -fno-strict-aliasing -shared -fPIC \
-    "$ROOT_DIR/src/mali_vulkan_icd.cpp" \
+    "$ROOT_DIR/../r54p3_vulkan_icd/mali_vulkan_icd.cpp" \
     "$BUILD_DIR/mali_mbs2_aot.o" \
     -o "$ICD_SO" "$ROOT_DIR/../../libmali_kbase_emu.so" -Wl,-rpath,"$ROOT_DIR/../.." -ldl -lm
 
@@ -81,10 +81,10 @@ export MALI0_EMU_BACKEND="$BACKEND_MODE"
 
 echo ""
 echo "[3/3] Building decompiled r54p3_vulkan_icd & running 10-suite Khronos Vulkan-Samples compliance..."
-"$ROOT_DIR/r54p3_vulkan_icd/build.sh"
+make -C "$ROOT_DIR/../r54p3_vulkan_icd"
 if [ ! -f "$ROOT_DIR/bin/test_vulkan_samples_compliance" ] || [ "$ROOT_DIR/tests/test_vulkan_samples_compliance.cpp" -nt "$ROOT_DIR/bin/test_vulkan_samples_compliance" ]; then
-    g++ -O2 -std=c++17 -I"$ROOT_DIR/include" -I"$ROOT_DIR/r54p3_vulkan_icd/include" \
+    g++ -O2 -std=c++17 -I"$ROOT_DIR/include" -I"$ROOT_DIR/../r54p3_vulkan_icd" \
         "$ROOT_DIR/tests/test_vulkan_samples_compliance.cpp" -ldl -lpthread -o "$ROOT_DIR/bin/test_vulkan_samples_compliance"
 fi
-VK_ICD_FILENAMES="$ROOT_DIR/r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json" "$ROOT_DIR/bin/test_vulkan_samples_compliance" "$ROOT_DIR/r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json"
+VK_ICD_FILENAMES="$ROOT_DIR/../r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json" "$ROOT_DIR/bin/test_vulkan_samples_compliance" "$ROOT_DIR/../r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json"
 VK_ICD_FILENAMES="$ICD_JSON" "$ROOT_DIR/bin/test_vulkan_samples_compliance" "$ICD_JSON"

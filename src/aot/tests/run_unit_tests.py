@@ -361,7 +361,7 @@ class TestMaliKbaseCsfUapiAndValhallToLavapipeHarness(unittest.TestCase):
 
     def test_r54p3_decompiled_icd_and_vulkan_samples_compliance(self):
         """Test 18: Decompiled r54p3 C++17 Vulkan ICD + 10-Suite Khronos Vulkan-Samples Compliance (Stub Textures)"""
-        r54_icd_json = os.path.join(ROOT_DIR, "r54p3_vulkan_icd", "lib", "r54p3_decompiled_icd.x86_64.json")
+        r54_icd_json = os.path.join(os.path.dirname(ROOT_DIR), "r54p3_vulkan_icd", "lib", "r54p3_decompiled_icd.x86_64.json")
         aot_icd_json = os.path.join(ROOT_DIR, "build", "r54p3-00eac0-6eda07", "mali_aot_icd.x86_64.json")
         compliance_bin = os.path.join(ROOT_DIR, "bin", "test_vulkan_samples_compliance")
         self.assertTrue(os.path.exists(r54_icd_json), "Missing r54p3_decompiled_icd.x86_64.json")

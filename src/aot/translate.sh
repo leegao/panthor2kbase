@@ -174,18 +174,18 @@ DYN_EMU="-Wl,--no-as-needed -L$BUILD_HOST_DIR -L$BUILD_HOST_DIR/emulator -L$BUIL
 AOT_RPATH='$ORIGIN:$ORIGIN/..:$ORIGIN/../..:$ORIGIN/../../..:$ORIGIN/emulator:$ORIGIN/../emulator:$ORIGIN/adapter:$ORIGIN/../adapter:$ORIGIN/../../../../build-x86-64:$ORIGIN/../../../build-x86-64'
 
 echo "[Link] Dynamically linking libmali_kbase_emu.so + libpanthor_kbase_adapter.so into runner and ICD..."
-g++ -O2 -fno-strict-aliasing -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
+g++ -O2 -fno-strict-aliasing -I"$REPO_ROOT/src/r54p3_vulkan_icd" -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
     -I"$REPO_ROOT/include" -I"$REPO_ROOT/src/adapter" -I"$REPO_ROOT/src/emulator" \
-    "$ROOT_DIR/src/mali_aot_runner.cpp" "$OUT_DIR/mali_mbs2_aot.o" "${EXTRA_AOT_OBJS[@]}" \
+    "$REPO_ROOT/src/r54p3_vulkan_icd/mali_aot_runner.cpp" "$OUT_DIR/mali_mbs2_aot.o" "${EXTRA_AOT_OBJS[@]}" \
     $DYN_EMU -ldl -lpthread \
     -Wl,-rpath,"$AOT_RPATH" \
     -o "$OUT_DIR/mali_aot_runner"
 
 g++ -O2 -std=c++17 -fno-strict-aliasing -shared -fPIC \
     -Wl,-Bsymbolic -Wl,-Bsymbolic-functions \
-    -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
+    -I"$REPO_ROOT/src/r54p3_vulkan_icd" -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
     -I"$REPO_ROOT/include" -I"$REPO_ROOT/src/adapter" -I"$REPO_ROOT/src/emulator" \
-    "$ROOT_DIR/src/mali_vulkan_icd.cpp" "$OUT_DIR/mali_mbs2_aot.o" "${EXTRA_AOT_OBJS[@]}" \
+    "$REPO_ROOT/src/r54p3_vulkan_icd/mali_vulkan_icd.cpp" "$OUT_DIR/mali_mbs2_aot.o" "${EXTRA_AOT_OBJS[@]}" \
     $DYN_EMU -ldl -lm -lpthread \
     -Wl,-rpath,"$AOT_RPATH" \
     -o "$OUT_DIR/libvulkan_mali_aot_icd.so"

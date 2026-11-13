@@ -54,7 +54,7 @@ echo "==========================================================================
 echo " [Suite 5/8] Khronos 20 Vulkan-Samples Compliance Harness (System Loader)      "
 echo "================================================================================"
 RUN_BIN aot/test_vulkan_samples_compliance
-RUN_BIN aot/test_vulkan_samples_compliance src/aot/r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json
+RUN_BIN aot/test_vulkan_samples_compliance src/r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json
 
 echo "================================================================================"
 echo " [Suite 6/8] UAPI & CSF Ring Trace Diff (winlator_log.txt vs. Ludashi panvk)   "

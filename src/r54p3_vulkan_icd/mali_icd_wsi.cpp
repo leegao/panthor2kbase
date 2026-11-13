@@ -258,54 +258,17 @@ struct MaliIcdSwapchain {
 // ============================================================================
 // VK_KHR_display & VK_EXT_debug_utils Support for Official Khronos vkcube (--wsi display)
 // ============================================================================
-struct VkDisplayPropertiesKHRIcd {
-    uint64_t    display;
-    const char* displayName;
-    uint32_t    physicalDimensions[2];
-    uint32_t    physicalResolution[2];
-    uint32_t    supportedTransforms;
-    uint32_t    planeReorderPossible;
-    uint32_t    persistentContent;
-};
-
-struct VkDisplayPlanePropertiesKHRIcd {
-    uint64_t currentDisplay;
-    uint32_t currentStackIndex;
-};
-
-struct VkDisplayModeParametersKHRIcd {
-    uint32_t visibleRegion[2];
-    uint32_t refreshRate;
-};
-
-struct VkDisplayModePropertiesKHRIcd {
-    uint64_t                      displayMode;
-    VkDisplayModeParametersKHRIcd parameters;
-};
-
-struct VkDisplayPlaneCapabilitiesKHRIcd {
-    uint32_t supportedAlpha;
-    int32_t  minSrcPosition[2];
-    int32_t  maxSrcPosition[2];
-    uint32_t minSrcExtent[2];
-    uint32_t maxSrcExtent[2];
-    int32_t  minDstPosition[2];
-    int32_t  maxDstPosition[2];
-    uint32_t minDstExtent[2];
-    uint32_t maxDstExtent[2];
-};
-
 __attribute__((visibility("default")))
 int32_t vkGetPhysicalDeviceDisplayPropertiesKHR(void* /*physicalDevice*/, uint32_t* pPropertyCount, void* pProperties) {
     if (!pPropertyCount) return -3;
     if (!pProperties) { *pPropertyCount = 1U; return 0; }
     if (*pPropertyCount == 0U) return 5;
-    auto* p = static_cast<VkDisplayPropertiesKHRIcd*>(pProperties);
-    p->display = 0xD1590001ULL;
+    auto* p = static_cast<VkDisplayPropertiesKHR*>(pProperties);
+    p->display = reinterpret_cast<VkDisplayKHR>(0xD1590001ULL);
     p->displayName = "Mali-G615 Virtual Kbase Display (500x500)";
-    p->physicalDimensions[0] = 500U; p->physicalDimensions[1] = 500U;
+    p->physicalDimensions.width = 500U; p->physicalDimensions.height = 500U;
     uint32_t disp_res = (getenv("MALI_VKCUBE_HIRES") != nullptr) ? 500U : 64U;
-    p->physicalResolution[0] = disp_res;  p->physicalResolution[1] = disp_res;
+    p->physicalResolution.width = disp_res;  p->physicalResolution.height = disp_res;
     p->supportedTransforms = 1U; // VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
     p->planeReorderPossible = 0U;
     p->persistentContent = 0U;
@@ -318,8 +281,8 @@ int32_t vkGetPhysicalDeviceDisplayPlanePropertiesKHR(void* /*physicalDevice*/, u
     if (!pPropertyCount) return -3;
     if (!pProperties) { *pPropertyCount = 1U; return 0; }
     if (*pPropertyCount == 0U) return 5;
-    auto* p = static_cast<VkDisplayPlanePropertiesKHRIcd*>(pProperties);
-    p->currentDisplay = 0xD1590001ULL;
+    auto* p = static_cast<VkDisplayPlanePropertiesKHR*>(pProperties);
+    p->currentDisplay = reinterpret_cast<VkDisplayKHR>(0xD1590001ULL);
     p->currentStackIndex = 0U;
     *pPropertyCount = 1U;
     return 0;
@@ -340,11 +303,11 @@ int32_t vkGetDisplayModePropertiesKHR(void* /*physicalDevice*/, uint64_t /*displ
     if (!pPropertyCount) return -3;
     if (!pProperties) { *pPropertyCount = 1U; return 0; }
     if (*pPropertyCount == 0U) return 5;
-    auto* p = static_cast<VkDisplayModePropertiesKHRIcd*>(pProperties);
-    p->displayMode = 0xD15900DEULL;
+    auto* p = static_cast<VkDisplayModePropertiesKHR*>(pProperties);
+    p->displayMode = reinterpret_cast<VkDisplayModeKHR>(0xD15900DEULL);
     uint32_t disp_res = (getenv("MALI_VKCUBE_HIRES") != nullptr) ? 500U : 64U;
-    p->parameters.visibleRegion[0] = disp_res;
-    p->parameters.visibleRegion[1] = disp_res;
+    p->parameters.visibleRegion.width = disp_res;
+    p->parameters.visibleRegion.height = disp_res;
     p->parameters.refreshRate = 60000U;
     *pPropertyCount = 1U;
     return 0;
@@ -360,13 +323,13 @@ int32_t vkCreateDisplayModeKHR(void* /*physicalDevice*/, uint64_t /*display*/, c
 __attribute__((visibility("default")))
 int32_t vkGetDisplayPlaneCapabilitiesKHR(void* /*physicalDevice*/, uint64_t /*mode*/, uint32_t /*planeIndex*/, void* pCapabilities) {
     if (!pCapabilities) return -3;
-    auto* c = static_cast<VkDisplayPlaneCapabilitiesKHRIcd*>(pCapabilities);
+    auto* c = static_cast<VkDisplayPlaneCapabilitiesKHR*>(pCapabilities);
     std::memset(c, 0, sizeof(*c));
     c->supportedAlpha = 1U; // VK_DISPLAY_PLANE_ALPHA_OPAQUE_BIT_KHR
-    c->minSrcExtent[0] = 16U; c->minSrcExtent[1] = 16U;
-    c->maxSrcExtent[0] = 4096U; c->maxSrcExtent[1] = 4096U;
-    c->minDstExtent[0] = 16U; c->minDstExtent[1] = 16U;
-    c->maxDstExtent[0] = 4096U; c->maxDstExtent[1] = 4096U;
+    c->minSrcExtent.width = 16U; c->minSrcExtent.height = 16U;
+    c->maxSrcExtent.width = 4096U; c->maxSrcExtent.height = 4096U;
+    c->minDstExtent.width = 16U; c->minDstExtent.height = 16U;
+    c->maxDstExtent.width = 4096U; c->maxDstExtent.height = 4096U;
     return 0;
 }
 

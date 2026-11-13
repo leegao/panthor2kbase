@@ -59,7 +59,7 @@ void aot_so_trace_fn_exit(void* cpu_ptr, uint64_t fn_va, const char* fn_name);
 
 #ifdef AOT_SO_PROFILER_IMPLEMENTATION
 
-#include "../generated/r54p3_debug_symbols.h"
+#include "../aot/generated/r54p3_debug_symbols.h"
 
 static inline const char* aot_so_resolve_debug_name(uint64_t fn_va, const char* fn_name) {
     if (!fn_name || std::strncmp(fn_name, "sub_", 4) == 0) {

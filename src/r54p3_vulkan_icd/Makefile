@@ -1,6 +1,6 @@
 CXX ?= g++
-CXXFLAGS ?= -O2 -std=c++17 -fPIC -Iinclude
-LDFLAGS ?= ../../libmali_kbase_emu.so -Wl,-rpath,$(abspath ../..) -ldl -lpthread
+CXXFLAGS ?= -O2 -std=c++17 -fPIC -I. -I../aot/include -I../emulator -I../../include
+LDFLAGS ?= -ldl -lpthread
 AR ?= ar
 
 TARGET_SHARED = lib/libr54p3_vulkan_icd.so
@@ -12,7 +12,7 @@ all: dirs $(TARGET_SHARED) $(TARGET_STATIC) json
 dirs:
 	@mkdir -p lib
 
-lib/r54p3_vulkan_icd.o: src/r54p3_vulkan_icd.cpp include/*.h*
+lib/r54p3_vulkan_icd.o: r54p3_vulkan_icd.cpp *.h*
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(TARGET_SHARED): lib/r54p3_vulkan_icd.o

@@ -12,9 +12,12 @@
 #include <vector>
 #include <sys/mman.h>
 
+#define VK_NO_PROTOTYPES
+#include <vulkan/vulkan.h>
+
 #include "mali_kbase_csf_lvp_harness.hpp"
 #define AOT_SO_PROFILER_IMPLEMENTATION
-#include "../include/aot_so_profiler.hpp"
+#include "aot_so_profiler.hpp"
 
 static constexpr uint64_t IMAGE_BASE = 0x400000000ULL;
 static constexpr uint64_t HLE_MALLOC_MAGIC   = 0xF000FFF0ULL;
@@ -894,28 +897,6 @@ static inline uint64_t csfEncodeWait(uint16_t wait_mask = 0) {
            (static_cast<uint64_t>(wait_mask) << 16);
 }
 
-struct VkExtensionProperties {
-    char     extensionName[256];
-    uint32_t specVersion;
-};
-
-struct VkShaderModuleCreateInfo {
-    uint32_t       sType;
-    const void*    pNext;
-    uint32_t       flags;
-    size_t         codeSize;
-    const uint32_t* pCode;
-};
-
-struct VkAllocationCallbacks {
-    void*    pUserData;
-    uint64_t pfnAllocation;
-    uint64_t pfnReallocation;
-    uint64_t pfnFree;
-    uint64_t pfnInternalAllocation;
-    uint64_t pfnInternalFree;
-};
-
 int main(int argc, char** argv) {
     const char* so_path = argc > 1 ? argv[1] : "ddk/libGLES_mali.so";
     g_kbase_emu.lvp_executor.init();
@@ -1128,8 +1109,8 @@ int main(int argc, char** argv) {
     // TEST 6: Sample SPIR-V 1.3 Shaders -> AOT vkCreateShaderModule (SHA-1) & Valhall ISA OBJC Deserialization
     auto sample_shaders = buildSampleSpirvShaders();
     VkAllocationCallbacks vk_alloc{};
-    vk_alloc.pfnAllocation = HLE_VK_ALLOC_MAGIC;
-    vk_alloc.pfnFree       = HLE_VK_FREE_MAGIC;
+    vk_alloc.pfnAllocation = reinterpret_cast<PFN_vkAllocationFunction>(HLE_VK_ALLOC_MAGIC);
+    vk_alloc.pfnFree       = reinterpret_cast<PFN_vkFreeFunction>(HLE_VK_FREE_MAGIC);
     std::vector<uint8_t> mock_vk_device(131072, 0);
     std::vector<std::vector<uint8_t>> validated_mbs2_blobs;
 
@@ -1141,7 +1122,7 @@ int main(int argc, char** argv) {
         bool sha1_verified = false;
         if (aot_vkCreateShaderModule && aot_vkDestroyShaderModule) {
             VkShaderModuleCreateInfo ci{};
-            ci.sType    = 16;
+            ci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
             ci.pNext    = nullptr;
             ci.flags    = 0;
             ci.codeSize = sh.spv.size();

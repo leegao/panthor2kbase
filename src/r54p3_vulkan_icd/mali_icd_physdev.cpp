@@ -48,7 +48,7 @@ int32_t vkEnumerateInstanceExtensionProperties(const char* pLayerName, uint32_t*
         *pPropertyCount = 0;
         return 0;
     }
-    std::vector<VkExtensionPropertiesIcd> exts;
+    std::vector<VkExtensionProperties> exts;
     if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkEnumerateInstanceExtensionProperties) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         uint32_t aot_count = 0;
@@ -96,7 +96,7 @@ int32_t vkEnumerateInstanceExtensionProperties(const char* pLayerName, uint32_t*
         }
     }
     if (disable_wayland) {
-        exts.erase(std::remove_if(exts.begin(), exts.end(), [](const VkExtensionPropertiesIcd& e) {
+        exts.erase(std::remove_if(exts.begin(), exts.end(), [](const VkExtensionProperties& e) {
             return std::strcmp(e.extensionName, "VK_KHR_wayland_surface") == 0;
         }), exts.end());
     }
@@ -111,7 +111,7 @@ int32_t vkEnumerateInstanceExtensionProperties(const char* pLayerName, uint32_t*
             }
         }
         if (!found) {
-            VkExtensionPropertiesIcd ep{};
+            VkExtensionProperties ep{};
             std::snprintf(ep.extensionName, sizeof(ep.extensionName), "%s", wext.name);
             ep.specVersion = wext.ver;
             exts.push_back(ep);
@@ -123,7 +123,7 @@ int32_t vkEnumerateInstanceExtensionProperties(const char* pLayerName, uint32_t*
         return 0;
     }
     uint32_t n = std::min(*pPropertyCount, total);
-    std::memcpy(pProperties, exts.data(), n * sizeof(VkExtensionPropertiesIcd));
+    std::memcpy(pProperties, exts.data(), n * sizeof(VkExtensionProperties));
     *pPropertyCount = n;
     return (n < total) ? 5 : 0;
 }
@@ -187,8 +187,8 @@ void vkGetPhysicalDeviceProperties(void* physicalDevice, void* pProperties) {
     if (!pProperties) return;
     g_aot_rt.ensureInitialized();
     auto* pdev = static_cast<MaliIcdPhysicalDevice*>(physicalDevice);
-    auto* props = static_cast<VkPhysicalDevicePropertiesIcd*>(pProperties);
-    std::memset(props, 0, sizeof(VkPhysicalDevicePropertiesIcd));
+    auto* props = static_cast<VkPhysicalDeviceProperties*>(pProperties);
+    std::memset(props, 0, sizeof(VkPhysicalDeviceProperties));
 
     // Execute AOT-lifted libGLES_mali.so vkGetPhysicalDeviceProperties (0x977730 -> 0x977738)
     // which populates all 504 bytes of genuine Valhall r54p3 VkPhysicalDeviceLimits & SparseProperties!
@@ -201,11 +201,6 @@ void vkGetPhysicalDeviceProperties(void* physicalDevice, void* pProperties) {
     }
 }
 
-struct VkBaseOutStructureIcd {
-    uint32_t               sType;
-    VkBaseOutStructureIcd* pNext;
-};
-
 __attribute__((visibility("default")))
 void vkGetPhysicalDeviceProperties2(void* physicalDevice, void* pProperties2) {
     if (!pProperties2) return;
@@ -215,7 +210,7 @@ void vkGetPhysicalDeviceProperties2(void* physicalDevice, void* pProperties2) {
     const uint8_t kDrvUuid[16] = {'A','R','M','-','M','A','L','I','-','R','5','4','P','3','-','0'};
 
     // Walk pNext chain for vulkaninfo & Vulkan 1.1/1.2/1.3/Extension property queries
-    auto* cur = reinterpret_cast<VkBaseOutStructureIcd*>(pProperties2)->pNext;
+    auto* cur = reinterpret_cast<VkBaseOutStructure*>(pProperties2)->pNext;
     while (cur) {
         uint8_t* raw = reinterpret_cast<uint8_t*>(cur);
         switch (cur->sType) {
@@ -341,13 +336,13 @@ void vkGetPhysicalDeviceQueueFamilyProperties(void* physicalDevice, uint32_t* pQ
         return;
     }
     if (*pQueueFamilyPropertyCount > 0) {
-        auto* qf = static_cast<VkQueueFamilyPropertiesIcd*>(pQueueFamilyProperties);
+        auto* qf = static_cast<VkQueueFamilyProperties*>(pQueueFamilyProperties);
         qf[0].queueFlags = 0x17U; // GRAPHICS | COMPUTE | TRANSFER | SPARSE_BINDING
         qf[0].queueCount = 2U;
         qf[0].timestampValidBits = 64U;
-        qf[0].minImageTransferGranularity[0] = 1U;
-        qf[0].minImageTransferGranularity[1] = 1U;
-        qf[0].minImageTransferGranularity[2] = 1U;
+        qf[0].minImageTransferGranularity.width = 1U;
+        qf[0].minImageTransferGranularity.height = 1U;
+        qf[0].minImageTransferGranularity.depth = 1U;
         *pQueueFamilyPropertyCount = 1;
     }
 }
@@ -388,8 +383,8 @@ void vkGetPhysicalDeviceMemoryProperties(void* physicalDevice, void* pMemoryProp
         aot_vkGetPhysicalDeviceMemoryProperties(&g_aot_rt.cpu);
         return;
     }
-    auto* mp = static_cast<VkPhysicalDeviceMemoryPropertiesIcd*>(pMemoryProperties);
-    std::memset(mp, 0, sizeof(VkPhysicalDeviceMemoryPropertiesIcd));
+    auto* mp = static_cast<VkPhysicalDeviceMemoryProperties*>(pMemoryProperties);
+    std::memset(mp, 0, sizeof(VkPhysicalDeviceMemoryProperties));
     mp->memoryTypeCount = 3;
     mp->memoryTypes[0].propertyFlags = 0x07U; // DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT
     mp->memoryTypes[0].heapIndex     = 0;
@@ -615,7 +610,7 @@ int32_t vkEnumerateDeviceExtensionProperties(void* physicalDevice, const char* p
     g_aot_rt.ensureInitialized();
     auto* pdev = static_cast<MaliIcdPhysicalDevice*>(physicalDevice);
 
-    std::vector<VkExtensionPropertiesIcd> exts;
+    std::vector<VkExtensionProperties> exts;
     if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkEnumerateDeviceExtensionProperties && pdev && (!pLayerName || pLayerName[0] == '\0')) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         pdev->initAotInternalLayout();
@@ -665,7 +660,7 @@ int32_t vkEnumerateDeviceExtensionProperties(void* physicalDevice, const char* p
             if (std::strcmp(e.extensionName, extra.name) == 0) { found = true; break; }
         }
         if (!found) {
-            VkExtensionPropertiesIcd ep{};
+            VkExtensionProperties ep{};
             std::snprintf(ep.extensionName, sizeof(ep.extensionName), "%s", extra.name);
             ep.specVersion = extra.ver;
             exts.push_back(ep);
@@ -677,9 +672,9 @@ int32_t vkEnumerateDeviceExtensionProperties(void* physicalDevice, const char* p
         *pPropertyCount = total;
         return 0;
     }
-    auto* out = static_cast<VkExtensionPropertiesIcd*>(pProperties);
+    auto* out = static_cast<VkExtensionProperties*>(pProperties);
     uint32_t n = std::min(*pPropertyCount, total);
-    std::memcpy(out, exts.data(), n * sizeof(VkExtensionPropertiesIcd));
+    std::memcpy(out, exts.data(), n * sizeof(VkExtensionProperties));
     *pPropertyCount = n;
     return (n < total) ? 5 : 0;
 }

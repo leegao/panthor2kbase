@@ -43,13 +43,16 @@
 
 #include <cstdarg>
 #include <unistd.h>
-#include "../include/mali0_emu_device.hpp"
-#include "../include/mali_aapcs64_auto_thunks.hpp"
+#define VK_NO_PROTOTYPES
+#include <vulkan/vulkan.h>
+
+#include "../aot/include/mali0_emu_device.hpp"
+#include "mali_aapcs64_auto_thunks.hpp"
 #define AOT_SO_PROFILER_IMPLEMENTATION
-#include "../include/aot_so_profiler.hpp"
-#include "../../emulator/lifted_kbase_ko.h"
-#include "../generated/mali_bionic_stubs_autogen.h"
-#include "../generated/mali_vk_dispatch_table_autogen.h"
+#include "aot_so_profiler.hpp"
+#include "../emulator/lifted_kbase_ko.h"
+#include "../aot/generated/mali_bionic_stubs_autogen.h"
+#include "../aot/generated/mali_vk_dispatch_table_autogen.h"
 
 static bool mali_icd_log_enabled() {
     static int s_enabled = -1;
@@ -959,162 +962,11 @@ static MaliAotGlobalRuntime g_aot_rt;
 // ============================================================================
 // Section 4: Vulkan C ABI Types & ICD Dispatchable Objects
 // ============================================================================
-struct VkExtensionPropertiesIcd {
-    char     extensionName[256];
-    uint32_t specVersion;
-};
-
-struct VkLayerPropertiesIcd {
-    char     layerName[256];
-    uint32_t specVersion;
-    uint32_t implementationVersion;
-    char     description[256];
-};
-
-struct alignas(8) VkPhysicalDeviceLimitsIcd {
-    uint8_t raw[504]; // Exact size of VkPhysicalDeviceLimits in Vulkan 1.3 (504 bytes, aligned to 8)
-};
-
-struct VkPhysicalDeviceSparsePropertiesIcd {
-    uint32_t residencyStandard2DBlockShape;
-    uint32_t residencyStandard2DMSBlockShape;
-    uint32_t residencyStandard3DBlockShape;
-    uint32_t residencyAlignedMipSize;
-    uint32_t residencyNonResidentStrict;
-};
-
-struct VkPhysicalDevicePropertiesIcd {
-    uint32_t                            apiVersion;
-    uint32_t                            driverVersion;
-    uint32_t                            vendorID;
-    uint32_t                            deviceID;
-    uint32_t                            deviceType;
-    char                                deviceName[256];
-    uint8_t                             pipelineCacheUUID[16];
-    VkPhysicalDeviceLimitsIcd           limits;
-    VkPhysicalDeviceSparsePropertiesIcd sparseProperties;
-};
-static_assert(offsetof(VkPhysicalDevicePropertiesIcd, limits) == 296,
-              "VkPhysicalDevicePropertiesIcd::limits must be at byte offset 296 (matching Vulkan C ABI)");
-static_assert(sizeof(VkPhysicalDevicePropertiesIcd) == 824,
-              "VkPhysicalDevicePropertiesIcd must be 824 bytes (matching Vulkan C ABI)");
-
-struct VkQueueFamilyPropertiesIcd {
-    uint32_t queueFlags;
-    uint32_t queueCount;
-    uint32_t timestampValidBits;
-    uint32_t minImageTransferGranularity[3];
-};
-
-struct VkMemoryTypeIcd {
-    uint32_t propertyFlags;
-    uint32_t heapIndex;
-};
-
-struct VkMemoryHeapIcd {
-    uint64_t size;
-    uint32_t flags;
-    uint32_t padding;
-};
-
-struct VkPhysicalDeviceMemoryPropertiesIcd {
-    uint32_t        memoryTypeCount;
-    VkMemoryTypeIcd memoryTypes[32];
-    uint32_t        memoryHeapCount;
-    VkMemoryHeapIcd memoryHeaps[16];
-};
-
-struct VkShaderModuleCreateInfoIcd {
-    uint32_t        sType;
-    const void*     pNext;
-    uint32_t        flags;
-    size_t          codeSize;
-    const uint32_t* pCode;
-};
-
-struct VkBufferCreateInfoIcd {
-    uint32_t        sType;
-    const void*     pNext;
-    uint32_t        flags;
-    uint64_t        size;
-    uint32_t        usage;
-    uint32_t        sharingMode;
-    uint32_t        queueFamilyIndexCount;
-    const uint32_t* pQueueFamilyIndices;
-};
-
-struct VkMemoryRequirementsIcd {
-    uint64_t size;
-    uint64_t alignment;
-    uint32_t memoryTypeBits;
-    uint32_t padding;
-};
-
-struct VkMemoryAllocateInfoIcd {
-    uint32_t    sType;
-    const void* pNext;
-    uint64_t    allocationSize;
-    uint32_t    memoryTypeIndex;
-};
-
-struct VkPipelineShaderStageCreateInfoIcd {
-    uint32_t    sType;
-    const void* pNext;
-    uint32_t    flags;
-    uint32_t    stage;
-    uint64_t    module;
-    const char* pName;
-    const void* pSpecializationInfo;
-};
-
-struct VkComputePipelineCreateInfoIcd {
-    uint32_t                           sType;
-    const void*                        pNext;
-    uint32_t                           flags;
-    VkPipelineShaderStageCreateInfoIcd stage;
-    uint64_t                           layout;
-    uint64_t                           basePipelineHandle;
-    int32_t                            basePipelineIndex;
-};
-
-struct VkDescriptorBufferInfoIcd {
-    uint64_t buffer;
-    uint64_t offset;
-    uint64_t range;
-};
-
-struct VkWriteDescriptorSetIcd {
-    uint32_t                         sType;
-    const void*                      pNext;
-    uint64_t                         dstSet;
-    uint32_t                         dstBinding;
-    uint32_t                         dstArrayElement;
-    uint32_t                         descriptorCount;
-    uint32_t                         descriptorType;
-    const void*                      pImageInfo;
-    const VkDescriptorBufferInfoIcd* pBufferInfo;
-    const void*                      pTexelBufferView;
-};
-
-struct VkCommandBufferAllocateInfoIcd {
-    uint32_t    sType;
-    const void* pNext;
-    uint64_t    commandPool;
-    uint32_t    level;
-    uint32_t    commandBufferCount;
-};
-
-struct VkSubmitInfoIcd {
-    uint32_t        sType;
-    const void*     pNext;
-    uint32_t        waitSemaphoreCount;
-    const uint64_t* pWaitSemaphores;
-    const uint32_t* pWaitDstStageMask;
-    uint32_t        commandBufferCount;
-    void* const*    pCommandBuffers;
-    uint32_t        signalSemaphoreCount;
-    const uint64_t* pSignalSemaphores;
-};
+// Standard Vulkan C ABI structs are provided by <vulkan/vulkan.h>.
+static_assert(offsetof(VkPhysicalDeviceProperties, limits) == 296,
+              "VkPhysicalDeviceProperties::limits must be at byte offset 296 (matching Vulkan C ABI)");
+static_assert(sizeof(VkPhysicalDeviceProperties) == 824,
+              "VkPhysicalDeviceProperties must be 824 bytes (matching Vulkan C ABI)");
 
 // Dispatchable ICD Handles (MUST start with uintptr_t loader_magic = 0x01CDC0DE)
 // Note: In libGLES_mali.so (r54p3), aot_vkGetPhysicalDeviceProperties (0x977730) and

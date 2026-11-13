@@ -28,13 +28,13 @@
 
 #define R54P3_THIN_AOT_WRAPPER_BUILD 1
 
-#include "../include/r54p3_dispatch_table.hpp"
-#include "../include/r54p3_cmpbe_boundary.hpp"
+#include "r54p3_dispatch_table.hpp"
+#include "r54p3_cmpbe_boundary.hpp"
 
 // Delegate the entire Vulkan 1.3 ICD & AOT-lifted `libGLES_mali.so` (`r54p3`)
 // runtime bridge directly to the unified AOT ICD implementation linked with
 // `mali_mbs2_aot.o` and `libmali_kbase_emu.so`.
-#include "../../src/mali_vulkan_icd.cpp"
+#include "mali_vulkan_icd.cpp"
 
 namespace mali_r54p3 {
 namespace bridge {
