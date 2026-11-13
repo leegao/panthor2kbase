@@ -444,10 +444,34 @@ static bool check_redzone_intact(const struct LiftedKoHeapBlockHdr *hdr) {
 }
 
 void *lifted_ko_heap_alloc(LiftedKbaseCPU *cpu, size_t sz) {
+    if (!cpu) return NULL;
     size_t aligned_sz = (sz + 15U) & ~15ULL;
     size_t total = sizeof(struct LiftedKoHeapBlockHdr) + aligned_sz + 16U;
-    if (!cpu || (size_t)cpu->heap.used + total > sizeof(cpu->heap.arena)) {
-        if (cpu) lifted_ko_print_stacktrace(cpu, "HEAP ARENA EXHAUSTION in lifted_ko_heap_alloc", NULL);
+    if ((size_t)cpu->heap.used + total > sizeof(cpu->heap.arena)) {
+        size_t off = 0;
+        while (off + sizeof(struct LiftedKoHeapBlockHdr) <= cpu->heap.used) {
+            struct LiftedKoHeapBlockHdr *fhdr = (struct LiftedKoHeapBlockHdr *)&cpu->heap.arena[off];
+            if (fhdr->magic != LIFTED_KO_HEAP_MAGIC) break;
+            size_t blk_aligned = ((size_t)fhdr->payload_size + 15U) & ~15ULL;
+            size_t blk_total = sizeof(struct LiftedKoHeapBlockHdr) + blk_aligned + 16U;
+            if (fhdr->state == LIFTED_KO_STATE_FREED && blk_aligned == aligned_sz) {
+                fhdr->state = LIFTED_KO_STATE_ALLOCATED;
+                fhdr->payload_size = (uint32_t)sz;
+                fhdr->alloc_seq = ++cpu->heap.alloc_count;
+                fhdr->alloc_guest_pc = cpu->cur_pc ? cpu->cur_pc : cpu->x[30];
+                fhdr->alloc_fn = cpu->cur_fn ? cpu->cur_fn : "kmalloc";
+                fhdr->alloc_host_bt[0] = __builtin_return_address(0);
+#if defined(__GLIBC__)
+                (void)backtrace(fhdr->alloc_host_bt, 4);
+#endif
+                void *payload = (uint8_t *)fhdr + sizeof(struct LiftedKoHeapBlockHdr);
+                memset(payload, 0, aligned_sz);
+                memset((uint8_t *)payload + aligned_sz, LIFTED_KO_REDZONE_BYTE, 16U);
+                return payload;
+            }
+            off += blk_total;
+        }
+        lifted_ko_print_stacktrace(cpu, "HEAP ARENA EXHAUSTION in lifted_ko_heap_alloc", NULL);
         return NULL;
     }
     uint8_t *base = &cpu->heap.arena[cpu->heap.used];

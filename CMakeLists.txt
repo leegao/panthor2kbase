@@ -414,7 +414,6 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
               "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/mali_icd_internal.h"
               "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/mali_icd_wsi.cpp"
               "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/mali_icd_physdev.cpp"
-              "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/host_lvp_executor.hpp"
       COMMENT "Running 64-bit Mali AOT translation pipeline (translate.sh)"
    )
 

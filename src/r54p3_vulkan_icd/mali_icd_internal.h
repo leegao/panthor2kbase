@@ -48,7 +48,6 @@
 
 #include "mali_csf_uapi_types.h"
 #include "valhall_spirv_lifter.hpp"
-#include "host_lvp_executor.hpp"
 #include "../emulator/mali_kbase_emu.h"
 #include "mali_aapcs64_auto_thunks.hpp"
 #define AOT_SO_PROFILER_IMPLEMENTATION
@@ -318,7 +317,196 @@ extern "C" uint64_t bionic_aapcs64_vsnprintf_bridge(uint64_t dst_addr, uint64_t 
     return out.size();
 }
 
-static HostLvpipeVulkanExecutor g_icd_lvp_executor;
+class HostSpirvExecutor {
+public:
+    static constexpr size_t kBufferCapacityBytes = 4 * 1024 * 1024;
+    typedef void (*PFN_vkVoidFunction)(void);
+    typedef PFN_vkVoidFunction (*PFN_vkGetInstanceProcAddr)(void*, const char*);
+    typedef int32_t (*PFN_vkCreateInstance)(const void*, const void*, void**);
+    typedef int32_t (*PFN_vkEnumeratePhysicalDevices)(void*, uint32_t*, void**);
+    typedef void (*PFN_vkGetPhysicalDeviceProperties)(void*, void*);
+    typedef int32_t (*PFN_vkCreateDevice)(void*, const void*, const void*, void**);
+    typedef void (*PFN_vkGetDeviceQueue)(void*, uint32_t, uint32_t, void**);
+    typedef int32_t (*PFN_vkCreateShaderModule)(void*, const void*, const void*, uint64_t*);
+    typedef void (*PFN_vkDestroyShaderModule)(void*, uint64_t, const void*);
+    typedef int32_t (*PFN_vkCreateDescriptorSetLayout)(void*, const void*, const void*, uint64_t*);
+    typedef int32_t (*PFN_vkCreatePipelineLayout)(void*, const void*, const void*, uint64_t*);
+    typedef int32_t (*PFN_vkCreateComputePipelines)(void*, uint64_t, uint32_t, const void*, const void*, uint64_t*);
+    typedef void (*PFN_vkDestroyPipeline)(void*, uint64_t, const void*);
+    typedef int32_t (*PFN_vkCreateBuffer)(void*, const void*, const void*, uint64_t*);
+    typedef int32_t (*PFN_vkAllocateMemory)(void*, const void*, const void*, uint64_t*);
+    typedef int32_t (*PFN_vkBindBufferMemory)(void*, uint64_t, uint64_t, uint64_t);
+    typedef int32_t (*PFN_vkMapMemory)(void*, uint64_t, uint64_t, uint64_t, uint32_t, void**);
+    typedef int32_t (*PFN_vkCreateDescriptorPool)(void*, const void*, const void*, uint64_t*);
+    typedef int32_t (*PFN_vkAllocateDescriptorSets)(void*, const void*, uint64_t*);
+    typedef void (*PFN_vkUpdateDescriptorSets)(void*, uint32_t, const void*, uint32_t, const void*);
+    typedef int32_t (*PFN_vkCreateCommandPool)(void*, const void*, const void*, uint64_t*);
+    typedef int32_t (*PFN_vkAllocateCommandBuffers)(void*, const void*, void**);
+    typedef int32_t (*PFN_vkResetCommandBuffer)(void*, uint32_t);
+    typedef int32_t (*PFN_vkBeginCommandBuffer)(void*, const void*);
+    typedef void (*PFN_vkCmdBindPipeline)(void*, uint32_t, uint64_t);
+    typedef void (*PFN_vkCmdBindDescriptorSets)(void*, uint32_t, uint64_t, uint32_t, uint32_t, const uint64_t*, uint32_t, const uint32_t*);
+    typedef void (*PFN_vkCmdDispatch)(void*, uint32_t, uint32_t, uint32_t);
+    typedef int32_t (*PFN_vkEndCommandBuffer)(void*);
+    typedef int32_t (*PFN_vkQueueSubmit)(void*, uint32_t, const void*, uint64_t);
+    typedef int32_t (*PFN_vkQueueWaitIdle)(void*);
+
+    void*    vk_lib = nullptr;
+    void*    instance = nullptr;
+    void*    phys_dev = nullptr;
+    void*    device = nullptr;
+    void*    queue = nullptr;
+    uint64_t desc_set_layout = 0;
+    uint64_t pipeline_layout = 0;
+    uint64_t desc_pool = 0;
+    uint64_t desc_set = 0;
+    uint64_t cmd_pool = 0;
+    void*    cmd_buf = nullptr;
+    uint64_t buf_in = 0, buf_out = 0;
+    uint64_t mem_in = 0, mem_out = 0;
+    void*    mapped_in = nullptr;
+    void*    mapped_out = nullptr;
+    std::string device_name;
+    PFN_vkGetInstanceProcAddr gipa = nullptr;
+
+    bool tryOpenBackendIcdLibrary(const char* so_path) {
+        void* handle = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
+        if (!handle) return false;
+        auto fn = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(handle, "vk_icdGetInstanceProcAddr"));
+        if (!fn) fn = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(handle, "vkGetInstanceProcAddr"));
+        if (!fn) { dlclose(handle); return false; }
+        struct AppInfo { uint32_t sType; const void* pNext; const char* pAppName; uint32_t appVer; const char* pEngineName; uint32_t engineVer; uint32_t apiVersion; }
+            appInfo = {0, nullptr, "mali0_spirv_exec", 1, "mali0", 1, (1U << 22) | (3U << 12)};
+        struct InstCI { uint32_t sType; const void* pNext; uint32_t flags; const void* pAppInfo; uint32_t lCount; const char* const* ppL; uint32_t eCount; const char* const* ppE; }
+            ici = {1, nullptr, 0, &appInfo, 0, nullptr, 0, nullptr};
+        auto createInst = reinterpret_cast<PFN_vkCreateInstance>(fn(nullptr, "vkCreateInstance"));
+        void* test_inst = nullptr;
+        if (!createInst || createInst(&ici, nullptr, &test_inst) != 0 || !test_inst) { dlclose(handle); return false; }
+        auto enumPD = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(fn(test_inst, "vkEnumeratePhysicalDevices"));
+        uint32_t pdCount = 1;
+        void* test_pd = nullptr;
+        if (!enumPD || enumPD(test_inst, &pdCount, &test_pd) != 0 || pdCount == 0 || !test_pd) { dlclose(handle); return false; }
+        vk_lib = handle; gipa = fn; instance = test_inst; phys_dev = test_pd;
+        return true;
+    }
+
+    bool init() {
+        if (device) return true;
+        static thread_local bool s_in_init = false;
+        if (s_in_init) return false;
+        struct Guard { bool& f; Guard(bool& v) : f(v) { f = true; } ~Guard() { f = false; } } guard(s_in_init);
+        const char* custom_lib = getenv("MALI0_EMU_BACKEND_LIB");
+        if (!custom_lib || !tryOpenBackendIcdLibrary(custom_lib)) {
+            const char* candidates[] = {
+                "/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so",
+                "/usr/lib/libvulkan_lvp.so",
+                "/usr/lib64/libvulkan_lvp.so",
+                "libvulkan_lvp.so"
+            };
+            for (const char* cand : candidates) {
+                if (tryOpenBackendIcdLibrary(cand)) break;
+            }
+        }
+        if (!vk_lib || !gipa || !instance || !phys_dev) return false;
+        uint8_t rawProps[1024]{};
+        auto getProps = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(gipa(instance, "vkGetPhysicalDeviceProperties"));
+        if (getProps) {
+            getProps(phys_dev, rawProps);
+            device_name = reinterpret_cast<const char*>(rawProps + 20);
+        }
+        float qPrio = 1.0f;
+        struct QCI { uint32_t sType; const void* pNext; uint32_t flags; uint32_t qfIdx; uint32_t qCount; const float* pPrio; } qci = {2, nullptr, 0, 0, 1, &qPrio};
+        struct DCI { uint32_t sType; const void* pNext; uint32_t flags; uint32_t qciCount; const void* pQci; uint32_t lCount; const char* const* ppL; uint32_t eCount; const char* const* ppE; const void* pFeatures; }
+            dci = {3, nullptr, 0, 1, &qci, 0, nullptr, 0, nullptr, nullptr};
+        auto createDev = reinterpret_cast<PFN_vkCreateDevice>(gipa(instance, "vkCreateDevice"));
+        if (!createDev || createDev(phys_dev, &dci, nullptr, &device) != 0) return false;
+        reinterpret_cast<PFN_vkGetDeviceQueue>(gipa(instance, "vkGetDeviceQueue"))(device, 0, 0, &queue);
+        struct DSLB { uint32_t binding; uint32_t descriptorType; uint32_t descriptorCount; uint32_t stageFlags; const void* pImm; } bindings[2] = {
+            {0, 7, 1, 0x20, nullptr}, {1, 7, 1, 0x20, nullptr}
+        };
+        struct DSLCI { uint32_t sType; const void* pNext; uint32_t flags; uint32_t bindingCount; const void* pBindings; } dslci = {32, nullptr, 0, 2, bindings};
+        if (reinterpret_cast<PFN_vkCreateDescriptorSetLayout>(gipa(instance, "vkCreateDescriptorSetLayout"))(device, &dslci, nullptr, &desc_set_layout) != 0) return false;
+        struct PLCI { uint32_t sType; const void* pNext; uint32_t flags; uint32_t setLayoutCount; const uint64_t* pSetLayouts; uint32_t pcCount; const void* pPc; }
+            plci = {30, nullptr, 0, 1, &desc_set_layout, 0, nullptr};
+        if (reinterpret_cast<PFN_vkCreatePipelineLayout>(gipa(instance, "vkCreatePipelineLayout"))(device, &plci, nullptr, &pipeline_layout) != 0) return false;
+        struct BCI { uint32_t sType; const void* pNext; uint32_t flags; uint64_t size; uint32_t usage; uint32_t sharingMode; uint32_t qfiCount; const uint32_t* pQfi; }
+            bci = {12, nullptr, 0, kBufferCapacityBytes, 0xE3U, 0, 0, nullptr};
+        auto createBuf = reinterpret_cast<PFN_vkCreateBuffer>(gipa(instance, "vkCreateBuffer"));
+        createBuf(device, &bci, nullptr, &buf_in);
+        createBuf(device, &bci, nullptr, &buf_out);
+        struct MAI { uint32_t sType; const void* pNext; uint64_t allocationSize; uint32_t memoryTypeIndex; } mai = {5, nullptr, kBufferCapacityBytes, 0};
+        auto allocMem = reinterpret_cast<PFN_vkAllocateMemory>(gipa(instance, "vkAllocateMemory"));
+        allocMem(device, &mai, nullptr, &mem_in);
+        allocMem(device, &mai, nullptr, &mem_out);
+        auto bindBuf = reinterpret_cast<PFN_vkBindBufferMemory>(gipa(instance, "vkBindBufferMemory"));
+        bindBuf(device, buf_in, mem_in, 0);
+        bindBuf(device, buf_out, mem_out, 0);
+        auto mapMem = reinterpret_cast<PFN_vkMapMemory>(gipa(instance, "vkMapMemory"));
+        mapMem(device, mem_in, 0, kBufferCapacityBytes, 0, &mapped_in);
+        mapMem(device, mem_out, 0, kBufferCapacityBytes, 0, &mapped_out);
+        struct DPS { uint32_t type; uint32_t count; } poolSz = {7, 2};
+        struct DPCI { uint32_t sType; const void* pNext; uint32_t flags; uint32_t maxSets; uint32_t poolSizeCount; const void* pPoolSizes; } dpci = {33, nullptr, 0, 1, 1, &poolSz};
+        reinterpret_cast<PFN_vkCreateDescriptorPool>(gipa(instance, "vkCreateDescriptorPool"))(device, &dpci, nullptr, &desc_pool);
+        struct DSAI { uint32_t sType; const void* pNext; uint64_t descriptorPool; uint32_t descriptorSetCount; const uint64_t* pSetLayouts; } dsai = {34, nullptr, desc_pool, 1, &desc_set_layout};
+        reinterpret_cast<PFN_vkAllocateDescriptorSets>(gipa(instance, "vkAllocateDescriptorSets"))(device, &dsai, &desc_set);
+        struct DBI { uint64_t buffer; uint64_t offset; uint64_t range; } dbi[2] = { {buf_in, 0, kBufferCapacityBytes}, {buf_out, 0, kBufferCapacityBytes} };
+        struct WDS { uint32_t sType; const void* pNext; uint64_t dstSet; uint32_t dstBinding; uint32_t dstArrayElement; uint32_t descriptorCount; uint32_t descriptorType; const void* pImg; const void* pBuf; const void* pTex; } wds[2] = {
+            {35, nullptr, desc_set, 0, 0, 1, 7, nullptr, &dbi[0], nullptr},
+            {35, nullptr, desc_set, 1, 0, 1, 7, nullptr, &dbi[1], nullptr}
+        };
+        reinterpret_cast<PFN_vkUpdateDescriptorSets>(gipa(instance, "vkUpdateDescriptorSets"))(device, 2, wds, 0, nullptr);
+        struct CPOCI { uint32_t sType; const void* pNext; uint32_t flags; uint32_t qfIdx; } cpoci = {39, nullptr, 0x02, 0};
+        reinterpret_cast<PFN_vkCreateCommandPool>(gipa(instance, "vkCreateCommandPool"))(device, &cpoci, nullptr, &cmd_pool);
+        struct CBAI { uint32_t sType; const void* pNext; uint64_t commandPool; uint32_t level; uint32_t count; } cbai = {40, nullptr, cmd_pool, 0, 1};
+        reinterpret_cast<PFN_vkAllocateCommandBuffers>(gipa(instance, "vkAllocateCommandBuffers"))(device, &cbai, &cmd_buf);
+        return true;
+    }
+
+    bool executeLiftedSpirv(const std::vector<uint32_t>& spv_words,
+                            const void* kbase_in_bo_ptr, void* kbase_out_bo_ptr,
+                            size_t copy_bytes = 64,
+                            uint32_t wg_x = 1, uint32_t wg_y = 1, uint32_t wg_z = 1) {
+        if (!init()) return false;
+        size_t clamped_bytes = std::min<size_t>(copy_bytes, kBufferCapacityBytes);
+        if (kbase_in_bo_ptr && mapped_in) std::memcpy(mapped_in, kbase_in_bo_ptr, clamped_bytes);
+        if (mapped_out) std::memset(mapped_out, 0, clamped_bytes);
+        struct SMCI { uint32_t sType; const void* pNext; uint32_t flags; size_t codeSize; const uint32_t* pCode; }
+            smci = {16, nullptr, 0, spv_words.size() * sizeof(uint32_t), spv_words.data()};
+        uint64_t shader_mod = 0;
+        if (reinterpret_cast<PFN_vkCreateShaderModule>(gipa(instance, "vkCreateShaderModule"))(device, &smci, nullptr, &shader_mod) != 0 || !shader_mod) return false;
+        struct CPCI {
+            uint32_t sType; const void* pNext; uint32_t flags;
+            struct { uint32_t sType; const void* pNext; uint32_t flags; uint32_t stage; uint64_t module; const char* pName; const void* pSpec; } stage;
+            uint64_t layout; uint64_t basePipelineHandle; int32_t basePipelineIndex;
+        } cpci = {29, nullptr, 0, {18, nullptr, 0, 0x20, shader_mod, "main", nullptr}, pipeline_layout, 0, -1};
+        uint64_t pipeline = 0;
+        if (reinterpret_cast<PFN_vkCreateComputePipelines>(gipa(instance, "vkCreateComputePipelines"))(device, 0, 1, &cpci, nullptr, &pipeline) != 0 || !pipeline) {
+            reinterpret_cast<PFN_vkDestroyShaderModule>(gipa(instance, "vkDestroyShaderModule"))(device, shader_mod, nullptr);
+            return false;
+        }
+        reinterpret_cast<PFN_vkResetCommandBuffer>(gipa(instance, "vkResetCommandBuffer"))(cmd_buf, 0);
+        struct CBBI { uint32_t sType; const void* pNext; uint32_t flags; const void* pInh; } cbbi = {42, nullptr, 0, nullptr};
+        reinterpret_cast<PFN_vkBeginCommandBuffer>(gipa(instance, "vkBeginCommandBuffer"))(cmd_buf, &cbbi);
+        reinterpret_cast<PFN_vkCmdBindPipeline>(gipa(instance, "vkCmdBindPipeline"))(cmd_buf, 1, pipeline);
+        reinterpret_cast<PFN_vkCmdBindDescriptorSets>(gipa(instance, "vkCmdBindDescriptorSets"))(cmd_buf, 1, pipeline_layout, 0, 1, &desc_set, 0, nullptr);
+        uint32_t max_wg_x = static_cast<uint32_t>(kBufferCapacityBytes / 16);
+        uint32_t safe_wg_x = (wg_x == 0) ? 1 : ((wg_x > max_wg_x) ? max_wg_x : wg_x);
+        reinterpret_cast<PFN_vkCmdDispatch>(gipa(instance, "vkCmdDispatch"))(cmd_buf, safe_wg_x, wg_y ? wg_y : 1, wg_z ? wg_z : 1);
+        reinterpret_cast<PFN_vkEndCommandBuffer>(gipa(instance, "vkEndCommandBuffer"))(cmd_buf);
+        struct SI { uint32_t sType; const void* pNext; uint32_t waitSemCount; const uint64_t* pWaitSems; const uint32_t* pWaitStages; uint32_t cmdBufCount; void* const* pCmdBufs; uint32_t sigSemCount; const uint64_t* pSigSems; }
+            si = {4, nullptr, 0, nullptr, nullptr, 1, &cmd_buf, 0, nullptr};
+        int32_t src = reinterpret_cast<PFN_vkQueueSubmit>(gipa(instance, "vkQueueSubmit"))(queue, 1, &si, 0);
+        reinterpret_cast<PFN_vkQueueWaitIdle>(gipa(instance, "vkQueueWaitIdle"))(queue);
+        if (src == 0 && kbase_out_bo_ptr && mapped_out) {
+            std::memcpy(kbase_out_bo_ptr, mapped_out, clamped_bytes);
+        }
+        reinterpret_cast<PFN_vkDestroyPipeline>(gipa(instance, "vkDestroyPipeline"))(device, pipeline, nullptr);
+        reinterpret_cast<PFN_vkDestroyShaderModule>(gipa(instance, "vkDestroyShaderModule"))(device, shader_mod, nullptr);
+        return src == 0;
+    }
+};
+
+static HostSpirvExecutor        g_icd_spirv_executor;
 static uint32_t                 g_icd_csf_jobs_executed = 0;
 static int                      g_icd_kbase_ioctl_calls = 0;
 
@@ -356,7 +544,7 @@ static void onLiftedCsfJobCallback(uint8_t /*opc*/, uint64_t insn, const uint64_
             out_ptr = reinterpret_cast<void*>(srt[1]);
             if (srt[2] >= 64 && srt[2] <= 65536) copy_bytes = static_cast<size_t>(srt[2]);
         }
-        if (g_icd_lvp_executor.executeLiftedSpirv(spirv, in_ptr, out_ptr, copy_bytes, wg_x, wg_y, wg_z)) {
+        if (g_icd_spirv_executor.executeLiftedSpirv(spirv, in_ptr, out_ptr, copy_bytes, wg_x, wg_y, wg_z)) {
             g_icd_csf_jobs_executed++;
         }
     }
@@ -991,8 +1179,8 @@ struct MaliAotGlobalRuntime {
         // into libvulkan_mali_aot_icd.so returns immediately instead of deadlocking g_aot_rt.mtx!
         initialized = true;
 
-        // 4. Initialize Host Vulkan (llvmpipe or host GPU) executor
-        g_icd_lvp_executor.init();
+        // 4. Initialize Host SPIR-V executor for CSF compute jobs
+        g_icd_spirv_executor.init();
         return true;
     }
 };
@@ -1019,8 +1207,10 @@ struct MaliIcdPhysicalDevice {
     void*     parent_instance = nullptr;
     uint8_t   aot_internal[2048]{};
     uint8_t   aot_inst_internal[512]{};
+    bool      aot_layout_initialized = false;
 
     void initAotInternalLayout() {
+        if (aot_layout_initialized) return;
         std::memset(aot_internal, 0, sizeof(aot_internal));
         std::memset(aot_inst_internal, 0, sizeof(aot_inst_internal));
 
@@ -1091,13 +1281,13 @@ struct MaliIcdPhysicalDevice {
         *reinterpret_cast<uint32_t*>(pbase + 0x7c) = static_cast<uint32_t>(raw_gpu_id); // deviceID
         std::memcpy(pbase + 0x80, uuid, 16);
         std::snprintf(reinterpret_cast<char*>(pbase + 192), 256,
-                      "%s (AOT %s via mali_kbase_emu [%s])",
+                      "%s (AOT %s via mali_kbase_emu)",
                       gpu_model,
-                      g_aot_rt.mapper.driver_version.c_str(),
-                      g_icd_lvp_executor.device_name.empty() ? "llvmpipe" : g_icd_lvp_executor.device_name.c_str());
+                      g_aot_rt.mapper.driver_version.c_str());
         pbase[745] = 0x80U; // timestampComputeAndGraphics = VK_TRUE
         *reinterpret_cast<float*>(pbase + 748)    = 1000.0f; // timestampPeriod = 1.0 ns
         *reinterpret_cast<uint32_t*>(pbase + 752) = 0xFFFFFFFFU;
+        aot_layout_initialized = true;
     }
 };
 

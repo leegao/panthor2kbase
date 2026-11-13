@@ -20,7 +20,130 @@
 
 #include "../../r54p3_vulkan_icd/r54p3_dispatch_table.hpp"
 #include "../../r54p3_vulkan_icd/r54p3_cmpbe_boundary.hpp"
-#include "../../r54p3_vulkan_icd/host_lvp_executor.hpp"
+
+namespace mali0_emu_tiling {
+
+inline uint32_t mortonEncode16x16(uint32_t tx, uint32_t ty) {
+    uint32_t x = (tx ^ ty) & 0xFU;
+    uint32_t y = ty & 0xFU;
+    uint32_t res = 0;
+    res |= ((x >> 0) & 1U) << 0;
+    res |= ((y >> 0) & 1U) << 1;
+    res |= ((x >> 1) & 1U) << 2;
+    res |= ((y >> 1) & 1U) << 3;
+    res |= ((x >> 2) & 1U) << 4;
+    res |= ((y >> 2) & 1U) << 5;
+    res |= ((x >> 3) & 1U) << 6;
+    res |= ((y >> 3) & 1U) << 7;
+    return res;
+}
+
+inline void tileLinearRGBA8ToUInterleaved(const uint32_t* linear_rgba, uint32_t* tiled_out, uint32_t width, uint32_t height) {
+    if (!linear_rgba || !tiled_out || width == 0 || height == 0) return;
+    uint32_t tiles_x = (width + 15U) / 16U;
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            uint32_t tile_idx = (y / 16U) * tiles_x + (x / 16U);
+            uint32_t intra    = mortonEncode16x16(x & 15U, y & 15U);
+            tiled_out[tile_idx * 256U + intra] = linear_rgba[y * width + x];
+        }
+    }
+}
+
+inline void detileUInterleavedToLinearRGBA8(const uint32_t* tiled_in, uint32_t* linear_rgba_out, uint32_t width, uint32_t height) {
+    if (!tiled_in || !linear_rgba_out || width == 0 || height == 0) return;
+    uint32_t tiles_x = (width + 15U) / 16U;
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            uint32_t tile_idx = (y / 16U) * tiles_x + (x / 16U);
+            uint32_t intra    = mortonEncode16x16(x & 15U, y & 15U);
+            linear_rgba_out[y * width + x] = tiled_in[tile_idx * 256U + intra];
+        }
+    }
+}
+
+inline size_t compressLinearRGBA8ToAfbc16x16(const uint32_t* linear_rgba, uint8_t* afbc_out, size_t afbc_cap, uint32_t width, uint32_t height) {
+    if (!linear_rgba || !afbc_out || width == 0 || height == 0) return 0;
+    uint32_t tiles_x = (width + 15U) / 16U;
+    uint32_t tiles_y = (height + 15U) / 16U;
+    uint32_t num_tiles = tiles_x * tiles_y;
+    size_t hdr_bytes = ((static_cast<size_t>(num_tiles) * 16ULL) + 63ULL) & ~63ULL;
+    if (afbc_cap < hdr_bytes) return 0;
+    std::memset(afbc_out, 0, hdr_bytes);
+    size_t body_off = hdr_bytes;
+
+    for (uint32_t ty = 0; ty < tiles_y; ++ty) {
+        for (uint32_t tx = 0; tx < tiles_x; ++tx) {
+            uint32_t t_idx = ty * tiles_x + tx;
+            uint32_t* hdr = reinterpret_cast<uint32_t*>(afbc_out + t_idx * 16ULL);
+            uint32_t first_px = linear_rgba[std::min(ty * 16U, height - 1U) * width + std::min(tx * 16U, width - 1U)];
+            bool all_same = true;
+            uint32_t block_px[256]{};
+            for (uint32_t iy = 0; iy < 16U; ++iy) {
+                for (uint32_t ix = 0; ix < 16U; ++ix) {
+                    uint32_t sx = std::min(tx * 16U + ix, width - 1U);
+                    uint32_t sy = std::min(ty * 16U + iy, height - 1U);
+                    uint32_t p = linear_rgba[sy * width + sx];
+                    block_px[iy * 16U + ix] = p;
+                    if (p != first_px) all_same = false;
+                }
+            }
+            if (all_same) {
+                hdr[0] = 0U;
+                hdr[1] = 0U;
+                hdr[2] = first_px;
+                hdr[3] = 0U;
+            } else {
+                if (body_off + 1024ULL > afbc_cap) return 0;
+                hdr[0] = static_cast<uint32_t>(body_off);
+                hdr[1] = 0x10101010U;
+                std::memcpy(afbc_out + body_off, block_px, 1024ULL);
+                body_off += 1024ULL;
+            }
+        }
+    }
+    return body_off;
+}
+
+inline bool decompressAfbc16x16ToLinearRGBA8(const uint8_t* afbc_in, size_t afbc_size, uint32_t* linear_rgba_out, uint32_t width, uint32_t height) {
+    if (!afbc_in || !linear_rgba_out || width == 0 || height == 0) return false;
+    uint32_t tiles_x = (width + 15U) / 16U;
+    uint32_t tiles_y = (height + 15U) / 16U;
+    uint32_t num_tiles = tiles_x * tiles_y;
+    if (afbc_size < static_cast<size_t>(num_tiles) * 16ULL) return false;
+
+    for (uint32_t ty = 0; ty < tiles_y; ++ty) {
+        for (uint32_t tx = 0; tx < tiles_x; ++tx) {
+            uint32_t t_idx = ty * tiles_x + tx;
+            const uint32_t* hdr = reinterpret_cast<const uint32_t*>(afbc_in + t_idx * 16ULL);
+            uint32_t body_ptr = hdr[0];
+            if (body_ptr == 0U) {
+                uint32_t solid_px = hdr[2];
+                for (uint32_t iy = 0; iy < 16U; ++iy) {
+                    uint32_t dy = ty * 16U + iy;
+                    if (dy >= height) continue;
+                    for (uint32_t ix = 0; ix < 16U; ++ix) {
+                        uint32_t dx = tx * 16U + ix;
+                        if (dx < width) linear_rgba_out[dy * width + dx] = solid_px;
+                    }
+                }
+            } else if (static_cast<size_t>(body_ptr) + 1024ULL <= afbc_size) {
+                const uint32_t* block_px = reinterpret_cast<const uint32_t*>(afbc_in + body_ptr);
+                for (uint32_t iy = 0; iy < 16U; ++iy) {
+                    uint32_t dy = ty * 16U + iy;
+                    if (dy >= height) continue;
+                    for (uint32_t ix = 0; ix < 16U; ++ix) {
+                        uint32_t dx = tx * 16U + ix;
+                        if (dx < width) linear_rgba_out[dy * width + dx] = block_px[iy * 16U + ix];
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+} // namespace mali0_emu_tiling
 
 namespace {
 
