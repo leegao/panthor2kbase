@@ -3045,7 +3045,7 @@ void mali_aot_icd_get_telemetry(uint32_t* out_ioctl_calls,
     if (out_ioctl_calls)           *out_ioctl_calls           = static_cast<uint32_t>(g_icd_kbase_ioctl_calls);
     if (out_shader_modules)        *out_shader_modules        = g_aot_rt.shader_modules_created;
     if (out_mbs2_deserializations) *out_mbs2_deserializations = g_aot_rt.mbs2_deserializations_run;
-    if (out_csf_jobs)              *out_csf_jobs              = static_cast<uint32_t>(g_icd_kbase_emu.executed_jobs.size());
+    if (out_csf_jobs)              *out_csf_jobs              = g_icd_csf_jobs_executed;
     if (out_vkcube_frames)         *out_vkcube_frames         = 0;
     (void)out_last_sha1;
 }

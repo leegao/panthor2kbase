@@ -4,7 +4,7 @@
 // Valhall (v9/v10/v11) 64-bit ISA & Bifrost (v7) 128-bit Clause ISA Disassembler
 // and SPIR-V 1.3 Translator (Compute, Vertex, and Fragment Pipelines)
 // ============================================================================
-#include "mali0_emu_uapi.h"
+#include "mali_csf_uapi_types.h"
 #include <cstdint>
 #include <cstddef>
 #include <cstring>

@@ -20,7 +20,7 @@
 
 #include "../../r54p3_vulkan_icd/r54p3_dispatch_table.hpp"
 #include "../../r54p3_vulkan_icd/r54p3_cmpbe_boundary.hpp"
-#include "../include/mali0_emu_lvp.hpp"
+#include "../../r54p3_vulkan_icd/host_lvp_executor.hpp"
 
 namespace {
 

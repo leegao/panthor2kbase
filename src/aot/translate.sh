@@ -173,14 +173,7 @@ fi
 DYN_EMU="-Wl,--no-as-needed -L$BUILD_HOST_DIR -L$BUILD_HOST_DIR/emulator -L$BUILD_HOST_DIR/adapter -lmali_kbase_emu -lpanthor_kbase_adapter"
 AOT_RPATH='$ORIGIN:$ORIGIN/..:$ORIGIN/../..:$ORIGIN/../../..:$ORIGIN/emulator:$ORIGIN/../emulator:$ORIGIN/adapter:$ORIGIN/../adapter:$ORIGIN/../../../../build-x86-64:$ORIGIN/../../../build-x86-64'
 
-echo "[Link] Dynamically linking libmali_kbase_emu.so + libpanthor_kbase_adapter.so into runner and ICD..."
-g++ -O2 -fno-strict-aliasing -I"$REPO_ROOT/src/r54p3_vulkan_icd" -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
-    -I"$REPO_ROOT/include" -I"$REPO_ROOT/src/adapter" -I"$REPO_ROOT/src/emulator" \
-    "$REPO_ROOT/src/r54p3_vulkan_icd/mali_aot_runner.cpp" "$OUT_DIR/mali_mbs2_aot.o" "${EXTRA_AOT_OBJS[@]}" \
-    $DYN_EMU -ldl -lpthread \
-    -Wl,-rpath,"$AOT_RPATH" \
-    -o "$OUT_DIR/mali_aot_runner"
-
+echo "[Link] Dynamically linking libmali_kbase_emu.so + libpanthor_kbase_adapter.so into ICD..."
 g++ -O2 -std=c++17 -fno-strict-aliasing -shared -fPIC \
     -Wl,-Bsymbolic -Wl,-Bsymbolic-functions \
     -I"$REPO_ROOT/src/r54p3_vulkan_icd" -I"$ROOT_DIR/include" -I"$ROOT_DIR/src" \
@@ -207,8 +200,6 @@ if [ -d "$BUILD_HOST_DIR" ]; then
     mkdir -p "$BUILD_HOST_DIR/aot"
     cp -f "$OUT_DIR/libvulkan_mali_aot_icd.so" "$BUILD_HOST_DIR/libvulkan_mali_aot_icd.so" 2>/dev/null || true
     cp -f "$OUT_DIR/libvulkan_mali_aot_icd.so" "$BUILD_HOST_DIR/aot/libvulkan_mali_aot_icd.so" 2>/dev/null || true
-    cp -f "$OUT_DIR/mali_aot_runner" "$BUILD_HOST_DIR/mali_aot_runner" 2>/dev/null || true
-    cp -f "$OUT_DIR/mali_aot_runner" "$BUILD_HOST_DIR/aot/mali_aot_runner" 2>/dev/null || true
     cp -f "$OUT_DIR/mali_aot_icd.x86_64.json" "$BUILD_HOST_DIR/mali_aot_icd.x86_64.json" 2>/dev/null || true
     cp -f "$OUT_DIR/mali_aot_icd.x86_64.json" "$BUILD_HOST_DIR/aot/mali_aot_icd.x86_64.json" 2>/dev/null || true
     cp -f "$OUT_DIR/mali_mbs2_aot.o" "$BUILD_HOST_DIR/aot/mali_mbs2_aot.o" 2>/dev/null || true
@@ -217,6 +208,5 @@ fi
 echo "================================================================================"
 echo " [SUCCESS] 64-Bit C++ LLVM AOT Translation Complete!"
 echo "   x86-64 Object  : $OUT_DIR/mali_mbs2_aot.o"
-echo "   Runner Binary  : $OUT_DIR/mali_aot_runner"
 echo "   Vulkan ICD     : $OUT_DIR/libvulkan_mali_aot_icd.so"
 echo "================================================================================"

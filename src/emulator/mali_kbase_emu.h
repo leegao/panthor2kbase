@@ -187,6 +187,8 @@ int mali_kbase_emu_close_direct(int fd);
 int mali_kbase_emu_ioctl_direct(int fd, unsigned long request, void *arg);
 void *mali_kbase_emu_mmap_direct(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
 int mali_kbase_emu_munmap_direct(void *addr, size_t length);
+ssize_t mali_kbase_emu_read_direct(int fd, void *buf, size_t count);
+int mali_kbase_emu_poll_direct(void *fds, unsigned long nfds, int timeout);
 
 #ifdef __cplusplus
 }

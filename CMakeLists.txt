@@ -401,11 +401,10 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
    )
 
    set(AOT_ICD_SO "${CMAKE_BINARY_DIR}/libvulkan_mali_aot_icd.so")
-   set(AOT_RUNNER "${CMAKE_BINARY_DIR}/mali_aot_runner")
    set(AOT_JSON   "${CMAKE_BINARY_DIR}/mali_aot_icd.x86_64.json")
 
    add_custom_command(
-      OUTPUT "${AOT_ICD_SO}" "${AOT_RUNNER}" "${AOT_JSON}" "${AOT_MBS2_OBJ}"
+      OUTPUT "${AOT_ICD_SO}" "${AOT_JSON}" "${AOT_MBS2_OBJ}"
       COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/translate.sh" ddk/libGLES_mali.so "${CMAKE_BINARY_DIR}"
       WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
       DEPENDS mali_kbase_emu
@@ -415,11 +414,10 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
               mali_llvm_pass_driver
               horizon2llvm
               "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/mali_vulkan_icd.cpp"
-              "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/mali_aot_runner.cpp"
               "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/mali_icd_internal.h"
               "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/mali_icd_wsi.cpp"
               "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/mali_icd_physdev.cpp"
-              "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/include/mali0_emu_lvp.hpp"
+              "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/host_lvp_executor.hpp"
       COMMENT "Running 64-bit Mali AOT translation pipeline (translate.sh)"
    )
 
@@ -432,12 +430,10 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
       "${CMAKE_BINARY_DIR}/mali_mbs2_aot.o.stamp"
       "${CMAKE_BINARY_DIR}/mali_mbs2_aot.o"
       "${CMAKE_BINARY_DIR}/libvulkan_mali_aot_icd.so"
-      "${CMAKE_BINARY_DIR}/mali_aot_runner"
       "${CMAKE_BINARY_DIR}/mali_aot_icd.x86_64.json"
       "${CMAKE_BINARY_DIR}/libr54p3_vulkan_icd.so"
       "${AOT_DIR}/mali_mbs2_aot.o"
       "${AOT_DIR}/libvulkan_mali_aot_icd.so"
-      "${AOT_DIR}/mali_aot_runner"
       "${AOT_DIR}/mali_aot_icd.x86_64.json"
    )
 endif()

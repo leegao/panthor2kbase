@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#include "../include/mali0_emu_uapi.h"
+#include "../../r54p3_vulkan_icd/mali_csf_uapi_types.h"
 
 namespace {
 

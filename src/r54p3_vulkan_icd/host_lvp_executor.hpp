@@ -4,8 +4,8 @@
 // Host Vulkan (Mesa Lavapipe / llvmpipe) Compute & 3D Graphics (vkcube) Backend
 // Executes lifted Valhall & Bifrost SPIR-V 1.3 shaders against /dev/mali0 BOs
 // ============================================================================
-#include "mali0_emu_uapi.h"
-#include "mali0_emu_isa.hpp"
+#include "mali_csf_uapi_types.h"
+#include "valhall_spirv_lifter.hpp"
 #include <cstdint>
 #include <cstddef>
 #include <cstring>

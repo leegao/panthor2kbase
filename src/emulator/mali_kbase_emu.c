@@ -25,6 +25,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -3412,6 +3413,30 @@ __attribute__((visibility("default")))
 int mali_kbase_emu_munmap_direct(void *addr, size_t length)
 {
    return munmap(addr, length);
+}
+
+__attribute__((visibility("default")))
+ssize_t mali_kbase_emu_read_direct(int fd, void *buf, size_t count)
+{
+   (void)fd;
+   if (buf && count > 0) {
+      memset(buf, 0, count);
+   }
+   return (ssize_t)count;
+}
+
+__attribute__((visibility("default")))
+int mali_kbase_emu_poll_direct(void *fds, unsigned long nfds, int timeout)
+{
+   (void)timeout;
+   if (fds && nfds > 0) {
+      struct pollfd *p = (struct pollfd *)fds;
+      for (unsigned long i = 0; i < nfds; ++i) {
+         p[i].revents = POLLIN;
+      }
+      return (int)nfds;
+   }
+   return 1;
 }
 
 static const struct kbase_ko_host_abi g_ko_host_abi = {
