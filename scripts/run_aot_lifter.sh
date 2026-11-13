@@ -79,7 +79,7 @@ resolve_active_icd_json() {
         return 0
     fi
     local latest
-    latest="$(ls -1t "$ROOT_DIR"/build-x86-64/aot/mali_aot_icd.x86_64.json "$ROOT_DIR"/build-x86-64/mali_aot_icd.x86_64.json 2>/dev/null | head -n 1 || true)"
+    latest="$(ls -1t "$ROOT_DIR"/build-x86-64/r54p3_decompiled_icd.x86_64.json "$ROOT_DIR"/src/r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json 2>/dev/null | head -n 1 || true)"
     if [ -n "$latest" ]; then
         echo "$latest"
         return 0

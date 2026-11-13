@@ -9,7 +9,7 @@
 #include <cstddef>
 #include <cstring>
 #include <vector>
-#include "valhall_spirv_lifter.hpp"
+#include "valhall_spirv_lifter.h"
 
 namespace mali_r54p3 {
 namespace cmpbe {

@@ -7,7 +7,7 @@
 
 // ============================================================================
 // mali_vulkan_icd.cpp
-// Full x86-64 Khronos Vulkan ICD (libvulkan_mali_aot_icd.so) that:
+// Full x86-64 Khronos Vulkan ICD (libr54p3_vulkan_icd.so) that:
 //   1. Loads the AOT-translated 64-bit ARM64 Mali driver (e.g. r54p3, r49p1, r26p0)
 //   2. Executes AOT-translated Vulkan ICD & CMPBE functions (vk_hal_open,
 //      vkGetInstanceProcAddr, vkEnumerateInstance*, vkCreateShaderModule,
@@ -47,7 +47,7 @@
 #include <vulkan/vulkan.h>
 
 #include "mali_csf_uapi_types.h"
-#include "valhall_spirv_lifter.hpp"
+#include "valhall_spirv_lifter.h"
 #include "../emulator/mali_kbase_emu.h"
 #include "mali_aapcs64_auto_thunks.hpp"
 #include "aot_so_profiler.hpp"
@@ -102,9 +102,12 @@ extern "C" {
     void aot_vkEnumerateInstanceVersion(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkEnumerateInstanceLayerProperties(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkEnumerateInstanceExtensionProperties(AOTCPUState* cpu) __attribute__((weak));
+    void aot_vkCreateInstance(AOTCPUState* cpu) __attribute__((weak));
+    void aot_vkDestroyInstance(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkEnumeratePhysicalDevices(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkEnumeratePhysicalDeviceGroups(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkGetPhysicalDeviceProperties(AOTCPUState* cpu) __attribute__((weak));
+    void aot_vkGetPhysicalDeviceProperties2(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkGetPhysicalDeviceFeatures(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkGetPhysicalDeviceFeatures2(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkGetPhysicalDeviceMemoryProperties(AOTCPUState* cpu) __attribute__((weak));
@@ -868,10 +871,75 @@ struct MaliAotGlobalRuntime {
                 uint64_t ddebug_cfg_va = reinterpret_cast<uint64_t>(bss_Scratch);
                 uint64_t gpu_tbl_va    = reinterpret_cast<uint64_t>(bss_Scratch + 0x2000ULL);
                 uint64_t gpu_entry_va  = reinterpret_cast<uint64_t>(bss_Scratch + 0x2100ULL);
-                *reinterpret_cast<uint32_t*>(gpu_entry_va + 144) = 2U; // Valhall arch version
+                uint64_t dev_list_va   = reinterpret_cast<uint64_t>(bss_Scratch + 0x2800ULL);
+                char*    gpu_name_va   = reinterpret_cast<char*>(bss_Scratch + 0x2900ULL);
+                std::snprintf(gpu_name_va, 64, "Arm Mali-G615");
+
+                uint32_t gpu_product_id = MALI_PROFILE_G615_CSF;
+                {
+                    int mfd = mali_kbase_emu_open_direct("/dev/mali0", 2 /* O_RDWR */);
+                    if (mfd >= 0) {
+                        uint8_t tlv[2048]{};
+                        struct { uint64_t buffer; uint32_t size; uint32_t flags; } gp{reinterpret_cast<uint64_t>(tlv), sizeof(tlv), 0};
+                        int sz = mali_kbase_emu_ioctl_direct(mfd, 0xc0108003UL /* KBASE_IOCTL_GET_GPUPROPS */, &gp);
+                        if (sz > 0 && sz <= static_cast<int>(sizeof(tlv))) {
+                            size_t off = 0;
+                            while (off + 4 <= static_cast<size_t>(sz)) {
+                                uint32_t hdr = 0;
+                                std::memcpy(&hdr, tlv + off, 4);
+                                off += 4;
+                                uint32_t prop_id = hdr >> 2;
+                                uint32_t vlen = 1U << (hdr & 3U);
+                                if (off + vlen > static_cast<size_t>(sz)) break;
+                                if (prop_id == 1U /* PRODUCT_ID */ && vlen == 4U) {
+                                    std::memcpy(&gpu_product_id, tlv + off, 4);
+                                    break;
+                                }
+                                off += vlen;
+                            }
+                        }
+                        mali_kbase_emu_close_direct(mfd);
+                    }
+                }
+                if (gpu_product_id == MALI_PROFILE_G76_JM) std::snprintf(gpu_name_va, 64, "Arm Mali-G76");
+                else if (gpu_product_id == MALI_PROFILE_G78_JM) std::snprintf(gpu_name_va, 64, "Arm Mali-G78");
+                else if (gpu_product_id == MALI_PROFILE_G925_CSF) std::snprintf(gpu_name_va, 64, "Arm Immortalis-G925");
+
+                // Populate gpu_entry fields read by vulkan::physical_device::initialize (0x97c9e0), 0x1e0a980, and 0x1e0aa40:
+                char*     dev_node_va       = reinterpret_cast<char*>(bss_Scratch + 0x2940ULL);
+                uint64_t* dev_node_ptr_cell = reinterpret_cast<uint64_t*>(bss_Scratch + 0x2960ULL);
+                std::snprintf(dev_node_va, 32, "/dev/mali0");
+                *dev_node_ptr_cell = reinterpret_cast<uint64_t>(dev_node_va);
+                *reinterpret_cast<uint64_t*>(gpu_entry_va + 0x00) = reinterpret_cast<uint64_t>(dev_node_ptr_cell);
+                *reinterpret_cast<uint64_t*>(gpu_entry_va + 0x08) = reinterpret_cast<uint64_t>(gpu_name_va);
+                *reinterpret_cast<uint16_t*>(gpu_entry_va + 0x10) = 1U;  // minor
+                *reinterpret_cast<uint16_t*>(gpu_entry_va + 0x12) = 0U;  // major
+                *reinterpret_cast<uint16_t*>(gpu_entry_va + 0x16) = 0U;  // arch_rev
+                *reinterpret_cast<uint16_t*>(gpu_entry_va + 0x1a) = static_cast<uint16_t>(gpu_product_id & 0xFFFFU);
+                *reinterpret_cast<uint16_t*>(gpu_entry_va + 0x1c) = static_cast<uint16_t>((gpu_product_id >> 16) & 0xFFFFU);
+                *reinterpret_cast<uint32_t*>(gpu_entry_va + 0x6c) = 64U; // num_l2_slices * 32 / cache line
+                *reinterpret_cast<uint64_t*>(gpu_entry_va + 0x98) = (8ULL << 30); // total memory
+                *reinterpret_cast<uint16_t*>(gpu_entry_va + 0xa0) = 4U;  // core count
+                *reinterpret_cast<uint32_t*>(gpu_entry_va + 144)  = 2U;  // Valhall arch version (0x90)
                 for (uint64_t i = 0; i < 8; ++i) {
                     reinterpret_cast<uint64_t*>(gpu_tbl_va)[i] = gpu_entry_va;
                 }
+                // Device discovery table read by vkCreateInstance @ 0x976594 (x27 = *(x8 + 0xc00))
+                *reinterpret_cast<uint64_t*>(dev_list_va + 0)  = 1ULL;
+                *reinterpret_cast<uint64_t*>(dev_list_va + 8)  = dev_list_va + 16ULL;
+                *reinterpret_cast<uint32_t*>(dev_list_va + 16) = 0U; // device index 0 (passed to 0x1e0aa40)
+                *reinterpret_cast<uint64_t*>(ddebug_cfg_va + 0xc00) = dev_list_va;
+                *reinterpret_cast<uint64_t*>(ddebug_cfg_va + 0x1020ULL) = 10000ULL; // timestamp calibration
+
+                // String pointer cells read by 0x1e0c090 (+0x1320) and 0x1e0c0c0 (+0x1338) inside 0x1b7b7d0
+                uint64_t* gpu_name_ptr_cell = reinterpret_cast<uint64_t*>(bss_Scratch + 0x2980ULL);
+                *gpu_name_ptr_cell = reinterpret_cast<uint64_t>(gpu_name_va);
+                *reinterpret_cast<uint64_t*>(ddebug_cfg_va + 0x1320ULL) = reinterpret_cast<uint64_t>(gpu_name_ptr_cell);
+                *reinterpret_cast<uint8_t*>(ddebug_cfg_va + 0x1331ULL)  = 1U;
+                *reinterpret_cast<uint64_t*>(ddebug_cfg_va + 0x1338ULL) = reinterpret_cast<uint64_t>(gpu_name_ptr_cell);
+                *reinterpret_cast<uint8_t*>(ddebug_cfg_va + 0x1349ULL)  = 1U;
+
+                *reinterpret_cast<uint32_t*>(mapper.base + 0x0314d1c0ULL) = 0x10000U; // high refcount so 0x1e0bb80 never frees bss_Scratch
                 *reinterpret_cast<uint64_t*>(mapper.base + 0x0314d170ULL) = 8ULL;
                 *reinterpret_cast<uint64_t*>(mapper.base + 0x0314d178ULL) = gpu_tbl_va;
                 *reinterpret_cast<uint64_t*>(mapper.base + 0x0314d190ULL) = gpu_entry_va;
@@ -965,26 +1033,41 @@ struct MaliAotGlobalRuntime {
             aot_mali_gpu_props_get(&cpu);
         }
 
-        // 3b. Initialize libGLES_mali.so .bss global config pointer at IMAGE_BASE + 0x31462a0
-        // (read by vkEnumerateDeviceExtensionProperties @ 0x977140 and vkGetPhysicalDeviceFeatures2 @ 0x97ad30)
+        // 3b. Initialize libGLES_mali.so .bss global format table at IMAGE_BASE + 0x31462a0
+        // (matching 0x1b7aec0: copy 0x3b48 bytes = 271 formats * 56B from .rodata + 0x3ff0e0,
+        //  resolve negative sample-count bytes, and publish table pointer at 0x031462a0).
         if (mapper.base) {
             uint8_t* cfg_blob = mapper.base + 0x03fd0000ULL;
-            // In libGLES_mali.so (r54p3):
-            //   - cfg_blob[704] (0x2c0) is read by vkGetPhysicalDeviceProperties @ 0x9778d4 for
-            //     framebufferNoAttachmentsSampleCounts AND bit 3 (0x08) is tested by tbz/tbnz
-            //     in vkEnumerateDeviceExtensionProperties @ 0x977140.
-            //   - cfg_blob[7368] (0x1cc8) is read by vkGetPhysicalDeviceProperties @ 0x9778cc for
-            //     framebufferColorSampleCounts, framebufferDepthSampleCounts, framebufferStencilSampleCounts,
-            //     and duplicated across v0.4s into sampledImage{Color,Integer,Depth,Stencil}SampleCounts!
-            // Setting 0x0FU (VK_SAMPLE_COUNT_1_BIT | 2_BIT | 4_BIT | 8_BIT) keeps bit 3 (0x08) set while
-            // advertising 1x, 2x, 4x, and 8x sample counts directly from lifted aot_vkGetPhysicalDeviceProperties!
-            cfg_blob[704]  = 0x0FU;
-            cfg_blob[7368] = 0x0FU;
+            constexpr size_t kFormatTableBytes = 0x3b48ULL;
+            constexpr size_t kFormatStride = 56ULL;
+            constexpr size_t kFormatCount = kFormatTableBytes / kFormatStride;
+            if (!mapper.so_path_loaded.empty() && mapper.image_size >= 0x003ff0e0ULL + kFormatTableBytes) {
+                std::memcpy(cfg_blob, mapper.base + 0x003ff0e0ULL, kFormatTableBytes);
+                uint32_t max_bw = *reinterpret_cast<uint32_t*>(mapper.base + 0x0314158cULL);
+                if (max_bw == 0U) {
+                    max_bw = 8192U;
+                    *reinterpret_cast<uint32_t*>(mapper.base + 0x0314158cULL) = max_bw;
+                }
+                for (size_t idx = 0; idx < kFormatCount; ++idx) {
+                    int8_t* sc_byte = reinterpret_cast<int8_t*>(cfg_blob + idx * kFormatStride + 32);
+                    if (*sc_byte < 0) {
+                        uint32_t bpp = static_cast<uint8_t>(*sc_byte) & 0x7FU;
+                        uint32_t mask = (max_bw >= (bpp << 9)) ? 5U : 1U;
+                        if (max_bw >= (bpp << 10)) mask |= 0x08U;
+                        if (max_bw >= (bpp << 11)) mask |= 0x10U;
+                        *reinterpret_cast<uint8_t*>(sc_byte) = static_cast<uint8_t>(mask);
+                    }
+                }
+            }
+            // Ensure 1x|2x|4x|8x MSAA bits (0x0F) on formats #12 (cfg_blob[704]) and #131 (cfg_blob[7368])
+            // tested by vkEnumerateDeviceExtensionProperties @ 0x977140 and vkGetPhysicalDeviceProperties @ 0x9778cc.
+            cfg_blob[704]  = static_cast<uint8_t>(cfg_blob[704] | 0x0FU);
+            cfg_blob[7368] = static_cast<uint8_t>(cfg_blob[7368] | 0x0FU);
             *reinterpret_cast<uint64_t*>(mapper.base + 0x031462a0ULL) = reinterpret_cast<uint64_t>(cfg_blob);
         }
 
         // Mark initialized = true BEFORE probing Host Vulkan so any re-entrant loader probe
-        // into libvulkan_mali_aot_icd.so returns immediately instead of deadlocking g_aot_rt.mtx!
+        // into libr54p3_vulkan_icd.so returns immediately instead of deadlocking g_aot_rt.mtx!
         initialized = true;
 
         // 4. Initialize Host SPIR-V executor for CSF compute jobs
@@ -1009,18 +1092,182 @@ static_assert(offsetof(VkPhysicalDeviceProperties, limits) == 296,
 static_assert(sizeof(VkPhysicalDeviceProperties) == 824,
               "VkPhysicalDeviceProperties must be 824 bytes (matching Vulkan C ABI)");
 
+// ============================================================================
+// -8 Byte Offset Handle Sidecar Mechanism for Native r54p3_lifted.o Handles
+// ============================================================================
+// Every dispatchable handle allocated by r54p3_lifted.o through our
+// VkAllocationCallbacks prefix allocator has 64 bytes reserved immediately
+// before `handle` with ((uintptr_t)handle & 0xFFFULL) >= 64 (for align <= 2048):
+//   meta[-5] = requested user byte size
+//   meta[-4] = raw base allocation pointer passed back to upstream pfnFree
+//   meta[-3] = MALI_SIDECAR_MAGIC ("MALISDCR")
+//   meta[-2] = sidecar object tag (MALI_SIDECAR_TAG_*)
+//   meta[-1] = sidecar pointer (reinterpret_cast<void**>(handle)[-1], offset -8)
+constexpr uint64_t MALI_SIDECAR_MAGIC        = 0x4D414C4953444352ULL;
+constexpr uint64_t MALI_SIDECAR_TAG_INSTANCE = 0x494E5354414E4345ULL;
+constexpr uint64_t MALI_SIDECAR_TAG_PHYSDEV  = 0x5048595344455621ULL;
+constexpr uint64_t MALI_SIDECAR_TAG_DEVICE   = 0x4445564943452121ULL;
+
+static inline bool icdHasSidecarSlot(const void* handle) {
+    if (!handle) return false;
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(handle);
+    if (addr < 0x10000ULL || (addr & 0x7ULL) != 0ULL) return false;
+    if ((addr & 0xFFFULL) < 64ULL) return false;
+    const auto* meta = reinterpret_cast<const uint64_t*>(addr);
+    return meta[-3] == MALI_SIDECAR_MAGIC;
+}
+
+static inline void icdSetSidecar(void* handle, uint64_t tag, void* sidecar) {
+    if (!icdHasSidecarSlot(handle)) return;
+    auto* meta = reinterpret_cast<uint64_t*>(handle);
+    meta[-2] = tag;
+    meta[-1] = reinterpret_cast<uintptr_t>(sidecar);
+}
+
+template <typename T>
+static inline T* icdGetSidecar(const void* handle, uint64_t tag) {
+    if (!icdHasSidecarSlot(handle)) return nullptr;
+    const auto* meta = reinterpret_cast<const uint64_t*>(handle);
+    if (meta[-2] != tag) return nullptr;
+    return reinterpret_cast<T*>(meta[-1]);
+}
+
+static inline void* VKAPI_PTR icdSidecarVkAlloc(
+    void* pUserData, size_t size, size_t alignment, VkSystemAllocationScope scope) {
+    const auto* up = static_cast<const VkAllocationCallbacks*>(pUserData);
+    size_t eff_align = (alignment == 0) ? 16 : alignment;
+    if ((eff_align & (eff_align - 1)) != 0) {
+        size_t p = 16;
+        while (p < eff_align) p <<= 1;
+        eff_align = p;
+    }
+    const size_t prefix_step = std::max<size_t>(eff_align, 64);
+    const size_t extra = (eff_align <= 2048) ? (prefix_step * 2 + 64) : (eff_align + 64);
+    const size_t req_sz = size + extra;
+    void* raw = nullptr;
+    if (up && up->pfnAllocation) {
+        raw = up->pfnAllocation(up->pUserData, req_sz, eff_align, scope);
+    } else {
+        const size_t aligned_sz = (req_sz + eff_align - 1) & ~(eff_align - 1);
+        raw = std::aligned_alloc(eff_align, aligned_sz ? aligned_sz : eff_align);
+    }
+    if (!raw) return nullptr;
+    uintptr_t addr = (reinterpret_cast<uintptr_t>(raw) + 64 + eff_align - 1) &
+                     ~static_cast<uintptr_t>(eff_align - 1);
+    if (eff_align <= 2048 && (addr & 0xFFFULL) < 64ULL) {
+        addr += prefix_step;
+    }
+    void* ptr = reinterpret_cast<void*>(addr);
+    auto* meta = reinterpret_cast<uint64_t*>(ptr);
+    meta[-5] = static_cast<uint64_t>(size);
+    meta[-4] = reinterpret_cast<uintptr_t>(raw);
+    meta[-3] = MALI_SIDECAR_MAGIC;
+    meta[-2] = 0ULL;
+    meta[-1] = 0ULL;
+    return ptr;
+}
+
+static inline void VKAPI_PTR icdSidecarVkFree(void* pUserData, void* pMemory) {
+    if (!pMemory) return;
+    const auto* up = static_cast<const VkAllocationCallbacks*>(pUserData);
+    if (icdHasSidecarSlot(pMemory)) {
+        auto* meta = reinterpret_cast<uint64_t*>(pMemory);
+        void* raw = reinterpret_cast<void*>(meta[-4]);
+        meta[-3] = 0ULL;
+        if (up && up->pfnFree) {
+            up->pfnFree(up->pUserData, raw);
+        } else {
+            std::free(raw);
+        }
+        return;
+    }
+    if (up && up->pfnFree) {
+        up->pfnFree(up->pUserData, pMemory);
+    } else {
+        std::free(pMemory);
+    }
+}
+
+static inline void* VKAPI_PTR icdSidecarVkRealloc(
+    void* pUserData, void* pOriginal, size_t size, size_t alignment, VkSystemAllocationScope scope) {
+    if (!pOriginal) return icdSidecarVkAlloc(pUserData, size, alignment, scope);
+    if (size == 0) {
+        icdSidecarVkFree(pUserData, pOriginal);
+        return nullptr;
+    }
+    if (!icdHasSidecarSlot(pOriginal)) {
+        const auto* up = static_cast<const VkAllocationCallbacks*>(pUserData);
+        if (up && up->pfnReallocation) {
+            return up->pfnReallocation(up->pUserData, pOriginal, size, alignment, scope);
+        }
+        return std::realloc(pOriginal, size);
+    }
+    const auto* old_meta = reinterpret_cast<const uint64_t*>(pOriginal);
+    const size_t old_size = static_cast<size_t>(old_meta[-5]);
+    const uint64_t old_tag = old_meta[-2];
+    const uint64_t old_sidecar = old_meta[-1];
+    void* next = icdSidecarVkAlloc(pUserData, size, alignment, scope);
+    if (!next) return nullptr;
+    std::memcpy(next, pOriginal, std::min(old_size, size));
+    auto* new_meta = reinterpret_cast<uint64_t*>(next);
+    new_meta[-2] = old_tag;
+    new_meta[-1] = old_sidecar;
+    icdSidecarVkFree(pUserData, pOriginal);
+    return next;
+}
+
+static inline const VkAllocationCallbacks* icdGetSidecarAllocator(const VkAllocationCallbacks* upstream) {
+    static std::mutex s_alloc_mtx;
+    static std::vector<std::unique_ptr<VkAllocationCallbacks>> s_upstream_copies;
+    static std::vector<std::unique_ptr<VkAllocationCallbacks>> s_wrapper_allocs;
+    static VkAllocationCallbacks s_default_alloc = []() {
+        VkAllocationCallbacks cb{};
+        cb.pUserData = nullptr;
+        cb.pfnAllocation = icdSidecarVkAlloc;
+        cb.pfnReallocation = icdSidecarVkRealloc;
+        cb.pfnFree = icdSidecarVkFree;
+        return cb;
+    }();
+    g_host_vk_allocators.registerCallbacks(&s_default_alloc);
+    if (!upstream || !upstream->pfnAllocation) {
+        return &s_default_alloc;
+    }
+    std::lock_guard<std::mutex> lk(s_alloc_mtx);
+    for (size_t i = 0; i < s_upstream_copies.size(); ++i) {
+        const auto& u = *s_upstream_copies[i];
+        if (u.pUserData == upstream->pUserData &&
+            u.pfnAllocation == upstream->pfnAllocation &&
+            u.pfnReallocation == upstream->pfnReallocation &&
+            u.pfnFree == upstream->pfnFree) {
+            return s_wrapper_allocs[i].get();
+        }
+    }
+    auto ucopy = std::make_unique<VkAllocationCallbacks>(*upstream);
+    auto wrap = std::make_unique<VkAllocationCallbacks>(s_default_alloc);
+    wrap->pUserData = ucopy.get();
+    if (upstream->pfnInternalAllocation) wrap->pfnInternalAllocation = upstream->pfnInternalAllocation;
+    if (upstream->pfnInternalFree) wrap->pfnInternalFree = upstream->pfnInternalFree;
+    const VkAllocationCallbacks* ret = wrap.get();
+    s_upstream_copies.push_back(std::move(ucopy));
+    s_wrapper_allocs.push_back(std::move(wrap));
+    return ret;
+}
+
 // Dispatchable ICD Handles (MUST start with uintptr_t loader_magic = 0x01CDC0DE)
-// Note: In libGLES_mali.so (r54p3), aot_vkGetPhysicalDeviceProperties (0x977730) and
-// aot_vkGetPhysicalDeviceFeatures2 (0x97ad30) add +8 to x0 before reading the internal
-// physical-device structure, whereas aot_vkGetPhysicalDeviceMemoryProperties (0x978fe0),
-// aot_vkGetPhysicalDeviceQueueFamilyProperties (0x97ab30), and
-// aot_vkEnumerateDeviceExtensionProperties (0x977140) read directly from x0.
 struct MaliIcdPhysicalDevice {
     uintptr_t loader_magic = ICD_LOADER_MAGIC;
+    uint64_t  sidecar_tag = MALI_SIDECAR_TAG_PHYSDEV;
+    void*     native_phys_dev = nullptr; // Real VkPhysicalDevice allocated by r54p3_lifted.o
     void*     parent_instance = nullptr;
     uint8_t   aot_internal[2048]{};
     uint8_t   aot_inst_internal[512]{};
     bool      aot_layout_initialized = false;
+
+    void* getAotHandle() {
+        if (native_phys_dev) return native_phys_dev;
+        initAotInternalLayout();
+        return aot_internal;
+    }
 
     void initAotInternalLayout() {
         if (aot_layout_initialized) return;
@@ -1105,8 +1352,16 @@ struct MaliIcdPhysicalDevice {
 };
 
 struct MaliIcdInstance {
-    uintptr_t             loader_magic = ICD_LOADER_MAGIC;
-    MaliIcdPhysicalDevice phys_dev{};
+    uintptr_t                              loader_magic = ICD_LOADER_MAGIC;
+    uint64_t                               sidecar_tag = MALI_SIDECAR_TAG_INSTANCE;
+    void*                                  native_instance = nullptr;
+    MaliIcdPhysicalDevice                  phys_dev{};
+    std::vector<void*>                     native_phys_devs;
+    std::vector<std::unique_ptr<MaliIcdPhysicalDevice>> extra_phys_devs;
+
+    void* getAotHandle() {
+        return native_instance ? native_instance : phys_dev.aot_inst_internal;
+    }
 };
 
 struct MaliIcdQueue {
@@ -1116,6 +1371,8 @@ struct MaliIcdQueue {
 
 struct MaliIcdDevice {
     uintptr_t            loader_magic = ICD_LOADER_MAGIC;
+    uint64_t             sidecar_tag = MALI_SIDECAR_TAG_DEVICE;
+    void*                native_device = nullptr;
     MaliIcdPhysicalDevice* phys_dev = nullptr;
     MaliIcdQueue         queue{};
     int32_t              mali_fd = 100;
@@ -1137,6 +1394,42 @@ struct MaliIcdDevice {
     uint64_t             tiler_heap_va  = 0;
     uint8_t              kcpu_queue_id  = 0;
 };
+
+static inline MaliIcdInstance* icdGetInstance(const void* handle) {
+    if (!handle) return nullptr;
+    if (auto* s = icdGetSidecar<MaliIcdInstance>(handle, MALI_SIDECAR_TAG_INSTANCE)) {
+        return s;
+    }
+    const auto* raw = static_cast<const MaliIcdInstance*>(handle);
+    if (raw->loader_magic == ICD_LOADER_MAGIC && raw->sidecar_tag == MALI_SIDECAR_TAG_INSTANCE) {
+        return const_cast<MaliIcdInstance*>(raw);
+    }
+    return nullptr;
+}
+
+static inline MaliIcdPhysicalDevice* icdGetPhysicalDevice(const void* handle) {
+    if (!handle) return nullptr;
+    if (auto* s = icdGetSidecar<MaliIcdPhysicalDevice>(handle, MALI_SIDECAR_TAG_PHYSDEV)) {
+        return s;
+    }
+    const auto* raw = static_cast<const MaliIcdPhysicalDevice*>(handle);
+    if (raw->loader_magic == ICD_LOADER_MAGIC && raw->sidecar_tag == MALI_SIDECAR_TAG_PHYSDEV) {
+        return const_cast<MaliIcdPhysicalDevice*>(raw);
+    }
+    return nullptr;
+}
+
+static inline MaliIcdDevice* icdGetDevice(const void* handle) {
+    if (!handle) return nullptr;
+    if (auto* s = icdGetSidecar<MaliIcdDevice>(handle, MALI_SIDECAR_TAG_DEVICE)) {
+        return s;
+    }
+    const auto* raw = static_cast<const MaliIcdDevice*>(handle);
+    if (raw->loader_magic == ICD_LOADER_MAGIC && raw->sidecar_tag == MALI_SIDECAR_TAG_DEVICE) {
+        return const_cast<MaliIcdDevice*>(raw);
+    }
+    return nullptr;
+}
 
 struct MaliIcdDeviceMemory {
     uint64_t gpu_va     = 0;

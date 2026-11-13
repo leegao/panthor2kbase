@@ -4,7 +4,7 @@
 // Executes through the standard system Khronos Vulkan Loader (`libvulkan.so.1`)
 // against both:
 //   1. `r54p3_vulkan_icd` (`libr54p3_vulkan_icd.so` - Decompiled C++17 ICD)
-//   2. `mali_aot_icd`     (`libvulkan_mali_aot_icd.so` - AOT ARM64 Hybrid ICD)
+//   2. `r54p3_vulkan_icd` (`libr54p3_vulkan_icd.so` - r54p3 Lifted Hybrid ICD)
 // with Procedural Stub Textures & Mipmaps where external KTX/glTF assets are omitted.
 // ============================================================================
 #include <cassert>
@@ -221,10 +221,9 @@ int main(int argc, char** argv) {
             if (char* sl = strrchr(exe_buf, '/')) { *sl = '\0'; exe_dir = exe_buf; }
         }
         std::vector<std::string> candidates = {
-            exe_dir + "/../mali_aot_icd.x86_64.json",
-            exe_dir + "/mali_aot_icd.x86_64.json",
-            "build-x86-64/mali_aot_icd.x86_64.json",
-            "build-x86-64/aot/mali_aot_icd.x86_64.json",
+            exe_dir + "/../r54p3_decompiled_icd.x86_64.json",
+            exe_dir + "/r54p3_decompiled_icd.x86_64.json",
+            "build-x86-64/r54p3_decompiled_icd.x86_64.json",
             "src/r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json"
         };
         for (const auto& cand : candidates) {

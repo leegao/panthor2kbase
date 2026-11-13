@@ -178,7 +178,7 @@ uint32_t mali_kbase_emu_get_open_fd_count(void);
 int mali_kbase_emu_wait_csf_idle(uint64_t timeout_ns);
 void mali_kbase_emu_dump_csf_state(void);
 
-/* Direct C API for AOT-translated libGLES_mali.so, libvulkan_mali_aot_icd.so, and r54p3_vulkan_icd */
+/* Direct C API for AOT-translated libGLES_mali.so and r54p3_vulkan_icd */
 typedef void (*mali_kbase_emu_csf_job_hook_fn)(uint8_t cs_opcode, uint64_t insn, const uint64_t *cs_regs, void *user_data);
 void mali_kbase_emu_register_csf_job_hook(mali_kbase_emu_csf_job_hook_fn fn, void *user_data);
 

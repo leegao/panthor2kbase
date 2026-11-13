@@ -129,28 +129,128 @@ int32_t vkEnumerateInstanceExtensionProperties(const char* pLayerName, uint32_t*
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateInstance(const void* pCreateInfo, const void* /*pAllocator*/, void** pInstance) {
+int32_t vkCreateInstance(const void* pCreateInfo, const void* pAllocator, void** pInstance) {
     if (!pInstance) return -3;
     if (!g_aot_rt.ensureInitialized()) return -3;
+
     auto* inst = new MaliIcdInstance();
     inst->loader_magic = ICD_LOADER_MAGIC;
+    inst->sidecar_tag = MALI_SIDECAR_TAG_INSTANCE;
     inst->phys_dev.loader_magic = ICD_LOADER_MAGIC;
+    inst->phys_dev.sidecar_tag = MALI_SIDECAR_TAG_PHYSDEV;
     inst->phys_dev.parent_instance = inst;
+
+    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkCreateInstance && aot_vkEnumeratePhysicalDevices) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+
+        std::vector<VkExtensionProperties> nat_exts;
+        if (aot_vkEnumerateInstanceExtensionProperties) {
+            uint32_t nat_cnt = 0;
+            if (mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+                    g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size,
+                    aot_vkEnumerateInstanceExtensionProperties,
+                    static_cast<const char*>(nullptr), &nat_cnt,
+                    static_cast<VkExtensionProperties*>(nullptr)) == 0 &&
+                nat_cnt > 0 && nat_cnt <= 256) {
+                nat_exts.resize(nat_cnt);
+                mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+                    g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size,
+                    aot_vkEnumerateInstanceExtensionProperties,
+                    static_cast<const char*>(nullptr), &nat_cnt, nat_exts.data());
+                nat_exts.resize(nat_cnt);
+            }
+        }
+
+        VkInstanceCreateInfo aot_ci{};
+        std::vector<const char*> filtered_exts;
+        if (pCreateInfo) {
+            aot_ci = *static_cast<const VkInstanceCreateInfo*>(pCreateInfo);
+            if (aot_ci.enabledExtensionCount > 0 && aot_ci.ppEnabledExtensionNames) {
+                filtered_exts.reserve(aot_ci.enabledExtensionCount);
+                for (uint32_t i = 0; i < aot_ci.enabledExtensionCount; ++i) {
+                    const char* ext_name = aot_ci.ppEnabledExtensionNames[i];
+                    if (!ext_name) continue;
+                    bool supported = false;
+                    for (const auto& ne : nat_exts) {
+                        if (std::strcmp(ne.extensionName, ext_name) == 0) {
+                            supported = true;
+                            break;
+                        }
+                    }
+                    if (supported) filtered_exts.push_back(ext_name);
+                }
+                aot_ci.enabledExtensionCount = static_cast<uint32_t>(filtered_exts.size());
+                aot_ci.ppEnabledExtensionNames = filtered_exts.empty() ? nullptr : filtered_exts.data();
+            }
+        } else {
+            aot_ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+        }
+
+        const VkAllocationCallbacks* sidecar_alloc = icdGetSidecarAllocator(
+            static_cast<const VkAllocationCallbacks*>(pAllocator));
+        void* aot_inst = nullptr;
+        int32_t r = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkCreateInstance,
+            &aot_ci, sidecar_alloc, &aot_inst);
+        g_aot_rt.lifted_vk_calls_executed++;
+        if (r == 0 && aot_inst != nullptr) {
+            icdSetSidecar(aot_inst, MALI_SIDECAR_TAG_INSTANCE, inst);
+            inst->native_instance = aot_inst;
+
+            uint32_t pd_count = 0;
+            int32_t pr = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+                g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkEnumeratePhysicalDevices,
+                aot_inst, &pd_count, static_cast<void**>(nullptr));
+            g_aot_rt.lifted_vk_calls_executed++;
+            if (pr == 0 && pd_count > 0 && pd_count <= 16) {
+                std::vector<void*> native_pds(pd_count, nullptr);
+                pr = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
+                    g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkEnumeratePhysicalDevices,
+                    aot_inst, &pd_count, native_pds.data());
+                g_aot_rt.lifted_vk_calls_executed++;
+                if ((pr == 0 || pr == 5) && pd_count > 0) {
+                    for (uint32_t i = 0; i < pd_count; ++i) {
+                        if (!native_pds[i]) continue;
+                        MaliIcdPhysicalDevice* pd_sidecar = nullptr;
+                        if (i == 0) {
+                            pd_sidecar = &inst->phys_dev;
+                        } else {
+                            auto extra = std::make_unique<MaliIcdPhysicalDevice>();
+                            pd_sidecar = extra.get();
+                            inst->extra_phys_devs.push_back(std::move(extra));
+                        }
+                        pd_sidecar->loader_magic = ICD_LOADER_MAGIC;
+                        pd_sidecar->sidecar_tag = MALI_SIDECAR_TAG_PHYSDEV;
+                        pd_sidecar->parent_instance = inst;
+                        pd_sidecar->native_phys_dev = native_pds[i];
+                        icdSetSidecar(native_pds[i], MALI_SIDECAR_TAG_PHYSDEV, pd_sidecar);
+                        inst->native_phys_devs.push_back(native_pds[i]);
+                    }
+                }
+            }
+            if (mali_icd_log_enabled()) {
+                mali_icd_log("vkCreateInstance -> native=%p sidecar=%p phys_devs=%zu",
+                             aot_inst, static_cast<void*>(inst), inst->native_phys_devs.size());
+            }
+            *pInstance = aot_inst;
+            return 0;
+        }
+        if (mali_icd_log_enabled()) {
+            mali_icd_log("vkCreateInstance: aot_vkCreateInstance returned %d (inst=%p); using fallback",
+                         r, aot_inst);
+        }
+    }
+
     inst->phys_dev.initAotInternalLayout();
     *pInstance = inst;
     if (mali_icd_log_enabled() && pCreateInfo) {
-        struct InstCI {
-            uint32_t sType; const void* pNext; uint32_t flags; const void* pAppInfo;
-            uint32_t layerCount; const char* const* ppLayers;
-            uint32_t extCount; const char* const* ppExts;
-        };
-        const auto* ci = static_cast<const InstCI*>(pCreateInfo);
+        const auto* ci = static_cast<const VkInstanceCreateInfo*>(pCreateInfo);
         std::string exts_str;
-        if (ci->extCount <= 64 && ci->ppExts) {
-            for (uint32_t i = 0; i < ci->extCount; ++i) {
-                if (ci->ppExts[i]) {
+        if (ci->enabledExtensionCount <= 64 && ci->ppEnabledExtensionNames) {
+            for (uint32_t i = 0; i < ci->enabledExtensionCount; ++i) {
+                if (ci->ppEnabledExtensionNames[i]) {
                     if (!exts_str.empty()) exts_str += ", ";
-                    exts_str += ci->ppExts[i];
+                    exts_str += ci->ppEnabledExtensionNames[i];
                 }
             }
         }
@@ -158,20 +258,46 @@ int32_t vkCreateInstance(const void* pCreateInfo, const void* /*pAllocator*/, vo
                      static_cast<void*>(inst),
                      g_aot_rt.mapper.so_path_loaded.empty() ? "standalone-builtin" : g_aot_rt.mapper.so_path_loaded.c_str(),
                      static_cast<unsigned long>(aot_get_lifted_vk_entrypoint_count()),
-                     ci->extCount, exts_str.c_str());
+                     ci->enabledExtensionCount, exts_str.c_str());
     }
     return 0;
 }
 
 __attribute__((visibility("default")))
-void vkDestroyInstance(void* instance, const void* /*pAllocator*/) {
-    delete static_cast<MaliIcdInstance*>(instance);
+void vkDestroyInstance(void* instance, const void* pAllocator) {
+    auto* inst = icdGetInstance(instance);
+    if (!inst) return;
+    void* aot_inst = inst->native_instance;
+    if (aot_inst && !g_aot_rt.mapper.so_path_loaded.empty() && aot_vkDestroyInstance) {
+        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        const VkAllocationCallbacks* sidecar_alloc = icdGetSidecarAllocator(
+            static_cast<const VkAllocationCallbacks*>(pAllocator));
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkDestroyInstance,
+            aot_inst, sidecar_alloc);
+        g_aot_rt.lifted_vk_calls_executed++;
+    }
+    delete inst;
 }
 
 __attribute__((visibility("default")))
 int32_t vkEnumeratePhysicalDevices(void* instance, uint32_t* pPhysicalDeviceCount, void** pPhysicalDevices) {
     if (!instance || !pPhysicalDeviceCount) return -3;
-    auto* inst = static_cast<MaliIcdInstance*>(instance);
+    auto* inst = icdGetInstance(instance);
+    if (!inst) return -3;
+    if (inst->native_instance && !inst->native_phys_devs.empty()) {
+        uint32_t total = static_cast<uint32_t>(inst->native_phys_devs.size());
+        if (!pPhysicalDevices) {
+            *pPhysicalDeviceCount = total;
+            return 0;
+        }
+        uint32_t n = std::min(*pPhysicalDeviceCount, total);
+        for (uint32_t i = 0; i < n; ++i) {
+            pPhysicalDevices[i] = inst->native_phys_devs[i];
+        }
+        *pPhysicalDeviceCount = n;
+        return (n < total) ? 5 : 0; // VK_INCOMPLETE : VK_SUCCESS
+    }
     if (!pPhysicalDevices) {
         *pPhysicalDeviceCount = 1;
         return 0;
@@ -182,26 +308,15 @@ int32_t vkEnumeratePhysicalDevices(void* instance, uint32_t* pPhysicalDeviceCoun
     return 0;
 }
 
+#include "generated/mali_physdev_wrappers_autogen.inc"
+
 __attribute__((visibility("default")))
 void vkGetPhysicalDeviceProperties(void* physicalDevice, void* pProperties) {
     if (!pProperties) return;
-    g_aot_rt.ensureInitialized();
-    auto* pdev = static_cast<MaliIcdPhysicalDevice*>(physicalDevice);
     auto* props = static_cast<VkPhysicalDeviceProperties*>(pProperties);
     std::memset(props, 0, sizeof(VkPhysicalDeviceProperties));
-
-    // Execute AOT-lifted libGLES_mali.so vkGetPhysicalDeviceProperties (0x977730 -> 0x977738)
-    // which populates all 504 bytes of genuine Valhall r54p3 VkPhysicalDeviceLimits & SparseProperties!
-    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkGetPhysicalDeviceProperties && pdev) {
-        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
-        pdev->initAotInternalLayout();
-        g_aot_rt.cpu.x[0] = reinterpret_cast<uint64_t>(pdev->aot_internal + 1024);
-        g_aot_rt.cpu.x[1] = reinterpret_cast<uint64_t>(props);
-        aot_vkGetPhysicalDeviceProperties(&g_aot_rt.cpu);
-    }
+    aot_forward_vkGetPhysicalDeviceProperties(static_cast<VkPhysicalDevice>(physicalDevice), props);
 }
-
-#include "generated/mali_physdev_wrappers_autogen.inc"
 
 __attribute__((visibility("default")))
 void vkGetPhysicalDeviceProperties2(void* physicalDevice, void* pProperties2) {

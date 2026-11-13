@@ -32,7 +32,7 @@ void mali_aot_icd_onload() {
     char exe_buf[512]{};
     ssize_t len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
     if (len > 0) exe_buf[len] = '\0';
-    mali_icd_log("Loaded libvulkan_mali_aot_icd.so into pid=%d exe='%s' DISPLAY='%s' WAYLAND_DISPLAY='%s' VK_ICD_FILENAMES='%s' VK_DRIVER_FILES='%s'",
+    mali_icd_log("Loaded libr54p3_vulkan_icd.so into pid=%d exe='%s' DISPLAY='%s' WAYLAND_DISPLAY='%s' VK_ICD_FILENAMES='%s' VK_DRIVER_FILES='%s'",
                  static_cast<int>(getpid()),
                  exe_buf[0] ? exe_buf : "(unknown)",
                  getenv("DISPLAY") ? getenv("DISPLAY") : "(unset)",

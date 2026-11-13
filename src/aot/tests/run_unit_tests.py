@@ -346,7 +346,7 @@ class TestMaliKbaseCsfUapiAndValhallToLavapipeHarness(unittest.TestCase):
         self.assertIn("Lavapipe Output BO vec4  : [15.000, 16.250, 17.500, 18.750]", res.stdout)
 
     def test_vulkan_icd_e2e_via_system_loader(self):
-        """Verify that libvulkan_mali_aot_icd.so + mali_aot_icd.x86_64.json loads as a native x86-64 Vulkan ICD in system libvulkan.so.1 across both llvmpipe and host backend modes."""
+        """Verify that libr54p3_vulkan_icd.so + r54p3_decompiled_icd.x86_64.json loads as a native x86-64 Vulkan ICD in system libvulkan.so.1 across both llvmpipe and host backend modes."""
         icd_sh = os.path.join(ROOT_DIR, "icd_harness.sh")
         self.assertTrue(os.path.exists(icd_sh))
         for backend in ("llvmpipe", "host"):
@@ -362,12 +362,7 @@ class TestMaliKbaseCsfUapiAndValhallToLavapipeHarness(unittest.TestCase):
     def test_r54p3_decompiled_icd_and_vulkan_samples_compliance(self):
         """Test 18: Decompiled r54p3 C++17 Vulkan ICD + 10-Suite Khronos Vulkan-Samples Compliance (Stub Textures)"""
         r54_icd_json = os.path.join(os.path.dirname(ROOT_DIR), "r54p3_vulkan_icd", "lib", "r54p3_decompiled_icd.x86_64.json")
-        aot_icd_json = os.path.join(ROOT_DIR, "build", "r54p3-00eac0-6eda07", "mali_aot_icd.x86_64.json")
-        compliance_bin = os.path.join(ROOT_DIR, "bin", "test_vulkan_samples_compliance")
-        self.assertTrue(os.path.exists(r54_icd_json), "Missing r54p3_decompiled_icd.x86_64.json")
-        self.assertTrue(os.path.exists(compliance_bin), "Missing test_vulkan_samples_compliance binary")
-
-        for label, manifest in [("r54p3_decompiled_icd", r54_icd_json), ("mali_aot_icd", aot_icd_json)]:
+        for label, manifest in [("r54p3_decompiled_icd", r54_icd_json)]:
             env = os.environ.copy()
             env["VK_ICD_FILENAMES"] = manifest
             res = subprocess.run([compliance_bin, manifest], cwd=ROOT_DIR, env=env, capture_output=True, text=True, timeout=60)

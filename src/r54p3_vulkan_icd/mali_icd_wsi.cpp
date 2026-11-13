@@ -336,13 +336,14 @@ int32_t vkGetDisplayPlaneCapabilitiesKHR(void* /*physicalDevice*/, uint64_t /*mo
 __attribute__((visibility("default")))
 int32_t vkCreateDebugUtilsMessengerEXT(void* instance, const void* pCreateInfo, const void* pAllocator, uint64_t* pMessenger) {
     if (!pMessenger) return -3;
-    auto* inst = static_cast<MaliIcdInstance*>(instance);
-    if (inst && !g_aot_rt.mapper.so_path_loaded.empty() && aot_vkCreateDebugUtilsMessengerEXT && pCreateInfo) {
+    auto* inst = icdGetInstance(instance);
+    if (inst && inst->native_instance && !g_aot_rt.mapper.so_path_loaded.empty() && aot_vkCreateDebugUtilsMessengerEXT && pCreateInfo) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        g_host_vk_allocators.registerCallbacks(pAllocator);
         uint64_t aot_msg = 0;
         int32_t r = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
             g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkCreateDebugUtilsMessengerEXT,
-            instance, pCreateInfo, pAllocator, &aot_msg);
+            inst->native_instance, pCreateInfo, pAllocator, &aot_msg);
         g_aot_rt.lifted_vk_calls_executed++;
         if (r == 0 && aot_msg != 0) { *pMessenger = aot_msg; return 0; }
     }

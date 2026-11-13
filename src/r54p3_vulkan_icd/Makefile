@@ -7,7 +7,7 @@ TARGET_SHARED = lib/libr54p3_vulkan_icd.so
 TARGET_STATIC = lib/libr54p3_vulkan_icd.a
 TARGET_JSON   = lib/r54p3_vulkan_icd.json
 
-OBJS = lib/mali_icd_internal.o lib/mali_icd_physdev.o lib/mali_icd_wsi.o lib/mali_vulkan_icd.o lib/r54p3_vulkan_icd.o
+OBJS = lib/mali_icd_internal.o lib/mali_icd_physdev.o lib/mali_icd_wsi.o lib/mali_vulkan_icd.o lib/r54p3_vulkan_icd.o lib/valhall_spirv_lifter.o
 
 all: dirs $(TARGET_SHARED) $(TARGET_STATIC) json
 

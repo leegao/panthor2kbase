@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(PANTHOR_KBASE_BUILD_TESTS "Build unit, compliance, and equivalence test suites" ON)
-option(PANTHOR_KBASE_BUILD_AOT "Build AOT lifter, libvulkan_mali_aot_icd.so, and DXVK layers" ON)
+option(PANTHOR_KBASE_BUILD_AOT "Build AOT lifter, libr54p3_vulkan_icd.so, and DXVK layers" ON)
 option(PANTHOR_KBASE_ENABLE_COVERAGE "Enable gcov/lcov coverage instrumentation" OFF)
 
 if(CMAKE_C_COMPILER MATCHES "android" OR CMAKE_CXX_COMPILER MATCHES "android")
@@ -375,9 +375,6 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
       RUNTIME_OUTPUT_DIRECTORY "${AOT_DIR}"
    )
 
-   set(AOT_ICD_SO "${CMAKE_BINARY_DIR}/libvulkan_mali_aot_icd.so")
-   set(AOT_JSON   "${CMAKE_BINARY_DIR}/mali_aot_icd.x86_64.json")
-
    add_custom_command(
       OUTPUT "${AOT_MBS2_OBJ}"
       COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/translate.sh" ddk/libGLES_mali.so "${CMAKE_BINARY_DIR}"
@@ -395,6 +392,7 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
       src/r54p3_vulkan_icd/mali_icd_wsi.cpp
       src/r54p3_vulkan_icd/mali_vulkan_icd.cpp
       src/r54p3_vulkan_icd/r54p3_vulkan_icd.cpp
+      src/r54p3_vulkan_icd/valhall_spirv_lifter.cpp
       "${AOT_MBS2_OBJ}"
    )
    add_dependencies(r54p3_vulkan_icd r54p3_lifted_obj)
@@ -411,12 +409,8 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
    )
    file(WRITE "${CMAKE_BINARY_DIR}/r54p3_decompiled_icd.x86_64.json" "{\n    \"file_format_version\": \"1.0.0\",\n    \"ICD\": {\n        \"library_path\": \"./libr54p3_vulkan_icd.so\",\n        \"api_version\": \"1.3.250\"\n    }\n}\n")
    file(WRITE "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json" "{\n    \"file_format_version\": \"1.0.0\",\n    \"ICD\": {\n        \"library_path\": \"./libr54p3_vulkan_icd.so\",\n        \"api_version\": \"1.3.250\"\n    }\n}\n")
-   file(WRITE "${AOT_JSON}" "{\n    \"file_format_version\": \"1.0.0\",\n    \"ICD\": {\n        \"library_path\": \"./libvulkan_mali_aot_icd.so\",\n        \"api_version\": \"1.3.250\"\n    }\n}\n")
-   file(WRITE "${AOT_DIR}/mali_aot_icd.x86_64.json" "{\n    \"file_format_version\": \"1.0.0\",\n    \"ICD\": {\n        \"library_path\": \"./libvulkan_mali_aot_icd.so\",\n        \"api_version\": \"1.3.250\"\n    }\n}\n")
    add_custom_command(TARGET r54p3_vulkan_icd POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:r54p3_vulkan_icd> "${CMAKE_BINARY_DIR}/libr54p3_vulkan_icd.so"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:r54p3_vulkan_icd> "${AOT_ICD_SO}"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:r54p3_vulkan_icd> "${AOT_DIR}/libvulkan_mali_aot_icd.so"
       COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:r54p3_vulkan_icd> "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/lib/libr54p3_vulkan_icd.so"
    )
 
@@ -428,12 +422,8 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
       "${CMAKE_BINARY_DIR}/mali_mbs2_opt.ll"
       "${CMAKE_BINARY_DIR}/r54p3_lifted.o.stamp"
       "${CMAKE_BINARY_DIR}/r54p3_lifted.o"
-      "${CMAKE_BINARY_DIR}/libvulkan_mali_aot_icd.so"
-      "${CMAKE_BINARY_DIR}/mali_aot_icd.x86_64.json"
       "${CMAKE_BINARY_DIR}/libr54p3_vulkan_icd.so"
       "${AOT_DIR}/r54p3_lifted.o"
-      "${AOT_DIR}/libvulkan_mali_aot_icd.so"
-      "${AOT_DIR}/mali_aot_icd.x86_64.json"
    )
 endif()
 

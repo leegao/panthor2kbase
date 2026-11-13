@@ -29,7 +29,8 @@ VkResult vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInf
 
     auto* dev = new MaliIcdDevice();
     dev->loader_magic = ICD_LOADER_MAGIC;
-    dev->phys_dev = reinterpret_cast<MaliIcdPhysicalDevice*>(physicalDevice);
+    dev->sidecar_tag = MALI_SIDECAR_TAG_DEVICE;
+    dev->phys_dev = icdGetPhysicalDevice(physicalDevice);
     dev->queue.loader_magic = ICD_LOADER_MAGIC;
     dev->queue.parent_device = dev;
 
@@ -57,7 +58,11 @@ VkResult vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInf
     *reinterpret_cast<uint64_t*>(dev->aot_vk_device_mem.data() + 0x10)   = HLE_VK_ALLOC_MAGIC;
     *reinterpret_cast<uint64_t*>(dev->aot_vk_device_mem.data() + 0x20)   = HLE_VK_FREE_MAGIC;
     *reinterpret_cast<uint64_t*>(dev->aot_vk_device_mem.data() + 0x28)   = 0xCAFE0000ULL;
-    *reinterpret_cast<uint64_t*>(dev->aot_vk_device_mem.data() + 0xd0)   = reinterpret_cast<uint64_t>(dev->phys_dev ? (dev->phys_dev->aot_internal + 1024 + 8) : nullptr);
+    void* aot_pd_plus_8 = nullptr;
+    if (dev->phys_dev) {
+        aot_pd_plus_8 = reinterpret_cast<uint8_t*>(dev->phys_dev->getAotHandle()) + 8;
+    }
+    *reinterpret_cast<uint64_t*>(dev->aot_vk_device_mem.data() + 0xd0)   = reinterpret_cast<uint64_t>(aot_pd_plus_8);
     *reinterpret_cast<uint64_t*>(dev->aot_vk_device_mem.data() + 0xd8)   = reinterpret_cast<uint64_t>(&dev->queue);
     *reinterpret_cast<uint64_t*>(dev->aot_vk_device_mem.data() + 0x118)  = reinterpret_cast<uint64_t>(cctx_ptr);
     *reinterpret_cast<uint64_t*>(dev->aot_vk_device_mem.data() + 0x130)  = HLE_VK_ALLOC_MAGIC;
@@ -2009,12 +2014,12 @@ void vkGetDeviceQueue2(void* device, const void* pQueueInfo, void** pQueue) {
 
 __attribute__((visibility("default")))
 int32_t vkGetPhysicalDeviceToolProperties(void* physicalDevice, uint32_t* pToolCount, void* pToolProperties) {
-    auto* pdev = static_cast<MaliIcdPhysicalDevice*>(physicalDevice);
+    auto* pdev = icdGetPhysicalDevice(physicalDevice);
     if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkGetPhysicalDeviceToolProperties && pdev && pToolCount) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         int32_t r = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
             g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkGetPhysicalDeviceToolProperties,
-            pdev->aot_internal, pToolCount, pToolProperties);
+            pdev->getAotHandle(), pToolCount, pToolProperties);
         g_aot_rt.lifted_vk_calls_executed++;
         return r;
     }

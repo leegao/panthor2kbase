@@ -105,7 +105,7 @@ if [ ! -f "$ICD_DIR/libr54p3_vulkan_icd.so" ]; then
     "$CMAKE_BIN" --build "$ROOT_DIR/build-x86-64" --target r54p3_vulkan_icd -j"$(nproc)"
 fi
 
-# Ensure mali_aot_icd.x86_64.json contains an absolute library_path pointing to this host's
+# Ensure r54p3_decompiled_icd.x86_64.json contains an absolute library_path pointing to this host's
 # $ICD_DIR/libr54p3_vulkan_icd.so so Wine child processes (which chdir to C:\windows\system32
 # or the .exe directory) never fail dlopen("./libr54p3_vulkan_icd.so") and fall back to RADV!
 cat << JSON_EOF > "$ICD_JSON"

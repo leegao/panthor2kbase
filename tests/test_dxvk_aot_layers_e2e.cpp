@@ -14,7 +14,7 @@
 //  4. Workstream 5: End-to-end execution of DXVK 1.10.3 multi-command-buffer
 //     submission (m_initBuffer + m_execBuffer) with VK_LAYER_BCN_BCnLayer
 //     (BC1/BC3 texture decompression) and VK_LAYER_COMPAT_DxvkMaliCompatLayer
-//     over AOT-lifted libGLES_mali.so (libvulkan_mali_aot_icd.so) and
+//     over AOT-lifted libGLES_mali.so (libr54p3_vulkan_icd.so) and
 //     libmali_kbase_emu.so.
 // ============================================================================
 #include <cassert>
@@ -60,21 +60,21 @@ int main() {
 
     // ------------------------------------------------------------------------
     // Test 2: Workstream 2 — vkGetDeviceProcAddr / vkGetInstanceProcAddr Completeness
-    //         for vkgears & DXVK 1.10.3 on libvulkan_mali_aot_icd.so
+    //         for vkgears & DXVK 1.10.3 on libr54p3_vulkan_icd.so
     // ------------------------------------------------------------------------
     const char* so_cands[] = {
-        "build-x86-64/libvulkan_mali_aot_icd.so",
-        "build-x86-64/aot/libvulkan_mali_aot_icd.so",
-        "../build-x86-64/libvulkan_mali_aot_icd.so",
-        "../libvulkan_mali_aot_icd.so",
-        "libvulkan_mali_aot_icd.so",
+        "build-x86-64/libr54p3_vulkan_icd.so",
+        "build-x86-64/aot/libr54p3_vulkan_icd.so",
+        "../build-x86-64/libr54p3_vulkan_icd.so",
+        "../libr54p3_vulkan_icd.so",
+        "libr54p3_vulkan_icd.so",
     };
     void* h_icd = nullptr;
     for (const char* s : so_cands) {
         h_icd = dlopen(s, RTLD_NOW | RTLD_LOCAL);
         if (h_icd) break;
     }
-    assert(h_icd != nullptr && "Failed to dlopen libvulkan_mali_aot_icd.so");
+    assert(h_icd != nullptr && "Failed to dlopen libr54p3_vulkan_icd.so");
 
     auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(h_icd, "vkGetInstanceProcAddr"));
     auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(dlsym(h_icd, "vkGetDeviceProcAddr"));
@@ -125,7 +125,7 @@ int main() {
         PFN_vkVoidFunction fn = gdpa(nullptr, sym);
         if (!fn) fn = gipa(nullptr, sym);
         if (!fn) {
-            std::fprintf(stderr, "[FAIL] Missing entrypoint in libvulkan_mali_aot_icd.so: %s\n", sym);
+            std::fprintf(stderr, "[FAIL] Missing entrypoint in libr54p3_vulkan_icd.so: %s\n", sym);
             return 1;
         }
     }

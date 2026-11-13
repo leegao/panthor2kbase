@@ -195,7 +195,7 @@ static void snapshot_memory_locked(CapMemoryState &ms)
 static void resolve_fallback_dispatch(void)
 {
    if (!g_next_gipa) {
-      void *icd = dlopen("libvulkan_mali_aot_icd.so", RTLD_LAZY | RTLD_NOLOAD);
+      void *icd = dlopen("libr54p3_vulkan_icd.so", RTLD_LAZY | RTLD_NOLOAD);
       if (!icd)
          icd = dlopen("libvulkan.so.1", RTLD_LAZY | RTLD_LOCAL);
       if (icd) {
@@ -1157,11 +1157,10 @@ int panthor_vk_replay_trace_file(const char *filepath,
       setenv("VK_DRIVER_FILES", opts->icd_json_path, 1);
    } else if (!getenv("VK_ICD_FILENAMES")) {
       const char *json_cands[] = {
-         "build-x86-64/mali_aot_icd.x86_64.json",
-         "build-x86-64/aot/mali_aot_icd.x86_64.json",
-         "../build-x86-64/mali_aot_icd.x86_64.json",
-         "../mali_aot_icd.x86_64.json",
-         "mali_aot_icd.x86_64.json",
+         "build-x86-64/r54p3_decompiled_icd.x86_64.json",
+         "../build-x86-64/r54p3_decompiled_icd.x86_64.json",
+         "../r54p3_decompiled_icd.x86_64.json",
+         "r54p3_decompiled_icd.x86_64.json",
       };
       for (const char *jc : json_cands) {
          if (access(jc, R_OK) == 0) {
@@ -1178,11 +1177,11 @@ int panthor_vk_replay_trace_file(const char *filepath,
    }
 
    const char *so_candidates[] = {
-      "build-x86-64/libvulkan_mali_aot_icd.so",
-      "build-x86-64/aot/libvulkan_mali_aot_icd.so",
-      "../build-x86-64/libvulkan_mali_aot_icd.so",
-      "../libvulkan_mali_aot_icd.so",
-      "libvulkan_mali_aot_icd.so",
+      "build-x86-64/libr54p3_vulkan_icd.so",
+      "build-x86-64/aot/libr54p3_vulkan_icd.so",
+      "../build-x86-64/libr54p3_vulkan_icd.so",
+      "../libr54p3_vulkan_icd.so",
+      "libr54p3_vulkan_icd.so",
       "libvulkan.so.1",
       "libvulkan.so"
    };

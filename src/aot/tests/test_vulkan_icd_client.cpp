@@ -2,7 +2,7 @@
 // test_vulkan_icd_client.cpp
 // Standard x86-64 Vulkan Client Application that loads the system Khronos
 // Vulkan Loader (libvulkan.so.1) with VK_ICD_FILENAMES pointing to our
-// AOT-translated Mali Vulkan ICD (libvulkan_mali_aot_icd.so) and verifies:
+// r54p3-lifted Mali Vulkan ICD (libr54p3_vulkan_icd.so) and verifies:
 //   1. Instance & Extension enumeration via AOT ARM64 driver
 //   2. PhysicalDevice discovery (VendorID 0x13B5 Arm, Mali-G615/G78/G76/G925)
 //   3. Logical VkDevice & /dev/mali0 CSF/JM Queue creation

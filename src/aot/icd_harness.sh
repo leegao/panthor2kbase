@@ -48,8 +48,8 @@ if [ ! -f "$BUILD_DIR/r54p3_lifted.o" ]; then
     "$ROOT_DIR/translate.sh" "$SO_PATH" "$BUILD_DIR"
 fi
 
-ICD_SO="$BUILD_DIR/libvulkan_mali_aot_icd.so"
-ICD_JSON="$BUILD_DIR/mali_aot_icd.x86_64.json"
+ICD_SO="$BUILD_DIR/libr54p3_vulkan_icd.so"
+ICD_JSON="$BUILD_DIR/r54p3_decompiled_icd.x86_64.json"
 CLIENT_BIN="$ROOT_DIR/bin/test_vulkan_icd_client"
 
 echo "[1/3] Building AOT Vulkan ICD ($ICD_SO)..."

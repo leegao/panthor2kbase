@@ -1776,14 +1776,14 @@ static void test_v29_wsi_layer_godot_4_7_2_and_host_panvk(void)
 {
    printf("[Unit Test 20] Verifying Checkpoint v29 Godot 4.7.2 Forward+ Fixes, Profiler & Host PanVK...\n");
 
-   /* 1. Verify Godot 4.7.2 Forward+ sequence on libvulkan_mali_aot_icd.so:
+   /* 1. Verify Godot 4.7.2 Forward+ sequence on libr54p3_vulkan_icd.so:
     *    - vkGetDeviceBufferMemoryRequirements / vkGetDeviceImageMemoryRequirements / vkResetDescriptorPool / vkCreateBufferView non-NULL
     *    - Multi-set vkAllocateDescriptorSets (count = 8) allocates all 8 sets
     *    - vkUpdateDescriptorSets with descriptorType=7 (STORAGE_BUFFER) and garbage pImageInfo does not crash
     */
-   void *icd_h = dlopen("aot/libvulkan_mali_aot_icd.so", RTLD_NOW | RTLD_LOCAL);
-   if (!icd_h) icd_h = dlopen("build-x86-64/aot/libvulkan_mali_aot_icd.so", RTLD_NOW | RTLD_LOCAL);
-   if (!icd_h) icd_h = dlopen("build-x86-64/libvulkan_mali_aot_icd.so", RTLD_NOW | RTLD_LOCAL);
+   void *icd_h = dlopen("aot/libr54p3_vulkan_icd.so", RTLD_NOW | RTLD_LOCAL);
+   if (!icd_h) icd_h = dlopen("build-x86-64/aot/libr54p3_vulkan_icd.so", RTLD_NOW | RTLD_LOCAL);
+   if (!icd_h) icd_h = dlopen("build-x86-64/libr54p3_vulkan_icd.so", RTLD_NOW | RTLD_LOCAL);
    assert(icd_h != NULL);
    typedef void *(*pfn_gdpa)(void *, const char *);
    pfn_gdpa gdpa = (pfn_gdpa)dlsym(icd_h, "vkGetDeviceProcAddr");
@@ -1965,8 +1965,8 @@ static void test_v32_full_r54p3_icd_deshimming_and_real_draw_pipeline(void)
 {
    printf("[TEST 22] Verifying Checkpoint v32 Full r54p3 ICD De-Shimming, Real Sync/Layout State & Real VBO/IBO Draw + Blit...\n");
 
-   void *icd_h = dlopen("aot/libvulkan_mali_aot_icd.so", RTLD_NOW | RTLD_LOCAL);
-   if (!icd_h) icd_h = dlopen("build-x86-64/aot/libvulkan_mali_aot_icd.so", RTLD_NOW | RTLD_LOCAL);
+   void *icd_h = dlopen("aot/libr54p3_vulkan_icd.so", RTLD_NOW | RTLD_LOCAL);
+   if (!icd_h) icd_h = dlopen("build-x86-64/aot/libr54p3_vulkan_icd.so", RTLD_NOW | RTLD_LOCAL);
    if (!icd_h) icd_h = dlopen("build-x86-64/libr54p3_vulkan_icd.so", RTLD_NOW | RTLD_LOCAL);
    assert(icd_h != NULL);
 
