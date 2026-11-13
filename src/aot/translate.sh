@@ -134,6 +134,7 @@ fi
 if [ -f "$OUT_DIR/mali_mbs2_aot.o" ] && [ "${MALI_AOT_FORCE_RELIFT:-0}" != "1" ] && [ "$STAMP_OK" -eq 1 ] && [ "$OUT_DIR/mali_mbs2_aot.o" -nt "$PASS_DRIVER" ] && [ "$OUT_DIR/mali_mbs2_aot.o" -nt "$ROOT_DIR/src/mali_llvm_passes.cpp" ]; then
     echo "[Cache] Reusing up-to-date $OUT_DIR/mali_mbs2_aot.o (set MALI_AOT_FORCE_RELIFT=1 to force full re-lift)"
 elif [ -n "$SO_PATH" ] && [ -f "$SO_PATH" ]; then
+    export MALI_AOT_CHUNK_MB=20
     "$PASS_DRIVER" --lift-so "$SO_PATH" "$OUT_DIR" --hook-Vulkan-calls
     if [ -n "$CUR_STAMP" ]; then
         echo "$CUR_STAMP" > "$STAMP_FILE"
@@ -189,7 +190,7 @@ g++ -O2 -std=c++17 -fno-strict-aliasing -shared -fPIC \
     -o "$OUT_DIR/libvulkan_mali_aot_icd.so"
 
 if [ "${MALI_AOT_KEEP_LL:-1}" = "0" ]; then
-    rm -f "$OUT_DIR/mali_mbs2_unopt.ll" "$OUT_DIR/mali_mbs2_opt.ll"
+    rm -f "$OUT_DIR/mali_mbs2_unopt.ll" "$OUT_DIR/mali_mbs2_opt.ll" "$OUT_DIR"/mali_mbs2_chunk_*.ll "$OUT_DIR"/mali_mbs2_wrappers_*.ll
 fi
 cat << JSON_EOF > "$OUT_DIR/mali_aot_icd.x86_64.json"
 {

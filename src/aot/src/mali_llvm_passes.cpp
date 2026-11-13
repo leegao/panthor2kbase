@@ -1068,6 +1068,12 @@ private:
                  "cmpbe_v2_init_options",
                  "cmpbe_v2_set_option_value",
                  "cmpbe_v2_free_compilation_result",
+                 "cmpbe_v2_compile_multiple_shaders",
+                 "cmpbe_v2_compile_single_shader",
+                 "cmpbe_blend_shadergen_generate_shader",
+                 "cmpbep_v2_get_variant_info",
+                 "cmpbe_has_robustness",
+                 "cmpbep_shutdown_llvm",
                  "vk_hal_open",
                  "vkGetInstanceProcAddr",
                  "vkGetDeviceProcAddr",
@@ -1162,6 +1168,11 @@ private:
                 q.push_back(cand);
             }
         }
+        for (const auto &vk_ent : vk_dispatch_entries) {
+            uint64_t faddr = findFuncStart(vk_ent.second);
+            if (faddr == 0) faddr = vk_ent.second;
+            if (isExecAddr(faddr)) q.push_back(faddr);
+        }
         std::set<uint64_t> visited;
         while (!q.empty()) {
             uint64_t faddr = q.front();
@@ -1245,9 +1256,8 @@ private:
                               : (addr_by_name.count("mali_gpu_props_get") ? addr_by_name["mali_gpu_props_get"] : 0ULL);
         uint64_t kb_lo = (kbase_anchor > 0x20000ULL) ? (kbase_anchor - 0x20000ULL) : 0ULL;
         uint64_t kb_hi = kbase_anchor ? (kbase_anchor + 0x30000ULL) : 0ULL;
-        uint64_t cmpbe_stop = addr_by_name.count("cmpbe_v2_compile_multiple_shaders") ? addr_by_name["cmpbe_v2_compile_multiple_shaders"] : 0x01c9ecb0ULL;
         const char *env_full = std::getenv("MALI_AOT_FULL_CLOSURE");
-        bool lift_full_closure = (env_full && std::strcmp(env_full, "1") == 0);
+        bool lift_full_closure = (!env_full || std::strcmp(env_full, "0") != 0);
         while (!vk_q.empty()) {
             uint64_t faddr = vk_q.front();
             vk_q.pop_front();
@@ -1277,8 +1287,8 @@ private:
                     } else if (top6 == 0x25 || !(target >= faddr && target < faddr + fsize)) {
                         uint64_t tst = findFuncStart(target);
                         uint64_t cand = tst ? tst : target;
-                        bool in_vk_or_kb = (cand >= vk_lo && cand <= vk_hi) || (kb_hi > 0 && cand >= kb_lo && cand <= kb_hi) || (cand >= 0x01ad0000ULL && cand < cmpbe_stop) || (cand >= 0x01dd0000ULL && cand <= 0x01e30000ULL);
-                        if (!visited.count(cand) && cand != cmpbe_stop && (lift_full_closure || in_vk_or_kb)) {
+                        bool in_vk_or_kb = (cand >= vk_lo && cand <= vk_hi) || (kb_hi > 0 && cand >= kb_lo && cand <= kb_hi) || (cand >= 0x01ad0000ULL && cand <= 0x02f21ab0ULL);
+                        if (!visited.count(cand) && (lift_full_closure || in_vk_or_kb)) {
                             vk_q.push_back(cand);
                         }
                     }
@@ -1297,8 +1307,8 @@ private:
                         } else {
                             uint64_t tst = findFuncStart(cond_target);
                             uint64_t cand = tst ? tst : cond_target;
-                            bool in_vk_or_kb = (cand >= vk_lo && cand <= vk_hi) || (kb_hi > 0 && cand >= kb_lo && cand <= kb_hi) || (cand >= 0x01ad0000ULL && cand < cmpbe_stop) || (cand >= 0x01dd0000ULL && cand <= 0x01e30000ULL);
-                            if (!visited.count(cand) && cand != cmpbe_stop && (lift_full_closure || in_vk_or_kb)) {
+                            bool in_vk_or_kb = (cand >= vk_lo && cand <= vk_hi) || (kb_hi > 0 && cand >= kb_lo && cand <= kb_hi) || (cand >= 0x01ad0000ULL && cand <= 0x02f21ab0ULL);
+                            if (!visited.count(cand) && (lift_full_closure || in_vk_or_kb)) {
                                 vk_q.push_back(cand);
                             }
                         }
@@ -3017,7 +3027,7 @@ public:
         emitRaw("}\n");
     }
 
-    std::string generateModuleText() {
+    void emitModuleHeader(const std::set<uint64_t> &defined_funcs, bool is_runtime_chunk) {
         out.str("");
         out.clear();
         emitRaw("; ============================================================================");
@@ -3104,8 +3114,16 @@ public:
         emitRaw("declare i32 @llvm.vector.reduce.umax.v2i32(<2 x i32>)");
         emitRaw("declare i32 @llvm.vector.reduce.umax.v4i32(<4 x i32>)\n");
 
-        if (instrument_calls) {
-            for (uint64_t faddr : loader.closure_funcs) {
+        if (!is_runtime_chunk) {
+            emitRaw("declare void @aot_indirect_dispatch(ptr, i64)");
+        }
+        for (uint64_t faddr : loader.closure_funcs) {
+            if (!defined_funcs.count(faddr)) {
+                emitRaw("declare void @aot_sub_" + hex8(faddr) + "(ptr)");
+            }
+        }
+        if (instrument_calls && !defined_funcs.empty()) {
+            for (uint64_t faddr : defined_funcs) {
                 auto fname_sz = loader.func_by_addr.count(faddr) ? loader.func_by_addr.at(faddr) : std::make_pair("sub_" + hex8(faddr), uint64_t(4));
                 std::string fn_label = fname_sz.first.empty() ? ("sub_" + hex8(faddr)) : fname_sz.first;
                 emitRaw("@.aot_fn_str_" + hex8(faddr) + " = private unnamed_addr constant [" +
@@ -3113,10 +3131,9 @@ public:
             }
             emitRaw("");
         }
-        for (uint64_t faddr : loader.closure_funcs) {
-            liftFunction(faddr);
-        }
+    }
 
+    void emitWrappersAndRuntime() {
         // Export version-independent entry wrappers & auto-detected offsets
         emitRaw("define i64 @aot_get_ctx_malloc_offset() #0 {");
         emit("ret i64 " + std::to_string(loader.ctx_malloc_offset));
@@ -3198,6 +3215,12 @@ public:
                  "cmpbe_v2_init_options",
                  "cmpbe_v2_set_option_value",
                  "cmpbe_v2_free_compilation_result",
+                 "cmpbe_v2_compile_multiple_shaders",
+                 "cmpbe_v2_compile_single_shader",
+                 "cmpbe_blend_shadergen_generate_shader",
+                 "cmpbep_v2_get_variant_info",
+                 "cmpbe_has_robustness",
+                 "cmpbep_shutdown_llvm",
                  "vk_hal_open",
                  "vkGetInstanceProcAddr",
                  "vkGetDeviceProcAddr",
@@ -3448,7 +3471,75 @@ public:
         emitRaw("}\n");
 
         emitRaw("attributes #0 = { nounwind \"frame-pointer\"=\"none\" }");
-        return out.str();
+    }
+
+    template <typename ChunkCallback>
+    void generateChunkedModules(size_t chunk_limit_bytes, ChunkCallback &&on_chunk) {
+        size_t chunk_idx = 0;
+        std::ostringstream body_ss;
+        std::set<uint64_t> chunk_funcs;
+
+        auto flush_func_chunk = [&]() {
+            if (chunk_funcs.empty()) return;
+            emitModuleHeader(chunk_funcs, false);
+            std::string hdr = std::move(out).str();
+            out.str(std::string());
+            out.clear();
+
+            std::string body = std::move(body_ss).str();
+            body_ss.str(std::string());
+            body_ss.clear();
+
+            std::string full_ir;
+            full_ir.reserve(hdr.size() + body.size() + 64);
+            full_ir.append(hdr);
+            full_ir.append(body);
+            full_ir.append("attributes #0 = { nounwind \"frame-pointer\"=\"none\" }\n");
+            std::string().swap(hdr);
+            std::string().swap(body);
+
+            char tag[32];
+            std::snprintf(tag, sizeof(tag), "chunk_%02zu", chunk_idx++);
+            on_chunk(tag, std::move(full_ir));
+            chunk_funcs.clear();
+        };
+
+        for (uint64_t faddr : loader.closure_funcs) {
+            out.str(std::string());
+            out.clear();
+            liftFunction(faddr);
+            std::string fn_ir = std::move(out).str();
+            out.str(std::string());
+            out.clear();
+
+            if (!chunk_funcs.empty() && chunk_limit_bytes > 0 &&
+                static_cast<size_t>(body_ss.tellp()) + fn_ir.size() > chunk_limit_bytes) {
+                flush_func_chunk();
+            }
+            body_ss << fn_ir;
+            chunk_funcs.insert(faddr);
+        }
+        flush_func_chunk();
+
+        // Emit runtime/wrapper chunk
+        std::set<uint64_t> empty_defs;
+        emitModuleHeader(empty_defs, true);
+        std::string hdr = std::move(out).str();
+        out.str(std::string());
+        out.clear();
+
+        emitWrappersAndRuntime();
+        std::string wrap_ir = std::move(out).str();
+        out.str(std::string());
+        out.clear();
+
+        std::string full_wrap;
+        full_wrap.reserve(hdr.size() + wrap_ir.size());
+        full_wrap.append(hdr);
+        full_wrap.append(wrap_ir);
+        std::string().swap(hdr);
+        std::string().swap(wrap_ir);
+        on_chunk("wrappers", std::move(full_wrap));
     }
 };
 
@@ -4091,38 +4182,89 @@ int main(int argc, char **argv) {
                 instrumentCalls = false;
             }
         }
-        printf("[LLVM Pass 2 & 3] CFGRecoveryAndPicJumpTablePass + AArch64ToLLVMIRLiftingPass (instrument_calls=%d)...\n", instrumentCalls ? 1 : 0);
-        AArch64ToLLVMIRLiftingPass lifter(loader, instrumentCalls);
-        std::string irText = lifter.generateModuleText();
-        printf("  Lifted instructions : %d (%d PIC jump tables, %d SIMD ops, %d Crypto SHA-1 ops, %d Atomics)\n",
-               lifter.stats.total_instructions, lifter.stats.jump_tables_lowered, lifter.stats.simd_ops_lifted,
-               lifter.stats.crypto_sha1_lifted, lifter.stats.atomic_ops_lifted);
-
-        std::string unoptPath = outDir + "/mali_mbs2_unopt.ll";
-        std::string optPath   = outDir + "/mali_mbs2_opt.ll";
-        std::string objPath   = outDir + "/mali_mbs2_aot.o";
+        size_t chunk_mb = 100;
+        if (const char *env_cmb = std::getenv("MALI_AOT_CHUNK_MB")) {
+            chunk_mb = static_cast<size_t>(std::strtoull(env_cmb, nullptr, 10));
+        }
+        size_t chunk_limit_bytes = chunk_mb * 1024ULL * 1024ULL;
         const char *keep_ll_env = std::getenv("MALI_AOT_KEEP_LL");
         bool keep_ll = (!keep_ll_env || std::strcmp(keep_ll_env, "0") != 0);
-        if (keep_ll) {
-            std::ofstream out(unoptPath);
-            out << irText;
-            printf("  Wrote unoptimized IR: %s (%zu bytes)\n", unoptPath.c_str(), irText.size());
-        } else {
-            printf("  Generated in-memory IR: %zu bytes\n", irText.size());
-        }
+        std::string objPath = outDir + "/mali_mbs2_aot.o";
 
-        LLVMContextRef C = LLVMContextCreate();
-        LLVMMemoryBufferRef memBuf = LLVMCreateMemoryBufferWithMemoryRangeCopy(irText.data(), irText.size(), "mali_mbs2_unopt.ll");
-        LLVMModuleRef M = nullptr;
-        char *errMsg = nullptr;
-        if (LLVMParseIRInContext(C, memBuf, &M, &errMsg) != 0) {
-            fprintf(stderr, "LLVM IR Parse Error: %s\n", errMsg ? errMsg : "unknown");
+        // Remove stale monolithic/chunk artifacts before lifting
+        std::remove((outDir + "/mali_mbs2_unopt.ll").c_str());
+        std::remove((outDir + "/mali_mbs2_opt.ll").c_str());
+
+        printf("[LLVM Pass 2 & 3] CFGRecoveryAndPicJumpTablePass + AArch64ToLLVMIRLiftingPass (instrument_calls=%d, chunk_mb=%zu)...\n",
+               instrumentCalls ? 1 : 0, chunk_mb);
+
+        std::vector<std::string> chunk_objs;
+        size_t total_ir_bytes = 0;
+        int rc = 0;
+        {
+            AArch64ToLLVMIRLiftingPass lifter(loader, instrumentCalls);
+            lifter.generateChunkedModules(chunk_limit_bytes, [&](const std::string &tag, std::string irText) {
+                if (rc != 0) return;
+                total_ir_bytes += irText.size();
+                std::string chunkUnopt = outDir + "/mali_mbs2_" + tag + "_unopt.ll";
+                std::string chunkOpt   = outDir + "/mali_mbs2_" + tag + "_opt.ll";
+                std::string chunkObj   = outDir + "/mali_mbs2_" + tag + ".o";
+                printf("  [Chunk %s] %zu bytes IR -> optimizing & emitting %s\n",
+                       tag.c_str(), irText.size(), chunkObj.c_str());
+
+                LLVMMemoryBufferRef memBuf = nullptr;
+                char *errMsg = nullptr;
+                if (keep_ll) {
+                    {
+                        std::ofstream out(chunkUnopt);
+                        out.write(irText.data(), static_cast<std::streamsize>(irText.size()));
+                    }
+                    std::string().swap(irText);
+                    if (LLVMCreateMemoryBufferWithContentsOfFile(chunkUnopt.c_str(), &memBuf, &errMsg) != 0) {
+                        fprintf(stderr, "Error reading %s: %s\n", chunkUnopt.c_str(), errMsg ? errMsg : "unknown");
+                        rc = 1;
+                        return;
+                    }
+                } else {
+                    memBuf = LLVMCreateMemoryBufferWithMemoryRangeCopy(irText.data(), irText.size(), chunkUnopt.c_str());
+                    std::string().swap(irText);
+                }
+
+                LLVMContextRef C = LLVMContextCreate();
+                LLVMModuleRef M = nullptr;
+                if (LLVMParseIRInContext(C, memBuf, &M, &errMsg) != 0) {
+                    fprintf(stderr, "LLVM IR Parse Error (%s): %s\n", tag.c_str(), errMsg ? errMsg : "unknown");
+                    LLVMContextDispose(C);
+                    rc = 1;
+                    return;
+                }
+                rc = runLoweringAndCodegenOnModule(M, chunkObj.c_str(), false, true, keep_ll ? chunkOpt.c_str() : nullptr);
+                LLVMDisposeModule(M);
+                LLVMContextDispose(C);
+                if (rc == 0) {
+                    chunk_objs.push_back(chunkObj);
+                }
+            });
+            printf("  Lifted instructions : %d (%d PIC jump tables, %d SIMD ops, %d Crypto SHA-1 ops, %d Atomics, total_ir=%zu bytes across %zu chunks)\n",
+                   lifter.stats.total_instructions, lifter.stats.jump_tables_lowered, lifter.stats.simd_ops_lifted,
+                   lifter.stats.crypto_sha1_lifted, lifter.stats.atomic_ops_lifted, total_ir_bytes, chunk_objs.size());
+        }
+        if (rc != 0) return rc;
+
+        std::string ld_cmd = "ld -r -o \"" + objPath + "\"";
+        for (const auto &co : chunk_objs) {
+            ld_cmd += " \"" + co + "\"";
+        }
+        printf("[Link] Merging %zu chunk objects into %s...\n", chunk_objs.size(), objPath.c_str());
+        int ld_rc = std::system(ld_cmd.c_str());
+        if (ld_rc != 0) {
+            fprintf(stderr, "ld -r failed with exit code %d\n", ld_rc);
             return 1;
         }
-        int rc = runLoweringAndCodegenOnModule(M, objPath.c_str(), false, true, keep_ll ? optPath.c_str() : nullptr);
-        LLVMDisposeModule(M);
-        LLVMContextDispose(C);
-        return rc;
+        for (const auto &co : chunk_objs) {
+            std::remove(co.c_str());
+        }
+        return 0;
     }
 
     // Mode 2: Run Lowering & Codegen Passes on an existing .ll file

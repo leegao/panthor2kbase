@@ -122,6 +122,9 @@ extern "C" {
     __attribute__((weak)) void aot_cmpbe_v2_init_options(AOTCPUState* /*cpu*/) {}
     __attribute__((weak)) void aot_cmpbe_v2_set_option_value(AOTCPUState* /*cpu*/) {}
     __attribute__((weak)) void aot_cmpbe_v2_free_compilation_result(AOTCPUState* /*cpu*/) {}
+    __attribute__((weak)) void aot_cmpbe_v2_compile_multiple_shaders(AOTCPUState* /*cpu*/) {}
+    __attribute__((weak)) void aot_cmpbe_v2_compile_single_shader(AOTCPUState* /*cpu*/) {}
+    __attribute__((weak)) void aot_cmpbe_blend_shadergen_generate_shader(AOTCPUState* /*cpu*/) {}
     void aot_vk_hal_open(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkGetInstanceProcAddr(AOTCPUState* cpu) __attribute__((weak));
     void aot_vkGetDeviceProcAddr(AOTCPUState* cpu) __attribute__((weak));
@@ -414,9 +417,12 @@ extern "C" void aot_unhandled_plt(AOTCPUState* cpu, uint64_t target_va) {
         return;
     }
     if (target_va == IMAGE_BASE + 0x01c9ecb0ULL) {
-        // cmpbe_v2_compile_multiple_shaders boundary (not lifted in mali_mbs2_aot.o;
-        // MBS2/Valhall compilation is handled by runAotMbs2PipelineCompile).
-        cpu->x[0] = 2;
+        // Delegate indirect call to lifted cmpbe_v2_compile_multiple_shaders
+        aot_cmpbe_v2_compile_multiple_shaders(cpu);
+        return;
+    }
+    if (target_va == IMAGE_BASE + 0x01c9ec50ULL) {
+        aot_cmpbe_v2_compile_single_shader(cpu);
         return;
     }
     if (g_host_vk_allocators.tryDispatch(cpu, target_va)) {
