@@ -97,7 +97,6 @@ struct KbaseCsfExecutedJob {
     std::vector<ValhallDecodedInstr> disasm;
     std::vector<uint32_t>            lifted_spirv;
     bool        executed_on_lvp = false;
-    bool        is_vkcube_graphics_job = false;
 };
 
 class MaliKbaseCsfKernelEmulator {
@@ -136,7 +135,6 @@ public:
         uint32_t core_req = 0;
         uint8_t  jm_job_type = 0;
         bool     is_bifrost_clause_isa = false;
-        bool     is_vkcube_graphics_atom = false;
         uint64_t jc_gpu_va = 0;
         uint64_t shader_objc_va = 0;
         uint32_t shader_objc_bytes = 0;
@@ -149,7 +147,6 @@ public:
     std::vector<std::string>              ioctl_trace;
     std::vector<KbaseCsfExecutedJob>      executed_jobs;
     std::vector<KbaseJmExecutedAtom>      executed_jm_atoms;
-    std::vector<VkCubeFrameStats>         executed_vkcube_frames;
     std::vector<BaseJdEventV2>            jm_event_queue;
     HostLvpipeVulkanExecutor              lvp_executor;
 
@@ -190,37 +187,7 @@ public:
             job.shader_objc_bytes = static_cast<uint32_t>(spd[1] & 0xFFFFFFFFULL);
         }
 
-        const MaliIdvsDrawPacket* draw_pkt = nullptr;
-        if (opc != MALI_CS_OPCODE_RUN_COMPUTE && job.tsd_gpu_va >= 0x10000ULL && *reinterpret_cast<const uint32_t*>(job.tsd_gpu_va) == MALI_IDVS_MAGIC) {
-            draw_pkt = reinterpret_cast<const MaliIdvsDrawPacket*>(job.tsd_gpu_va);
-        } else if (opc != MALI_CS_OPCODE_RUN_COMPUTE && job.srt_gpu_va >= 0x10000ULL && *reinterpret_cast<const uint32_t*>(job.srt_gpu_va) == MALI_IDVS_MAGIC) {
-            draw_pkt = reinterpret_cast<const MaliIdvsDrawPacket*>(job.srt_gpu_va);
-        }
-
-        if (draw_pkt && draw_pkt->mfbd_gpu_va) {
-            job.is_vkcube_graphics_job = true;
-            if (job.shader_objc_va >= 0x10000ULL && job.shader_objc_bytes >= 8 && job.shader_objc_bytes <= 65536) {
-                const uint64_t* objc_words = reinterpret_cast<const uint64_t*>(job.shader_objc_va);
-                size_t num_words = job.shader_objc_bytes / 8;
-                job.disasm = ValhallISAToSpirvTranslator::disassembleObjc(objc_words, num_words);
-            }
-            if (opc == MALI_CS_OPCODE_RUN_IDVS) {
-                job.lifted_spirv = MaliVkCubeIsaPipelineTranslator::liftVertexObjcToSpirv(
-                    (job.shader_objc_va >= 0x10000ULL) ? reinterpret_cast<const uint64_t*>(job.shader_objc_va) : nullptr,
-                    (job.shader_objc_va >= 0x10000ULL) ? (job.shader_objc_bytes / 8) : 0, false);
-                job.executed_on_lvp = lvp_executor.validateShaderModuleOnLvpipe(job.lifted_spirv);
-            } else if (opc == MALI_CS_OPCODE_RUN_FRAGMENT) {
-                job.lifted_spirv = MaliVkCubeIsaPipelineTranslator::liftFragmentObjcToSpirv(
-                    (job.shader_objc_va >= 0x10000ULL) ? reinterpret_cast<const uint64_t*>(job.shader_objc_va) : nullptr,
-                    (job.shader_objc_va >= 0x10000ULL) ? (job.shader_objc_bytes / 8) : 0, false);
-                auto vs_spv = MaliVkCubeIsaPipelineTranslator::liftVertexObjcToSpirv(nullptr, 0, false);
-                auto* mfbd  = reinterpret_cast<MaliMfbdDescriptor*>(draw_pkt->mfbd_gpu_va);
-                VkCubeFrameStats fstats{};
-                job.executed_on_lvp = lvp_executor.executeVkCubeGraphicsPass(
-                    *draw_pkt, *mfbd, vs_spv, job.lifted_spirv, &fstats);
-                executed_vkcube_frames.push_back(fstats);
-            }
-        } else if (job.shader_objc_va >= 0x10000ULL && job.shader_objc_bytes >= 8 && job.shader_objc_bytes <= 65536) {
+        if (job.shader_objc_va >= 0x10000ULL && job.shader_objc_bytes >= 8 && job.shader_objc_bytes <= 65536) {
             const uint64_t* objc_words = reinterpret_cast<const uint64_t*>(job.shader_objc_va);
             size_t num_words = job.shader_objc_bytes / 8;
             job.lifted_spirv = ValhallISAToSpirvTranslator::translateObjcToSpirv(
@@ -635,38 +602,7 @@ public:
                             job.shader_objc_bytes = static_cast<uint32_t>(spd[1] & 0xFFFFFFFFULL);
                         }
 
-                        // Check if this is a 3D vkcube IDVS + Fragment graphics pipeline draw packet
-                        const MaliIdvsDrawPacket* draw_pkt = nullptr;
-                        if (opc != MALI_CS_OPCODE_RUN_COMPUTE && job.tsd_gpu_va && *reinterpret_cast<const uint32_t*>(job.tsd_gpu_va) == MALI_IDVS_MAGIC) {
-                            draw_pkt = reinterpret_cast<const MaliIdvsDrawPacket*>(job.tsd_gpu_va);
-                        } else if (opc != MALI_CS_OPCODE_RUN_COMPUTE && job.srt_gpu_va && *reinterpret_cast<const uint32_t*>(job.srt_gpu_va) == MALI_IDVS_MAGIC) {
-                            draw_pkt = reinterpret_cast<const MaliIdvsDrawPacket*>(job.srt_gpu_va);
-                        }
-
-                        if (draw_pkt && draw_pkt->mfbd_gpu_va) {
-                            job.is_vkcube_graphics_job = true;
-                            if (job.shader_objc_va && job.shader_objc_bytes >= 8) {
-                                const uint64_t* objc_words = reinterpret_cast<const uint64_t*>(job.shader_objc_va);
-                                size_t num_words = job.shader_objc_bytes / 8;
-                                job.disasm = ValhallISAToSpirvTranslator::disassembleObjc(objc_words, num_words);
-                            }
-                            if (opc == MALI_CS_OPCODE_RUN_IDVS) {
-                                job.lifted_spirv = MaliVkCubeIsaPipelineTranslator::liftVertexObjcToSpirv(
-                                    reinterpret_cast<const uint64_t*>(job.shader_objc_va),
-                                    job.shader_objc_bytes / 8, false);
-                                job.executed_on_lvp = lvp_executor.validateShaderModuleOnLvpipe(job.lifted_spirv);
-                            } else if (opc == MALI_CS_OPCODE_RUN_FRAGMENT) {
-                                job.lifted_spirv = MaliVkCubeIsaPipelineTranslator::liftFragmentObjcToSpirv(
-                                    reinterpret_cast<const uint64_t*>(job.shader_objc_va),
-                                    job.shader_objc_bytes / 8, false);
-                                auto vs_spv = MaliVkCubeIsaPipelineTranslator::liftVertexObjcToSpirv(nullptr, 0, false);
-                                auto* mfbd  = reinterpret_cast<MaliMfbdDescriptor*>(draw_pkt->mfbd_gpu_va);
-                                VkCubeFrameStats fstats{};
-                                job.executed_on_lvp = lvp_executor.executeVkCubeGraphicsPass(
-                                    *draw_pkt, *mfbd, vs_spv, job.lifted_spirv, &fstats);
-                                executed_vkcube_frames.push_back(fstats);
-                            }
-                        } else if (job.shader_objc_va && job.shader_objc_bytes >= 8) {
+                        if (job.shader_objc_va && job.shader_objc_bytes >= 8) {
                             const uint64_t* objc_words = reinterpret_cast<const uint64_t*>(job.shader_objc_va);
                             size_t num_words = job.shader_objc_bytes / 8;
                             job.lifted_spirv = ValhallISAToSpirvTranslator::translateObjcToSpirv(
@@ -769,43 +705,7 @@ public:
                     exec_atom.shader_objc_bytes = static_cast<uint32_t>(rsd[1] & 0xFFFFFFFFULL);
                 }
 
-                // Check if srt_va points to a 3D vkcube MaliIdvsDrawPacket
-                const MaliIdvsDrawPacket* draw_pkt = nullptr;
-                if (srt_va != 0 && *reinterpret_cast<const uint32_t*>(srt_va) == MALI_IDVS_MAGIC) {
-                    draw_pkt = reinterpret_cast<const MaliIdvsDrawPacket*>(srt_va);
-                }
-
-                if (draw_pkt && draw_pkt->mfbd_gpu_va) {
-                    exec_atom.is_vkcube_graphics_atom = true;
-                    if (exec_atom.shader_objc_va != 0 && exec_atom.shader_objc_bytes >= 8) {
-                        const uint64_t* objc_words = reinterpret_cast<const uint64_t*>(exec_atom.shader_objc_va);
-                        size_t num_words = exec_atom.shader_objc_bytes / 8;
-                        if (exec_atom.is_bifrost_clause_isa) {
-                            exec_atom.bifrost_disasm = BifrostISAToSpirvTranslator::disassembleClauses(objc_words, num_words);
-                        } else {
-                            exec_atom.valhall_disasm = ValhallISAToSpirvTranslator::disassembleObjc(objc_words, num_words);
-                        }
-                    }
-                    if (jtype == MALI_JOB_TYPE_TILER || jtype == MALI_JOB_TYPE_VERTEX) {
-                        exec_atom.lifted_spirv = MaliVkCubeIsaPipelineTranslator::liftVertexObjcToSpirv(
-                            reinterpret_cast<const uint64_t*>(exec_atom.shader_objc_va),
-                            exec_atom.shader_objc_bytes / 8,
-                            exec_atom.is_bifrost_clause_isa);
-                        exec_atom.executed_on_lvp = lvp_executor.validateShaderModuleOnLvpipe(exec_atom.lifted_spirv);
-                    } else if (jtype == MALI_JOB_TYPE_FRAGMENT) {
-                        exec_atom.lifted_spirv = MaliVkCubeIsaPipelineTranslator::liftFragmentObjcToSpirv(
-                            reinterpret_cast<const uint64_t*>(exec_atom.shader_objc_va),
-                            exec_atom.shader_objc_bytes / 8,
-                            exec_atom.is_bifrost_clause_isa);
-                        auto vs_spv = MaliVkCubeIsaPipelineTranslator::liftVertexObjcToSpirv(
-                            nullptr, 0, exec_atom.is_bifrost_clause_isa);
-                        auto* mfbd = reinterpret_cast<MaliMfbdDescriptor*>(draw_pkt->mfbd_gpu_va);
-                        VkCubeFrameStats fstats{};
-                        exec_atom.executed_on_lvp = lvp_executor.executeVkCubeGraphicsPass(
-                            *draw_pkt, *mfbd, vs_spv, exec_atom.lifted_spirv, &fstats);
-                        executed_vkcube_frames.push_back(fstats);
-                    }
-                } else if (exec_atom.shader_objc_va != 0 && exec_atom.shader_objc_bytes >= 8) {
+                if (exec_atom.shader_objc_va != 0 && exec_atom.shader_objc_bytes >= 8) {
                     const uint64_t* objc_words = reinterpret_cast<const uint64_t*>(exec_atom.shader_objc_va);
                     size_t num_words = exec_atom.shader_objc_bytes / 8;
                     if (exec_atom.is_bifrost_clause_isa) {

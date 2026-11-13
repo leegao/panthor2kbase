@@ -223,7 +223,6 @@ struct RecordedCommand {
         CMD_DISPATCH,
         CMD_DRAW,
         CMD_DRAW_INDEXED,
-        CMD_DRAW_GEARS,
         CMD_COPY_BUFFER,
         CMD_COPY_BUFFER_TO_IMAGE,
         CMD_BLIT_IMAGE,

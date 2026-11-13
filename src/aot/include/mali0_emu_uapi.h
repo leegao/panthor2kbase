@@ -414,11 +414,10 @@ struct KbaseIoctlMemImport {
 };
 
 // ============================================================================
-// Section 1D: Multi-Target Framebuffer Descriptor (MFBD) & IDVS 3D Draw Packet
-// Matches panfrost/genxml/v9.xml (Valhall) & v7.xml (Bifrost) MFBD + IDVS layout
+// Section 1D: Multi-Target Framebuffer Descriptor (MFBD)
+// Matches panfrost/genxml/v9.xml (Valhall) & v7.xml (Bifrost) MFBD layout
 // ============================================================================
 static constexpr uint32_t MALI_MFBD_MAGIC = 0x4D464244U; // 'MFBD'
-static constexpr uint32_t MALI_IDVS_MAGIC = 0x49445653U; // 'IDVS'
 
 struct MaliMfbdDescriptor {
     uint32_t magic;              // MALI_MFBD_MAGIC ('MFBD')
@@ -431,27 +430,6 @@ struct MaliMfbdDescriptor {
     uint64_t depth_bo_gpu_va;    // Depth Z32_FLOAT BO GPU VA
     uint64_t tiler_heap_gpu_va;  // CSF/JM Tiler heap chunk GPU VA
     uint64_t stats_bo_gpu_va;    // Optional output stats BO GPU VA
-};
-
-struct MaliCubeVertex {
-    float px, py, pz, pw;        // 3D object-space position (x, y, z, 1.0)
-    float cr, cg, cb, ca;        // Vertex RGBA color
-    float nx, ny, nz, nw;        // Vertex / face normal
-};
-
-struct MaliIdvsDrawPacket {
-    uint32_t magic;              // MALI_IDVS_MAGIC ('IDVS')
-    uint32_t vertex_count;       // Number of vertices (e.g., 8 or 24 for cube)
-    uint32_t index_count;        // Number of indices (36 for 12 triangles)
-    uint32_t instance_count;     // Number of instances (1)
-    uint32_t frame_index;        // Frame number (0, 1, ...)
-    float    rotation_deg;       // Cube rotation angle in degrees
-    uint64_t vertex_bo_gpu_va;   // MaliCubeVertex[] BO GPU VA
-    uint64_t index_bo_gpu_va;    // uint32_t indices[36] BO GPU VA
-    uint64_t mvp_ubo_gpu_va;     // float mvp[16] + light_dir[4] UBO/FAU GPU VA
-    uint64_t mfbd_gpu_va;        // MaliMfbdDescriptor GPU VA
-    uint64_t vs_spd_gpu_va;      // Vertex Shader SPD/RSD GPU VA
-    uint64_t fs_spd_gpu_va;      // Fragment Shader SPD/RSD GPU VA
 };
 
 // Configurable GPU Hardware Profiles for /dev/mali0 Emulation

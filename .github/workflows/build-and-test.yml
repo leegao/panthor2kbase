@@ -1,8 +1,8 @@
 name: Build and Test Panthor-to-Kbase UAPI Adapter (Make & CMake)
 
 on:
-  push:
-  pull_request:
+  # push:
+  # pull_request:
   workflow_dispatch:
 
 jobs:

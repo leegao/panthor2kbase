@@ -46,11 +46,8 @@ RUN_BIN tests/test_ludashi_panvk_aot_and_host
 RUN_BIN tests/panprobe_runner_suite
 
 echo "================================================================================"
-echo " [Suite 4/8] Khronos WSI 3D vkcube End-to-End (AOT & Decompiled r54p3 ICDs)    "
+echo " [Suite 4/8] DXVK AOT Layers E2E                                                "
 echo "================================================================================"
-RUN_BIN aot/aot_vkcube
-RUN_BIN aot/aot_vkcube src/aot/r54p3_vulkan_icd/lib/r54p3_decompiled_icd.x86_64.json
-RUN_BIN tests/test_wayland_and_vkgears_e2e
 RUN_BIN tests/test_dxvk_aot_layers_e2e
 
 echo "================================================================================"

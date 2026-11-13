@@ -41,7 +41,6 @@ clean:
 	      libvulkan_panfrost_patched.so libmali_uapi_tracer.so \
 	      tests/run_vulkan_samples_and_equivalence_suite \
 	      tests/unit_tests_edge_cases \
-	      tests/test_wayland_and_vkgears_e2e \
 	      tests/panprobe/panprobe_runner_suite \
 	      tests/test_ludashi_panvk_aot_and_host \
 	      build/test_dxvk_aot_layers_e2e \

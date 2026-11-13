@@ -317,136 +317,15 @@ int main(int argc, char** argv) {
     runComputeShaderViaIcd("vector_compute.spv", buildVectorComputeSpv(), exp_vec);
     runComputeShaderViaIcd("branch_loop_compute.spv", buildBranchLoopComputeSpv(), exp_loop);
 
-    // ------------------------------------------------------------------------
-    // Stage 5: 3D vkcube Multi-Frame Rendering via vkCmdDrawIndexed + vkQueueSubmit
-    // ------------------------------------------------------------------------
-    uint64_t buf_fb = 0, mem_fb = 0;
-    void* ptr_fb = nullptr;
-    assert(createBuf(device, &bci, nullptr, &buf_fb) == 0);
-    assert(allocMem(device, &mai, nullptr, &mem_fb) == 0);
-    assert(bindBuf(device, buf_fb, mem_fb, 0) == 0);
-    assert(mapMem(device, mem_fb, 0, 16384, 0, &ptr_fb) == 0 && ptr_fb != nullptr);
-
-    // Set up MaliIdvsDrawPacket + MaliMfbdDescriptor + 24-vertex Cube in ptr_in (mapped /dev/mali0 BO)
-    uint8_t* geom_base = static_cast<uint8_t*>(ptr_in);
-    auto* cube_verts   = reinterpret_cast<MaliCubeVertex*>(geom_base + 0x100);
-    auto* cube_indices = reinterpret_cast<uint32_t*>(geom_base + 0x580);
-    auto* mvp_ubo      = reinterpret_cast<float*>(geom_base + 0x680);
-    auto* mfbd         = reinterpret_cast<MaliMfbdDescriptor*>(geom_base + 0x780);
-    auto* idvs_pkt     = reinterpret_cast<MaliIdvsDrawPacket*>(geom_base + 0x000); // at offset 0 of buf_in!
-    auto* vs_spd       = reinterpret_cast<uint64_t*>(geom_base + 0x880);
-    auto* fs_spd       = reinterpret_cast<uint64_t*>(geom_base + 0x8C0);
-    auto* stats_out    = reinterpret_cast<uint32_t*>(geom_base + 0x900);
-
-    // Build cube geometry & MVP using a shader module's EXEC_VA BO
-    auto vec_spv = buildVectorComputeSpv();
-    struct VkShaderModuleCreateInfo {
-        uint32_t sType; const void* pNext; uint32_t flags; size_t codeSize; const uint32_t* pCode;
-    } smci = {16, nullptr, 0, vec_spv.size() * 4, vec_spv.data()};
-    uint64_t cube_sm = 0;
-    reinterpret_cast<PFN_vkCreateShaderModule>(gipa(instance, "vkCreateShaderModule"))(device, &smci, nullptr, &cube_sm);
-
-    // Populate cube faces
-    struct FaceDef { float nx, ny, nz, cr, cg, cb; float v[4][3]; };
-    const FaceDef faces[6] = {
-        {  0,  0,  1, 0.95f, 0.25f, 0.20f, { {-1,-1, 1}, { 1,-1, 1}, { 1, 1, 1}, {-1, 1, 1} } },
-        {  0,  0, -1, 0.15f, 0.85f, 0.90f, { { 1,-1,-1}, {-1,-1,-1}, {-1, 1,-1}, { 1, 1,-1} } },
-        {  1,  0,  0, 0.20f, 0.90f, 0.35f, { { 1,-1, 1}, { 1,-1,-1}, { 1, 1,-1}, { 1, 1, 1} } },
-        { -1,  0,  0, 0.90f, 0.25f, 0.85f, { {-1,-1,-1}, {-1,-1, 1}, {-1, 1, 1}, {-1, 1,-1} } },
-        {  0,  1,  0, 0.98f, 0.85f, 0.15f, { {-1, 1, 1}, { 1, 1, 1}, { 1, 1,-1}, {-1, 1,-1} } },
-        {  0, -1,  0, 0.25f, 0.45f, 0.98f, { {-1,-1,-1}, { 1,-1,-1}, { 1,-1, 1}, {-1,-1, 1} } }
-    };
-    for (uint32_t f = 0; f < 6; ++f) {
-        for (uint32_t k = 0; k < 4; ++k) {
-            auto& dst = cube_verts[f * 4 + k];
-            dst.px = faces[f].v[k][0]; dst.py = faces[f].v[k][1]; dst.pz = faces[f].v[k][2]; dst.pw = 1.0f;
-            dst.cr = faces[f].cr; dst.cg = faces[f].cg; dst.cb = faces[f].cb; dst.ca = 1.0f;
-            dst.nx = faces[f].nx; dst.ny = faces[f].ny; dst.nz = faces[f].nz; dst.nw = 0.0f;
-        }
-        uint32_t base = f * 4;
-        cube_indices[f*6+0] = base+0; cube_indices[f*6+1] = base+1; cube_indices[f*6+2] = base+2;
-        cube_indices[f*6+3] = base+0; cube_indices[f*6+4] = base+2; cube_indices[f*6+5] = base+3;
-    }
-
-    vs_spd[0] = 0; vs_spd[1] = 0;
-    fs_spd[0] = 0; fs_spd[1] = 0;
-    mfbd->magic             = MALI_MFBD_MAGIC;
-    mfbd->width             = 64;
-    mfbd->height            = 64;
-    mfbd->sample_count      = 1;
-    mfbd->clear_color_rgba8 = 0xFF181410U;
-    mfbd->clear_depth       = 1.0f;
-    mfbd->color_rt0_gpu_va  = reinterpret_cast<uint64_t>(ptr_fb);
-    mfbd->depth_bo_gpu_va   = reinterpret_cast<uint64_t>(ptr_out);
-    mfbd->stats_bo_gpu_va   = reinterpret_cast<uint64_t>(stats_out);
-
-    idvs_pkt->magic            = MALI_IDVS_MAGIC;
-    idvs_pkt->vertex_count     = 24;
-    idvs_pkt->index_count      = 36;
-    idvs_pkt->instance_count   = 1;
-    idvs_pkt->vertex_bo_gpu_va = reinterpret_cast<uint64_t>(cube_verts);
-    idvs_pkt->index_bo_gpu_va  = reinterpret_cast<uint64_t>(cube_indices);
-    idvs_pkt->mvp_ubo_gpu_va   = reinterpret_cast<uint64_t>(mvp_ubo);
-    idvs_pkt->mfbd_gpu_va      = reinterpret_cast<uint64_t>(mfbd);
-    idvs_pkt->vs_spd_gpu_va    = reinterpret_cast<uint64_t>(vs_spd);
-    idvs_pkt->fs_spd_gpu_va    = reinterpret_cast<uint64_t>(fs_spd);
-
-    auto renderCubeFrameViaIcd = [&](uint32_t frame_no, float angle_deg) -> uint32_t {
-        idvs_pkt->frame_index  = frame_no;
-        idvs_pkt->rotation_deg = angle_deg;
-        float rad_y = angle_deg * 3.1415926535f / 180.0f;
-        float rad_x = 24.0f     * 3.1415926535f / 180.0f;
-        float cy = std::cos(rad_y), sy = std::sin(rad_y);
-        float cx = std::cos(rad_x), sx = std::sin(rad_x);
-        float s = 0.52f;
-        mvp_ubo[0] = s*cy;       mvp_ubo[1] = s*sx*sy;    mvp_ubo[2] = -0.25f*cx*sy; mvp_ubo[3] = 0.0f;
-        mvp_ubo[4] = 0.0f;       mvp_ubo[5] = s*cx;       mvp_ubo[6] = 0.25f*sx;     mvp_ubo[7] = 0.0f;
-        mvp_ubo[8] = s*sy;       mvp_ubo[9] = -s*sx*cy;   mvp_ubo[10]= -0.25f*cx*cy; mvp_ubo[11]= 0.0f;
-        mvp_ubo[12]= 0.0f;       mvp_ubo[13]= 0.0f;       mvp_ubo[14]= 0.0f;         mvp_ubo[15]= 1.0f;
-        mvp_ubo[16]= 0.408248f;  mvp_ubo[17]= 0.577350f;  mvp_ubo[18]= 0.707107f;    mvp_ubo[19]= 0.0f;
-
-        struct VkCommandBufferBeginInfo { uint32_t sType; const void* pNext; uint32_t flags; const void* pInh; } cbbi = {42, nullptr, 0, nullptr};
-        reinterpret_cast<PFN_vkBeginCommandBuffer>(gipa(instance, "vkBeginCommandBuffer"))(cmd_buf, &cbbi);
-        reinterpret_cast<PFN_vkCmdBindDescriptorSets>(gipa(instance, "vkCmdBindDescriptorSets"))(cmd_buf, 0, pipe_layout, 0, 1, &desc_set, 0, nullptr);
-        reinterpret_cast<PFN_vkCmdDrawIndexed>(gipa(instance, "vkCmdDrawIndexed"))(cmd_buf, 36, 1, 0, 0, frame_no);
-        reinterpret_cast<PFN_vkEndCommandBuffer>(gipa(instance, "vkEndCommandBuffer"))(cmd_buf);
-
-        struct VkSubmitInfo {
-            uint32_t sType; const void* pNext; uint32_t waitC; const uint64_t* pWaitS; const uint32_t* pWaitM;
-            uint32_t cbC; void* const* pCbs; uint32_t sigC; const uint64_t* pSigS;
-        } si = {4, nullptr, 0, nullptr, nullptr, 1, &cmd_buf, 0, nullptr};
-        assert(reinterpret_cast<PFN_vkQueueSubmit>(gipa(instance, "vkQueueSubmit"))(queue, 1, &si, 0) == 0);
-        reinterpret_cast<PFN_vkQueueWaitIdle>(gipa(instance, "vkQueueWaitIdle"))(queue);
-
-        const uint32_t* rgba = static_cast<const uint32_t*>(ptr_fb);
-        uint32_t shaded = 0, crc = 0x811C9DC5U;
-        for (int i = 0; i < 64 * 64; ++i) {
-            if (rgba[i] != 0xFF181410U) shaded++;
-            crc = (crc ^ rgba[i]) * 0x01000193U;
-        }
-        assert(shaded == 1788);
-        return crc;
-    };
-
-    uint32_t crc0 = renderCubeFrameViaIcd(0, 25.0f);
-    uint32_t crc1 = renderCubeFrameViaIcd(1, 65.0f);
-    assert(crc0 != crc1);
-    std::cout << "[PASS] ICD Stage 5 (3D vkcube via vkCmdDrawIndexed + vkQueueSubmit):\n"
-              << "       Frame 0 (25 deg): shaded_px=1788, crc32=0x" << std::hex << crc0 << "\n"
-              << "       Frame 1 (65 deg): shaded_px=1788, crc32=0x" << crc1 << std::dec << "\n";
-
-    reinterpret_cast<PFN_vkDestroyShaderModule>(gipa(instance, "vkDestroyShaderModule"))(device, cube_sm, nullptr);
-    reinterpret_cast<PFN_vkDestroyBuffer>(gipa(instance, "vkDestroyBuffer"))(device, buf_fb, nullptr);
     reinterpret_cast<PFN_vkDestroyBuffer>(gipa(instance, "vkDestroyBuffer"))(device, buf_in, nullptr);
     reinterpret_cast<PFN_vkDestroyBuffer>(gipa(instance, "vkDestroyBuffer"))(device, buf_out, nullptr);
-    reinterpret_cast<PFN_vkFreeMemory>(gipa(instance, "vkFreeMemory"))(device, mem_fb, nullptr);
     reinterpret_cast<PFN_vkFreeMemory>(gipa(instance, "vkFreeMemory"))(device, mem_in, nullptr);
     reinterpret_cast<PFN_vkFreeMemory>(gipa(instance, "vkFreeMemory"))(device, mem_out, nullptr);
     reinterpret_cast<PFN_vkDestroyDevice>(gipa(instance, "vkDestroyDevice"))(device, nullptr);
     reinterpret_cast<PFN_vkDestroyInstance>(gipa(instance, "vkDestroyInstance"))(instance, nullptr);
 
     std::cout << "================================================================================\n";
-    std::cout << " ALL 5 E2E VULKAN ICD STAGES PASSED VIA SYSTEM KHRONOS LOADER (libvulkan.so.1)! \n";
+    std::cout << " ALL 4 E2E VULKAN ICD STAGES PASSED VIA SYSTEM KHRONOS LOADER (libvulkan.so.1)! \n";
     std::cout << "================================================================================\n";
     return 0;
 }

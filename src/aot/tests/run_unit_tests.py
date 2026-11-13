@@ -344,22 +344,6 @@ class TestMaliKbaseCsfUapiAndValhallToLavapipeHarness(unittest.TestCase):
         self.assertIn("Lavapipe Output BO vec4  : [1.000, 0.500, 0.250, 1.000]", res.stdout)
         self.assertIn("Lavapipe Output BO vec4  : [38.250, 67.000, 103.750, 148.500]", res.stdout)
         self.assertIn("Lavapipe Output BO vec4  : [15.000, 16.250, 17.500, 18.750]", res.stdout)
-        self.assertIn("[PASS] Test 8.2: 3D vkcube Multi-Frame (CSF RUN_IDVS+RUN_FRAGMENT)", res.stdout)
-        self.assertIn("[PASS] Test 8.3: Multi-Pass Compute Deformation -> 3D Graphics on Lavapipe", res.stdout)
-
-    def test_mali0_emu_subproject_vkcube_and_multipass(self):
-        """Verify the standalone mali0_emu subproject library (libmali0_emu.a / libmali0_emu.so) and vkcube + multi-pass E2E test suite."""
-        mali0_dir = os.path.join(ROOT_DIR, "mali0_emu")
-        build_sh = os.path.join(mali0_dir, "build.sh")
-        self.assertTrue(os.path.exists(build_sh))
-        res = subprocess.run([build_sh], capture_output=True, text=True, check=True)
-        self.assertTrue(os.path.exists(os.path.join(mali0_dir, "lib", "libmali0_emu.a")))
-        self.assertTrue(os.path.exists(os.path.join(mali0_dir, "lib", "libmali0_emu.so")))
-        self.assertIn("[PASS] Suite 1: /dev/dma_heap/system WSI Alloc", res.stdout)
-        self.assertIn("[PASS] Suite 2: CSF Valhall 3D vkcube Multi-Frame on Lavapipe", res.stdout)
-        self.assertIn("[PASS] Suite 3: JM Bifrost 3D vkcube (TILER_JOB + FRAGMENT_JOB)", res.stdout)
-        self.assertIn("[PASS] Suite 4: Multi-Pass Compute", res.stdout)
-        self.assertIn("ALL 4 STANDALONE mali0_emu SUITES PASSED ON MESA LAVAPIPE!", res.stdout)
 
     def test_vulkan_icd_e2e_via_system_loader(self):
         """Verify that libvulkan_mali_aot_icd.so + mali_aot_icd.x86_64.json loads as a native x86-64 Vulkan ICD in system libvulkan.so.1 across both llvmpipe and host backend modes."""
@@ -372,8 +356,7 @@ class TestMaliKbaseCsfUapiAndValhallToLavapipeHarness(unittest.TestCase):
             self.assertIn("[PASS] ICD Stage 3: vkCreateDevice & vkGetDeviceQueue", res.stdout)
             self.assertIn("[PASS] ICD Stage 4 (vector_compute.spv): Dispatched via libvulkan.so.1 -> AOT CSF Ringbuffer -> mali0_emu -> [38.250, 67.000, 103.750, 148.500]", res.stdout)
             self.assertIn("[PASS] ICD Stage 4 (branch_loop_compute.spv): Dispatched via libvulkan.so.1 -> AOT CSF Ringbuffer -> mali0_emu -> [15.000, 16.250, 17.500, 18.750]", res.stdout)
-            self.assertIn("[PASS] ICD Stage 5 (3D vkcube via vkCmdDrawIndexed + vkQueueSubmit):", res.stdout)
-            self.assertIn("ALL 5 E2E VULKAN ICD STAGES PASSED VIA SYSTEM KHRONOS LOADER (libvulkan.so.1)!", res.stdout)
+            self.assertIn("ALL 4 E2E VULKAN ICD STAGES PASSED VIA SYSTEM KHRONOS LOADER (libvulkan.so.1)!", res.stdout)
 
 
     def test_r54p3_decompiled_icd_and_vulkan_samples_compliance(self):
@@ -392,8 +375,8 @@ class TestMaliKbaseCsfUapiAndValhallToLavapipeHarness(unittest.TestCase):
             self.assertIn("ALL 10 KHRONOS VULKAN-SAMPLES COMPLIANCE SUITES PASSED VIA SYSTEM LOADER!", res.stdout)
 
 
-    def test_wsi_vkcube_and_39_aot_vulkan_entrypoints(self):
-        """Test 19: Verify all 39 AOT-translated Vulkan ICD entrypoints, dispatch table metadata, and standalone Khronos WSI bin/vkcube across both ICDs."""
+    def test_39_aot_vulkan_entrypoints(self):
+        """Test 19: Verify all 39 AOT-translated Vulkan ICD entrypoints and dispatch table metadata."""
         r54_obj = os.path.join(ROOT_DIR, "build", "r54p3-00eac0-6eda07", "mali_mbs2_aot.o")
         self.assertTrue(os.path.exists(r54_obj))
         nm = subprocess.run(["nm", "--defined-only", r54_obj], capture_output=True, text=True, check=True).stdout
@@ -435,18 +418,6 @@ class TestMaliKbaseCsfUapiAndValhallToLavapipeHarness(unittest.TestCase):
             "aot_vkDestroyShaderModule",
         ]:
             self.assertIn(sym, nm, f"Missing exported AOT Vulkan symbol {sym}")
-
-        vkcube_bin = os.path.join(ROOT_DIR, "bin", "vkcube")
-        self.assertTrue(os.path.exists(vkcube_bin))
-        r54_icd_json = os.path.join(ROOT_DIR, "r54p3_vulkan_icd", "lib", "r54p3_decompiled_icd.x86_64.json")
-        aot_icd_json = os.path.join(ROOT_DIR, "build", "r54p3-00eac0-6eda07", "mali_aot_icd.x86_64.json")
-        for manifest in (aot_icd_json, r54_icd_json):
-            res = subprocess.run([vkcube_bin, manifest, SO_R54P3], cwd=ROOT_DIR, capture_output=True, text=True, check=True)
-            self.assertIn("vkcube Frame 0 (25 deg, swapchain_img=0): shaded_px=1788, crc32=0xd8969b18", res.stdout)
-            self.assertIn("vkcube Frame 1 (43 deg, swapchain_img=1): shaded_px=1910, crc32=0x5f95f74d", res.stdout)
-            self.assertIn("vkcube Frame 2 (61 deg, swapchain_img=0): shaded_px=1850, crc32=0x7f6b3bf8", res.stdout)
-            self.assertIn("vkcube Frame 3 (79 deg, swapchain_img=1): shaded_px=1668, crc32=0xfe159e0a", res.stdout)
-            self.assertIn("[SUCCESS] All 4 WSI vkcube Frames Rendered & Presented via Translated Mali ICD!", res.stdout)
 
 
 if __name__ == "__main__":

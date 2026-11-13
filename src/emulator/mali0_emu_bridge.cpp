@@ -2,7 +2,7 @@
 // mali0_emu.cpp
 // Standalone C/C++ Library Implementation for /dev/mali0 & /dev/dma_heap Emulator
 // ============================================================================
-#include "../aot/include/mali0_emu.hpp"
+#include "../aot/include/mali0_emu_device.hpp"
 
 namespace {
 MaliKbaseCsfKernelEmulator& getGlobalEmulator() {

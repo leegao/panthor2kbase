@@ -199,77 +199,6 @@ void vkGetPhysicalDeviceProperties(void* physicalDevice, void* pProperties) {
         g_aot_rt.cpu.x[1] = reinterpret_cast<uint64_t>(props);
         aot_vkGetPhysicalDeviceProperties(&g_aot_rt.cpu);
     }
-
-    // Ensure top-level header fields reflect active emulated /dev/mali0 GPU profile & driver version
-    props->apiVersion    = g_aot_rt.aot_queried_api_version;
-    props->driverVersion = (54U << 22) | (3U << 12);
-    props->vendorID      = 0x13B5U; // Arm Ltd.
-    props->deviceID      = static_cast<uint32_t>(g_icd_kbase_emu.raw_gpu_id);
-    props->deviceType    = 1U;      // VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
-
-    const char* gpu_model = "Arm Mali-G615";
-    if (g_icd_kbase_emu.gpu_product_id == MALI_PROFILE_G76_JM) gpu_model = "Arm Mali-G76";
-    else if (g_icd_kbase_emu.gpu_product_id == MALI_PROFILE_G78_JM) gpu_model = "Arm Mali-G78";
-    else if (g_icd_kbase_emu.gpu_product_id == MALI_PROFILE_G925_CSF) gpu_model = "Arm Immortalis-G925";
-
-    std::snprintf(props->deviceName, sizeof(props->deviceName),
-                  "%s (AOT %s via mali0_emu [%s])",
-                  gpu_model,
-                  g_aot_rt.mapper.driver_version.c_str(),
-                  g_icd_kbase_emu.lvp_executor.device_name.empty() ? "llvmpipe" : g_icd_kbase_emu.lvp_executor.device_name.c_str());
-
-    // Guarantee full Valhall G615 VkPhysicalDeviceLimits & DXVK 1.10.3 VP_DXVK_d3d11_level_11_1_baseline limits
-    uint8_t* lim = props->limits.raw;
-    if (*reinterpret_cast<uint32_t*>(lim + 0) == 0)   *reinterpret_cast<uint32_t*>(lim + 0)   = 16384U; // maxImageDimension1D
-    if (*reinterpret_cast<uint32_t*>(lim + 4) == 0)   *reinterpret_cast<uint32_t*>(lim + 4)   = 16384U; // maxImageDimension2D
-    if (*reinterpret_cast<uint32_t*>(lim + 8) == 0)   *reinterpret_cast<uint32_t*>(lim + 8)   = 2048U;  // maxImageDimension3D
-    if (*reinterpret_cast<uint32_t*>(lim + 12) == 0)  *reinterpret_cast<uint32_t*>(lim + 12)  = 16384U; // maxImageDimensionCube
-    if (*reinterpret_cast<uint32_t*>(lim + 16) == 0)  *reinterpret_cast<uint32_t*>(lim + 16)  = 2048U;  // maxImageArrayLayers
-    if (*reinterpret_cast<uint32_t*>(lim + 20) == 0)  *reinterpret_cast<uint32_t*>(lim + 20)  = 134217728U; // maxTexelBufferElements
-    if (*reinterpret_cast<uint32_t*>(lim + 24) == 0)  *reinterpret_cast<uint32_t*>(lim + 24)  = 65536U; // maxUniformBufferRange
-    if (*reinterpret_cast<uint32_t*>(lim + 28) == 0)  *reinterpret_cast<uint32_t*>(lim + 28)  = 0xFFFFFFFFU; // maxStorageBufferRange
-    if (*reinterpret_cast<uint32_t*>(lim + 32) < 256U) *reinterpret_cast<uint32_t*>(lim + 32) = 256U;   // maxPushConstantsSize (256B for DXVK)
-    if (*reinterpret_cast<uint32_t*>(lim + 36) < 4096U) *reinterpret_cast<uint32_t*>(lim + 36) = 4096U; // maxMemoryAllocationCount
-    if (*reinterpret_cast<uint32_t*>(lim + 40) < 4000U) *reinterpret_cast<uint32_t*>(lim + 40) = 4000U; // maxSamplerAllocationCount
-    if (*reinterpret_cast<uint64_t*>(lim + 48) == 0)  *reinterpret_cast<uint64_t*>(lim + 48)  = 64ULL;  // bufferImageGranularity
-    if (*reinterpret_cast<uint32_t*>(lim + 64) < 8U)  *reinterpret_cast<uint32_t*>(lim + 64)  = 8U;     // maxBoundDescriptorSets
-    if (*reinterpret_cast<uint32_t*>(lim + 68) == 0)  *reinterpret_cast<uint32_t*>(lim + 68)  = 1024U;  // maxPerStageDescriptorSamplers
-    if (*reinterpret_cast<uint32_t*>(lim + 128) == 0) *reinterpret_cast<uint32_t*>(lim + 128) = 32U;    // maxVertexInputAttributes
-    if (*reinterpret_cast<uint32_t*>(lim + 132) == 0) *reinterpret_cast<uint32_t*>(lim + 132) = 32U;    // maxVertexInputBindings
-    if (*reinterpret_cast<uint32_t*>(lim + 136) == 0) *reinterpret_cast<uint32_t*>(lim + 136) = 2047U;  // maxVertexInputAttributeOffset
-    if (*reinterpret_cast<uint32_t*>(lim + 140) == 0) *reinterpret_cast<uint32_t*>(lim + 140) = 2048U;  // maxVertexInputBindingStride
-    if (*reinterpret_cast<uint32_t*>(lim + 144) == 0) *reinterpret_cast<uint32_t*>(lim + 144) = 128U;   // maxVertexOutputComponents
-    if (*reinterpret_cast<uint32_t*>(lim + 200) == 0) *reinterpret_cast<uint32_t*>(lim + 200) = 128U;   // maxFragmentInputComponents
-    if (*reinterpret_cast<uint32_t*>(lim + 204) == 0) *reinterpret_cast<uint32_t*>(lim + 204) = 8U;     // maxFragmentOutputAttachments
-    if (*reinterpret_cast<uint32_t*>(lim + 216) == 0) *reinterpret_cast<uint32_t*>(lim + 216) = 32768U; // maxComputeSharedMemorySize
-    if (*reinterpret_cast<uint32_t*>(lim + 232) == 0) *reinterpret_cast<uint32_t*>(lim + 232) = 1024U;  // maxComputeWorkGroupInvocations
-    if (*reinterpret_cast<uint32_t*>(lim + 260) == 0) *reinterpret_cast<uint32_t*>(lim + 260) = 0xFFFFFFFFU; // maxDrawIndexedIndexValue
-    if (*reinterpret_cast<uint32_t*>(lim + 264) < 0xFFFFU) *reinterpret_cast<uint32_t*>(lim + 264) = 0xFFFFFFFFU; // maxDrawIndirectCount
-    if (*reinterpret_cast<float*>(lim + 272) < 16.0f) *reinterpret_cast<float*>(lim + 272)    = 16.0f;  // maxSamplerAnisotropy
-    if (*reinterpret_cast<uint32_t*>(lim + 276) < 16U) *reinterpret_cast<uint32_t*>(lim + 276) = 16U;   // maxViewports
-    if (*reinterpret_cast<uint32_t*>(lim + 280) == 0) *reinterpret_cast<uint32_t*>(lim + 280) = 16384U; // maxViewportDimensions[0]
-    if (*reinterpret_cast<uint32_t*>(lim + 284) == 0) *reinterpret_cast<uint32_t*>(lim + 284) = 16384U; // maxViewportDimensions[1]
-    if (*reinterpret_cast<uint64_t*>(lim + 304) == 0) *reinterpret_cast<uint64_t*>(lim + 304) = 64ULL;  // minMemoryMapAlignment
-    if (*reinterpret_cast<uint64_t*>(lim + 312) == 0) *reinterpret_cast<uint64_t*>(lim + 312) = 64ULL;  // minTexelBufferOffsetAlignment
-    if (*reinterpret_cast<uint64_t*>(lim + 320) == 0) *reinterpret_cast<uint64_t*>(lim + 320) = 64ULL;  // minUniformBufferOffsetAlignment
-    if (*reinterpret_cast<uint64_t*>(lim + 328) == 0) *reinterpret_cast<uint64_t*>(lim + 328) = 64ULL;  // minStorageBufferOffsetAlignment
-    if (*reinterpret_cast<uint32_t*>(lim + 364) == 0) *reinterpret_cast<uint32_t*>(lim + 364) = 16384U; // maxFramebufferWidth
-    if (*reinterpret_cast<uint32_t*>(lim + 368) == 0) *reinterpret_cast<uint32_t*>(lim + 368) = 16384U; // maxFramebufferHeight
-    if (*reinterpret_cast<uint32_t*>(lim + 372) == 0) *reinterpret_cast<uint32_t*>(lim + 372) = 2048U;  // maxFramebufferLayers
-    // Sample counts (VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT = 0x05) required by vkgears & DXVK:
-    *reinterpret_cast<uint32_t*>(lim + 376) |= 0x05U;  // framebufferColorSampleCounts
-    *reinterpret_cast<uint32_t*>(lim + 380) |= 0x05U;  // framebufferDepthSampleCounts
-    *reinterpret_cast<uint32_t*>(lim + 384) |= 0x05U;  // framebufferStencilSampleCounts
-    *reinterpret_cast<uint32_t*>(lim + 388) |= 0x05U;  // framebufferNoAttachmentsSampleCounts
-    if (*reinterpret_cast<uint32_t*>(lim + 392) == 0) *reinterpret_cast<uint32_t*>(lim + 392) = 8U;     // maxColorAttachments
-    *reinterpret_cast<uint32_t*>(lim + 396) |= 0x05U;  // sampledImageColorSampleCounts
-    *reinterpret_cast<uint32_t*>(lim + 400) |= 0x05U;  // sampledImageIntegerSampleCounts
-    *reinterpret_cast<uint32_t*>(lim + 404) |= 0x05U;  // sampledImageDepthSampleCounts
-    *reinterpret_cast<uint32_t*>(lim + 408) |= 0x05U;  // sampledImageStencilSampleCounts
-    *reinterpret_cast<uint32_t*>(lim + 412) |= 0x01U;  // storageImageSampleCounts
-    if (*reinterpret_cast<uint32_t*>(lim + 420) == 0) *reinterpret_cast<uint32_t*>(lim + 420) = 1U;     // timestampComputeAndGraphics
-    if (*reinterpret_cast<float*>(lim + 424) == 0.0f) *reinterpret_cast<float*>(lim + 424)    = 1.0f;   // timestampPeriod
-    if (*reinterpret_cast<uint64_t*>(lim + 496) == 0) *reinterpret_cast<uint64_t*>(lim + 496) = 64ULL;  // nonCoherentAtomSize
 }
 
 struct VkBaseOutStructureIcd {
@@ -377,8 +306,6 @@ void vkGetPhysicalDeviceFeatures(void* physicalDevice, void* pFeatures) {
         g_aot_rt.cpu.x[1] = reinterpret_cast<uint64_t>(pFeatures);
         aot_vkGetPhysicalDeviceFeatures(&g_aot_rt.cpu);
     }
-    uint32_t* f = static_cast<uint32_t*>(pFeatures);
-    for (int i = 0; i < 55; ++i) f[i] = 1U;
 }
 
 __attribute__((visibility("default")))
@@ -393,7 +320,6 @@ void vkGetPhysicalDeviceFeatures2(void* physicalDevice, void* pFeatures2) {
         g_aot_rt.cpu.x[1] = reinterpret_cast<uint64_t>(pFeatures2);
         aot_vkGetPhysicalDeviceFeatures2(&g_aot_rt.cpu);
     }
-    vkGetPhysicalDeviceFeatures(physicalDevice, static_cast<uint8_t*>(pFeatures2) + 16);
 }
 
 __attribute__((visibility("default")))

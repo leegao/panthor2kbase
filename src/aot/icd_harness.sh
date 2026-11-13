@@ -51,9 +51,8 @@ fi
 ICD_SO="$BUILD_DIR/libvulkan_mali_aot_icd.so"
 ICD_JSON="$BUILD_DIR/mali_aot_icd.x86_64.json"
 CLIENT_BIN="$ROOT_DIR/bin/test_vulkan_icd_client"
-VKCUBE_BIN="$ROOT_DIR/bin/vkcube"
 
-echo "[1/4] Building AOT Vulkan ICD ($ICD_SO)..."
+echo "[1/3] Building AOT Vulkan ICD ($ICD_SO)..."
 g++ -O3 -std=c++17 -fno-strict-aliasing -shared -fPIC \
     "$ROOT_DIR/src/mali_vulkan_icd.cpp" \
     "$BUILD_DIR/mali_mbs2_aot.o" \
@@ -69,7 +68,7 @@ cat << JSON_EOF > "$ICD_JSON"
 }
 JSON_EOF
 
-echo "[2/4] Building & Running E2E Vulkan ICD Client ($CLIENT_BIN)..."
+echo "[2/3] Building & Running E2E Vulkan ICD Client ($CLIENT_BIN)..."
 g++ -O3 -std=c++17 -fno-strict-aliasing \
     "$ROOT_DIR/tests/test_vulkan_icd_client.cpp" \
     -o "$CLIENT_BIN" "$ROOT_DIR/../../libmali_kbase_emu.so" -Wl,-rpath,"$ROOT_DIR/../.." -ldl -lm
@@ -81,14 +80,7 @@ export MALI0_EMU_BACKEND="$BACKEND_MODE"
 "$CLIENT_BIN" "$ICD_JSON" "$SO_PATH"
 
 echo ""
-echo "[3/4] Building & Running Khronos WSI 3D vkcube ($VKCUBE_BIN)..."
-g++ -O3 -std=c++17 -fno-strict-aliasing -I"$ROOT_DIR/include" \
-    "$ROOT_DIR/tests/vkcube_wsi_e2e.cpp" \
-    -o "$VKCUBE_BIN" -ldl -lpthread -lm
-"$VKCUBE_BIN" "$ICD_JSON" "$SO_PATH"
-
-echo ""
-echo "[4/4] Building decompiled r54p3_vulkan_icd & running 10-suite Khronos Vulkan-Samples compliance..."
+echo "[3/3] Building decompiled r54p3_vulkan_icd & running 10-suite Khronos Vulkan-Samples compliance..."
 "$ROOT_DIR/r54p3_vulkan_icd/build.sh"
 if [ ! -f "$ROOT_DIR/bin/test_vulkan_samples_compliance" ] || [ "$ROOT_DIR/tests/test_vulkan_samples_compliance.cpp" -nt "$ROOT_DIR/bin/test_vulkan_samples_compliance" ]; then
     g++ -O2 -std=c++17 -I"$ROOT_DIR/include" -I"$ROOT_DIR/r54p3_vulkan_icd/include" \

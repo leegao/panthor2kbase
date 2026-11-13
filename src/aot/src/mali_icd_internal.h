@@ -43,7 +43,7 @@
 
 #include <cstdarg>
 #include <unistd.h>
-#include "../include/mali0_emu.hpp"
+#include "../include/mali0_emu_device.hpp"
 #include "../include/mali_aapcs64_auto_thunks.hpp"
 #define AOT_SO_PROFILER_IMPLEMENTATION
 #include "../include/aot_so_profiler.hpp"
@@ -1398,9 +1398,7 @@ struct MaliIcdRecordedCmd {
         CMD_CLEAR_COLOR_IMAGE = 6,
         CMD_CLEAR_ATTACHMENTS = 7,
         CMD_WRITE_TIMESTAMP = 8,
-        CMD_PIPELINE_BARRIER = 9,
-        CMD_DRAW_INDEXED_VKCUBE = CMD_DRAW_INDEXED,
-        CMD_DRAW_GEARS          = CMD_DRAW
+        CMD_PIPELINE_BARRIER = 9
     } type;
     uint32_t              rp_draw_idx = 0;
     MaliIcdPipeline*      pipeline = nullptr;
@@ -1421,8 +1419,6 @@ struct MaliIcdRecordedCmd {
     uint64_t              index_bo_size = 0;
     uint32_t              index_type = 1; // 0 = UINT16, 1 = UINT32
     uint8_t               push_constants[256]{};
-    float                 vkcube_angle_deg = 25.0f;
-    uint32_t              vkcube_frame_idx = 0;
     uint64_t              src_va = 0, dst_va = 0, copy_bytes = 0;
     MaliIcdImage*         src_image = nullptr;
     MaliIcdImage*         dst_image = nullptr;

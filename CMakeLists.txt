@@ -387,14 +387,6 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
    )
 
    # AOT binaries
-   add_executable(aot_vkcube
-      src/aot/tests/vkcube_wsi_e2e.cpp
-   )
-   target_link_libraries(aot_vkcube PRIVATE ${PLATFORM_LIBS})
-   set_target_properties(aot_vkcube PROPERTIES
-      RUNTIME_OUTPUT_DIRECTORY "${AOT_DIR}"
-   )
-
    add_executable(test_vulkan_samples_compliance
       src/aot/tests/test_vulkan_samples_compliance.cpp
    )
@@ -551,26 +543,6 @@ if(PANTHOR_KBASE_BUILD_TESTS AND NOT ANDROID)
       RUNTIME_OUTPUT_DIRECTORY "${TESTS_DIR}"
    )
    add_test(NAME ludashi_panvk_aot_and_host COMMAND test_ludashi_panvk_aot_and_host WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
-
-   add_executable(test_wayland_and_vkgears_e2e
-      tests/test_wayland_and_vkgears_e2e.cpp
-   )
-   target_include_directories(test_wayland_and_vkgears_e2e PRIVATE
-      "${CMAKE_CURRENT_SOURCE_DIR}/mesa/include"
-      "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/include"
-   )
-   set(TEST_WAYLAND_LIBS panthor_kbase_adapter mali_kbase_emu ${PLATFORM_LIBS})
-   if(VULKAN_LIB)
-      list(APPEND TEST_WAYLAND_LIBS ${VULKAN_LIB})
-   endif()
-   target_link_libraries(test_wayland_and_vkgears_e2e PRIVATE ${TEST_WAYLAND_LIBS})
-   set_target_properties(test_wayland_and_vkgears_e2e PROPERTIES
-      RUNTIME_OUTPUT_DIRECTORY "${TESTS_DIR}"
-   )
-   if(TARGET aot_targets)
-      add_dependencies(test_wayland_and_vkgears_e2e aot_targets)
-   endif()
-   add_test(NAME test_wayland_and_vkgears_e2e COMMAND test_wayland_and_vkgears_e2e WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
    add_executable(test_dxvk_aot_layers_e2e
       tests/test_dxvk_aot_layers_e2e.cpp

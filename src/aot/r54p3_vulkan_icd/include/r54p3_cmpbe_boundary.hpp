@@ -9,7 +9,7 @@
 #include <cstddef>
 #include <cstring>
 #include <vector>
-#include "../../include/mali0_emu.hpp"
+#include "../../include/mali0_emu_device.hpp"
 
 namespace mali_r54p3 {
 namespace cmpbe {
@@ -162,10 +162,11 @@ inline CmpbeStatus defaultCmpbeV2CompileMultipleShaders(
         res->work_reg_count  = 16;
         res->uniform_reg_cnt = 8;
 
-        if (stage == 0x01U) { // VK_SHADER_STAGE_VERTEX_BIT
-            res->objc_words = MaliVkCubeIsaPipelineTranslator::buildValhallVkCubeVertexObjc();
-        } else if (stage == 0x10U) { // VK_SHADER_STAGE_FRAGMENT_BIT
-            res->objc_words = MaliVkCubeIsaPipelineTranslator::buildValhallVkCubeFragmentObjc();
+        if (stage == 0x01U || stage == 0x10U) { // VK_SHADER_STAGE_VERTEX_BIT / FRAGMENT_BIT
+            res->objc_words = {
+                ValhallISAToSpirvTranslator::encodeLoadI128(0, 60, 0, 1),
+                ValhallISAToSpirvTranslator::encodeNopEnd()
+            };
         } else {
             bool has_branch = false;
             bool has_fmul   = false;
