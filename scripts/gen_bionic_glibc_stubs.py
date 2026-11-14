@@ -455,12 +455,11 @@ def generate_plt_thunks():
         "__android_log_print", "__android_log_write", "android_set_abort_message",
         "atrace_async_begin_body", "atrace_async_end_body", "atrace_begin_body",
         "atrace_end_body", "atrace_get_enabled_tags", "atrace_int64_body",
-        "exit", "_exit", "fork", "execv", "execve", "prctl", "syscall",
+        "fork", "execv", "execve", "prctl", "syscall",
         "__fwrite_chk", "__memchr_chk", "__strchr_chk", "__strcpy_chk",
         "__strncat_chk", "__strncpy_chk", "__strncpy_chk2",
         "fstatfs", "statfs", "statvfs", "readdir", "getpwnam", "getpwuid",
-        "localtime", "localtime_r", "asctime", "strftime", "strftime_l",
-        "getaddrinfo", "freeaddrinfo", "recvmsg", "sendmsg",
+        "localtime", "localtime_r", "strftime",
     }
 
     def split_args(arg_str):
@@ -482,8 +481,7 @@ def generate_plt_thunks():
         return parts
 
     def strip_param_name(p):
-        p = re.sub(r"\b__restrict\b", "", p)
-        p = re.sub(r"\brestrict\b", "", p)
+        p = re.sub(r"\b__restrict\b|\brestrict\b|\b__extension__\b", "", p)
         p = " ".join(p.split())
         if "*" in p:
             idx = p.rfind("*")
@@ -492,21 +490,25 @@ def generate_plt_thunks():
             idx = p.find("[")
             base = p[:idx].strip()
             toks = base.split()
-            if len(toks) > 1 and toks[-1] not in ("int", "long", "char", "short", "unsigned", "signed", "float", "double", "void", "size_t", "ssize_t", "__ssize_t", "off_t", "__off_t", "off64_t", "__off64_t", "mode_t", "__mode_t", "pid_t", "__pid_t", "uid_t", "__uid_t", "gid_t", "__gid_t", "clockid_t", "__clockid_t", "time_t", "__time_t", "locale_t", "wint_t", "wchar_t", "fexcept_t", "nfds_t", "socklen_t", "__socklen_t", "rlim_t", "pthread_t", "pthread_key_t", "Bytef", "uInt", "uLong", "voidpf"):
+            if len(toks) > 1 and toks[-1] not in ("int", "long", "char", "short", "unsigned", "signed", "float", "double", "void", "size_t", "ssize_t", "__ssize_t", "off_t", "__off_t", "off64_t", "__off64_t", "mode_t", "__mode_t", "pid_t", "__pid_t", "uid_t", "__uid_t", "gid_t", "__gid_t", "clockid_t", "__clockid_t", "time_t", "__time_t", "useconds_t", "__useconds_t", "id_t", "__id_t", "__rlimit_resource_t", "__rusage_who_t", "__priority_which_t", "__SOCKADDR_ARG", "__CONST_SOCKADDR_ARG", "locale_t", "wint_t", "wchar_t", "fexcept_t", "nfds_t", "socklen_t", "__socklen_t", "rlim_t", "pthread_t", "pthread_key_t", "Bytef", "uInt", "uLong", "voidpf", "z_streamp"):
                 base = " ".join(toks[:-1])
             return base + "*"
         toks = p.split()
-        if len(toks) > 1 and toks[-1] not in ("int", "long", "char", "short", "unsigned", "signed", "float", "double", "void", "size_t", "ssize_t", "__ssize_t", "off_t", "__off_t", "off64_t", "__off64_t", "mode_t", "__mode_t", "pid_t", "__pid_t", "uid_t", "__uid_t", "gid_t", "__gid_t", "clockid_t", "__clockid_t", "time_t", "__time_t", "locale_t", "wint_t", "wchar_t", "nfds_t", "socklen_t", "__socklen_t", "rlim_t", "pthread_t", "pthread_key_t", "Bytef", "uInt", "uLong", "voidpf"):
+        if len(toks) > 1 and toks[-1] not in ("int", "long", "char", "short", "unsigned", "signed", "float", "double", "void", "size_t", "ssize_t", "__ssize_t", "off_t", "__off_t", "off64_t", "__off64_t", "mode_t", "__mode_t", "pid_t", "__pid_t", "uid_t", "__uid_t", "gid_t", "__gid_t", "clockid_t", "__clockid_t", "time_t", "__time_t", "useconds_t", "__useconds_t", "id_t", "__id_t", "__rlimit_resource_t", "__rusage_who_t", "__priority_which_t", "__SOCKADDR_ARG", "__CONST_SOCKADDR_ARG", "locale_t", "wint_t", "wchar_t", "nfds_t", "socklen_t", "__socklen_t", "rlim_t", "pthread_t", "pthread_key_t", "Bytef", "uInt", "uLong", "voidpf", "z_streamp"):
             if toks[-2] not in ("struct", "enum", "union"):
                 return " ".join(toks[:-1])
         return p
 
     def classify_type(t):
-        t = re.sub(r"\b__restrict\b|\brestrict\b", "", t)
+        t = re.sub(r"\b__restrict\b|\brestrict\b|\b__extension__\b|\bextern\b", "", t)
         t = " ".join(t.split())
         if "*" in t:
             return "ptr", t
-        if t == "locale_t":
+        if t == "__SOCKADDR_ARG":
+            return "ptr", "struct sockaddr *"
+        if t == "__CONST_SOCKADDR_ARG":
+            return "ptr", "const struct sockaddr *"
+        if t in ("locale_t", "z_streamp"):
             return "ptr", t
         t = re.sub(r"\bconst\b|\bvolatile\b", "", t)
         t = " ".join(t.split())
@@ -516,15 +518,17 @@ def generate_plt_thunks():
             return "f32", "float"
         if t == "double":
             return "f64", "double"
-        if "long double" in t or "__float" in t:
+        if t == "long double":
+            return "f128", "long double"
+        if "__float" in t:
             return "unsupported", t
-        if t in ("int", "signed int", "short", "signed short", "char", "signed char", "int32_t", "int16_t", "int8_t", "pid_t", "__pid_t", "clockid_t", "__clockid_t", "wint_t", "wchar_t"):
+        if t in ("int", "signed int", "short", "signed short", "char", "signed char", "int32_t", "int16_t", "int8_t", "pid_t", "__pid_t", "clockid_t", "__clockid_t", "wint_t", "wchar_t", "__rlimit_resource_t", "__rusage_who_t", "__priority_which_t"):
             return "i32", t
-        if t in ("unsigned int", "unsigned", "unsigned short", "unsigned char", "uint32_t", "uint16_t", "uint8_t", "uid_t", "__uid_t", "gid_t", "__gid_t", "mode_t", "__mode_t", "socklen_t", "__socklen_t", "wctype_t", "uInt"):
+        if t in ("unsigned int", "unsigned", "unsigned short", "unsigned char", "uint32_t", "uint16_t", "uint8_t", "uid_t", "__uid_t", "gid_t", "__gid_t", "mode_t", "__mode_t", "useconds_t", "__useconds_t", "id_t", "__id_t", "socklen_t", "__socklen_t", "wctype_t", "uInt"):
             return "u32", t
-        if t in ("long", "long int", "signed long", "long long", "int64_t", "ssize_t", "__ssize_t", "off_t", "__off_t", "off64_t", "__off64_t", "time_t", "__time_t", "ptrdiff_t", "intptr_t", "clock_t"):
+        if t in ("long", "long int", "signed long", "long long", "long long int", "signed long long", "signed long long int", "int64_t", "ssize_t", "__ssize_t", "off_t", "__off_t", "off64_t", "__off64_t", "time_t", "__time_t", "ptrdiff_t", "intptr_t", "clock_t"):
             return "i64", t
-        if t in ("unsigned long", "unsigned long int", "unsigned long long", "uint64_t", "size_t", "uintptr_t", "nfds_t", "rlim_t", "pthread_t", "pthread_key_t", "uLong", "fexcept_t"):
+        if t in ("unsigned long", "unsigned long int", "unsigned long long", "unsigned long long int", "uint64_t", "size_t", "uintptr_t", "nfds_t", "rlim_t", "pthread_t", "pthread_key_t", "uLong", "fexcept_t"):
             return "u64", t
         return "unsupported", t
 
@@ -562,6 +566,7 @@ def generate_plt_thunks():
         "#include <sys/timerfd.h>",
         "#include <sys/sendfile.h>",
         "#include <sys/auxv.h>",
+        "#include <netdb.h>",
         "#include <pwd.h>",
         "#include <syslog.h>",
         "#include <zlib.h>",
@@ -599,7 +604,7 @@ def generate_plt_thunks():
                 break
             pt = strip_param_name(rp)
             pk, cty = classify_type(pt)
-            if pk == "unsupported" or pk == "void":
+            if pk == "unsupported" or pk == "void" or pk == "f128":
                 ok = False
                 break
             if pk in ("f32", "f64"):
@@ -644,6 +649,8 @@ def generate_plt_thunks():
             out.append(f"    float r = {call_expr}; uint64_t bits = 0; std::memcpy(&bits, &r, 4); cpu->v[0] = bits;")
         elif ret_kind == "f64":
             out.append(f"    double r = {call_expr}; uint64_t bits = 0; std::memcpy(&bits, &r, 8); cpu->v[0] = bits;")
+        elif ret_kind == "f128":
+            out.append(f"    long double r = {call_expr}; __float128 r128 = static_cast<__float128>(r); std::memcpy(&cpu->v[0], &r128, 16);")
         elif ret_kind == "i32":
             out.append(f"    auto r = {call_expr}; cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));")
         elif ret_kind == "u32":

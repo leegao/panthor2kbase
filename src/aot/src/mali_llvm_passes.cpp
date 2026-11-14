@@ -1244,6 +1244,12 @@ private:
             if (faddr == 0) faddr = vk_ent.second;
             if (isExecAddr(faddr)) q.push_back(faddr);
         }
+        for (uint64_t slot : relocated_data_slots) {
+            if (slot + 8 <= elf.size()) {
+                uint64_t ptr = readU64(elf, slot) & 0xFFFFFFFFFFFFULL;
+                if (func_by_addr.count(ptr)) q.push_back(ptr);
+            }
+        }
         std::set<uint64_t> visited;
         std::set<uint64_t> scanned_vtables;
         uint64_t relro_lo = 0, relro_hi = 0;

@@ -1,6 +1,9 @@
 #include "mali_icd_internal.h"
 #include "generated/mali_plt_thunks_autogen.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
@@ -9,9 +12,12 @@
 #include <sys/prctl.h>
 #include <sys/statfs.h>
 #include <sys/statvfs.h>
+#include <sys/syscall.h>
 #include <pwd.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 // Pull in generated PLT & GLOB_DAT manifests from build-x86-64/
 #include "r54p3_plt_imports.inc"
@@ -101,6 +107,54 @@ void __mali_unhandled_aot_trampoline(AOTCPUState* cpu) {
 template <int Idx>
 void __mali_unhandled_libcpp_trampoline(AOTCPUState* cpu) {
     __mali_report_unhandled_plt(cpu, "libcpp", Idx, kLibcppPltNames[Idx]);
+}
+
+constexpr int kAotPltCount = MALI_PLT_TABLE_COUNT > 0 ? MALI_PLT_TABLE_COUNT : 1;
+constexpr int kLibcppPltCount = LIBCPP_PLT_TABLE_COUNT > 0 ? LIBCPP_PLT_TABLE_COUNT : 1;
+MaliPltFn g_aot_plt_real[kAotPltCount] = {};
+MaliPltFn g_libcpp_plt_real[kLibcppPltCount] = {};
+std::atomic<uint64_t> g_aot_plt_hits[kAotPltCount] = {};
+std::atomic<uint64_t> g_libcpp_plt_hits[kLibcppPltCount] = {};
+
+template <int Idx>
+void __mali_prof_aot_trampoline(AOTCPUState* cpu) {
+    g_aot_plt_hits[Idx].fetch_add(1, std::memory_order_relaxed);
+    g_aot_plt_real[Idx](cpu);
+}
+
+template <int Idx>
+void __mali_prof_libcpp_trampoline(AOTCPUState* cpu) {
+    g_libcpp_plt_hits[Idx].fetch_add(1, std::memory_order_relaxed);
+    g_libcpp_plt_real[Idx](cpu);
+}
+
+template <int... Is>
+void install_aot_plt_profilers(std::integer_sequence<int, Is...>, MaliPltFn* tbl) {
+    ((tbl[Is] = &__mali_prof_aot_trampoline<Is>), ...);
+}
+
+template <int... Is>
+void install_libcpp_plt_profilers(std::integer_sequence<int, Is...>, MaliPltFn* tbl) {
+    ((tbl[Is] = &__mali_prof_libcpp_trampoline<Is>), ...);
+}
+
+void mali_dump_plt_profile() {
+    struct Row { const char* tbl; const char* sym; uint64_t hits; };
+    std::vector<Row> rows;
+    for (int i = 0; i < MALI_PLT_TABLE_COUNT; ++i) {
+        uint64_t h = g_aot_plt_hits[i].load(std::memory_order_relaxed);
+        if (h > 0) rows.push_back({"aot", kMaliPltNames[i], h});
+    }
+    for (int i = 0; i < LIBCPP_PLT_TABLE_COUNT; ++i) {
+        uint64_t h = g_libcpp_plt_hits[i].load(std::memory_order_relaxed);
+        if (h > 0) rows.push_back({"libcpp", kLibcppPltNames[i], h});
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.hits > b.hits; });
+    std::fprintf(stderr, "\n=== [MALI_PLT_PROFILE] Top Hot PLT Calls (candidates for isHotInlinePltSym) ===\n");
+    for (size_t i = 0; i < std::min<size_t>(rows.size(), 40); ++i) {
+        std::fprintf(stderr, "  #%02zu [%s] %10llu  %s\n",
+                     i + 1, rows[i].tbl, static_cast<unsigned long long>(rows[i].hits), rows[i].sym);
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -674,6 +728,19 @@ static void thunk_prctl(AOTCPUState* cpu) {
     int r = ::prctl(op, cpu->x[1], cpu->x[2], cpu->x[3], cpu->x[4]);
     cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
 }
+static void thunk_syscall(AOTCPUState* cpu) {
+    long nr = static_cast<long>(cpu->x[0]);
+    long r = -1;
+    switch (nr) {
+        case 178: r = ::syscall(SYS_gettid); break; // arm64 __NR_gettid
+        case 172: r = ::syscall(SYS_getpid); break; // arm64 __NR_getpid
+        case 98:  r = ::syscall(SYS_futex, cpu->x[1], cpu->x[2], cpu->x[3], cpu->x[4], cpu->x[5], cpu->x[6]); break; // arm64 __NR_futex
+        case 278: r = ::syscall(SYS_getrandom, cpu->x[1], cpu->x[2], cpu->x[3]); break; // arm64 __NR_getrandom
+        default: errno = ENOSYS; r = -1; break;
+    }
+    cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void thunk_enosys(AOTCPUState* cpu) { errno = ENOSYS; cpu->x[0] = static_cast<uint64_t>(-1LL); }
 struct HidlString {
     const char* mBuffer;
     uint32_t mSize;
@@ -897,6 +964,12 @@ void mali_init_plt_tables() {
         reg["getpwuid"] = &thunk_getpwuid;
         reg["getpwnam"] = &thunk_getpwnam;
         reg["prctl"] = &thunk_prctl;
+        reg["syscall"] = &thunk_syscall;
+        reg["fork"] = &thunk_enosys;
+        reg["execv"] = &thunk_enosys;
+        reg["execve"] = &thunk_enosys;
+        reg["syslog"] = &thunk_noop0;
+        reg["pixel_gpu_flags_mali_protected_tls_cache"] = &thunk_noop0;
         reg["fstatfs"] = &thunk_noop0;
         reg["statfs"] = &thunk_noop0;
         reg["statvfs"] = &thunk_noop0;
@@ -921,6 +994,14 @@ void mali_init_plt_tables() {
             if (it != reg.end()) {
                 g_libcpp_plt_table[i] = it->second;
             }
+        }
+        const char* prof_env = std::getenv("MALI_PLT_PROFILE");
+        if (prof_env && prof_env[0] == '1') {
+            for (int i = 0; i < kAotPltCount; ++i) g_aot_plt_real[i] = g_aot_plt_table[i];
+            for (int i = 0; i < kLibcppPltCount; ++i) g_libcpp_plt_real[i] = g_libcpp_plt_table[i];
+            install_aot_plt_profilers(std::make_integer_sequence<int, kAotPltCount>{}, g_aot_plt_table);
+            install_libcpp_plt_profilers(std::make_integer_sequence<int, kLibcppPltCount>{}, g_libcpp_plt_table);
+            std::atexit(mali_dump_plt_profile);
         }
         (void)thunk_ret1;
     });
