@@ -3031,8 +3031,61 @@ public:
                                 cur = nxt;
                             }
                             storeVec(rd, vty, cur, Q == 0);
+                        } else if (U == 1 && Q == 1) {
+                            // INS vD.<Ts>[dst_idx], vN.<Ts>[src_idx]
+                            unsigned src_idx = imm4 >> tz;
+                            std::string vn = loadVec(rn, full_vty), vd = loadVec(rd, full_vty);
+                            std::string el = newTmp("insel_v"), res = newTmp("insel_out");
+                            emit(el + " = extractelement " + full_vty + " " + vn + ", i32 " + std::to_string(src_idx));
+                            emit(res + " = insertelement " + full_vty + " " + vd + ", " + sty + " " + el + ", i32 " + std::to_string(idx));
+                            storeVec(rd, full_vty, res, false);
                         }
                         continue;
+                    }
+
+                    // AdvSIMD Shift-by-Immediate (SSHR / USHR / SHL)
+                    if (((insn >> 23) & 0x3F) == 0x1E && ((insn >> 10) & 1) == 1 && ((insn >> 19) & 0xF) != 0) {
+                        unsigned immh = (insn >> 19) & 0xF;
+                        unsigned immb = (insn >> 16) & 7;
+                        unsigned opcode = (insn >> 11) & 0x1F;
+                        unsigned msb = 31U - static_cast<unsigned>(__builtin_clz(immh));
+                        unsigned esz = 1U << msb;
+                        unsigned bits = esz * 8U;
+                        unsigned lanes = (Q ? 16U : 8U) / esz;
+                        std::string sty = "i" + std::to_string(bits);
+                        std::string vty = "<" + std::to_string(lanes) + " x " + sty + ">";
+                        unsigned imm7 = (immh << 3) | immb;
+                        auto splatShift = [&](unsigned sh) {
+                            std::ostringstream ss;
+                            ss << "<";
+                            for (unsigned i = 0; i < lanes; ++i) {
+                                if (i > 0) ss << ", ";
+                                ss << sty << " " << sh;
+                            }
+                            ss << ">";
+                            return ss.str();
+                        };
+                        if (opcode == 0x0A && U == 0) {
+                            unsigned sh = imm7 - bits;
+                            std::string a = loadVec(rn, vty), res = newTmp("vshli");
+                            emit(res + " = shl " + vty + " " + a + ", " + splatShift(sh));
+                            storeVec(rd, vty, res, Q == 0);
+                            continue;
+                        } else if (opcode == 0x00) {
+                            unsigned sh = (2U * bits) - imm7;
+                            std::string a = loadVec(rn, vty), res = newTmp("vshri");
+                            if (sh >= bits) {
+                                if (U) {
+                                    res = "zeroinitializer";
+                                } else {
+                                    emit(res + " = ashr " + vty + " " + a + ", " + splatShift(bits - 1));
+                                }
+                            } else {
+                                emit(res + " = " + (U ? "lshr " : "ashr ") + vty + " " + a + ", " + splatShift(sh));
+                            }
+                            storeVec(rd, vty, res, Q == 0);
+                            continue;
+                        }
                     }
 
                     // AdvSIMD vector logical (AND, BIC, ORR, EOR)
@@ -3170,43 +3223,81 @@ public:
                         continue;
                     }
 
-                    // AdvSIMD UZP1
-                    if (((insn >> 24) & 0x3F) == 0x0E && ((insn >> 21) & 1) == 0 && ((insn >> 10) & 3) == 2) {
+                    // AdvSIMD Permute (UZP1, TRN1, ZIP1, UZP2, TRN2, ZIP2)
+                    if (((insn >> 24) & 0x3F) == 0x0E && ((insn >> 21) & 1) == 0 && ((insn >> 10) & 3) == 2 && U == 0) {
+                        unsigned perm_op = (insn >> 12) & 7;
                         unsigned esz = 1U << sz;
                         unsigned lanes = (Q ? 16U : 8U) / esz;
                         std::string vty = "<" + std::to_string(lanes) + " x i" + std::to_string(esz * 8) + ">";
-                        std::string a = loadVec(rn, vty), b = loadVec(rm, vty), res = newTmp("uzp1");
+                        std::string a = loadVec(rn, vty), b = loadVec(rm, vty), res = newTmp("vperm");
                         std::ostringstream idx_ss;
                         for (unsigned i = 0; i < lanes; ++i) {
                             if (i > 0) idx_ss << ", ";
-                            idx_ss << "i32 " << (i * 2);
+                            unsigned src_idx = 0;
+                            if (perm_op == 1) { // UZP1
+                                src_idx = i * 2;
+                            } else if (perm_op == 5) { // UZP2
+                                src_idx = i * 2 + 1;
+                            } else if (perm_op == 2) { // TRN1
+                                src_idx = (i & 1) ? (lanes + (i & ~1U)) : i;
+                            } else if (perm_op == 6) { // TRN2
+                                src_idx = (i & 1) ? (lanes + i) : (i + 1);
+                            } else if (perm_op == 3) { // ZIP1
+                                src_idx = (i & 1) ? (lanes + (i >> 1)) : (i >> 1);
+                            } else if (perm_op == 7) { // ZIP2
+                                unsigned h = lanes / 2;
+                                src_idx = (i & 1) ? (lanes + h + (i >> 1)) : (h + (i >> 1));
+                            } else {
+                                src_idx = i;
+                            }
+                            idx_ss << "i32 " << src_idx;
                         }
                         emit(res + " = shufflevector " + vty + " " + a + ", " + vty + " " + b + ", <" + std::to_string(lanes) + " x i32> <" + idx_ss.str() + ">");
                         storeVec(rd, vty, res, Q == 0);
                         continue;
                     }
 
-                    // AdvSIMD Two-Register Misc: CNT, MVN, CMEQ #0
+                    // AdvSIMD Two-Register Misc: CNT, MVN, CM{EQ,GT,GE,LE,LT} #0, ABS, NEG
                     if (((insn >> 24) & 0x1F) == 0x0E && ((insn >> 17) & 0x1F) == 0x10 && ((insn >> 10) & 3) == 2) {
                         unsigned opcode = (insn >> 12) & 0x1F;
                         unsigned esz = 1U << sz;
                         unsigned lanes = (Q ? 16U : 8U) / esz;
                         std::string vty = "<" + std::to_string(lanes) + " x i" + std::to_string(esz * 8) + ">";
+                        std::string bty = "<" + std::to_string(lanes) + " x i1>";
                         if (opcode == 0x05) {
                             if (U == 0) {
-                                std::string vin = loadVec(rn, "<8 x i8>"), vout = newTmp("vcnt");
-                                emit(vout + " = call <8 x i8> @llvm.ctpop.v8i8(<8 x i8> " + vin + ")");
-                                storeVec(rd, "<8 x i8>", vout);
+                                unsigned clanes = Q ? 16U : 8U;
+                                std::string cty = "<" + std::to_string(clanes) + " x i8>";
+                                std::string vin = loadVec(rn, cty), vout = newTmp("vcnt");
+                                emit(vout + " = call " + cty + " @llvm.ctpop.v" + std::to_string(clanes) + "i8(" + cty + " " + vin + ")");
+                                storeVec(rd, cty, vout, Q == 0);
                             } else {
                                 std::string vin = loadVec(rn, "i128"), vout = newTmp("vmvn");
                                 emit(vout + " = xor i128 " + vin + ", -1");
                                 storeVec(rd, "i128", vout, false);
                             }
-                        } else if (opcode == 0x09 && U == 0) {
-                            std::string vin = loadVec(rn, vty), cmp_v = newTmp("cmeq0"), sext_v = newTmp("cmeq_sx");
-                            emit(cmp_v + " = icmp eq " + vty + " " + vin + ", zeroinitializer");
-                            emit(sext_v + " = sext <" + std::to_string(lanes) + " x i1> " + cmp_v + " to " + vty);
+                        } else if ((opcode == 0x08) || (opcode == 0x09) || (opcode == 0x0A && U == 0)) {
+                            const char* pred = "eq ";
+                            if (opcode == 0x08 && U == 0) pred = "sgt ";
+                            else if (opcode == 0x08 && U == 1) pred = "sge ";
+                            else if (opcode == 0x09 && U == 0) pred = "eq ";
+                            else if (opcode == 0x09 && U == 1) pred = "sle ";
+                            else if (opcode == 0x0A && U == 0) pred = "slt ";
+                            std::string vin = loadVec(rn, vty), cmp_v = newTmp("vcm0"), sext_v = newTmp("vcm0_sx");
+                            emit(cmp_v + " = icmp " + std::string(pred) + vty + " " + vin + ", zeroinitializer");
+                            emit(sext_v + " = sext " + bty + " " + cmp_v + " to " + vty);
                             storeVec(rd, vty, sext_v, Q == 0);
+                        } else if (opcode == 0x0B) {
+                            std::string vin = loadVec(rn, vty), neg_v = newTmp("vneg");
+                            emit(neg_v + " = sub " + vty + " zeroinitializer, " + vin);
+                            if (U == 0) {
+                                std::string is_neg = newTmp("vabs_c"), abs_v = newTmp("vabs");
+                                emit(is_neg + " = icmp slt " + vty + " " + vin + ", zeroinitializer");
+                                emit(abs_v + " = select " + bty + " " + is_neg + ", " + vty + " " + neg_v + ", " + vty + " " + vin);
+                                storeVec(rd, vty, abs_v, Q == 0);
+                            } else {
+                                storeVec(rd, vty, neg_v, Q == 0);
+                            }
                         }
                         continue;
                     }
@@ -3343,6 +3434,7 @@ public:
         emitRaw("declare void @llvm.memmove.p0.p0.i64(ptr nocapture writeonly, ptr nocapture readonly, i64, i1 immarg)");
         emitRaw("declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg)");
         emitRaw("declare <8 x i8> @llvm.ctpop.v8i8(<8 x i8>)");
+        emitRaw("declare <16 x i8> @llvm.ctpop.v16i8(<16 x i8>)");
         emitRaw("declare i8 @llvm.vector.reduce.add.v8i8(<8 x i8>)");
         emitRaw("declare i8 @llvm.vector.reduce.add.v16i8(<16 x i8>)");
         emitRaw("declare i16 @llvm.vector.reduce.add.v4i16(<4 x i16>)");
