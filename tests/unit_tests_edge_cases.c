@@ -3104,6 +3104,136 @@ static void test_v37_r54p3_icd_textured_draw_sampling(void)
    printf("  -> PASS: r54p3_vulkan_icd textured draw sampled real texture pixels!\n");
 }
 
+static void test_v38_vkcube_wsi_deferred_bind_and_panvk_fragment_shading(void)
+{
+   printf("[TEST 28] Verifying Checkpoint v38 vkcube WSI deferred vkBindImageMemory after vkCreateFramebuffer...\n");
+
+   void *icd_h = dlopen("aot/libr54p3_vulkan_icd.so", RTLD_NOW | RTLD_LOCAL);
+   if (!icd_h) icd_h = dlopen("build-x86-64/aot/libr54p3_vulkan_icd.so", RTLD_NOW | RTLD_LOCAL);
+   if (!icd_h) icd_h = dlopen("build-x86-64/libr54p3_vulkan_icd.so", RTLD_NOW | RTLD_LOCAL);
+   assert(icd_h != NULL);
+
+   typedef void *(*pfn_gipa)(void *, const char *);
+   typedef void *(*pfn_gdpa)(void *, const char *);
+   pfn_gipa gipa = (pfn_gipa)dlsym(icd_h, "vk_icdGetInstanceProcAddr");
+   pfn_gdpa gdpa = (pfn_gdpa)dlsym(icd_h, "vkGetDeviceProcAddr");
+   assert(gipa != NULL && gdpa != NULL);
+
+   typedef int32_t (*pfn_create_inst)(const void *, const void *, void **);
+   typedef int32_t (*pfn_enum_pd)(void *, uint32_t *, void **);
+   typedef int32_t (*pfn_create_dev)(void *, const void *, const void *, void **);
+   typedef void (*pfn_get_queue)(void *, uint32_t, uint32_t, void **);
+   typedef void (*pfn_destroy_dev)(void *, const void *);
+   typedef void (*pfn_destroy_inst)(void *, const void *);
+   typedef int32_t (*pfn_create_obj)(void *, const void *, const void *, uint64_t *);
+   typedef void (*pfn_destroy_obj)(void *, uint64_t, const void *);
+   typedef void (*pfn_get_req)(void *, uint64_t, void *);
+   typedef int32_t (*pfn_bind_mem)(void *, uint64_t, uint64_t, uint64_t);
+   typedef int32_t (*pfn_map_mem)(void *, uint64_t, uint64_t, uint64_t, uint32_t, void **);
+   typedef void (*pfn_unmap_mem)(void *, uint64_t);
+   typedef int32_t (*pfn_alloc_cbs)(void *, const void *, void **);
+   typedef int32_t (*pfn_begin_cb)(void *, const void *);
+   typedef int32_t (*pfn_end_cb)(void *);
+   typedef void (*pfn_cmd_begin_rp)(void *, const void *, uint32_t);
+   typedef void (*pfn_cmd_clear_att)(void *, uint32_t, const void *, uint32_t, const void *);
+   typedef void (*pfn_cmd_end_rp)(void *);
+   typedef int32_t (*pfn_queue_submit)(void *, uint32_t, const void *, uint64_t);
+   typedef int32_t (*pfn_queue_wait_idle)(void *);
+
+   struct { uint32_t sType; const void *pNext; uint32_t flags; const void *pApp; uint32_t lCnt; const void *pL; uint32_t eCnt; const void *pE; } ici = { 1U, NULL, 0, NULL, 0, NULL, 0, NULL };
+   void *inst = NULL, *pdev = NULL, *dev = NULL, *queue = NULL;
+   assert(((pfn_create_inst)gipa(NULL, "vkCreateInstance"))(&ici, NULL, &inst) == 0 && inst);
+   uint32_t pd_cnt = 1;
+   assert(((pfn_enum_pd)gipa(NULL, "vkEnumeratePhysicalDevices"))(inst, &pd_cnt, &pdev) == 0 && pdev);
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t qciCnt; const void *pQci; uint32_t lCnt; const void *pL; uint32_t eCnt; const void *pE; const void *pFeat; } dci = { 3U, NULL, 0, 0, NULL, 0, NULL, 0, NULL, NULL };
+   assert(((pfn_create_dev)gipa(NULL, "vkCreateDevice"))(pdev, &dci, NULL, &dev) == 0 && dev);
+   ((pfn_get_queue)gdpa(dev, "vkGetDeviceQueue"))(dev, 0, 0, &queue);
+
+   pfn_create_obj create_img = (pfn_create_obj)gdpa(dev, "vkCreateImage");
+   pfn_destroy_obj destroy_img = (pfn_destroy_obj)gdpa(dev, "vkDestroyImage");
+   pfn_get_req get_img_req = (pfn_get_req)gdpa(dev, "vkGetImageMemoryRequirements");
+   pfn_bind_mem bind_img_mem = (pfn_bind_mem)gdpa(dev, "vkBindImageMemory");
+   pfn_create_obj alloc_mem = (pfn_create_obj)gdpa(dev, "vkAllocateMemory");
+   pfn_destroy_obj free_mem = (pfn_destroy_obj)gdpa(dev, "vkFreeMemory");
+   pfn_map_mem map_mem = (pfn_map_mem)gdpa(dev, "vkMapMemory");
+   pfn_unmap_mem unmap_mem = (pfn_unmap_mem)gdpa(dev, "vkUnmapMemory");
+   pfn_create_obj create_iv = (pfn_create_obj)gdpa(dev, "vkCreateImageView");
+   pfn_destroy_obj destroy_iv = (pfn_destroy_obj)gdpa(dev, "vkDestroyImageView");
+   pfn_create_obj create_rp = (pfn_create_obj)gdpa(dev, "vkCreateRenderPass");
+   pfn_destroy_obj destroy_rp = (pfn_destroy_obj)gdpa(dev, "vkDestroyRenderPass");
+   pfn_create_obj create_fb = (pfn_create_obj)gdpa(dev, "vkCreateFramebuffer");
+   pfn_destroy_obj destroy_fb = (pfn_destroy_obj)gdpa(dev, "vkDestroyFramebuffer");
+   pfn_create_obj create_cp = (pfn_create_obj)gdpa(dev, "vkCreateCommandPool");
+   pfn_destroy_obj destroy_cp = (pfn_destroy_obj)gdpa(dev, "vkDestroyCommandPool");
+   pfn_alloc_cbs alloc_cbs = (pfn_alloc_cbs)gdpa(dev, "vkAllocateCommandBuffers");
+
+   /* Create image, imageView, and framebuffer BEFORE vkBindImageMemory */
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t imageType; uint32_t format; uint32_t w, h, d; uint32_t mipLevels; uint32_t arrayLayers; uint32_t samples; uint32_t tiling; uint32_t usage; uint32_t sharingMode; uint32_t qfiCnt; const uint32_t *pQfi; uint32_t initialLayout; }
+      rt_ci = { 14U, NULL, 0U, 1U, 44U /* B8G8R8A8_UNORM */, 64U, 64U, 1U, 1U, 1U, 1U, 0U, 0x11U, 0U, 0U, NULL, 0U };
+   uint64_t rt_img = 0, rt_mem = 0, rt_iv = 0, rp = 0, fb = 0;
+   assert(create_img(dev, &rt_ci, NULL, &rt_img) == 0 && rt_img);
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint64_t image; uint32_t viewType; uint32_t format; uint32_t comp[4]; uint32_t aspectMask; uint32_t baseMip; uint32_t levelCnt; uint32_t baseLayer; uint32_t layerCnt; }
+      iv_ci = { 15U, NULL, 0U, rt_img, 1U, 44U, {0,0,0,0}, 1U, 0U, 1U, 0U, 1U };
+   assert(create_iv(dev, &iv_ci, NULL, &rt_iv) == 0 && rt_iv);
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t attCnt; const void *pAtt; uint32_t subCnt; const void *pSub; uint32_t depCnt; const void *pDep; }
+      rp_ci = { 38U, NULL, 0U, 0U, NULL, 0U, NULL, 0U, NULL };
+   assert(create_rp(dev, &rp_ci, NULL, &rp) == 0 && rp);
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint64_t renderPass; uint32_t attCnt; const uint64_t *pAtt; uint32_t w, h, layers; }
+      fb_ci = { 37U, NULL, 0U, rp, 1U, &rt_iv, 64U, 64U, 1U };
+   assert(create_fb(dev, &fb_ci, NULL, &fb) == 0 && fb);
+
+   /* Now bind memory AFTER vkCreateFramebuffer (simulating WSI swapchain deferred binding) */
+   struct { uint64_t size; uint64_t alignment; uint32_t memTypeBits; } req = { 0 };
+   get_img_req(dev, rt_img, &req);
+   struct { uint32_t sType; const void *pNext; uint64_t size; uint32_t memTypeIdx; } mai = { 5U, NULL, req.size, 0U };
+   assert(alloc_mem(dev, &mai, NULL, &rt_mem) == 0 && rt_mem);
+   assert(bind_img_mem(dev, rt_img, rt_mem, 0ULL) == 0);
+
+   uint64_t cp = 0;
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t qfi; } cp_ci = { 39U, NULL, 0x02U, 0U };
+   assert(create_cp(dev, &cp_ci, NULL, &cp) == 0 && cp);
+   void *cb = NULL;
+   struct { uint32_t sType; const void *pNext; uint64_t pool; uint32_t level; uint32_t cnt; } cb_ai = { 40U, NULL, cp, 0U, 1U };
+   assert(alloc_cbs(dev, &cb_ai, &cb) == 0 && cb);
+
+   struct { uint32_t sType; const void *pNext; uint32_t flags; const void *pInh; } cbbi = { 42U, NULL, 0U, NULL };
+   assert(((pfn_begin_cb)gdpa(dev, "vkBeginCommandBuffer"))(cb, &cbbi) == 0);
+   float clear_col[4] = { 0.25f, 0.5f, 0.75f, 1.0f };
+   struct { uint32_t sType; const void *pNext; uint64_t rp; uint64_t fb; int32_t rx, ry; uint32_t rw, rh; uint32_t clrCnt; const float *pClr; }
+      rpbi = { 43U, NULL, rp, fb, 0, 0, 64U, 64U, 1U, clear_col };
+   ((pfn_cmd_begin_rp)gdpa(dev, "vkCmdBeginRenderPass"))(cb, &rpbi, 0U);
+   struct { uint32_t aspectMask; uint32_t colorAttachment; float color[4]; }
+      clr_att = { 1U, 0U, { 0.25f, 0.5f, 0.75f, 1.0f } };
+   struct { int32_t x, y; uint32_t w, h; uint32_t baseLayer, layerCount; }
+      clr_rect = { 0, 0, 64U, 64U, 0U, 1U };
+   ((pfn_cmd_clear_att)gdpa(dev, "vkCmdClearAttachments"))(cb, 1U, &clr_att, 1U, &clr_rect);
+   ((pfn_cmd_end_rp)gdpa(dev, "vkCmdEndRenderPass"))(cb);
+   assert(((pfn_end_cb)gdpa(dev, "vkEndCommandBuffer"))(cb) == 0);
+
+   struct { uint32_t sType; const void *pNext; uint32_t waitCnt; const uint64_t *pWait; const uint32_t *pStages; uint32_t cbCnt; void *const *pCBs; uint32_t sigCnt; const uint64_t *pSig; }
+      si = { 4U, NULL, 0U, NULL, NULL, 1U, &cb, 0U, NULL };
+   assert(((pfn_queue_submit)gdpa(dev, "vkQueueSubmit"))(queue, 1U, &si, 0ULL) == 0);
+   assert(((pfn_queue_wait_idle)gdpa(dev, "vkQueueWaitIdle"))(queue) == 0);
+
+   void *rt_ptr = NULL;
+   assert(map_mem(dev, rt_mem, 0ULL, 64U * 64U * 4ULL, 0U, &rt_ptr) == 0 && rt_ptr);
+   uint32_t center_px = ((const uint32_t *)rt_ptr)[32U * 64U + 32U];
+   unmap_mem(dev, rt_mem);
+   printf("  -> Deferred vkBindImageMemory after vkCreateFramebuffer clear pixel = 0x%08X\n", center_px);
+   assert(center_px != 0U);
+
+   destroy_cp(dev, cp, NULL);
+   destroy_fb(dev, fb, NULL);
+   destroy_rp(dev, rp, NULL);
+   destroy_iv(dev, rt_iv, NULL);
+   destroy_img(dev, rt_img, NULL);
+   free_mem(dev, rt_mem, NULL);
+   ((pfn_destroy_dev)gdpa(dev, "vkDestroyDevice"))(dev, NULL);
+   ((pfn_destroy_inst)gipa(NULL, "vkDestroyInstance"))(inst, NULL);
+   dlclose(icd_h);
+   printf("  -> PASS: Checkpoint v38 WSI deferred vkBindImageMemory after vkCreateFramebuffer verified!\n");
+}
+
 int main(void)
 {
    printf("[Unit Tests] Running edge cases, mali_kbase.ko flag invariants, and RAII logging suite...\n");
@@ -3134,6 +3264,7 @@ int main(void)
    test_v35_kbase_emu_stats_sized_abi_guard();
    test_v36_raw_syscall_hook_and_panvk_hw_fragment_bridge();
    test_v37_r54p3_icd_textured_draw_sampling();
+   test_v38_vkcube_wsi_deferred_bind_and_panvk_fragment_shading();
    printf("[Unit Tests] ALL EDGE CASES PASSED!\n");
    return 0;
 }

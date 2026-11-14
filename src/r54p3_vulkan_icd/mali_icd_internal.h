@@ -591,6 +591,8 @@ struct MaliCsfGraphicsDrawPacket {
     uint32_t depth_test_enable;
     uint32_t depth_write_enable;
     uint32_t depth_compare_op;
+    uint32_t first_instance;
+    uint32_t dynamic_offset;
 };
 
 extern HostSpirvExecutor        g_icd_spirv_executor;
@@ -1859,9 +1861,13 @@ struct MaliIcdRenderPass {
     uint32_t depth_load_op    = 0;
 };
 
+struct MaliIcdImage;
+
 struct MaliIcdFramebuffer {
     uint32_t           width = 64, height = 64;
     MaliMfbdDescriptor hw_mfbd{};
+    MaliIcdImage*      color_rt0_image = nullptr;
+    MaliIcdImage*      depth_image = nullptr;
     std::vector<float> depth_buffer;
     bool               cleared_in_rp = false;
 };

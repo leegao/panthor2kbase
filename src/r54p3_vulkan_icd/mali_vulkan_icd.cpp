@@ -878,7 +878,7 @@ static void populateAotStubTexture(MaliIcdImage* img) {
     uint32_t d = std::max<uint32_t>(1U, img->depth);
     uint32_t layers = std::max<uint32_t>(1U, img->array_layers);
     img->byte_size = static_cast<uint64_t>(w) * h * d * layers * 4ULL;
-    if (w <= 256U && h <= 256U && d == 1U && layers == 1U) {
+    if (w <= 2048U && h <= 2048U && d == 1U && layers == 1U) {
         img->stub_texture_backing.resize(static_cast<size_t>(w) * h * 4);
         uint32_t* px = reinterpret_cast<uint32_t*>(img->stub_texture_backing.data());
         for (uint32_t i = 0; i < w * h; ++i) {
@@ -1037,8 +1037,13 @@ int32_t vkCreateFramebuffer(void* /*device*/, const void* pCreateInfo, const voi
     for (uint32_t i = 0; i < fi->attachmentCount && fi->pAttachments; ++i) {
         auto* iv = reinterpret_cast<MaliIcdImageView*>(fi->pAttachments[i]);
         if (iv && iv->image) {
-            if (i == 0) fb->hw_mfbd.color_rt0_gpu_va = iv->image->bound_gpu_va;
-            else if (i == 1) fb->hw_mfbd.depth_bo_gpu_va = iv->image->bound_gpu_va;
+            if (i == 0) {
+                fb->color_rt0_image = iv->image;
+                fb->hw_mfbd.color_rt0_gpu_va = iv->image->bound_gpu_va;
+            } else if (i == 1) {
+                fb->depth_image = iv->image;
+                fb->hw_mfbd.depth_bo_gpu_va = iv->image->bound_gpu_va;
+            }
         }
     }
     *pFramebuffer = reinterpret_cast<uint64_t>(fb);
@@ -1819,6 +1824,9 @@ VkResult vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* 
                         for (uint32_t p = 0; p < total; ++p) px[p] = cmd.clear_rgba8;
                     }
                 } else if (cmd.type == MaliIcdRecordedCmd::CMD_CLEAR_ATTACHMENTS) {
+                    if (cmd.framebuffer && cmd.framebuffer->color_rt0_image && cmd.framebuffer->color_rt0_image->bound_gpu_va != 0) {
+                        cmd.framebuffer->hw_mfbd.color_rt0_gpu_va = cmd.framebuffer->color_rt0_image->bound_gpu_va;
+                    }
                     if (cmd.framebuffer && cmd.framebuffer->hw_mfbd.color_rt0_gpu_va) {
                         uint32_t* px = reinterpret_cast<uint32_t*>(cmd.framebuffer->hw_mfbd.color_rt0_gpu_va);
                         uint32_t total = std::max<uint32_t>(1U, cmd.framebuffer->width) * std::max<uint32_t>(1U, cmd.framebuffer->height);
@@ -1876,6 +1884,12 @@ VkResult vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* 
                     }
                 } else if (cmd.type == MaliIcdRecordedCmd::CMD_DRAW_INDEXED ||
                            cmd.type == MaliIcdRecordedCmd::CMD_DRAW) {
+                    if (cmd.framebuffer) {
+                        if (cmd.framebuffer->color_rt0_image && cmd.framebuffer->color_rt0_image->bound_gpu_va != 0)
+                            cmd.framebuffer->hw_mfbd.color_rt0_gpu_va = cmd.framebuffer->color_rt0_image->bound_gpu_va;
+                        if (cmd.framebuffer->depth_image && cmd.framebuffer->depth_image->bound_gpu_va != 0)
+                            cmd.framebuffer->hw_mfbd.depth_bo_gpu_va = cmd.framebuffer->depth_image->bound_gpu_va;
+                    }
                     // Submit Valhall CSF IDVS + FRAGMENT job into ring_bo_va -> KBASE_IOCTL_CS_QUEUE_KICK
                     if (cmd.framebuffer && cmd.framebuffer->hw_mfbd.color_rt0_gpu_va != 0) {
                         static MaliCsfGraphicsDrawPacket s_gfx_pkt{};
@@ -1895,6 +1909,8 @@ VkResult vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* 
                         s_gfx_pkt.first_index    = cmd.first_index;
                         s_gfx_pkt.vertex_offset  = cmd.vertex_offset;
                         s_gfx_pkt.instance_count = cmd.instance_count;
+                        s_gfx_pkt.first_instance = cmd.first_instance;
+                        s_gfx_pkt.dynamic_offset = cmd.dynamic_offset;
                         s_gfx_pkt.stride_bytes   = (cmd.pipeline && cmd.pipeline->vertex_stride >= 8U) ? cmd.pipeline->vertex_stride : 16U;
                         s_gfx_pkt.topology       = cmd.pipeline ? cmd.pipeline->topology : 3U;
                         s_gfx_pkt.cull_mode      = cmd.pipeline ? cmd.pipeline->cull_mode : 0U;
@@ -1904,7 +1920,7 @@ VkResult vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* 
                         s_gfx_pkt.depth_write_enable = (cmd.pipeline && cmd.pipeline->depth_write) ? 1U : 0U;
                         s_gfx_pkt.depth_compare_op   = cmd.pipeline ? cmd.pipeline->depth_compare : 1U;
                         s_gfx_pkt.rp_draw_idx    = cmd.rp_draw_idx;
-                        s_gfx_pkt.ubo_va         = cmd.desc_set ? (cmd.desc_set->bound_buffer_va[0] + cmd.dynamic_offset) : 0ULL;
+                        s_gfx_pkt.ubo_va         = (cmd.desc_set && cmd.desc_set->bound_buffer_va[0]) ? (cmd.desc_set->bound_buffer_va[0] + cmd.dynamic_offset) : 0ULL;
                         s_gfx_pkt.ubo_range      = cmd.desc_set ? cmd.desc_set->bound_buffer_range[0] : 0ULL;
                         s_gfx_pkt.has_frag_const = 0U;
                         s_gfx_pkt.frag_const_rgba8 = 0U;

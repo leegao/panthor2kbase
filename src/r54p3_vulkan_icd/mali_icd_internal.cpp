@@ -6,6 +6,7 @@
 #define AOT_SO_PROFILER_IMPLEMENTATION
 #include "mali_icd_internal.h"
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <unordered_set>
@@ -166,6 +167,22 @@ static uint32_t vkFormatBytesPerPixel(VkFormat fmt) {
     }
 }
 
+static bool isMappedHostMemoryRange(const void* ptr, size_t bytes) {
+    if (!ptr || bytes == 0) return false;
+    uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+    if (addr < 0x10000ULL) return false;
+    uintptr_t pg_sz = static_cast<uintptr_t>(::sysconf(_SC_PAGESIZE));
+    if (pg_sz == 0) pg_sz = 4096ULL;
+    uintptr_t start = addr & ~(pg_sz - 1ULL);
+    uintptr_t end = (addr + bytes - 1ULL) & ~(pg_sz - 1ULL);
+    if (end < start) return false;
+    for (uintptr_t p = start; p <= end; p += pg_sz) {
+        if (::msync(reinterpret_cast<void*>(p), pg_sz, MS_ASYNC) != 0) return false;
+        if (p == end) break;
+    }
+    return true;
+}
+
 bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraphicsDrawPacket& pkt) {
     if (!exec.init() || !pkt.mfbd_color_va || pkt.width == 0 || pkt.height == 0) return false;
     auto* gipa = exec.gipa;
@@ -223,19 +240,24 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
         0x000100FDU, 0x00010038U
     };
     std::vector<uint32_t> vs_spv(kPassthroughVs, kPassthroughVs + sizeof(kPassthroughVs) / 4);
-    auto hasSpirvOpFunction = [](const uint32_t* words, uint32_t count) -> bool {
-        if (!words || count < 5) return false;
+    auto hasSpirvOpFunction = [](const uint32_t* words, uint32_t count, uint32_t expected_exec_model) -> bool {
+        if (!words || count < 5 || count > 0x100000U) return false;
+        if (!isMappedHostMemoryRange(words, static_cast<size_t>(count) * 4ULL)) return false;
+        if (words[0] != 0x07230203U) return false;
+        bool has_fn = false, has_entry = false;
         size_t p = 5;
         while (p < count) {
             uint16_t wc = static_cast<uint16_t>(words[p] >> 16);
             uint16_t op = static_cast<uint16_t>(words[p] & 0xFFFFU);
-            if (wc == 0 || p + wc > count) break;
-            if (op == 54U /* OpFunction */) return true;
+            if (wc == 0 || p + wc > count) return false;
+            if (op == 15U /* OpEntryPoint */ && wc >= 3 && words[p + 1] == expected_exec_model) has_entry = true;
+            if (op == 54U /* OpFunction */) has_fn = true;
             p += wc;
         }
-        return false;
+        return has_fn && has_entry;
     };
-    if (pkt.vs_spirv_ptr && hasSpirvOpFunction(pkt.vs_spirv_ptr, pkt.vs_spirv_words)) {
+    const bool has_valid_vs = (pkt.vs_spirv_ptr && hasSpirvOpFunction(pkt.vs_spirv_ptr, pkt.vs_spirv_words, 0U /* Vertex */));
+    if (has_valid_vs) {
         vs_spv.assign(pkt.vs_spirv_ptr, pkt.vs_spirv_ptr + pkt.vs_spirv_words);
     }
     // Valid SPIR-V 1.0 constant-color fragment shader
@@ -271,7 +293,8 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
             (1U<<16)|56U                                   // OpFunctionEnd
         };
     };
-    std::vector<uint32_t> fs_spv = (pkt.fs_spirv_ptr && hasSpirvOpFunction(pkt.fs_spirv_ptr, pkt.fs_spirv_words))
+    const bool has_valid_fs = (pkt.fs_spirv_ptr && hasSpirvOpFunction(pkt.fs_spirv_ptr, pkt.fs_spirv_words, 4U /* Fragment */));
+    std::vector<uint32_t> fs_spv = has_valid_fs
         ? std::vector<uint32_t>(pkt.fs_spirv_ptr, pkt.fs_spirv_ptr + pkt.fs_spirv_words)
         : makeConstFsSpv();
 
@@ -388,7 +411,8 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
     };
     std::vector<VkVertexInputBindingDescription> vbinds;
     std::vector<VkVertexInputAttributeDescription> vattrs;
-    if (pkt.vertex_bindings && pkt.vertex_binding_count > 0) {
+    if (pkt.vertex_bindings && pkt.vertex_binding_count > 0 && pkt.vertex_binding_count < 64U &&
+        isMappedHostMemoryRange(pkt.vertex_bindings, static_cast<size_t>(pkt.vertex_binding_count) * sizeof(MaliVertexBindingDesc))) {
         for (uint32_t b = 0; b < pkt.vertex_binding_count; ++b) {
             vbinds.push_back({pkt.vertex_bindings[b].binding, pkt.vertex_bindings[b].stride,
                               static_cast<VkVertexInputRate>(pkt.vertex_bindings[b].input_rate)});
@@ -396,7 +420,8 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
     } else if (pkt.vertex_bo_va != 0) {
         vbinds.push_back({0, pkt.stride_bytes ? pkt.stride_bytes : 16U, VK_VERTEX_INPUT_RATE_VERTEX});
     }
-    if (pkt.vertex_attrs && pkt.vertex_attr_count > 0) {
+    if (pkt.vertex_attrs && pkt.vertex_attr_count > 0 && pkt.vertex_attr_count < 64U &&
+        isMappedHostMemoryRange(pkt.vertex_attrs, static_cast<size_t>(pkt.vertex_attr_count) * sizeof(MaliVertexAttrDesc))) {
         for (uint32_t a = 0; a < pkt.vertex_attr_count; ++a) {
             vattrs.push_back({pkt.vertex_attrs[a].location, pkt.vertex_attrs[a].binding,
                               static_cast<VkFormat>(pkt.vertex_attrs[a].format), pkt.vertex_attrs[a].offset});
@@ -670,15 +695,19 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
     if (gprc == 0 && pipe != 0) {
         if (pkt.ubo_va && exec.mapped_ubo) {
             size_t ubytes = pkt.ubo_range ? std::min<size_t>(pkt.ubo_range, HostSpirvExecutor::kUboCapacityBytes) : HostSpirvExecutor::kUboCapacityBytes;
-            std::memcpy(exec.mapped_ubo, reinterpret_cast<const void*>(pkt.ubo_va), ubytes);
+            if (isMappedHostMemoryRange(reinterpret_cast<const void*>(pkt.ubo_va), ubytes)) {
+                std::memcpy(exec.mapped_ubo, reinterpret_cast<const void*>(pkt.ubo_va), ubytes);
+            }
         }
         size_t vbytes = std::min<size_t>(pkt.vertex_bo_size, HostSpirvExecutor::kBufferCapacityBytes / 2);
-        if (pkt.vertex_bo_va && vbytes && exec.mapped_in) {
+        if (pkt.vertex_bo_va && vbytes && exec.mapped_in &&
+            isMappedHostMemoryRange(reinterpret_cast<const void*>(pkt.vertex_bo_va), vbytes)) {
             std::memcpy(exec.mapped_in, reinterpret_cast<const void*>(pkt.vertex_bo_va), vbytes);
         }
         size_t ibytes = std::min<size_t>(pkt.index_bo_size, HostSpirvExecutor::kBufferCapacityBytes / 2);
         size_t ioff = HostSpirvExecutor::kBufferCapacityBytes / 2;
-        if (pkt.is_indexed && pkt.index_bo_va && ibytes && exec.mapped_in) {
+        if (pkt.is_indexed && pkt.index_bo_va && ibytes && exec.mapped_in &&
+            isMappedHostMemoryRange(reinterpret_cast<const void*>(pkt.index_bo_va), ibytes)) {
             std::memcpy(static_cast<uint8_t*>(exec.mapped_in) + ioff, reinterpret_cast<const void*>(pkt.index_bo_va), ibytes);
         }
         reinterpret_cast<HostSpirvExecutor::PFN_vkResetCommandBuffer>(gipa(inst, "vkResetCommandBuffer"))(exec.cmd_buf, 0);
@@ -721,9 +750,9 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
             }
         }
         VkClearValue clrs[2]{};
-        clrs[0].color.float32[0] = (pkt.clear_rgba8 & 0xFFU) / 255.0f;
+        clrs[0].color.float32[0] = ((pkt.clear_rgba8 >> 16) & 0xFFU) / 255.0f;
         clrs[0].color.float32[1] = ((pkt.clear_rgba8 >> 8) & 0xFFU) / 255.0f;
-        clrs[0].color.float32[2] = ((pkt.clear_rgba8 >> 16) & 0xFFU) / 255.0f;
+        clrs[0].color.float32[2] = (pkt.clear_rgba8 & 0xFFU) / 255.0f;
         clrs[0].color.float32[3] = ((pkt.clear_rgba8 >> 24) & 0xFFU) / 255.0f;
         clrs[1].depthStencil.depth = 1.0f;
         clrs[1].depthStencil.stencil = 0U;
