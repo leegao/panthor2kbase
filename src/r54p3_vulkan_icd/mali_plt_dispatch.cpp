@@ -6,6 +6,7 @@
 #include <cstring>
 #include <mutex>
 #include <semaphore.h>
+#include <sys/prctl.h>
 #include <sys/statfs.h>
 #include <sys/statvfs.h>
 #include <pwd.h>
@@ -436,6 +437,22 @@ static sem_t* resolve_bionic_sem(uint64_t va, bool create_if_missing, unsigned i
     s_sem_map[va] = s;
     return s;
 }
+static void thunk_pthread_mutexattr_init(AOTCPUState* cpu) {
+    auto* attr = reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(cpu->x[0]));
+    if (attr) *attr = 0x4D410000U;
+    cpu->x[0] = 0;
+}
+static void thunk_pthread_mutexattr_destroy(AOTCPUState* cpu) {
+    auto* attr = reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(cpu->x[0]));
+    if (attr) *attr = 0;
+    cpu->x[0] = 0;
+}
+static void thunk_pthread_mutexattr_settype(AOTCPUState* cpu) {
+    auto* attr = reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(cpu->x[0]));
+    uint32_t type = static_cast<uint32_t>(cpu->x[1]);
+    if (attr) *attr = 0x4D410000U | (type & 0x3U);
+    cpu->x[0] = 0;
+}
 static void thunk_sem_init(AOTCPUState* cpu) {
     uint64_t va = cpu->x[0];
     unsigned int val = static_cast<unsigned int>(cpu->x[2]);
@@ -651,6 +668,35 @@ static void thunk_getpwnam(AOTCPUState* cpu) {
     const char* name = reinterpret_cast<const char*>(static_cast<uintptr_t>(cpu->x[0]));
     cpu->x[0] = reinterpret_cast<uint64_t>(name ? ::getpwnam(name) : nullptr);
 }
+static void thunk_prctl(AOTCPUState* cpu) {
+    int op = static_cast<int>(cpu->x[0]);
+    if (op == 0x53564d41) { cpu->x[0] = 0; return; } // PR_SET_VMA (Android-only)
+    int r = ::prctl(op, cpu->x[1], cpu->x[2], cpu->x[3], cpu->x[4]);
+    cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+struct HidlString {
+    const char* mBuffer;
+    uint32_t mSize;
+    bool mOwnsBuffer;
+};
+static void thunk_hidl_string_ctor(AOTCPUState* cpu) {
+    auto* self = reinterpret_cast<HidlString*>(static_cast<uintptr_t>(cpu->x[0]));
+    const char* s = reinterpret_cast<const char*>(static_cast<uintptr_t>(cpu->x[1]));
+    if (self) {
+        self->mBuffer = s ? s : "";
+        self->mSize = s ? static_cast<uint32_t>(std::strlen(s)) : 0;
+        self->mOwnsBuffer = false;
+    }
+}
+static void thunk_hidl_string_dtor(AOTCPUState* cpu) {
+    auto* self = reinterpret_cast<HidlString*>(static_cast<uintptr_t>(cpu->x[0]));
+    if (self && self->mOwnsBuffer && self->mBuffer) {
+        std::free(const_cast<char*>(self->mBuffer));
+        self->mBuffer = nullptr;
+        self->mSize = 0;
+        self->mOwnsBuffer = false;
+    }
+}
 
 std::unordered_map<std::string, uint64_t> g_libcpp_func_rvas;
 std::unordered_map<std::string, uint64_t> g_libcpp_data_rvas;
@@ -782,9 +828,9 @@ void mali_init_plt_tables() {
         reg["pthread_attr_init"] = &thunk_pthread_noop0;
         reg["pthread_attr_destroy"] = &thunk_pthread_noop0;
         reg["pthread_attr_setstacksize"] = &thunk_pthread_noop0;
-        reg["pthread_mutexattr_init"] = &thunk_pthread_noop0;
-        reg["pthread_mutexattr_destroy"] = &thunk_pthread_noop0;
-        reg["pthread_mutexattr_settype"] = &thunk_pthread_noop0;
+        reg["pthread_mutexattr_init"] = &thunk_pthread_mutexattr_init;
+        reg["pthread_mutexattr_destroy"] = &thunk_pthread_mutexattr_destroy;
+        reg["pthread_mutexattr_settype"] = &thunk_pthread_mutexattr_settype;
         reg["pthread_condattr_init"] = &thunk_pthread_noop0;
         reg["pthread_condattr_setclock"] = &thunk_pthread_noop0;
         reg["pthread_setname_np"] = &thunk_pthread_noop0;
@@ -850,6 +896,7 @@ void mali_init_plt_tables() {
         reg["readdir"] = &thunk_readdir;
         reg["getpwuid"] = &thunk_getpwuid;
         reg["getpwnam"] = &thunk_getpwnam;
+        reg["prctl"] = &thunk_prctl;
         reg["fstatfs"] = &thunk_noop0;
         reg["statfs"] = &thunk_noop0;
         reg["statvfs"] = &thunk_noop0;
@@ -857,6 +904,8 @@ void mali_init_plt_tables() {
         reg["CreateDmabufHeapBufferAllocator"] = &thunk_noop0;
         reg["DmabufHeapAlloc2"] = &thunk_noop0;
         reg["android_load_sphal_library"] = &thunk_noop0;
+        reg["_ZN7android8hardware11hidl_stringC1EPKc"] = &thunk_hidl_string_ctor;
+        reg["_ZN7android8hardware11hidl_stringD1Ev"] = &thunk_hidl_string_dtor;
         reg["__emutls_get_address"] = &thunk_noop0;
 
         // 4. Populate g_aot_plt_table & g_libcpp_plt_table

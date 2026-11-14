@@ -370,7 +370,7 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
 
    set(AOT_MBS2_OBJ "${CMAKE_BINARY_DIR}/r54p3_lifted.o")
    set(AOT_LIBCPP_OBJ "${CMAKE_BINARY_DIR}/r54p3_libcpp_lifted.o")
-   set(AOT_LIBCPP_SO "/home/leegao/Android/Sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so")
+   set(AOT_LIBCPP_SO "${CMAKE_BINARY_DIR}/ddk/libc++_shared.so")
    set_source_files_properties("${AOT_MBS2_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
    set_source_files_properties("${AOT_LIBCPP_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 

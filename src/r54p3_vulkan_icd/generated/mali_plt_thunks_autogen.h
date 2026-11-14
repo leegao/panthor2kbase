@@ -128,6 +128,18 @@ static void __mali_plt_thunk_exp2f(AOTCPUState* cpu) {
     float a0 = 0.0f; std::memcpy(&a0, &cpu->v[0], 4);
     float r = ::exp2f(a0); uint64_t bits = 0; std::memcpy(&bits, &r, 4); cpu->v[0] = bits;
 }
+static void __mali_plt_thunk_fchmod(AOTCPUState* cpu) {
+    int a0 = static_cast<int>(cpu->x[0]);
+    __mode_t a1 = static_cast<__mode_t>(cpu->x[1]);
+    auto r = ::fchmod(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_fchmodat(AOTCPUState* cpu) {
+    int a0 = static_cast<int>(cpu->x[0]);
+    const char * a1 = reinterpret_cast<const char *>(static_cast<uintptr_t>(cpu->x[1]));
+    __mode_t a2 = static_cast<__mode_t>(cpu->x[2]);
+    int a3 = static_cast<int>(cpu->x[3]);
+    auto r = ::fchmodat(a0, a1, a2, a3); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
 static void __mali_plt_thunk_fclose(AOTCPUState* cpu) {
     FILE * a0 = reinterpret_cast<FILE *>(static_cast<uintptr_t>(cpu->x[0]));
     auto r = ::fclose(a0); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
@@ -187,11 +199,30 @@ static void __mali_plt_thunk_free(AOTCPUState* cpu) {
     void * a0 = reinterpret_cast<void *>(static_cast<uintptr_t>(cpu->x[0]));
     ::free(a0);
 }
+static void __mali_plt_thunk_freelocale(AOTCPUState* cpu) {
+    locale_t a0 = reinterpret_cast<locale_t>(static_cast<uintptr_t>(cpu->x[0]));
+    ::freelocale(a0);
+}
 static void __mali_plt_thunk_fseek(AOTCPUState* cpu) {
     FILE * a0 = reinterpret_cast<FILE *>(static_cast<uintptr_t>(cpu->x[0]));
     long int a1 = static_cast<long int>(cpu->x[1]);
     int a2 = static_cast<int>(cpu->x[2]);
     auto r = ::fseek(a0, a1, a2); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_fseeko(AOTCPUState* cpu) {
+    FILE * a0 = reinterpret_cast<FILE *>(static_cast<uintptr_t>(cpu->x[0]));
+    __off_t a1 = static_cast<__off_t>(cpu->x[1]);
+    int a2 = static_cast<int>(cpu->x[2]);
+    auto r = ::fseeko(a0, a1, a2); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_ftello(AOTCPUState* cpu) {
+    FILE * a0 = reinterpret_cast<FILE *>(static_cast<uintptr_t>(cpu->x[0]));
+    auto r = ::ftello(a0); cpu->x[0] = static_cast<uint64_t>(r);
+}
+static void __mali_plt_thunk_ftruncate(AOTCPUState* cpu) {
+    int a0 = static_cast<int>(cpu->x[0]);
+    __off_t a1 = static_cast<__off_t>(cpu->x[1]);
+    auto r = ::ftruncate(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
 }
 static void __mali_plt_thunk_fwrite(AOTCPUState* cpu) {
     const void * a0 = reinterpret_cast<const void *>(static_cast<uintptr_t>(cpu->x[0]));
@@ -219,8 +250,14 @@ static void __mali_plt_thunk_getenv(AOTCPUState* cpu) {
     auto r = ::getenv(a0);
     cpu->x[0] = reinterpret_cast<uint64_t>(r);
 }
+static void __mali_plt_thunk_geteuid(AOTCPUState* cpu) {
+    auto r = ::geteuid(); cpu->x[0] = static_cast<uint64_t>(static_cast<uint32_t>(r));
+}
 static void __mali_plt_thunk_getpagesize(AOTCPUState* cpu) {
     auto r = ::getpagesize(); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_getpid(AOTCPUState* cpu) {
+    auto r = ::getpid(); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
 }
 static void __mali_plt_thunk_getsockopt(AOTCPUState* cpu) {
     int a0 = static_cast<int>(cpu->x[0]);
@@ -229,6 +266,12 @@ static void __mali_plt_thunk_getsockopt(AOTCPUState* cpu) {
     void * a3 = reinterpret_cast<void *>(static_cast<uintptr_t>(cpu->x[3]));
     socklen_t * a4 = reinterpret_cast<socklen_t *>(static_cast<uintptr_t>(cpu->x[4]));
     auto r = ::getsockopt(a0, a1, a2, a3, a4); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_gettid(AOTCPUState* cpu) {
+    auto r = ::gettid(); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_getuid(AOTCPUState* cpu) {
+    auto r = ::getuid(); cpu->x[0] = static_cast<uint64_t>(static_cast<uint32_t>(r));
 }
 static void __mali_plt_thunk_getwc(AOTCPUState* cpu) {
     __FILE * a0 = reinterpret_cast<__FILE *>(static_cast<uintptr_t>(cpu->x[0]));
@@ -241,6 +284,61 @@ static void __mali_plt_thunk_ilogbf(AOTCPUState* cpu) {
 static void __mali_plt_thunk_isatty(AOTCPUState* cpu) {
     int a0 = static_cast<int>(cpu->x[0]);
     auto r = ::isatty(a0); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_iswalpha_l(AOTCPUState* cpu) {
+    wint_t a0 = static_cast<wint_t>(cpu->x[0]);
+    locale_t a1 = reinterpret_cast<locale_t>(static_cast<uintptr_t>(cpu->x[1]));
+    auto r = ::iswalpha_l(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_iswblank_l(AOTCPUState* cpu) {
+    wint_t a0 = static_cast<wint_t>(cpu->x[0]);
+    locale_t a1 = reinterpret_cast<locale_t>(static_cast<uintptr_t>(cpu->x[1]));
+    auto r = ::iswblank_l(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_iswcntrl_l(AOTCPUState* cpu) {
+    wint_t a0 = static_cast<wint_t>(cpu->x[0]);
+    locale_t a1 = reinterpret_cast<locale_t>(static_cast<uintptr_t>(cpu->x[1]));
+    auto r = ::iswcntrl_l(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_iswdigit_l(AOTCPUState* cpu) {
+    wint_t a0 = static_cast<wint_t>(cpu->x[0]);
+    locale_t a1 = reinterpret_cast<locale_t>(static_cast<uintptr_t>(cpu->x[1]));
+    auto r = ::iswdigit_l(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_iswlower_l(AOTCPUState* cpu) {
+    wint_t a0 = static_cast<wint_t>(cpu->x[0]);
+    locale_t a1 = reinterpret_cast<locale_t>(static_cast<uintptr_t>(cpu->x[1]));
+    auto r = ::iswlower_l(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_iswprint_l(AOTCPUState* cpu) {
+    wint_t a0 = static_cast<wint_t>(cpu->x[0]);
+    locale_t a1 = reinterpret_cast<locale_t>(static_cast<uintptr_t>(cpu->x[1]));
+    auto r = ::iswprint_l(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_iswpunct_l(AOTCPUState* cpu) {
+    wint_t a0 = static_cast<wint_t>(cpu->x[0]);
+    locale_t a1 = reinterpret_cast<locale_t>(static_cast<uintptr_t>(cpu->x[1]));
+    auto r = ::iswpunct_l(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_iswspace_l(AOTCPUState* cpu) {
+    wint_t a0 = static_cast<wint_t>(cpu->x[0]);
+    locale_t a1 = reinterpret_cast<locale_t>(static_cast<uintptr_t>(cpu->x[1]));
+    auto r = ::iswspace_l(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_iswupper_l(AOTCPUState* cpu) {
+    wint_t a0 = static_cast<wint_t>(cpu->x[0]);
+    locale_t a1 = reinterpret_cast<locale_t>(static_cast<uintptr_t>(cpu->x[1]));
+    auto r = ::iswupper_l(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_iswxdigit_l(AOTCPUState* cpu) {
+    wint_t a0 = static_cast<wint_t>(cpu->x[0]);
+    locale_t a1 = reinterpret_cast<locale_t>(static_cast<uintptr_t>(cpu->x[1]));
+    auto r = ::iswxdigit_l(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_kill(AOTCPUState* cpu) {
+    __pid_t a0 = static_cast<__pid_t>(cpu->x[0]);
+    int a1 = static_cast<int>(cpu->x[1]);
+    auto r = ::kill(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
 }
 static void __mali_plt_thunk_ldexp(AOTCPUState* cpu) {
     double a0 = 0.0; std::memcpy(&a0, &cpu->v[0], 8);
@@ -280,6 +378,18 @@ static void __mali_plt_thunk_log2f(AOTCPUState* cpu) {
 static void __mali_plt_thunk_logf(AOTCPUState* cpu) {
     float a0 = 0.0f; std::memcpy(&a0, &cpu->v[0], 4);
     float r = ::logf(a0); uint64_t bits = 0; std::memcpy(&bits, &r, 4); cpu->v[0] = bits;
+}
+static void __mali_plt_thunk_lseek(AOTCPUState* cpu) {
+    int a0 = static_cast<int>(cpu->x[0]);
+    __off_t a1 = static_cast<__off_t>(cpu->x[1]);
+    int a2 = static_cast<int>(cpu->x[2]);
+    auto r = ::lseek(a0, a1, a2); cpu->x[0] = static_cast<uint64_t>(r);
+}
+static void __mali_plt_thunk_lseek64(AOTCPUState* cpu) {
+    int a0 = static_cast<int>(cpu->x[0]);
+    __off64_t a1 = static_cast<__off64_t>(cpu->x[1]);
+    int a2 = static_cast<int>(cpu->x[2]);
+    auto r = ::lseek64(a0, a1, a2); cpu->x[0] = static_cast<uint64_t>(r);
 }
 static void __mali_plt_thunk_madvise(AOTCPUState* cpu) {
     void * a0 = reinterpret_cast<void *>(static_cast<uintptr_t>(cpu->x[0]));
@@ -334,6 +444,11 @@ static void __mali_plt_thunk_memcmp(AOTCPUState* cpu) {
     size_t a2 = static_cast<size_t>(cpu->x[2]);
     auto r = ::memcmp(a0, a1, a2); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
 }
+static void __mali_plt_thunk_mkdir(AOTCPUState* cpu) {
+    const char * a0 = reinterpret_cast<const char *>(static_cast<uintptr_t>(cpu->x[0]));
+    __mode_t a1 = static_cast<__mode_t>(cpu->x[1]);
+    auto r = ::mkdir(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
 static void __mali_plt_thunk_mkstemp(AOTCPUState* cpu) {
     char * a0 = reinterpret_cast<char *>(static_cast<uintptr_t>(cpu->x[0]));
     auto r = ::mkstemp(a0); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
@@ -348,6 +463,13 @@ static void __mali_plt_thunk_nanosleep(AOTCPUState* cpu) {
     const struct timespec * a0 = reinterpret_cast<const struct timespec *>(static_cast<uintptr_t>(cpu->x[0]));
     struct timespec * a1 = reinterpret_cast<struct timespec *>(static_cast<uintptr_t>(cpu->x[1]));
     auto r = ::nanosleep(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_newlocale(AOTCPUState* cpu) {
+    int a0 = static_cast<int>(cpu->x[0]);
+    const char * a1 = reinterpret_cast<const char *>(static_cast<uintptr_t>(cpu->x[1]));
+    locale_t a2 = reinterpret_cast<locale_t>(static_cast<uintptr_t>(cpu->x[2]));
+    auto r = ::newlocale(a0, a1, a2);
+    cpu->x[0] = reinterpret_cast<uint64_t>(r);
 }
 static void __mali_plt_thunk_nextafterf(AOTCPUState* cpu) {
     float a0 = 0.0f; std::memcpy(&a0, &cpu->v[0], 4);
@@ -385,6 +507,13 @@ static void __mali_plt_thunk_powf(AOTCPUState* cpu) {
     float a0 = 0.0f; std::memcpy(&a0, &cpu->v[0], 4);
     float a1 = 0.0f; std::memcpy(&a1, &cpu->v[1], 4);
     float r = ::powf(a0, a1); uint64_t bits = 0; std::memcpy(&bits, &r, 4); cpu->v[0] = bits;
+}
+static void __mali_plt_thunk_pread(AOTCPUState* cpu) {
+    int a0 = static_cast<int>(cpu->x[0]);
+    void * a1 = reinterpret_cast<void *>(static_cast<uintptr_t>(cpu->x[1]));
+    size_t a2 = static_cast<size_t>(cpu->x[2]);
+    __off_t a3 = static_cast<__off_t>(cpu->x[3]);
+    auto r = ::pread(a0, a1, a2, a3); cpu->x[0] = static_cast<uint64_t>(r);
 }
 static void __mali_plt_thunk_pthread_getspecific(AOTCPUState* cpu) {
     pthread_key_t a0 = static_cast<pthread_key_t>(cpu->x[0]);
@@ -535,6 +664,12 @@ static void __mali_plt_thunk_strcmp(AOTCPUState* cpu) {
     const char * a1 = reinterpret_cast<const char *>(static_cast<uintptr_t>(cpu->x[1]));
     auto r = ::strcmp(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
 }
+static void __mali_plt_thunk_strcoll_l(AOTCPUState* cpu) {
+    const char * a0 = reinterpret_cast<const char *>(static_cast<uintptr_t>(cpu->x[0]));
+    const char * a1 = reinterpret_cast<const char *>(static_cast<uintptr_t>(cpu->x[1]));
+    locale_t a2 = reinterpret_cast<locale_t>(static_cast<uintptr_t>(cpu->x[2]));
+    auto r = ::strcoll_l(a0, a1, a2); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
 static void __mali_plt_thunk_strdup(AOTCPUState* cpu) {
     const char * a0 = reinterpret_cast<const char *>(static_cast<uintptr_t>(cpu->x[0]));
     auto r = ::strdup(a0);
@@ -633,6 +768,13 @@ static void __mali_plt_thunk_strtoul(AOTCPUState* cpu) {
     int a2 = static_cast<int>(cpu->x[2]);
     auto r = ::strtoul(a0, a1, a2); cpu->x[0] = static_cast<uint64_t>(r);
 }
+static void __mali_plt_thunk_strxfrm_l(AOTCPUState* cpu) {
+    char * a0 = reinterpret_cast<char *>(static_cast<uintptr_t>(cpu->x[0]));
+    const char * a1 = reinterpret_cast<const char *>(static_cast<uintptr_t>(cpu->x[1]));
+    size_t a2 = static_cast<size_t>(cpu->x[2]);
+    locale_t a3 = reinterpret_cast<locale_t>(static_cast<uintptr_t>(cpu->x[3]));
+    auto r = ::strxfrm_l(a0, a1, a2, a3); cpu->x[0] = static_cast<uint64_t>(r);
+}
 static void __mali_plt_thunk_symlink(AOTCPUState* cpu) {
     const char * a0 = reinterpret_cast<const char *>(static_cast<uintptr_t>(cpu->x[0]));
     const char * a1 = reinterpret_cast<const char *>(static_cast<uintptr_t>(cpu->x[1]));
@@ -650,12 +792,32 @@ static void __mali_plt_thunk_time(AOTCPUState* cpu) {
     time_t * a0 = reinterpret_cast<time_t *>(static_cast<uintptr_t>(cpu->x[0]));
     auto r = ::time(a0); cpu->x[0] = static_cast<uint64_t>(r);
 }
+static void __mali_plt_thunk_timerfd_create(AOTCPUState* cpu) {
+    __clockid_t a0 = static_cast<__clockid_t>(cpu->x[0]);
+    int a1 = static_cast<int>(cpu->x[1]);
+    auto r = ::timerfd_create(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
 static void __mali_plt_thunk_timerfd_settime(AOTCPUState* cpu) {
     int a0 = static_cast<int>(cpu->x[0]);
     int a1 = static_cast<int>(cpu->x[1]);
     const struct itimerspec * a2 = reinterpret_cast<const struct itimerspec *>(static_cast<uintptr_t>(cpu->x[2]));
     struct itimerspec * a3 = reinterpret_cast<struct itimerspec *>(static_cast<uintptr_t>(cpu->x[3]));
     auto r = ::timerfd_settime(a0, a1, a2, a3); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_towlower_l(AOTCPUState* cpu) {
+    wint_t a0 = static_cast<wint_t>(cpu->x[0]);
+    locale_t a1 = reinterpret_cast<locale_t>(static_cast<uintptr_t>(cpu->x[1]));
+    auto r = ::towlower_l(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_towupper_l(AOTCPUState* cpu) {
+    wint_t a0 = static_cast<wint_t>(cpu->x[0]);
+    locale_t a1 = reinterpret_cast<locale_t>(static_cast<uintptr_t>(cpu->x[1]));
+    auto r = ::towupper_l(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_truncate(AOTCPUState* cpu) {
+    const char * a0 = reinterpret_cast<const char *>(static_cast<uintptr_t>(cpu->x[0]));
+    __off_t a1 = static_cast<__off_t>(cpu->x[1]);
+    auto r = ::truncate(a0, a1); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
 }
 static void __mali_plt_thunk_uname(AOTCPUState* cpu) {
     struct utsname * a0 = reinterpret_cast<struct utsname *>(static_cast<uintptr_t>(cpu->x[0]));
@@ -681,6 +843,11 @@ static void __mali_plt_thunk_unlinkat(AOTCPUState* cpu) {
     int a2 = static_cast<int>(cpu->x[2]);
     auto r = ::unlinkat(a0, a1, a2); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
 }
+static void __mali_plt_thunk_uselocale(AOTCPUState* cpu) {
+    locale_t a0 = reinterpret_cast<locale_t>(static_cast<uintptr_t>(cpu->x[0]));
+    auto r = ::uselocale(a0);
+    cpu->x[0] = reinterpret_cast<uint64_t>(r);
+}
 static void __mali_plt_thunk_utimensat(AOTCPUState* cpu) {
     int a0 = static_cast<int>(cpu->x[0]);
     const char * a1 = reinterpret_cast<const char *>(static_cast<uintptr_t>(cpu->x[1]));
@@ -688,11 +855,28 @@ static void __mali_plt_thunk_utimensat(AOTCPUState* cpu) {
     int a3 = static_cast<int>(cpu->x[3]);
     auto r = ::utimensat(a0, a1, a2, a3); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
 }
+static void __mali_plt_thunk_wait(AOTCPUState* cpu) {
+    int * a0 = reinterpret_cast<int *>(static_cast<uintptr_t>(cpu->x[0]));
+    auto r = ::wait(a0); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
+static void __mali_plt_thunk_wait4(AOTCPUState* cpu) {
+    __pid_t a0 = static_cast<__pid_t>(cpu->x[0]);
+    int * a1 = reinterpret_cast<int *>(static_cast<uintptr_t>(cpu->x[1]));
+    int a2 = static_cast<int>(cpu->x[2]);
+    struct rusage * a3 = reinterpret_cast<struct rusage *>(static_cast<uintptr_t>(cpu->x[3]));
+    auto r = ::wait4(a0, a1, a2, a3); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
+}
 static void __mali_plt_thunk_wcrtomb(AOTCPUState* cpu) {
     char * a0 = reinterpret_cast<char *>(static_cast<uintptr_t>(cpu->x[0]));
     wchar_t a1 = static_cast<wchar_t>(cpu->x[1]);
     mbstate_t * a2 = reinterpret_cast<mbstate_t *>(static_cast<uintptr_t>(cpu->x[2]));
     auto r = ::wcrtomb(a0, a1, a2); cpu->x[0] = static_cast<uint64_t>(r);
+}
+static void __mali_plt_thunk_wcscoll_l(AOTCPUState* cpu) {
+    const wchar_t * a0 = reinterpret_cast<const wchar_t *>(static_cast<uintptr_t>(cpu->x[0]));
+    const wchar_t * a1 = reinterpret_cast<const wchar_t *>(static_cast<uintptr_t>(cpu->x[1]));
+    locale_t a2 = reinterpret_cast<locale_t>(static_cast<uintptr_t>(cpu->x[2]));
+    auto r = ::wcscoll_l(a0, a1, a2); cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));
 }
 static void __mali_plt_thunk_wcslen(AOTCPUState* cpu) {
     const wchar_t * a0 = reinterpret_cast<const wchar_t *>(static_cast<uintptr_t>(cpu->x[0]));
@@ -727,6 +911,13 @@ static void __mali_plt_thunk_wcstoul(AOTCPUState* cpu) {
     wchar_t ** a1 = reinterpret_cast<wchar_t **>(static_cast<uintptr_t>(cpu->x[1]));
     int a2 = static_cast<int>(cpu->x[2]);
     auto r = ::wcstoul(a0, a1, a2); cpu->x[0] = static_cast<uint64_t>(r);
+}
+static void __mali_plt_thunk_wcsxfrm_l(AOTCPUState* cpu) {
+    wchar_t * a0 = reinterpret_cast<wchar_t *>(static_cast<uintptr_t>(cpu->x[0]));
+    const wchar_t * a1 = reinterpret_cast<const wchar_t *>(static_cast<uintptr_t>(cpu->x[1]));
+    size_t a2 = static_cast<size_t>(cpu->x[2]);
+    locale_t a3 = reinterpret_cast<locale_t>(static_cast<uintptr_t>(cpu->x[3]));
+    auto r = ::wcsxfrm_l(a0, a1, a2, a3); cpu->x[0] = static_cast<uint64_t>(r);
 }
 static void __mali_plt_thunk_wctob(AOTCPUState* cpu) {
     wint_t a0 = static_cast<wint_t>(cpu->x[0]);
@@ -774,6 +965,8 @@ static inline void mali_register_autogen_plt_thunks(std::unordered_map<std::stri
     reg["exp"] = &__mali_plt_thunk_exp;
     reg["exp2"] = &__mali_plt_thunk_exp2;
     reg["exp2f"] = &__mali_plt_thunk_exp2f;
+    reg["fchmod"] = &__mali_plt_thunk_fchmod;
+    reg["fchmodat"] = &__mali_plt_thunk_fchmodat;
     reg["fclose"] = &__mali_plt_thunk_fclose;
     reg["fdatasync"] = &__mali_plt_thunk_fdatasync;
     reg["fdopendir"] = &__mali_plt_thunk_fdopendir;
@@ -786,17 +979,36 @@ static inline void mali_register_autogen_plt_thunks(std::unordered_map<std::stri
     reg["fputwc"] = &__mali_plt_thunk_fputwc;
     reg["fread"] = &__mali_plt_thunk_fread;
     reg["free"] = &__mali_plt_thunk_free;
+    reg["freelocale"] = &__mali_plt_thunk_freelocale;
     reg["fseek"] = &__mali_plt_thunk_fseek;
+    reg["fseeko"] = &__mali_plt_thunk_fseeko;
+    reg["ftello"] = &__mali_plt_thunk_ftello;
+    reg["ftruncate"] = &__mali_plt_thunk_ftruncate;
     reg["fwrite"] = &__mali_plt_thunk_fwrite;
     reg["getauxval"] = &__mali_plt_thunk_getauxval;
     reg["getc"] = &__mali_plt_thunk_getc;
     reg["getcwd"] = &__mali_plt_thunk_getcwd;
     reg["getenv"] = &__mali_plt_thunk_getenv;
+    reg["geteuid"] = &__mali_plt_thunk_geteuid;
     reg["getpagesize"] = &__mali_plt_thunk_getpagesize;
+    reg["getpid"] = &__mali_plt_thunk_getpid;
     reg["getsockopt"] = &__mali_plt_thunk_getsockopt;
+    reg["gettid"] = &__mali_plt_thunk_gettid;
+    reg["getuid"] = &__mali_plt_thunk_getuid;
     reg["getwc"] = &__mali_plt_thunk_getwc;
     reg["ilogbf"] = &__mali_plt_thunk_ilogbf;
     reg["isatty"] = &__mali_plt_thunk_isatty;
+    reg["iswalpha_l"] = &__mali_plt_thunk_iswalpha_l;
+    reg["iswblank_l"] = &__mali_plt_thunk_iswblank_l;
+    reg["iswcntrl_l"] = &__mali_plt_thunk_iswcntrl_l;
+    reg["iswdigit_l"] = &__mali_plt_thunk_iswdigit_l;
+    reg["iswlower_l"] = &__mali_plt_thunk_iswlower_l;
+    reg["iswprint_l"] = &__mali_plt_thunk_iswprint_l;
+    reg["iswpunct_l"] = &__mali_plt_thunk_iswpunct_l;
+    reg["iswspace_l"] = &__mali_plt_thunk_iswspace_l;
+    reg["iswupper_l"] = &__mali_plt_thunk_iswupper_l;
+    reg["iswxdigit_l"] = &__mali_plt_thunk_iswxdigit_l;
+    reg["kill"] = &__mali_plt_thunk_kill;
     reg["ldexp"] = &__mali_plt_thunk_ldexp;
     reg["ldexpf"] = &__mali_plt_thunk_ldexpf;
     reg["link"] = &__mali_plt_thunk_link;
@@ -806,6 +1018,8 @@ static inline void mali_register_autogen_plt_thunks(std::unordered_map<std::stri
     reg["log2"] = &__mali_plt_thunk_log2;
     reg["log2f"] = &__mali_plt_thunk_log2f;
     reg["logf"] = &__mali_plt_thunk_logf;
+    reg["lseek"] = &__mali_plt_thunk_lseek;
+    reg["lseek64"] = &__mali_plt_thunk_lseek64;
     reg["madvise"] = &__mali_plt_thunk_madvise;
     reg["mbrlen"] = &__mali_plt_thunk_mbrlen;
     reg["mbrtowc"] = &__mali_plt_thunk_mbrtowc;
@@ -814,9 +1028,11 @@ static inline void mali_register_autogen_plt_thunks(std::unordered_map<std::stri
     reg["mbtowc"] = &__mali_plt_thunk_mbtowc;
     reg["memchr"] = &__mali_plt_thunk_memchr;
     reg["memcmp"] = &__mali_plt_thunk_memcmp;
+    reg["mkdir"] = &__mali_plt_thunk_mkdir;
     reg["mkstemp"] = &__mali_plt_thunk_mkstemp;
     reg["mprotect"] = &__mali_plt_thunk_mprotect;
     reg["nanosleep"] = &__mali_plt_thunk_nanosleep;
+    reg["newlocale"] = &__mali_plt_thunk_newlocale;
     reg["nextafterf"] = &__mali_plt_thunk_nextafterf;
     reg["opendir"] = &__mali_plt_thunk_opendir;
     reg["openlog"] = &__mali_plt_thunk_openlog;
@@ -824,6 +1040,7 @@ static inline void mali_register_autogen_plt_thunks(std::unordered_map<std::stri
     reg["posix_memalign"] = &__mali_plt_thunk_posix_memalign;
     reg["pow"] = &__mali_plt_thunk_pow;
     reg["powf"] = &__mali_plt_thunk_powf;
+    reg["pread"] = &__mali_plt_thunk_pread;
     reg["pthread_getspecific"] = &__mali_plt_thunk_pthread_getspecific;
     reg["pthread_key_delete"] = &__mali_plt_thunk_pthread_key_delete;
     reg["pthread_self"] = &__mali_plt_thunk_pthread_self;
@@ -855,6 +1072,7 @@ static inline void mali_register_autogen_plt_thunks(std::unordered_map<std::stri
     reg["srand"] = &__mali_plt_thunk_srand;
     reg["strchr"] = &__mali_plt_thunk_strchr;
     reg["strcmp"] = &__mali_plt_thunk_strcmp;
+    reg["strcoll_l"] = &__mali_plt_thunk_strcoll_l;
     reg["strdup"] = &__mali_plt_thunk_strdup;
     reg["strerror"] = &__mali_plt_thunk_strerror;
     reg["strncasecmp"] = &__mali_plt_thunk_strncasecmp;
@@ -872,24 +1090,34 @@ static inline void mali_register_autogen_plt_thunks(std::unordered_map<std::stri
     reg["strtok_r"] = &__mali_plt_thunk_strtok_r;
     reg["strtol"] = &__mali_plt_thunk_strtol;
     reg["strtoul"] = &__mali_plt_thunk_strtoul;
+    reg["strxfrm_l"] = &__mali_plt_thunk_strxfrm_l;
     reg["symlink"] = &__mali_plt_thunk_symlink;
     reg["tan"] = &__mali_plt_thunk_tan;
     reg["tanh"] = &__mali_plt_thunk_tanh;
     reg["time"] = &__mali_plt_thunk_time;
+    reg["timerfd_create"] = &__mali_plt_thunk_timerfd_create;
     reg["timerfd_settime"] = &__mali_plt_thunk_timerfd_settime;
+    reg["towlower_l"] = &__mali_plt_thunk_towlower_l;
+    reg["towupper_l"] = &__mali_plt_thunk_towupper_l;
+    reg["truncate"] = &__mali_plt_thunk_truncate;
     reg["uname"] = &__mali_plt_thunk_uname;
     reg["ungetc"] = &__mali_plt_thunk_ungetc;
     reg["ungetwc"] = &__mali_plt_thunk_ungetwc;
     reg["unlink"] = &__mali_plt_thunk_unlink;
     reg["unlinkat"] = &__mali_plt_thunk_unlinkat;
+    reg["uselocale"] = &__mali_plt_thunk_uselocale;
     reg["utimensat"] = &__mali_plt_thunk_utimensat;
+    reg["wait"] = &__mali_plt_thunk_wait;
+    reg["wait4"] = &__mali_plt_thunk_wait4;
     reg["wcrtomb"] = &__mali_plt_thunk_wcrtomb;
+    reg["wcscoll_l"] = &__mali_plt_thunk_wcscoll_l;
     reg["wcslen"] = &__mali_plt_thunk_wcslen;
     reg["wcsnrtombs"] = &__mali_plt_thunk_wcsnrtombs;
     reg["wcstod"] = &__mali_plt_thunk_wcstod;
     reg["wcstof"] = &__mali_plt_thunk_wcstof;
     reg["wcstol"] = &__mali_plt_thunk_wcstol;
     reg["wcstoul"] = &__mali_plt_thunk_wcstoul;
+    reg["wcsxfrm_l"] = &__mali_plt_thunk_wcsxfrm_l;
     reg["wctob"] = &__mali_plt_thunk_wctob;
     reg["wmemchr"] = &__mali_plt_thunk_wmemchr;
     reg["wmemcmp"] = &__mali_plt_thunk_wmemcmp;

@@ -1081,7 +1081,6 @@ struct MaliAotGlobalRuntime {
 
         const char* libcpp_cands[] = {
             getenv("MALI_AOT_LIBCPP_SO"),
-            "/home/leegao/Android/Sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so",
             "ddk/libc++_shared.so",
             "libc++_shared.so"
         };

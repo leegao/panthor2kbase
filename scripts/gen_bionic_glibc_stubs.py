@@ -163,10 +163,18 @@ def main():
         "    return m ? pthread_mutex_trylock(m) : 0;",
         "}",
         "static inline int mali_stubs_pthread_mutex_init_hook(uint64_t mtx_va, uint64_t attr_va) {",
-        "    (void)attr_va;",
         "    if (!mtx_va) return 22;",
         "    auto* slot = reinterpret_cast<BionicHybrisMutexSlot*>(mtx_va);",
         "    slot->magic = 0;",
+        "    slot->bionic_state = 0;",
+        "    if (attr_va) {",
+        "        uint32_t raw_attr = *reinterpret_cast<const uint32_t*>(attr_va);",
+        "        if ((raw_attr & 0xFFFF0000U) == 0x4D410000U) {",
+        "            slot->bionic_state = (raw_attr & 0x3U) << 14;",
+        "        } else {",
+        "            slot->bionic_state = (raw_attr & 0x3U) << 14;",
+        "        }",
+        "    }",
         "    slot->host_mtx = nullptr;",
         "    return mali_hybris_resolve_mutex(mtx_va) ? 0 : 12;",
         "}",
@@ -484,11 +492,11 @@ def generate_plt_thunks():
             idx = p.find("[")
             base = p[:idx].strip()
             toks = base.split()
-            if len(toks) > 1 and toks[-1] not in ("int", "long", "char", "short", "unsigned", "signed", "float", "double", "void", "size_t", "ssize_t", "off_t", "off64_t", "mode_t", "pid_t", "uid_t", "gid_t", "clockid_t", "locale_t", "wint_t", "wchar_t", "fexcept_t", "nfds_t", "socklen_t", "rlim_t", "pthread_t", "pthread_key_t", "Bytef", "uInt", "uLong", "voidpf"):
+            if len(toks) > 1 and toks[-1] not in ("int", "long", "char", "short", "unsigned", "signed", "float", "double", "void", "size_t", "ssize_t", "__ssize_t", "off_t", "__off_t", "off64_t", "__off64_t", "mode_t", "__mode_t", "pid_t", "__pid_t", "uid_t", "__uid_t", "gid_t", "__gid_t", "clockid_t", "__clockid_t", "time_t", "__time_t", "locale_t", "wint_t", "wchar_t", "fexcept_t", "nfds_t", "socklen_t", "__socklen_t", "rlim_t", "pthread_t", "pthread_key_t", "Bytef", "uInt", "uLong", "voidpf"):
                 base = " ".join(toks[:-1])
             return base + "*"
         toks = p.split()
-        if len(toks) > 1 and toks[-1] not in ("int", "long", "char", "short", "unsigned", "signed", "float", "double", "void", "size_t", "ssize_t", "off_t", "off64_t", "mode_t", "pid_t", "uid_t", "gid_t", "clockid_t", "locale_t", "wint_t", "wchar_t", "nfds_t", "socklen_t", "rlim_t", "pthread_t", "pthread_key_t", "Bytef", "uInt", "uLong", "voidpf"):
+        if len(toks) > 1 and toks[-1] not in ("int", "long", "char", "short", "unsigned", "signed", "float", "double", "void", "size_t", "ssize_t", "__ssize_t", "off_t", "__off_t", "off64_t", "__off64_t", "mode_t", "__mode_t", "pid_t", "__pid_t", "uid_t", "__uid_t", "gid_t", "__gid_t", "clockid_t", "__clockid_t", "time_t", "__time_t", "locale_t", "wint_t", "wchar_t", "nfds_t", "socklen_t", "__socklen_t", "rlim_t", "pthread_t", "pthread_key_t", "Bytef", "uInt", "uLong", "voidpf"):
             if toks[-2] not in ("struct", "enum", "union"):
                 return " ".join(toks[:-1])
         return p
@@ -497,6 +505,8 @@ def generate_plt_thunks():
         t = re.sub(r"\b__restrict\b|\brestrict\b", "", t)
         t = " ".join(t.split())
         if "*" in t:
+            return "ptr", t
+        if t == "locale_t":
             return "ptr", t
         t = re.sub(r"\bconst\b|\bvolatile\b", "", t)
         t = " ".join(t.split())
@@ -508,11 +518,11 @@ def generate_plt_thunks():
             return "f64", "double"
         if "long double" in t or "__float" in t:
             return "unsupported", t
-        if t in ("int", "signed int", "short", "signed short", "char", "signed char", "int32_t", "int16_t", "int8_t", "pid_t", "clockid_t", "wint_t", "wchar_t"):
+        if t in ("int", "signed int", "short", "signed short", "char", "signed char", "int32_t", "int16_t", "int8_t", "pid_t", "__pid_t", "clockid_t", "__clockid_t", "wint_t", "wchar_t"):
             return "i32", t
-        if t in ("unsigned int", "unsigned", "unsigned short", "unsigned char", "uint32_t", "uint16_t", "uint8_t", "uid_t", "gid_t", "mode_t", "socklen_t", "wctype_t", "uInt"):
+        if t in ("unsigned int", "unsigned", "unsigned short", "unsigned char", "uint32_t", "uint16_t", "uint8_t", "uid_t", "__uid_t", "gid_t", "__gid_t", "mode_t", "__mode_t", "socklen_t", "__socklen_t", "wctype_t", "uInt"):
             return "u32", t
-        if t in ("long", "long int", "signed long", "long long", "int64_t", "ssize_t", "off_t", "off64_t", "time_t", "ptrdiff_t", "intptr_t", "clock_t"):
+        if t in ("long", "long int", "signed long", "long long", "int64_t", "ssize_t", "__ssize_t", "off_t", "__off_t", "off64_t", "__off64_t", "time_t", "__time_t", "ptrdiff_t", "intptr_t", "clock_t"):
             return "i64", t
         if t in ("unsigned long", "unsigned long int", "unsigned long long", "uint64_t", "size_t", "uintptr_t", "nfds_t", "rlim_t", "pthread_t", "pthread_key_t", "uLong", "fexcept_t"):
             return "u64", t

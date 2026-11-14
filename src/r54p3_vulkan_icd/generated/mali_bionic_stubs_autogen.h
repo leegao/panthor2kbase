@@ -102,10 +102,18 @@ static inline int mali_stubs_pthread_mutex_trylock_hook(uint64_t mtx_va) {
     return m ? pthread_mutex_trylock(m) : 0;
 }
 static inline int mali_stubs_pthread_mutex_init_hook(uint64_t mtx_va, uint64_t attr_va) {
-    (void)attr_va;
     if (!mtx_va) return 22;
     auto* slot = reinterpret_cast<BionicHybrisMutexSlot*>(mtx_va);
     slot->magic = 0;
+    slot->bionic_state = 0;
+    if (attr_va) {
+        uint32_t raw_attr = *reinterpret_cast<const uint32_t*>(attr_va);
+        if ((raw_attr & 0xFFFF0000U) == 0x4D410000U) {
+            slot->bionic_state = (raw_attr & 0x3U) << 14;
+        } else {
+            slot->bionic_state = (raw_attr & 0x3U) << 14;
+        }
+    }
     slot->host_mtx = nullptr;
     return mali_hybris_resolve_mutex(mtx_va) ? 0 : 12;
 }
