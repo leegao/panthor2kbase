@@ -674,9 +674,16 @@ struct HostVkAllocatorTable {
     }
 };
 
+static constexpr uint64_t LIBCPP_IMAGE_BASE = 0x500000000ULL;
+static constexpr uint64_t SYNTH_PLT_VA_BASE = 0x600000000ULL;
+
 extern HostVkAllocatorTable g_host_vk_allocators;
 extern "C" void aot_unhandled_plt(AOTCPUState* cpu, uint64_t target_va);
 extern "C" void aot_host_hle_dispatch(AOTCPUState* cpu, uint64_t target_va);
+extern "C" void libcpp_indirect_dispatch(AOTCPUState* cpu, uint64_t target_va);
+extern "C" void libcpp_run_dt_init_array(AOTCPUState* cpu);
+extern "C" void mali_init_plt_tables();
+extern "C" uint64_t mali_resolve_glob_dat_symbol(const char* sym_name, int64_t addend);
 // ============================================================================
 // Section 3: ELF64 Image Mapper & AOT Driver Context Manager
 // ============================================================================
@@ -701,10 +708,11 @@ struct MaliIcdImageMapper {
         }
     }
 
-    bool loadAndRelocate(const char* so_path) {
+    bool loadAndRelocate(const char* so_path, uint64_t fixed_base = IMAGE_BASE, size_t map_size = 0x04000000) {
         std::ifstream in(so_path, std::ios::binary);
         if (!in) return false;
         so_path_loaded = so_path;
+        image_size = map_size;
         elf.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         if (elf.size() < 0x1000 || elf[0] != 0x7f || elf[4] != 2) return false;
 
@@ -720,7 +728,7 @@ struct MaliIcdImageMapper {
             }
         }
 
-        void* mapped = mmap(reinterpret_cast<void*>(IMAGE_BASE), image_size,
+        void* mapped = mmap(reinterpret_cast<void*>(fixed_base), image_size,
                             PROT_READ | PROT_WRITE,
                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
         if (mapped == MAP_FAILED) return false;
@@ -827,7 +835,9 @@ struct MaliIcdImageMapper {
                         } else if (shndx == 0 && (r_type == 1025 || r_type == 257)) {
                             uint32_t st_name = *reinterpret_cast<const uint32_t*>(s + 0);
                             const char* sym_name = dynstr_off ? reinterpret_cast<const char*>(&elf[dynstr_off + st_name]) : "";
-                            if (std::strcmp(sym_name, "__progname") == 0) {
+                            if (uint64_t resolved = mali_resolve_glob_dat_symbol(sym_name, cur_addend)) {
+                                *target = resolved;
+                            } else if (std::strcmp(sym_name, "__progname") == 0) {
                                 static const char* s_mali_progname = "mali_icd";
                                 *target = reinterpret_cast<uint64_t>(&s_mali_progname);
                             } else if (std::strcmp(sym_name, "environ") == 0) {
@@ -841,6 +851,45 @@ struct MaliIcdImageMapper {
                         }
                     }
                     done++;
+                }
+            }
+        } else if (reladyn_off && reladyn_sz >= 24) {
+            for (size_t pos = reladyn_off; pos + 24 <= reladyn_off + reladyn_sz; pos += 24) {
+                uint64_t r_offset = *reinterpret_cast<const uint64_t*>(&elf[pos]);
+                uint64_t r_info   = *reinterpret_cast<const uint64_t*>(&elf[pos + 8]);
+                int64_t  r_addend = *reinterpret_cast<const int64_t*>(&elf[pos + 16]);
+                uint32_t sym_idx  = static_cast<uint32_t>(r_info >> 32);
+                uint32_t r_type   = static_cast<uint32_t>(r_info & 0xffffffffU);
+                if (r_offset + 8 > image_size) continue;
+                uint64_t* target = reinterpret_cast<uint64_t*>(base + r_offset);
+                if (r_type == 1027) {
+                    *target = reinterpret_cast<uint64_t>(base) + static_cast<uint64_t>(r_addend);
+                } else if (r_type == 1031) {
+                    target[0] = HLE_TLSDESC_MAGIC;
+                    target[1] = static_cast<uint64_t>(r_addend);
+                } else if (dynsym_off && sym_idx > 0) {
+                    const uint8_t* s = &elf[dynsym_off + sym_idx * 24];
+                    uint16_t shndx = *reinterpret_cast<const uint16_t*>(s + 6);
+                    uint64_t sval = *reinterpret_cast<const uint64_t*>(s + 8);
+                    if (shndx != 0 && sval != 0) {
+                        *target = reinterpret_cast<uint64_t>(base) + sval + static_cast<uint64_t>(r_addend);
+                    } else if (shndx == 0 && (r_type == 1025 || r_type == 257)) {
+                        uint32_t st_name = *reinterpret_cast<const uint32_t*>(s + 0);
+                        const char* sym_name = dynstr_off ? reinterpret_cast<const char*>(&elf[dynstr_off + st_name]) : "";
+                        if (uint64_t resolved = mali_resolve_glob_dat_symbol(sym_name, r_addend)) {
+                            *target = resolved;
+                        } else if (std::strcmp(sym_name, "__progname") == 0) {
+                            static const char* s_mali_progname = "mali_icd";
+                            *target = reinterpret_cast<uint64_t>(&s_mali_progname);
+                        } else if (std::strcmp(sym_name, "environ") == 0) {
+                            *target = reinterpret_cast<uint64_t>(&environ);
+                        } else if (std::strcmp(sym_name, "__stack_chk_guard") == 0) {
+                            static uint64_t s_mali_stack_guard = 0x595a2b8f4d414c49ULL;
+                            *target = reinterpret_cast<uint64_t>(&s_mali_stack_guard);
+                        } else {
+                            *target = ext_glob_stub_va;
+                        }
+                    }
                 }
             }
         }
@@ -932,6 +981,7 @@ struct MaliAotGlobalRuntime {
     std::mutex           mtx;
     bool                 initialized = false;
     MaliIcdImageMapper   mapper;
+    MaliIcdImageMapper   libcpp_mapper;
     AOTCPUState          cpu{};
     uint8_t*             stack_mem = nullptr;
     size_t               stack_size = 8 * 1024 * 1024;
@@ -1026,6 +1076,22 @@ struct MaliAotGlobalRuntime {
     bool ensureInitialized() {
         std::lock_guard<std::mutex> lock(mtx);
         if (initialized) return true;
+
+        mali_init_plt_tables();
+
+        const char* libcpp_cands[] = {
+            getenv("MALI_AOT_LIBCPP_SO"),
+            "/home/leegao/Android/Sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so",
+            "ddk/libc++_shared.so",
+            "libc++_shared.so"
+        };
+        bool libcpp_mapped = false;
+        for (const char* lc : libcpp_cands) {
+            if (lc && lc[0] && libcpp_mapper.loadAndRelocate(lc, LIBCPP_IMAGE_BASE, 0x00400000)) {
+                libcpp_mapped = true;
+                break;
+            }
+        }
 
         const char* env_so = getenv("MALI_AOT_DRIVER_SO");
         std::string icd_dir_so, icd_aot_so, icd_repo_so, icd_repo_up_so, icd_root_r44_so;
@@ -1205,6 +1271,9 @@ struct MaliAotGlobalRuntime {
 
         // 0. Execute lifted Bionic DT_INIT_ARRAY (.init_array) constructors
         const char* skip_ia = getenv("MALI_AOT_SKIP_INIT_ARRAY");
+        if (libcpp_mapped && (!skip_ia || skip_ia[0] == '0')) {
+            libcpp_run_dt_init_array(&cpu);
+        }
         if (mapped_ok && (!skip_ia || skip_ia[0] == '0')) {
             static sigjmp_buf s_ia_jmp;
             static volatile sig_atomic_t s_ia_guard = 0;

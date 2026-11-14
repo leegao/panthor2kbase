@@ -996,7 +996,28 @@ extern "C" void __mali_stack_chk_fail_diag(AOTCPUState* cpu) {
 
 HostVkAllocatorTable g_host_vk_allocators;
 
+extern "C" bool mali_dispatch_synth_plt_va(AOTCPUState* cpu, uint64_t target_va);
+
 extern "C" void aot_unhandled_plt(AOTCPUState* cpu, uint64_t target_va) {
+    if (target_va >= LIBCPP_IMAGE_BASE && target_va < LIBCPP_IMAGE_BASE + 0x00400000ULL) {
+        static thread_local int s_libcpp_depth = 0;
+        if (s_libcpp_depth < 64) {
+            struct Guard { int& d; Guard(int& x) : d(x) { ++d; } ~Guard() { --d; } } g(s_libcpp_depth);
+            libcpp_indirect_dispatch(cpu, target_va);
+            return;
+        }
+    }
+    if (target_va >= IMAGE_BASE && target_va < IMAGE_BASE + 0x04000000ULL) {
+        static thread_local int s_aot_depth = 0;
+        if (s_aot_depth == 0) {
+            struct Guard { int& d; Guard(int& x) : d(x) { ++d; } ~Guard() { --d; } } g(s_aot_depth);
+            aot_indirect_dispatch(cpu, target_va);
+            return;
+        }
+    }
+    if (mali_dispatch_synth_plt_va(cpu, target_va)) {
+        return;
+    }
     if (target_va == IMAGE_BASE + 0x01c650d0ULL) {
         // cctx hash-table malloc callback (0x01c650d0: bti c; mov x0, x1; b malloc@PLT)
         size_t sz = static_cast<size_t>(cpu->x[1] ? cpu->x[1] : cpu->x[0]);
@@ -1243,277 +1264,6 @@ uint64_t __mali_unhandled_plt_stub(AOTCPUState* /*cpu*/) {
     return 0;
 }
 
-namespace {
-struct LibCppString {
-    union {
-        struct {
-            uint8_t size_and_flag;
-            char data[23];
-        } s;
-        struct {
-            uint64_t cap_and_flag;
-            uint64_t size;
-            char* data;
-        } l;
-    };
-};
-static_assert(sizeof(LibCppString) == 24, "libc++ SSO string must be 24 bytes");
-
-inline bool lcpp_is_long(const LibCppString* str) {
-    return (str->s.size_and_flag & 1U) != 0;
-}
-inline size_t lcpp_size(const LibCppString* str) {
-    return lcpp_is_long(str) ? static_cast<size_t>(str->l.size)
-                              : static_cast<size_t>(str->s.size_and_flag >> 1U);
-}
-inline size_t lcpp_cap(const LibCppString* str) {
-    return lcpp_is_long(str) ? static_cast<size_t>((str->l.cap_and_flag & ~1ULL) - 1ULL)
-                              : 22U;
-}
-inline char* lcpp_data(LibCppString* str) {
-    return lcpp_is_long(str) ? str->l.data : str->s.data;
-}
-inline const char* lcpp_cdata(const LibCppString* str) {
-    return lcpp_is_long(str) ? str->l.data : str->s.data;
-}
-inline void lcpp_set_size(LibCppString* str, size_t n) {
-    if (lcpp_is_long(str)) {
-        str->l.size = n;
-        str->l.data[n] = '\0';
-    } else {
-        str->s.size_and_flag = static_cast<uint8_t>(n << 1U);
-        str->s.data[n] = '\0';
-    }
-}
-inline void lcpp_ensure_cap(LibCppString* str, size_t req_cap) {
-    if (req_cap <= lcpp_cap(str)) return;
-    size_t old_sz = lcpp_size(str);
-    size_t cur_cap = lcpp_cap(str);
-    size_t new_cap = req_cap;
-    if (new_cap < cur_cap * 2U) new_cap = cur_cap * 2U;
-    size_t alloc_sz = (new_cap + 1U + 15U) & ~size_t(15U);
-    if (alloc_sz < 32U) alloc_sz = 32U;
-    char* buf = static_cast<char*>(std::malloc(alloc_sz));
-    const char* old_ptr = lcpp_cdata(str);
-    if (old_sz > 0 && old_ptr) {
-        std::memcpy(buf, old_ptr, old_sz);
-    }
-    buf[old_sz] = '\0';
-    if (lcpp_is_long(str) && str->l.data) {
-        std::free(str->l.data);
-    }
-    str->l.cap_and_flag = static_cast<uint64_t>(alloc_sz) | 1ULL;
-    str->l.size = old_sz;
-    str->l.data = buf;
-}
-inline void lcpp_replace_impl(LibCppString* str, size_t pos, size_t n1, const char* src, size_t n2) {
-    size_t sz = lcpp_size(str);
-    if (pos > sz) pos = sz;
-    if (n1 > sz - pos) n1 = sz - pos;
-    size_t new_sz = sz - n1 + n2;
-    std::string tmp;
-    if (src && n2 > 0) {
-        const char* cur = lcpp_cdata(str);
-        if (src >= cur && src < cur + sz + 1) {
-            tmp.assign(src, n2);
-            src = tmp.data();
-        }
-    }
-    lcpp_ensure_cap(str, new_sz);
-    char* d = lcpp_data(str);
-    size_t tail = sz - (pos + n1);
-    if (tail > 0 && n1 != n2) {
-        std::memmove(d + pos + n2, d + pos + n1, tail);
-    }
-    if (src && n2 > 0) {
-        std::memcpy(d + pos, src, n2);
-    }
-    lcpp_set_size(str, new_sz);
-}
-} // namespace
-
-__attribute__((visibility("default"), weak, used))
-uint64_t __mali_libcpp_string_dtor(uint64_t str_va) {
-    if (!str_va) return str_va;
-    auto* str = reinterpret_cast<LibCppString*>(str_va);
-    if (lcpp_is_long(str) && str->l.data) {
-        std::free(str->l.data);
-        str->l.data = nullptr;
-        str->l.cap_and_flag = 0;
-        str->l.size = 0;
-    }
-    return str_va;
-}
-
-__attribute__((visibility("default"), weak, used))
-uint64_t __mali_libcpp_string_assign_n(uint64_t str_va, uint64_t cstr_va, uint64_t n) {
-    if (!str_va) return 0;
-    auto* str = reinterpret_cast<LibCppString*>(str_va);
-    lcpp_replace_impl(str, 0, lcpp_size(str), reinterpret_cast<const char*>(cstr_va), static_cast<size_t>(n));
-    return str_va;
-}
-
-__attribute__((visibility("default"), weak, used))
-uint64_t __mali_libcpp_string_assign_cstr(uint64_t str_va, uint64_t cstr_va) {
-    const char* s = reinterpret_cast<const char*>(cstr_va);
-    return __mali_libcpp_string_assign_n(str_va, cstr_va, s ? std::strlen(s) : 0);
-}
-
-__attribute__((visibility("default"), weak, used))
-uint64_t __mali_libcpp_string_assign_str(uint64_t dst_va, uint64_t src_va) {
-    if (!dst_va || !src_va || dst_va == src_va) return dst_va;
-    auto* dst = reinterpret_cast<LibCppString*>(dst_va);
-    const auto* src = reinterpret_cast<const LibCppString*>(src_va);
-    lcpp_replace_impl(dst, 0, lcpp_size(dst), lcpp_cdata(src), lcpp_size(src));
-    return dst_va;
-}
-
-__attribute__((visibility("default"), weak, used))
-uint64_t __mali_libcpp_string_assign_char(uint64_t str_va, uint64_t ch) {
-    if (!str_va) return 0;
-    char c = static_cast<char>(ch & 0xFFU);
-    auto* str = reinterpret_cast<LibCppString*>(str_va);
-    lcpp_replace_impl(str, 0, lcpp_size(str), &c, 1);
-    return str_va;
-}
-
-__attribute__((visibility("default"), weak, used))
-uint64_t __mali_libcpp_string_append_n(uint64_t str_va, uint64_t cstr_va, uint64_t n) {
-    if (!str_va) return 0;
-    auto* str = reinterpret_cast<LibCppString*>(str_va);
-    lcpp_replace_impl(str, lcpp_size(str), 0, reinterpret_cast<const char*>(cstr_va), static_cast<size_t>(n));
-    return str_va;
-}
-
-__attribute__((visibility("default"), weak, used))
-uint64_t __mali_libcpp_string_append_cstr(uint64_t str_va, uint64_t cstr_va) {
-    const char* s = reinterpret_cast<const char*>(cstr_va);
-    return __mali_libcpp_string_append_n(str_va, cstr_va, s ? std::strlen(s) : 0);
-}
-
-__attribute__((visibility("default"), weak, used))
-uint64_t __mali_libcpp_string_insert_n(uint64_t str_va, uint64_t pos, uint64_t cstr_va, uint64_t n) {
-    if (!str_va) return 0;
-    auto* str = reinterpret_cast<LibCppString*>(str_va);
-    lcpp_replace_impl(str, static_cast<size_t>(pos), 0, reinterpret_cast<const char*>(cstr_va), static_cast<size_t>(n));
-    return str_va;
-}
-
-__attribute__((visibility("default"), weak, used))
-uint64_t __mali_libcpp_string_insert_cstr(uint64_t str_va, uint64_t pos, uint64_t cstr_va) {
-    const char* s = reinterpret_cast<const char*>(cstr_va);
-    return __mali_libcpp_string_insert_n(str_va, pos, cstr_va, s ? std::strlen(s) : 0);
-}
-
-__attribute__((visibility("default"), weak, used))
-uint64_t __mali_libcpp_string_replace_n(uint64_t str_va, uint64_t pos, uint64_t n1, uint64_t cstr_va, uint64_t n2) {
-    if (!str_va) return 0;
-    auto* str = reinterpret_cast<LibCppString*>(str_va);
-    lcpp_replace_impl(str, static_cast<size_t>(pos), static_cast<size_t>(n1), reinterpret_cast<const char*>(cstr_va), static_cast<size_t>(n2));
-    return str_va;
-}
-
-__attribute__((visibility("default"), weak, used))
-uint64_t __mali_libcpp_string_replace_cstr(uint64_t str_va, uint64_t pos, uint64_t n1, uint64_t cstr_va) {
-    const char* s = reinterpret_cast<const char*>(cstr_va);
-    return __mali_libcpp_string_replace_n(str_va, pos, n1, cstr_va, s ? std::strlen(s) : 0);
-}
-
-__attribute__((visibility("default"), weak, used))
-uint64_t __mali_libcpp_string_push_back(uint64_t str_va, uint64_t ch) {
-    if (!str_va) return 0;
-    char c = static_cast<char>(ch & 0xFFU);
-    auto* str = reinterpret_cast<LibCppString*>(str_va);
-    lcpp_replace_impl(str, lcpp_size(str), 0, &c, 1);
-    return str_va;
-}
-
-__attribute__((visibility("default"), weak, used))
-uint64_t __mali_libcpp_string_reserve(uint64_t str_va, uint64_t cap) {
-    if (!str_va) return 0;
-    lcpp_ensure_cap(reinterpret_cast<LibCppString*>(str_va), static_cast<size_t>(cap));
-    return str_va;
-}
-
-__attribute__((visibility("default"), weak, used))
-uint64_t __mali_libcpp_string_at(uint64_t str_va, uint64_t pos) {
-    if (!str_va) return 0;
-    auto* str = reinterpret_cast<LibCppString*>(str_va);
-    return reinterpret_cast<uint64_t>(lcpp_data(str) + static_cast<size_t>(pos));
-}
-
-__attribute__((visibility("default"), weak, used))
-uint64_t __mali_libcpp_string_substr_ctor(uint64_t dst_va, uint64_t src_va, uint64_t pos, uint64_t n, uint64_t /*alloc_va*/) {
-    if (!dst_va) return 0;
-    auto* dst = reinterpret_cast<LibCppString*>(dst_va);
-    std::memset(dst, 0, sizeof(*dst));
-    if (src_va) {
-        const auto* src = reinterpret_cast<const LibCppString*>(src_va);
-        size_t sz = lcpp_size(src);
-        size_t p = static_cast<size_t>(pos);
-        if (p > sz) p = sz;
-        size_t len = static_cast<size_t>(n);
-        if (len > sz - p) len = sz - p;
-        lcpp_replace_impl(dst, 0, 0, lcpp_cdata(src) + p, len);
-    }
-    return dst_va;
-}
-
-__attribute__((visibility("default"), weak, used))
-uint64_t __mali_libcpp_string_plus_cstr_str(uint64_t sret_va, uint64_t cstr_va, uint64_t str_va) {
-    if (!sret_va) return 0;
-    auto* dst = reinterpret_cast<LibCppString*>(sret_va);
-    std::memset(dst, 0, sizeof(*dst));
-    const char* s = reinterpret_cast<const char*>(cstr_va);
-    if (s) lcpp_replace_impl(dst, 0, 0, s, std::strlen(s));
-    if (str_va) {
-        const auto* rhs = reinterpret_cast<const LibCppString*>(str_va);
-        lcpp_replace_impl(dst, lcpp_size(dst), 0, lcpp_cdata(rhs), lcpp_size(rhs));
-    }
-    return sret_va;
-}
-
-__attribute__((visibility("default"), weak, used))
-void __mali_libcpp_call_once(AOTCPUState* cpu) {
-    if (!cpu) return;
-    auto* flag = reinterpret_cast<uint64_t*>(cpu->x[0]);
-    uint64_t arg = cpu->x[1];
-    uint64_t fn_va = cpu->x[2];
-    if (!flag) return;
-    uint64_t expected = 0;
-    if (__atomic_compare_exchange_n(flag, &expected, uint64_t(1), false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-        if (fn_va) {
-            AOTCPUState sub = *cpu;
-            sub.x[0] = arg;
-            aot_indirect_dispatch(&sub, fn_va);
-        }
-        __atomic_store_n(flag, ~uint64_t(0), __ATOMIC_RELEASE);
-    } else {
-        while (__atomic_load_n(flag, __ATOMIC_ACQUIRE) == 1) {
-            sched_yield();
-        }
-    }
-}
-
-__attribute__((visibility("default"), weak, used))
-uint64_t __mali_libcpp_hardware_concurrency() {
-    long n = sysconf(_SC_NPROCESSORS_ONLN);
-    return static_cast<uint64_t>(n > 0 ? n : 4);
-}
-
-__attribute__((visibility("default"), weak, used))
-uint64_t __mali_libcpp_steady_clock_now() {
-    struct timespec ts{};
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
-}
-
-__attribute__((visibility("default"), weak, used))
-uint64_t __mali_libcpp_system_clock_now() {
-    struct timespec ts{};
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return static_cast<uint64_t>(ts.tv_sec) * 1000000ULL + static_cast<uint64_t>(ts.tv_nsec) / 1000ULL;
-}
 } // extern "C"
 
 std::mutex   g_icd_mutex;

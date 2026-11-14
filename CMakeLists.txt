@@ -369,7 +369,10 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
    )
 
    set(AOT_MBS2_OBJ "${CMAKE_BINARY_DIR}/r54p3_lifted.o")
+   set(AOT_LIBCPP_OBJ "${CMAKE_BINARY_DIR}/r54p3_libcpp_lifted.o")
+   set(AOT_LIBCPP_SO "/home/leegao/Android/Sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so")
    set_source_files_properties("${AOT_MBS2_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+   set_source_files_properties("${AOT_LIBCPP_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 
    add_executable(mali_llvm_pass_driver
       src/aot/src/mali_llvm_passes.cpp
@@ -388,27 +391,37 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
               "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/translate.sh"
       COMMENT "Lifting ddk/libGLES_mali.so -> r54p3_lifted.o (translate.sh)"
    )
-   add_custom_target(r54p3_lifted_obj DEPENDS "${AOT_MBS2_OBJ}")
+   add_custom_command(
+      OUTPUT "${AOT_LIBCPP_OBJ}"
+      COMMAND "${AOT_DIR}/mali_llvm_pass_driver" --lift-libcpp "${AOT_LIBCPP_SO}" "${CMAKE_BINARY_DIR}" -j8
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+      DEPENDS mali_llvm_pass_driver
+      COMMENT "Lifting NDK libc++_shared.so -> r54p3_libcpp_lifted.o"
+   )
+   add_custom_target(r54p3_lifted_obj DEPENDS "${AOT_MBS2_OBJ}" "${AOT_LIBCPP_OBJ}")
 
    add_library(r54p3_vulkan_icd SHARED
       src/r54p3_vulkan_icd/generated/mali_aot_forwarders_autogen.cpp
       src/r54p3_vulkan_icd/mali_icd_internal.cpp
       src/r54p3_vulkan_icd/mali_icd_physdev.cpp
       src/r54p3_vulkan_icd/mali_icd_wsi.cpp
+      src/r54p3_vulkan_icd/mali_plt_dispatch.cpp
       src/r54p3_vulkan_icd/mali_vulkan_icd.cpp
       src/r54p3_vulkan_icd/r54p3_vulkan_icd.cpp
       src/r54p3_vulkan_icd/valhall_spirv_lifter.cpp
       "${AOT_MBS2_OBJ}"
+      "${AOT_LIBCPP_OBJ}"
    )
    add_dependencies(r54p3_vulkan_icd r54p3_lifted_obj)
    target_include_directories(r54p3_vulkan_icd PRIVATE
+      "${CMAKE_BINARY_DIR}"
       "${CMAKE_CURRENT_SOURCE_DIR}/include"
       "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd"
       "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/include"
       "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator"
    )
    target_link_options(r54p3_vulkan_icd PRIVATE -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -Wl,--no-as-needed)
-   target_link_libraries(r54p3_vulkan_icd PRIVATE mali_kbase_emu ${PLATFORM_LIBS})
+   target_link_libraries(r54p3_vulkan_icd PRIVATE mali_kbase_emu z ${PLATFORM_LIBS})
    set_target_properties(r54p3_vulkan_icd PROPERTIES
       LIBRARY_OUTPUT_DIRECTORY "${AOT_DIR}"
    )

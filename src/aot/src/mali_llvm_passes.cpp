@@ -340,7 +340,26 @@ static inline LLVMTypeRef LLVMPointerTypeInContext(LLVMContextRef C, unsigned Ad
     return g_llvm.p_LLVMPointerType(g_llvm.p_LLVMInt8TypeInContext(C), AddressSpace);
 }
 
-static constexpr uint64_t IMAGE_BASE = 0x400000000ULL;
+struct LifterConfig {
+    bool is_libcpp = false;
+    std::string prefix = "aot";
+    std::string plt_table_name = "g_aot_plt_table";
+    uint64_t image_base = 0x400000000ULL;
+    bool seed_all_dynsyms = false;
+};
+
+static inline bool isHotInlinePltSym(const std::string &sym) {
+    return sym == "memcpy" || sym == "__memcpy_chk" ||
+           sym == "memmove" || sym == "__memmove_chk" ||
+           sym == "memset" || sym == "__memset_chk" ||
+           sym == "strlen" || sym == "__strlen_chk" ||
+           sym == "malloc" || sym == "calloc" || sym == "realloc" || sym == "free" ||
+           sym == "_Znwm" || sym == "_ZnwmRKSt9nothrow_t" ||
+           sym == "_Znam" || sym == "_ZnamRKSt9nothrow_t" ||
+           sym == "_ZdlPv" || sym == "_ZdaPv" || sym == "_ZdlPvm" || sym == "_ZdaPvm" ||
+           sym == "__cxa_guard_acquire" || sym == "__cxa_guard_release" || sym == "__cxa_guard_abort";
+}
+
 static constexpr uint64_t HLE_MALLOC_MAGIC   = 0xF000FFF0ULL;
 static constexpr uint64_t HLE_TLSDESC_MAGIC  = 0xF000FFF4ULL;
 static constexpr uint64_t HLE_VK_FREE_MAGIC  = 0xF000FFF6ULL;
@@ -505,8 +524,20 @@ public:
     uint64_t vk_dispatch_table_stride = 0;
     std::vector<std::pair<std::string, uint64_t>> vk_dispatch_entries;
     std::vector<uint64_t> init_array_funcs;
+    struct GlobDatReloc {
+        uint64_t r_offset;
+        uint32_t r_type;
+        std::string sym_name;
+    };
+    std::vector<GlobDatReloc> glob_dat_relocs;
+    std::vector<std::pair<std::string, uint64_t>> exported_funcs;
+    std::vector<std::pair<std::string, uint64_t>> exported_data;
+    uint64_t image_base = 0x400000000ULL;
+    bool seed_all_dynsyms = false;
 
-    bool run(const std::string &so_path) {
+    bool run(const std::string &so_path, uint64_t img_base = 0x400000000ULL, bool seed_all = false) {
+        image_base = img_base;
+        seed_all_dynsyms = seed_all;
         std::ifstream in(so_path, std::ios::binary);
         if (!in) return false;
         raw.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -654,6 +685,9 @@ private:
                 if (sz == 0 && func_by_addr.count(st_value)) sz = func_by_addr[st_value].second;
                 func_by_addr[st_value] = {name, sz};
                 addr_by_name[name] = st_value;
+                if (st_shndx != 0) exported_funcs.push_back({name, st_value});
+            } else if (st_value != 0 && st_shndx != 0 && !name.empty()) {
+                exported_data.push_back({name, st_value});
             }
         }
     }
@@ -717,10 +751,33 @@ private:
                             if (dynsyms[sym_idx].shndx != 0 && dynsyms[sym_idx].value != 0) {
                                 writeU64(elf, cur_offset, dynsyms[sym_idx].value + cur_addend);
                                 relocated_data_slots.insert(static_cast<uint64_t>(cur_offset));
+                            } else if (dynsyms[sym_idx].shndx == 0 && (r_type == 1025 || r_type == 257)) {
+                                glob_dat_relocs.push_back({static_cast<uint64_t>(cur_offset), r_type, dynsyms[sym_idx].name});
                             }
                         }
                     }
                     done++;
+                }
+            }
+        } else {
+            for (size_t pos = sec.offset; pos + 24 <= sec.offset + sec.size; pos += 24) {
+                uint64_t r_offset = readU64(raw, pos);
+                uint64_t r_info = readU64(raw, pos + 8);
+                int64_t r_addend = static_cast<int64_t>(readU64(raw, pos + 16));
+                uint32_t r_type = static_cast<uint32_t>(r_info & 0xFFFFFFFFULL);
+                uint32_t sym_idx = static_cast<uint32_t>(r_info >> 32);
+                if (r_offset + 8 <= elf.size()) {
+                    if (r_type == 1027) {
+                        writeU64(elf, r_offset, static_cast<uint64_t>(r_addend));
+                        relocated_data_slots.insert(r_offset);
+                    } else if (sym_idx > 0 && sym_idx < dynsyms.size()) {
+                        if (dynsyms[sym_idx].shndx != 0 && dynsyms[sym_idx].value != 0) {
+                            writeU64(elf, r_offset, dynsyms[sym_idx].value + r_addend);
+                            relocated_data_slots.insert(r_offset);
+                        } else if (dynsyms[sym_idx].shndx == 0 && (r_type == 1025 || r_type == 257)) {
+                            glob_dat_relocs.push_back({r_offset, r_type, dynsyms[sym_idx].name});
+                        }
+                    }
                 }
             }
         }
@@ -1158,6 +1215,13 @@ private:
                 q.push_back(st ? st : addr_by_name[sym]);
             }
         }
+        if (seed_all_dynsyms) {
+            for (const auto &kv : addr_by_name) {
+                uint64_t st = findFuncStart(kv.second);
+                uint64_t cand = st ? st : kv.second;
+                if (isExecAddr(cand)) q.push_back(cand);
+            }
+        }
         // Seed all DT_INIT_ARRAY (.init_array) constructors (e.g. 399 entries in r54p3)
         if (sections.count(".init_array")) {
             auto ia_sec = sections[".init_array"];
@@ -1167,7 +1231,7 @@ private:
                 uint64_t va = ia_sec.addr + i * 8ULL;
                 if (va + 8 > elf.size()) break;
                 uint64_t raw_ptr = readU64(elf, va);
-                uint64_t rva = (raw_ptr >= IMAGE_BASE) ? (raw_ptr - IMAGE_BASE) : (raw_ptr & 0xFFFFFFFFFFFFULL);
+                uint64_t rva = (raw_ptr >= image_base) ? (raw_ptr - image_base) : (raw_ptr & 0xFFFFFFFFFFFFULL);
                 if (!isExecAddr(rva)) continue;
                 uint64_t st = findFuncStart(rva);
                 uint64_t cand = st ? st : rva;
@@ -1383,6 +1447,8 @@ private:
 class AArch64ToLLVMIRLiftingPass {
 public:
     const ELF64LoaderAndCallGraphPass &loader;
+    const LifterConfig &cfg;
+    const std::map<std::string, size_t> &plt_index_map;
     std::set<uint64_t> func_set;
     uint64_t tmp_id = 0;
     std::ostringstream out;
@@ -1397,9 +1463,14 @@ public:
     } stats;
 
     bool instrument_calls = true;
+    bool cur_uses_vec = false;
 
-    explicit AArch64ToLLVMIRLiftingPass(const ELF64LoaderAndCallGraphPass &ld, bool inst_calls = true)
-        : loader(ld), func_set(ld.closure_funcs.begin(), ld.closure_funcs.end()), instrument_calls(inst_calls) {
+    AArch64ToLLVMIRLiftingPass(const ELF64LoaderAndCallGraphPass &ld,
+                               const LifterConfig &config,
+                               const std::map<std::string, size_t> &plt_idx,
+                               bool inst_calls = true)
+        : loader(ld), cfg(config), plt_index_map(plt_idx),
+          func_set(ld.closure_funcs.begin(), ld.closure_funcs.end()), instrument_calls(inst_calls) {
         stats.total_functions = static_cast<int>(ld.closure_funcs.size());
     }
 
@@ -1589,30 +1660,64 @@ public:
     }
 
     void emitBionicPltCall(const std::string &sym) {
-        for (unsigned r = 0; r < 8; ++r) {
+        for (unsigned r = 0; r <= 8; ++r) {
             std::string rv = loadGpr(r, true);
             std::string rp = newTmp("plt_in");
             emit(rp + " = getelementptr inbounds i8, ptr %cpu, i64 " + std::to_string(r * 8));
             emit("store i64 " + rv + ", ptr " + rp + ", align 8");
         }
-        emit("call void @llvm.mali.bionic.plt64." + sym + "(ptr %cpu)");
-        std::string r0_p = newTmp("plt_out"), r0_v = newTmp("plt_res");
-        emit(r0_p + " = getelementptr inbounds i8, ptr %cpu, i64 0");
-        emit(r0_v + " = load i64, ptr " + r0_p + ", align 8");
-        storeGpr(0, r0_v, true);
+        {
+            std::string lr_v = loadGpr(30, true);
+            std::string lr_p = newTmp("plt_lr");
+            emit(lr_p + " = getelementptr inbounds i8, ptr %cpu, i64 240");
+            emit("store i64 " + lr_v + ", ptr " + lr_p + ", align 8");
+            std::string sp_v = newTmp("plt_spv"), sp_p = newTmp("plt_spp");
+            emit(sp_v + " = load i64, ptr %reg_sp, align 8");
+            emit(sp_p + " = getelementptr inbounds i8, ptr %cpu, i64 248");
+            emit("store i64 " + sp_v + ", ptr " + sp_p + ", align 8");
+        }
+        if (cur_uses_vec) {
+            for (unsigned r = 0; r < 8; ++r) {
+                std::string vv = newTmp("plt_vin"), pv = newTmp("plt_vptr");
+                emit(vv + " = load i128, ptr %reg_v" + std::to_string(r) + ", align 16");
+                emit(pv + " = getelementptr inbounds i8, ptr %cpu, i64 " + std::to_string(272 + r * 16));
+                emit("store i128 " + vv + ", ptr " + pv + ", align 16");
+            }
+        }
+        auto it = plt_index_map.find(sym);
+        if (!isHotInlinePltSym(sym) && it != plt_index_map.end()) {
+            std::string slot_p = newTmp("plt_slot"), fn_p = newTmp("plt_fn");
+            emit(slot_p + " = getelementptr inbounds ptr, ptr @" + cfg.plt_table_name + ", i64 " + std::to_string(it->second));
+            emit(fn_p + " = load ptr, ptr " + slot_p + ", align 8");
+            emit("call void " + fn_p + "(ptr %cpu)");
+        } else {
+            emit("call void @llvm.mali.bionic.plt64." + sym + "(ptr %cpu)");
+        }
+        if (cur_uses_vec) {
+            std::string pv0 = newTmp("plt_vout"), vv0 = newTmp("plt_vres");
+            emit(pv0 + " = getelementptr inbounds i8, ptr %cpu, i64 272");
+            emit(vv0 + " = load i128, ptr " + pv0 + ", align 16");
+            emit("store i128 " + vv0 + ", ptr %reg_v0, align 16");
+        }
+        for (unsigned r = 0; r < 2; ++r) {
+            std::string ro_p = newTmp("plt_out"), ro_v = newTmp("plt_res");
+            emit(ro_p + " = getelementptr inbounds i8, ptr %cpu, i64 " + std::to_string(r * 8));
+            emit(ro_v + " = load i64, ptr " + ro_p + ", align 8");
+            storeGpr(r, ro_v, true);
+        }
     }
 
     void emitCallToTarget(uint64_t target_rva) {
         if (loader.closure_plts.count(target_rva)) {
             emitBionicPltCall(loader.closure_plts.at(target_rva));
         } else if (func_set.count(target_rva)) {
-            emit("call void @aot_sub_" + hex8(target_rva) + "(ptr %cpu)");
+            emit("call void @" + cfg.prefix + "_sub_" + hex8(target_rva) + "(ptr %cpu)");
         } else {
             uint64_t fst = loader.findFuncStart(target_rva);
             if (fst != 0 && fst == target_rva && func_set.count(fst)) {
-                emit("call void @aot_sub_" + hex8(fst) + "(ptr %cpu)");
+                emit("call void @" + cfg.prefix + "_sub_" + hex8(fst) + "(ptr %cpu)");
             } else {
-                emit("call void @aot_indirect_dispatch(ptr %cpu, i64 " + std::to_string(IMAGE_BASE + target_rva) + ")");
+                emit("call void @" + cfg.prefix + "_indirect_dispatch(ptr %cpu, i64 " + std::to_string(cfg.image_base + target_rva) + ")");
             }
         }
     }
@@ -1770,11 +1875,12 @@ public:
             if (top6 == 0x25 || top6 == 0x05) {
                 int64_t imm26 = sext64(insn & 0x3FFFFFFU, 26);
                 uint64_t target = static_cast<uint64_t>(static_cast<int64_t>(pc) + (imm26 << 2));
-                if (loader.closure_plts.count(target)) used_gpr_mask |= 0xFFU;
+                if (loader.closure_plts.count(target)) used_gpr_mask |= 0x1FFU;
             }
         }
         std::vector<uint64_t> sorted_leaders(leaders.begin(), leaders.end());
-        emitRaw("define void @aot_sub_" + hex8(faddr) + "(ptr %cpu) #0 {");
+        cur_uses_vec = uses_vec;
+        emitRaw("define void @" + cfg.prefix + "_sub_" + hex8(faddr) + "(ptr %cpu) #0 {");
         emitRaw("entry:");
         for (unsigned r = 0; r < 31; ++r) {
             if ((used_gpr_mask >> r) & 1U) emit("%reg_x" + std::to_string(r) + " = alloca i64, align 8");
@@ -1847,7 +1953,7 @@ public:
         emit("store i1 false, ptr %flag_c, align 1");
         emit("store i1 false, ptr %flag_v, align 1");
         if (instrument_calls) {
-            emit("call void @aot_so_trace_fn_enter(ptr %cpu, i64 " + std::to_string(IMAGE_BASE + faddr) + ", ptr @.aot_fn_str_" + hex8(faddr) + ")");
+            emit("call void @aot_so_trace_fn_enter(ptr %cpu, i64 " + std::to_string(cfg.image_base + faddr) + ", ptr @." + cfg.prefix + "_fn_str_" + hex8(faddr) + ")");
         }
         emit("br label %bb_" + hex8(faddr));
 
@@ -1879,8 +1985,8 @@ public:
                     unsigned subop = (insn >> 23) & 0x7;
                     if (subop == 0 || subop == 1) {
                         int64_t imm = sext64(((insn >> 5) & 0x7FFFFU) << 2 | ((insn >> 29) & 3U), 21);
-                        uint64_t val = sf ? (IMAGE_BASE + ((pc & ~0xFFFULL) + static_cast<uint64_t>(imm << 12)))
-                                          : (IMAGE_BASE + static_cast<uint64_t>(static_cast<int64_t>(pc) + imm));
+                        uint64_t val = sf ? (cfg.image_base + ((pc & ~0xFFFULL) + static_cast<uint64_t>(imm << 12)))
+                                          : (cfg.image_base + static_cast<uint64_t>(static_cast<int64_t>(pc) + imm));
                         storeGpr(rd, std::to_string(val), true);
                     } else if (subop == 2 || subop == 3) {
                         unsigned op = (insn >> 30) & 1;
@@ -1993,7 +2099,7 @@ public:
                     if (top6 == 0x05 || top6 == 0x25) {
                         uint64_t target = static_cast<uint64_t>(static_cast<int64_t>(pc) + (sext64(insn & 0x3FFFFFFU, 26) << 2));
                         if (top6 == 0x25) {
-                            storeGpr(30, std::to_string(IMAGE_BASE + pc + 4), true);
+                            storeGpr(30, std::to_string(cfg.image_base + pc + 4), true);
                             if (loader.closure_plts.count(target)) {
                                 emitCallToTarget(target);
                             } else {
@@ -2071,9 +2177,9 @@ public:
                             break;
                         } else if (opc == 1) {
                             std::string tgt = loadGpr(rn, true);
-                            storeGpr(30, std::to_string(IMAGE_BASE + pc + 4), true);
+                            storeGpr(30, std::to_string(cfg.image_base + pc + 4), true);
                             flushState(0x600701FFU, true, 8);
-                            emit("call void @aot_indirect_dispatch(ptr %cpu, i64 " + tgt + ")");
+                            emit("call void @" + cfg.prefix + "_indirect_dispatch(ptr %cpu, i64 " + tgt + ")");
                             reloadState(0x000001FFU, false, 8);
                             continue;
                         } else if (opc == 0) {
@@ -2084,7 +2190,7 @@ public:
                                 std::set<uint64_t> seen;
                                 for (uint64_t t_rva : jtables[pc]) {
                                     if (seen.insert(t_rva).second) {
-                                        cases << "i64 " << (IMAGE_BASE + t_rva) << ", label %bb_" << hex8(t_rva) << " ";
+                                        cases << "i64 " << (cfg.image_base + t_rva) << ", label %bb_" << hex8(t_rva) << " ";
                                     }
                                 }
                                 emit("switch i64 " + tgt + ", label %exit_ret [ " + cases.str() + "]");
@@ -2093,7 +2199,7 @@ public:
                             } else {
                                 std::string tgt = loadGpr(rn, true);
                                 flushState(0x7FFF01FFU, true, 16);
-                                emit("call void @aot_indirect_dispatch(ptr %cpu, i64 " + tgt + ")");
+                                emit("call void @" + cfg.prefix + "_indirect_dispatch(ptr %cpu, i64 " + tgt + ")");
                                 reloadState(0x000001FFU, false, 8);
                                 emit("br label %exit_ret");
                                 terminated = true;
@@ -3078,7 +3184,7 @@ public:
         emitRaw("exit_ret:");
         flushState(0x000001FFU, true, 8);
         if (instrument_calls) {
-            emit("call void @aot_so_trace_fn_exit(ptr %cpu, i64 " + std::to_string(IMAGE_BASE + faddr) + ", ptr @.aot_fn_str_" + hex8(faddr) + ")");
+            emit("call void @aot_so_trace_fn_exit(ptr %cpu, i64 " + std::to_string(cfg.image_base + faddr) + ", ptr @." + cfg.prefix + "_fn_str_" + hex8(faddr) + ")");
         }
         emit("ret void");
         emitRaw("}\n");
@@ -3099,9 +3205,14 @@ public:
         emitRaw("declare void @llvm.mali.arm64.dc_zva(i64)");
         emitRaw("declare i64 @llvm.mali.bionic.tlsdesc(i64)");
         std::set<std::string> plt_syms = {"malloc", "free"};
-        for (const auto &kv : loader.closure_plts) plt_syms.insert(kv.second);
+        for (const auto &kv : loader.closure_plts) {
+            if (isHotInlinePltSym(kv.second)) plt_syms.insert(kv.second);
+        }
         for (const auto &sym : plt_syms) {
             emitRaw("declare void @llvm.mali.bionic.plt64." + sym + "(ptr)");
+        }
+        if (!plt_index_map.empty()) {
+            emitRaw("@" + cfg.plt_table_name + " = external global ptr, align 8");
         }
         emitRaw("declare ptr @calloc(i64, i64)");
         emitRaw("declare ptr @realloc(ptr, i64)");
@@ -3175,18 +3286,18 @@ public:
         emitRaw("declare i32 @llvm.vector.reduce.umax.v4i32(<4 x i32>)\n");
 
         if (!is_runtime_chunk) {
-            emitRaw("declare void @aot_indirect_dispatch(ptr, i64)");
+            emitRaw("declare void @" + cfg.prefix + "_indirect_dispatch(ptr, i64)");
         }
         for (uint64_t faddr : loader.closure_funcs) {
             if (!defined_funcs.count(faddr)) {
-                emitRaw("declare void @aot_sub_" + hex8(faddr) + "(ptr)");
+                emitRaw("declare void @" + cfg.prefix + "_sub_" + hex8(faddr) + "(ptr)");
             }
         }
         if (instrument_calls && !defined_funcs.empty()) {
             for (uint64_t faddr : defined_funcs) {
                 auto fname_sz = loader.func_by_addr.count(faddr) ? loader.func_by_addr.at(faddr) : std::make_pair("sub_" + hex8(faddr), uint64_t(4));
                 std::string fn_label = fname_sz.first.empty() ? ("sub_" + hex8(faddr)) : fname_sz.first;
-                emitRaw("@.aot_fn_str_" + hex8(faddr) + " = private unnamed_addr constant [" +
+                emitRaw("@." + cfg.prefix + "_fn_str_" + hex8(faddr) + " = private unnamed_addr constant [" +
                         std::to_string(fn_label.size() + 1) + " x i8] c\"" + escapeIrString(fn_label) + "\\00\", align 1");
             }
             emitRaw("");
@@ -3194,40 +3305,42 @@ public:
     }
 
     void emitWrappersAndRuntime() {
-        // Export version-independent entry wrappers & auto-detected offsets
-        emitRaw("define i64 @aot_get_ctx_malloc_offset() #0 {");
-        emit("ret i64 " + std::to_string(loader.ctx_malloc_offset));
-        emitRaw("}\n");
+        if (!cfg.is_libcpp) {
+            // Export version-independent entry wrappers & auto-detected offsets
+            emitRaw("define i64 @aot_get_ctx_malloc_offset() #0 {");
+            emit("ret i64 " + std::to_string(loader.ctx_malloc_offset));
+            emitRaw("}\n");
 
-        emitRaw("define i64 @aot_get_vk_hmi_addr() #0 {");
-        emit("ret i64 " + std::to_string(loader.hmi_rva ? (IMAGE_BASE + loader.hmi_rva) : 0ULL));
-        emitRaw("}\n");
+            emitRaw("define i64 @aot_get_vk_hmi_addr() #0 {");
+            emit("ret i64 " + std::to_string(loader.hmi_rva ? (cfg.image_base + loader.hmi_rva) : 0ULL));
+            emitRaw("}\n");
 
-        emitRaw("define i64 @aot_get_kbase_page_shift_addr() #0 {");
-        emit("ret i64 " + std::to_string(loader.kbase_page_shift_rva ? (IMAGE_BASE + loader.kbase_page_shift_rva) : 0ULL));
-        emitRaw("}\n");
+            emitRaw("define i64 @aot_get_kbase_page_shift_addr() #0 {");
+            emit("ret i64 " + std::to_string(loader.kbase_page_shift_rva ? (cfg.image_base + loader.kbase_page_shift_rva) : 0ULL));
+            emitRaw("}\n");
 
-        emitRaw("define i64 @aot_get_vk_dispatch_table_rva() #0 {");
-        emit("ret i64 " + std::to_string(loader.vk_dispatch_table_rva));
-        emitRaw("}\n");
+            emitRaw("define i64 @aot_get_vk_dispatch_table_rva() #0 {");
+            emit("ret i64 " + std::to_string(loader.vk_dispatch_table_rva));
+            emitRaw("}\n");
 
-        emitRaw("define i64 @aot_get_vk_dispatch_table_count() #0 {");
-        emit("ret i64 " + std::to_string(loader.vk_dispatch_table_count));
-        emitRaw("}\n");
+            emitRaw("define i64 @aot_get_vk_dispatch_table_count() #0 {");
+            emit("ret i64 " + std::to_string(loader.vk_dispatch_table_count));
+            emitRaw("}\n");
 
-        emitRaw("define i64 @aot_get_vk_dispatch_table_stride() #0 {");
-        emit("ret i64 " + std::to_string(loader.vk_dispatch_table_stride));
-        emitRaw("}\n");
+            emitRaw("define i64 @aot_get_vk_dispatch_table_stride() #0 {");
+            emit("ret i64 " + std::to_string(loader.vk_dispatch_table_stride));
+            emitRaw("}\n");
 
-        emitRaw("define i64 @aot_get_lifted_vk_entrypoint_count() #0 {");
-        emit("ret i64 " + std::to_string(loader.vk_dispatch_entries.size()));
-        emitRaw("}\n");
+            emitRaw("define i64 @aot_get_lifted_vk_entrypoint_count() #0 {");
+            emit("ret i64 " + std::to_string(loader.vk_dispatch_entries.size()));
+            emitRaw("}\n");
+        }
 
-        emitRaw("define i64 @aot_get_init_array_count() #0 {");
+        emitRaw("define i64 @" + cfg.prefix + "_get_init_array_count() #0 {");
         emit("ret i64 " + std::to_string(loader.init_array_funcs.size()));
         emitRaw("}\n");
 
-        emitRaw("define void @aot_run_dt_init_array_entry(ptr %cpu, i64 %idx) #0 {");
+        emitRaw("define void @" + cfg.prefix + "_run_dt_init_array_entry(ptr %cpu, i64 %idx) #0 {");
         emit("switch i64 %idx, label %ia_done [");
         for (size_t i = 0; i < loader.init_array_funcs.size(); ++i) {
             uint64_t rva = loader.init_array_funcs[i];
@@ -3240,7 +3353,7 @@ public:
             uint64_t rva = loader.init_array_funcs[i];
             if (func_set.count(rva)) {
                 emitRaw("ia_" + std::to_string(i) + ":");
-                emit("call void @aot_sub_" + hex8(rva) + "(ptr %cpu)");
+                emit("call void @" + cfg.prefix + "_sub_" + hex8(rva) + "(ptr %cpu)");
                 emit("br label %ia_done");
             }
         }
@@ -3248,15 +3361,17 @@ public:
         emit("ret void");
         emitRaw("}\n");
 
-        emitRaw("define void @aot_run_dt_init_array(ptr %cpu) #0 {");
+        emitRaw("define void @" + cfg.prefix + "_run_dt_init_array(ptr %cpu) #0 {");
         for (size_t i = 0; i < loader.init_array_funcs.size(); ++i) {
             uint64_t rva = loader.init_array_funcs[i];
             if (func_set.count(rva)) {
-                emit("call void @aot_sub_" + hex8(rva) + "(ptr %cpu)");
+                emit("call void @" + cfg.prefix + "_sub_" + hex8(rva) + "(ptr %cpu)");
             }
         }
         emit("ret void");
         emitRaw("}\n");
+
+        if (!cfg.is_libcpp) {
 
         std::set<std::string> emitted_aot_wrappers;
         for (const auto &vk_ent : loader.vk_dispatch_entries) {
@@ -3363,8 +3478,10 @@ public:
             }
         }
 
-        // Emit @aot_indirect_dispatch
-        emitRaw("define void @aot_indirect_dispatch(ptr %cpu, i64 %target_va) #0 {");
+        } // end if (!cfg.is_libcpp)
+
+        // Emit @<prefix>_indirect_dispatch
+        emitRaw("define void @" + cfg.prefix + "_indirect_dispatch(ptr %cpu, i64 %target_va) #0 {");
         emitRaw("entry:");
         emit("  %is_null = icmp eq i64 %target_va, 0");
         emit("  br i1 %is_null, label %handle_null, label %check_malloc");
@@ -3414,12 +3531,12 @@ public:
         emitRaw("dispatch_switch:");
         std::ostringstream cases;
         for (uint64_t faddr : loader.closure_funcs) {
-            cases << "i64 " << (IMAGE_BASE + faddr) << ", label %call_" << hex8(faddr) << " ";
+            cases << "i64 " << (cfg.image_base + faddr) << ", label %call_" << hex8(faddr) << " ";
         }
         emit("  switch i64 %target_va, label %fallback [ " + cases.str() + "]");
         for (uint64_t faddr : loader.closure_funcs) {
             emitRaw("call_" + hex8(faddr) + ":");
-            emit("  call void @aot_sub_" + hex8(faddr) + "(ptr %cpu)");
+            emit("  call void @" + cfg.prefix + "_sub_" + hex8(faddr) + "(ptr %cpu)");
             emit("  ret void");
         }
         emitRaw("fallback:");
@@ -3427,6 +3544,7 @@ public:
         emit("  ret void");
         emitRaw("}\n");
 
+        if (!cfg.is_libcpp) {
         emitRaw("define i64 @__mali_cxa_guard_acquire(i64 %guard_addr) #0 {");
         emitRaw("entry:");
         emit("  %is_null = icmp eq i64 %guard_addr, 0");
@@ -3529,6 +3647,7 @@ public:
         emitRaw("ret_ok:");
         emit("  ret i64 0");
         emitRaw("}\n");
+        } // end if (!cfg.is_libcpp)
 
         emitRaw("attributes #0 = { nounwind \"frame-pointer\"=\"none\" }");
     }
@@ -3820,175 +3939,6 @@ void runBionicToGlibcLibcLoweringPass(LLVMModuleRef M, PassStats &stats) {
                         LLVMTypeRef strlenTy = LLVMFunctionType(i64Ty, &ptrTy, 1, 0);
                         LLVMValueRef res = LLVMBuildCall2(B, strlenTy, strlenFn, &ptr, 1, "");
                         storeReg64(cpu, 0, res);
-                    } else if (sym == "strchr") {
-                        LLVMValueRef x0 = loadReg64(cpu, 0);
-                        LLVMValueRef x1 = loadReg64(cpu, 1);
-                        LLVMValueRef ptr = LLVMBuildIntToPtr(B, x0, ptrTy, "");
-                        LLVMValueRef ch = LLVMBuildTrunc(B, x1, i32Ty, "");
-                        LLVMValueRef strchrFn = getOrCreateFunction(M, "strchr", ptrTy, {ptrTy, i32Ty});
-                        LLVMTypeRef schParams[2] = {ptrTy, i32Ty};
-                        LLVMTypeRef strchrTy = LLVMFunctionType(ptrTy, schParams, 2, 0);
-                        LLVMValueRef args[2] = {ptr, ch};
-                        LLVMValueRef resPtr = LLVMBuildCall2(B, strchrTy, strchrFn, args, 2, "");
-                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, resPtr, i64Ty, ""));
-                    } else if (sym == "strcspn") {
-                        LLVMValueRef x0 = loadReg64(cpu, 0);
-                        LLVMValueRef x1 = loadReg64(cpu, 1);
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, x0, ptrTy, "");
-                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, x1, ptrTy, "");
-                        LLVMValueRef fnIntr = getOrCreateFunction(M, "strcspn", i64Ty, {ptrTy, ptrTy});
-                        LLVMTypeRef pTys[2] = {ptrTy, ptrTy};
-                        LLVMTypeRef fnTy = LLVMFunctionType(i64Ty, pTys, 2, 0);
-                        LLVMValueRef args[2] = {p0, p1};
-                        LLVMValueRef res = LLVMBuildCall2(B, fnTy, fnIntr, args, 2, "");
-                        storeReg64(cpu, 0, res);
-                    } else if (sym == "strncasecmp" || sym == "memcmp" || sym == "strncmp") {
-                        LLVMValueRef x0 = loadReg64(cpu, 0);
-                        LLVMValueRef x1 = loadReg64(cpu, 1);
-                        LLVMValueRef x2 = loadReg64(cpu, 2);
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, x0, ptrTy, "");
-                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, x1, ptrTy, "");
-                        LLVMValueRef fnIntr = getOrCreateFunction(M, sym.c_str(), i32Ty, {ptrTy, ptrTy, i64Ty});
-                        LLVMTypeRef pTys[3] = {ptrTy, ptrTy, i64Ty};
-                        LLVMTypeRef fnTy = LLVMFunctionType(i32Ty, pTys, 3, 0);
-                        LLVMValueRef args[3] = {p0, p1, x2};
-                        LLVMValueRef res32 = LLVMBuildCall2(B, fnTy, fnIntr, args, 3, "");
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
-                    } else if (sym == "strncat") {
-                        LLVMValueRef x0 = loadReg64(cpu, 0);
-                        LLVMValueRef x1 = loadReg64(cpu, 1);
-                        LLVMValueRef x2 = loadReg64(cpu, 2);
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, x0, ptrTy, "");
-                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, x1, ptrTy, "");
-                        LLVMValueRef fnIntr = getOrCreateFunction(M, "strncat", ptrTy, {ptrTy, ptrTy, i64Ty});
-                        LLVMTypeRef pTys[3] = {ptrTy, ptrTy, i64Ty};
-                        LLVMTypeRef fnTy = LLVMFunctionType(ptrTy, pTys, 3, 0);
-                        LLVMValueRef args[3] = {p0, p1, x2};
-                        LLVMValueRef resPtr = LLVMBuildCall2(B, fnTy, fnIntr, args, 3, "");
-                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, resPtr, i64Ty, ""));
-                    } else if (sym == "strcmp") {
-                        LLVMValueRef x0 = loadReg64(cpu, 0);
-                        LLVMValueRef x1 = loadReg64(cpu, 1);
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, x0, ptrTy, "");
-                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, x1, ptrTy, "");
-                        LLVMValueRef fnIntr = getOrCreateFunction(M, "strcmp", i32Ty, {ptrTy, ptrTy});
-                        LLVMTypeRef pTys[2] = {ptrTy, ptrTy};
-                        LLVMTypeRef fnTy = LLVMFunctionType(i32Ty, pTys, 2, 0);
-                        LLVMValueRef args[2] = {p0, p1};
-                        LLVMValueRef res32 = LLVMBuildCall2(B, fnTy, fnIntr, args, 2, "");
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
-                    } else if (sym == "__errno") {
-                        LLVMValueRef errnoFn = getOrCreateFunction(M, "__errno_location", ptrTy, {});
-                        LLVMTypeRef errnoTy = LLVMFunctionType(ptrTy, nullptr, 0, 0);
-                        LLVMValueRef resPtr = LLVMBuildCall2(B, errnoTy, errnoFn, nullptr, 0, "");
-                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, resPtr, i64Ty, ""));
-                    } else if (sym == "vsnprintf" || sym == "__vsnprintf_chk") {
-                        LLVMValueRef x0 = loadReg64(cpu, 0);
-                        LLVMValueRef x1 = loadReg64(cpu, 1);
-                        LLVMValueRef x2 = loadReg64(cpu, 2);
-                        LLVMValueRef x3 = loadReg64(cpu, 3);
-                        LLVMValueRef bridgeFn = getOrCreateFunction(M, "bionic_aapcs64_vsnprintf_bridge", i64Ty, {i64Ty, i64Ty, i64Ty, i64Ty});
-                        LLVMTypeRef vsnParams[4] = {i64Ty, i64Ty, i64Ty, i64Ty};
-                        LLVMTypeRef bridgeTy = LLVMFunctionType(i64Ty, vsnParams, 4, 0);
-                        LLVMValueRef args[4] = {x0, x1, x2, x3};
-                        LLVMValueRef res = LLVMBuildCall2(B, bridgeTy, bridgeFn, args, 4, "");
-                        storeReg64(cpu, 0, res);
-                    } else if (sym == "ioctl") {
-                        // Mali /dev/mali0 (kbase) Kernel UAPI ioctl shim
-                        LLVMValueRef x0 = loadReg64(cpu, 0);
-                        LLVMValueRef x1 = loadReg64(cpu, 1);
-                        LLVMValueRef x2 = loadReg64(cpu, 2);
-                        LLVMValueRef ioctlFn = getOrCreateFunction(M, "bionic_mali_kbase_ioctl_stub", i64Ty, {i64Ty, i64Ty, i64Ty});
-                        LLVMTypeRef ioctlParams[3] = {i64Ty, i64Ty, i64Ty};
-                        LLVMTypeRef ioctlTy = LLVMFunctionType(i64Ty, ioctlParams, 3, 0);
-                        LLVMValueRef args[3] = {x0, x1, x2};
-                        LLVMValueRef res = LLVMBuildCall2(B, ioctlTy, ioctlFn, args, 3, "");
-                        storeReg64(cpu, 0, res);
-                        stats.kbase_uapi_lowered++;
-                    } else if (sym == "open" || sym == "__open_2" || sym == "open64") {
-                        LLVMValueRef x0 = loadReg64(cpu, 0);
-                        LLVMValueRef x1 = loadReg64(cpu, 1);
-                        LLVMValueRef openFn = getOrCreateFunction(M, "bionic_mali_open_stub", i64Ty, {i64Ty, i64Ty});
-                        LLVMTypeRef openParams[2] = {i64Ty, i64Ty};
-                        LLVMTypeRef openTy = LLVMFunctionType(i64Ty, openParams, 2, 0);
-                        LLVMValueRef args[2] = {x0, x1};
-                        LLVMValueRef res = LLVMBuildCall2(B, openTy, openFn, args, 2, "");
-                        storeReg64(cpu, 0, res);
-                        stats.kbase_uapi_lowered++;
-                    } else if (sym == "close") {
-                        LLVMValueRef x0 = loadReg64(cpu, 0);
-                        LLVMValueRef closeFn = getOrCreateFunction(M, "bionic_mali_close_stub", i64Ty, {i64Ty});
-                        LLVMTypeRef closeTy = LLVMFunctionType(i64Ty, &i64Ty, 1, 0);
-                        LLVMValueRef res = LLVMBuildCall2(B, closeTy, closeFn, &x0, 1, "");
-                        storeReg64(cpu, 0, res);
-                        stats.kbase_uapi_lowered++;
-                    } else if (sym == "mmap" || sym == "mmap64") {
-                        LLVMValueRef args[6] = {
-                            loadReg64(cpu, 0), loadReg64(cpu, 1), loadReg64(cpu, 2),
-                            loadReg64(cpu, 3), loadReg64(cpu, 4), loadReg64(cpu, 5)
-                        };
-                        LLVMValueRef mmapFn = getOrCreateFunction(M, "bionic_mali_mmap_stub", i64Ty, {i64Ty, i64Ty, i64Ty, i64Ty, i64Ty, i64Ty});
-                        LLVMTypeRef mmapParams[6] = {i64Ty, i64Ty, i64Ty, i64Ty, i64Ty, i64Ty};
-                        LLVMTypeRef mmapTy = LLVMFunctionType(i64Ty, mmapParams, 6, 0);
-                        LLVMValueRef res = LLVMBuildCall2(B, mmapTy, mmapFn, args, 6, "");
-                        storeReg64(cpu, 0, res);
-                        stats.kbase_uapi_lowered++;
-                    } else if (sym == "munmap") {
-                        LLVMValueRef args[2] = {loadReg64(cpu, 0), loadReg64(cpu, 1)};
-                        LLVMValueRef munmapFn = getOrCreateFunction(M, "bionic_mali_munmap_stub", i64Ty, {i64Ty, i64Ty});
-                        LLVMTypeRef munmapParams[2] = {i64Ty, i64Ty};
-                        LLVMTypeRef munmapTy = LLVMFunctionType(i64Ty, munmapParams, 2, 0);
-                        LLVMValueRef res = LLVMBuildCall2(B, munmapTy, munmapFn, args, 2, "");
-                        storeReg64(cpu, 0, res);
-                        stats.kbase_uapi_lowered++;
-                    } else if (sym == "read" || sym == "__read_chk") {
-                        LLVMValueRef args[3] = {loadReg64(cpu, 0), loadReg64(cpu, 1), loadReg64(cpu, 2)};
-                        LLVMValueRef readFn = getOrCreateFunction(M, "bionic_mali_read_stub", i64Ty, {i64Ty, i64Ty, i64Ty});
-                        LLVMTypeRef readParams[3] = {i64Ty, i64Ty, i64Ty};
-                        LLVMTypeRef readTy = LLVMFunctionType(i64Ty, readParams, 3, 0);
-                        LLVMValueRef res = LLVMBuildCall2(B, readTy, readFn, args, 3, "");
-                        storeReg64(cpu, 0, res);
-                        stats.kbase_uapi_lowered++;
-                    } else if (sym == "poll" || sym == "__poll_chk" || sym == "ppoll" || sym == "__ppoll_chk") {
-                        LLVMValueRef args[3] = {loadReg64(cpu, 0), loadReg64(cpu, 1), loadReg64(cpu, 2)};
-                        LLVMValueRef pollFn = getOrCreateFunction(M, "bionic_mali_poll_stub", i64Ty, {i64Ty, i64Ty, i64Ty});
-                        LLVMTypeRef pollParams[3] = {i64Ty, i64Ty, i64Ty};
-                        LLVMTypeRef pollTy = LLVMFunctionType(i64Ty, pollParams, 3, 0);
-                        LLVMValueRef res = LLVMBuildCall2(B, pollTy, pollFn, args, 3, "");
-                        storeReg64(cpu, 0, res);
-                        stats.kbase_uapi_lowered++;
-                    } else if (sym == "CreateDmabufHeapBufferAllocator") {
-                        LLVMValueRef fn = getOrCreateFunction(M, "bionic_mali_create_dmabuf_heap_allocator_stub", i64Ty, {});
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, nullptr, 0, 0);
-                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, nullptr, 0, "");
-                        storeReg64(cpu, 0, res);
-                        stats.external_stubs_lowered++;
-                    } else if (sym == "DmabufHeapAlloc2") {
-                        LLVMValueRef args[5] = {loadReg64(cpu, 0), loadReg64(cpu, 1), loadReg64(cpu, 2),
-                                                loadReg64(cpu, 3), loadReg64(cpu, 4)};
-                        LLVMValueRef fn = getOrCreateFunction(M, "bionic_mali_dmabuf_heap_alloc2_stub",
-                                                              i64Ty, {i64Ty, i64Ty, i64Ty, i64Ty, i64Ty});
-                        LLVMTypeRef params[5] = {i64Ty, i64Ty, i64Ty, i64Ty, i64Ty};
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, params, 5, 0);
-                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, args, 5, "");
-                        storeReg64(cpu, 0, res);
-                        stats.external_stubs_lowered++;
-                    } else if (sym == "pthread_self" || sym == "getuid") {
-                        storeReg64(cpu, 0, LLVMConstInt(i64Ty, 1000, 0));
-                        stats.external_stubs_lowered++;
-                    } else if (sym == "getpid") {
-                        LLVMValueRef fn = getOrCreateFunction(M, "getpid", i32Ty, {});
-                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, nullptr, 0, 0);
-                        LLVMValueRef res32 = LLVMBuildCall2(B, fTy, fn, nullptr, 0, "");
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
-                    } else if (sym == "getpagesize") {
-                        storeReg64(cpu, 0, LLVMConstInt(i64Ty, 4096, 0));
-                    } else if (sym == "sysconf") {
-                        LLVMValueRef x0 = loadReg64(cpu, 0);
-                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_sysconf_bionic", i64Ty, {i64Ty});
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, &i64Ty, 1, 0);
-                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, &x0, 1, "");
-                        storeReg64(cpu, 0, res);
                     } else if (sym == "__cxa_guard_acquire") {
                         LLVMValueRef x0 = loadReg64(cpu, 0);
                         LLVMValueRef fn = getOrCreateFunction(M, "__mali_cxa_guard_acquire", i64Ty, {i64Ty});
@@ -4001,365 +3951,8 @@ void runBionicToGlibcLibcLoweringPass(LLVMModuleRef M, PassStats &stats) {
                         LLVMTypeRef fTy = LLVMFunctionType(voidTy, &i64Ty, 1, 0);
                         LLVMBuildCall2(B, fTy, fn, &x0, 1, "");
                         storeReg64(cpu, 0, LLVMConstInt(i64Ty, 0, 0));
-                    } else if (sym == "_ZNSt3__112__next_primeEm") {
-                        LLVMValueRef x0 = loadReg64(cpu, 0);
-                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_next_prime", i64Ty, {i64Ty});
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, &i64Ty, 1, 0);
-                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, &x0, 1, "");
-                        storeReg64(cpu, 0, res);
-                    } else if (sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED2Ev" ||
-                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev") {
-                        LLVMValueRef x0 = loadReg64(cpu, 0);
-                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_libcpp_string_dtor", i64Ty, {i64Ty});
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, &i64Ty, 1, 0);
-                        storeReg64(cpu, 0, LLVMBuildCall2(B, fTy, fn, &x0, 1, ""));
-                    } else if (sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKc" ||
-                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKc" ||
-                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSERKS5_" ||
-                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSEc" ||
-                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc" ||
-                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7reserveEm" ||
-                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE2atEm") {
-                        const char* hname = "__mali_libcpp_string_assign_cstr";
-                        if (sym.find("6append") != std::string::npos) hname = "__mali_libcpp_string_append_cstr";
-                        else if (sym.find("aSERKS5_") != std::string::npos) hname = "__mali_libcpp_string_assign_str";
-                        else if (sym.find("aSEc") != std::string::npos) hname = "__mali_libcpp_string_assign_char";
-                        else if (sym.find("9push_backEc") != std::string::npos) hname = "__mali_libcpp_string_push_back";
-                        else if (sym.find("7reserveEm") != std::string::npos) hname = "__mali_libcpp_string_reserve";
-                        else if (sym.find("2atEm") != std::string::npos) hname = "__mali_libcpp_string_at";
-                        LLVMValueRef args[2] = {loadReg64(cpu, 0), loadReg64(cpu, 1)};
-                        LLVMValueRef fn = getOrCreateFunction(M, hname, i64Ty, {i64Ty, i64Ty});
-                        LLVMTypeRef pTys[2] = {i64Ty, i64Ty};
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 2, 0);
-                        storeReg64(cpu, 0, LLVMBuildCall2(B, fTy, fn, args, 2, ""));
-                    } else if (sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKcm" ||
-                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm" ||
-                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKc") {
-                        const char* hname = "__mali_libcpp_string_assign_n";
-                        if (sym.find("6append") != std::string::npos) hname = "__mali_libcpp_string_append_n";
-                        else if (sym.find("6insertEmPKc") != std::string::npos) hname = "__mali_libcpp_string_insert_cstr";
-                        LLVMValueRef args[3] = {loadReg64(cpu, 0), loadReg64(cpu, 1), loadReg64(cpu, 2)};
-                        LLVMValueRef fn = getOrCreateFunction(M, hname, i64Ty, {i64Ty, i64Ty, i64Ty});
-                        LLVMTypeRef pTys[3] = {i64Ty, i64Ty, i64Ty};
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 3, 0);
-                        storeReg64(cpu, 0, LLVMBuildCall2(B, fTy, fn, args, 3, ""));
-                    } else if (sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKcm" ||
-                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7replaceEmmPKc") {
-                        const char* hname = (sym.find("7replace") != std::string::npos)
-                                          ? "__mali_libcpp_string_replace_cstr"
-                                          : "__mali_libcpp_string_insert_n";
-                        LLVMValueRef args[4] = {loadReg64(cpu, 0), loadReg64(cpu, 1), loadReg64(cpu, 2), loadReg64(cpu, 3)};
-                        LLVMValueRef fn = getOrCreateFunction(M, hname, i64Ty, {i64Ty, i64Ty, i64Ty, i64Ty});
-                        LLVMTypeRef pTys[4] = {i64Ty, i64Ty, i64Ty, i64Ty};
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 4, 0);
-                        storeReg64(cpu, 0, LLVMBuildCall2(B, fTy, fn, args, 4, ""));
-                    } else if (sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7replaceEmmPKcm" ||
-                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC2ERKS5_mmRKS4_") {
-                        const char* hname = (sym.find("7replace") != std::string::npos)
-                                          ? "__mali_libcpp_string_replace_n"
-                                          : "__mali_libcpp_string_substr_ctor";
-                        LLVMValueRef args[5] = {loadReg64(cpu, 0), loadReg64(cpu, 1), loadReg64(cpu, 2), loadReg64(cpu, 3), loadReg64(cpu, 4)};
-                        LLVMValueRef fn = getOrCreateFunction(M, hname, i64Ty, {i64Ty, i64Ty, i64Ty, i64Ty, i64Ty});
-                        LLVMTypeRef pTys[5] = {i64Ty, i64Ty, i64Ty, i64Ty, i64Ty};
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 5, 0);
-                        storeReg64(cpu, 0, LLVMBuildCall2(B, fTy, fn, args, 5, ""));
-                    } else if (sym == "_ZNSt3__1plIcNS_11char_traitsIcEENS_9allocatorIcEEEENS_12basic_stringIT_T0_T1_EEPKS6_RKS9_") {
-                        LLVMValueRef args[3] = {loadReg64(cpu, 8), loadReg64(cpu, 0), loadReg64(cpu, 1)};
-                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_libcpp_string_plus_cstr_str", i64Ty, {i64Ty, i64Ty, i64Ty});
-                        LLVMTypeRef pTys[3] = {i64Ty, i64Ty, i64Ty};
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 3, 0);
-                        LLVMBuildCall2(B, fTy, fn, args, 3, "");
-                    } else if (sym == "_ZNSt3__111__call_onceERVmPvPFvS2_E") {
-                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_libcpp_call_once", voidTy, {ptrTy});
-                        LLVMTypeRef fTy = LLVMFunctionType(voidTy, &ptrTy, 1, 0);
-                        LLVMBuildCall2(B, fTy, fn, &cpu, 1, "");
-                    } else if (sym == "_ZNSt3__16thread20hardware_concurrencyEv") {
-                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_libcpp_hardware_concurrency", i64Ty, {});
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, nullptr, 0, 0);
-                        storeReg64(cpu, 0, LLVMBuildCall2(B, fTy, fn, nullptr, 0, ""));
-                    } else if (sym == "_ZNSt3__16chrono12steady_clock3nowEv") {
-                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_libcpp_steady_clock_now", i64Ty, {});
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, nullptr, 0, 0);
-                        storeReg64(cpu, 0, LLVMBuildCall2(B, fTy, fn, nullptr, 0, ""));
-                    } else if (sym == "_ZNSt3__16chrono12system_clock3nowEv") {
-                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_libcpp_system_clock_now", i64Ty, {});
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, nullptr, 0, 0);
-                        storeReg64(cpu, 0, LLVMBuildCall2(B, fTy, fn, nullptr, 0, ""));
-                    } else if (sym == "_ZNSt3__15mutex4lockEv" || sym == "_ZNSt3__15mutex6unlockEv" || sym == "_ZNSt3__15mutexD1Ev" ||
-                               sym == "_ZNSt3__115recursive_mutex4lockEv" || sym == "_ZNSt3__115recursive_mutex6unlockEv" || sym == "_ZNSt3__115recursive_mutexD1Ev") {
-                        const char* hname = "__mali_bionic_pthread_mutex_lock";
-                        if (sym.find("unlock") != std::string::npos) hname = "__mali_bionic_pthread_mutex_unlock";
-                        else if (sym.find("D1Ev") != std::string::npos) hname = "__mali_bionic_pthread_mutex_destroy";
-                        LLVMValueRef a0 = loadReg64(cpu, 0);
-                        LLVMValueRef hookFn = getOrCreateFunction(M, hname, i32Ty, {i64Ty});
-                        LLVMTypeRef hTy = LLVMFunctionType(i32Ty, &i64Ty, 1, 0);
-                        LLVMValueRef res32 = LLVMBuildCall2(B, hTy, hookFn, &a0, 1, "");
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
-                    } else if (sym == "_ZNSt3__118condition_variable10notify_oneEv" ||
-                               sym == "_ZNSt3__118condition_variable10notify_allEv" ||
-                               sym == "_ZNSt3__118condition_variableD1Ev") {
-                        const char* hname = "__mali_bionic_pthread_cond_signal";
-                        if (sym.find("notify_all") != std::string::npos) hname = "__mali_bionic_pthread_cond_broadcast";
-                        else if (sym.find("D1Ev") != std::string::npos) hname = "__mali_bionic_pthread_cond_destroy";
-                        LLVMValueRef a0 = loadReg64(cpu, 0);
-                        LLVMValueRef hookFn = getOrCreateFunction(M, hname, i32Ty, {i64Ty});
-                        LLVMTypeRef hTy = LLVMFunctionType(i32Ty, &i64Ty, 1, 0);
-                        LLVMValueRef res32 = LLVMBuildCall2(B, hTy, hookFn, &a0, 1, "");
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
-                    } else if (sym == "access") {
-                        LLVMValueRef args[2] = {loadReg64(cpu, 0), loadReg64(cpu, 1)};
-                        LLVMValueRef fn = getOrCreateFunction(M, "bionic_mali_access_stub", i64Ty, {i64Ty, i64Ty});
-                        LLVMTypeRef pTys[2] = {i64Ty, i64Ty};
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 2, 0);
-                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, args, 2, "");
-                        storeReg64(cpu, 0, res);
-                        stats.kbase_uapi_lowered++;
-                    } else if (sym == "stat" || sym == "stat64" || sym == "lstat" || sym == "lstat64") {
-                        LLVMValueRef args[2] = {loadReg64(cpu, 0), loadReg64(cpu, 1)};
-                        LLVMValueRef fn = getOrCreateFunction(M, "bionic_mali_stat_stub", i64Ty, {i64Ty, i64Ty});
-                        LLVMTypeRef pTys[2] = {i64Ty, i64Ty};
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 2, 0);
-                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, args, 2, "");
-                        storeReg64(cpu, 0, res);
-                        stats.kbase_uapi_lowered++;
-                    } else if (sym == "fstat" || sym == "fstat64") {
-                        LLVMValueRef args[2] = {loadReg64(cpu, 0), loadReg64(cpu, 1)};
-                        LLVMValueRef fn = getOrCreateFunction(M, "bionic_mali_fstat_stub", i64Ty, {i64Ty, i64Ty});
-                        LLVMTypeRef pTys[2] = {i64Ty, i64Ty};
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 2, 0);
-                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, args, 2, "");
-                        storeReg64(cpu, 0, res);
-                        stats.kbase_uapi_lowered++;
-                    } else if (sym == "dup") {
-                        LLVMValueRef w0 = LLVMBuildTrunc(B, loadReg64(cpu, 0), i32Ty, "");
-                        LLVMValueRef fn = getOrCreateFunction(M, "dup", i32Ty, {i32Ty});
-                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, &i32Ty, 1, 0);
-                        LLVMValueRef res32 = LLVMBuildCall2(B, fTy, fn, &w0, 1, "");
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
-                        stats.kbase_uapi_lowered++;
-                    } else if (sym == "dup2") {
-                        LLVMValueRef w0 = LLVMBuildTrunc(B, loadReg64(cpu, 0), i32Ty, "");
-                        LLVMValueRef w1 = LLVMBuildTrunc(B, loadReg64(cpu, 1), i32Ty, "");
-                        LLVMValueRef fn = getOrCreateFunction(M, "dup2", i32Ty, {i32Ty, i32Ty});
-                        LLVMTypeRef pTys[2] = {i32Ty, i32Ty};
-                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, pTys, 2, 0);
-                        LLVMValueRef args[2] = {w0, w1};
-                        LLVMValueRef res32 = LLVMBuildCall2(B, fTy, fn, args, 2, "");
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
-                        stats.kbase_uapi_lowered++;
-                    } else if (sym == "strncpy" || sym == "__strncpy_chk" || sym == "__strncpy_chk2") {
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
-                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
-                        LLVMValueRef x2 = loadReg64(cpu, 2);
-                        LLVMValueRef fn = getOrCreateFunction(M, "strncpy", ptrTy, {ptrTy, ptrTy, i64Ty});
-                        LLVMTypeRef pTys[3] = {ptrTy, ptrTy, i64Ty};
-                        LLVMTypeRef fTy = LLVMFunctionType(ptrTy, pTys, 3, 0);
-                        LLVMValueRef args[3] = {p0, p1, x2};
-                        LLVMValueRef resPtr = LLVMBuildCall2(B, fTy, fn, args, 3, "");
-                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, resPtr, i64Ty, ""));
-                    } else if (sym == "strcpy" || sym == "__strcpy_chk") {
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
-                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
-                        LLVMValueRef fn = getOrCreateFunction(M, "strcpy", ptrTy, {ptrTy, ptrTy});
-                        LLVMTypeRef pTys[2] = {ptrTy, ptrTy};
-                        LLVMTypeRef fTy = LLVMFunctionType(ptrTy, pTys, 2, 0);
-                        LLVMValueRef args[2] = {p0, p1};
-                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, LLVMBuildCall2(B, fTy, fn, args, 2, ""), i64Ty, ""));
-                    } else if (sym == "memchr" || sym == "__memchr_chk") {
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
-                        LLVMValueRef w1 = LLVMBuildTrunc(B, loadReg64(cpu, 1), i32Ty, "");
-                        LLVMValueRef x2 = loadReg64(cpu, 2);
-                        LLVMValueRef fn = getOrCreateFunction(M, "memchr", ptrTy, {ptrTy, i32Ty, i64Ty});
-                        LLVMTypeRef pTys[3] = {ptrTy, i32Ty, i64Ty};
-                        LLVMTypeRef fTy = LLVMFunctionType(ptrTy, pTys, 3, 0);
-                        LLVMValueRef args[3] = {p0, w1, x2};
-                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, LLVMBuildCall2(B, fTy, fn, args, 3, ""), i64Ty, ""));
-                    } else if (sym == "__strchr_chk") {
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
-                        LLVMValueRef w1 = LLVMBuildTrunc(B, loadReg64(cpu, 1), i32Ty, "");
-                        LLVMValueRef fn = getOrCreateFunction(M, "strchr", ptrTy, {ptrTy, i32Ty});
-                        LLVMTypeRef pTys[2] = {ptrTy, i32Ty};
-                        LLVMTypeRef fTy = LLVMFunctionType(ptrTy, pTys, 2, 0);
-                        LLVMValueRef args[2] = {p0, w1};
-                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, LLVMBuildCall2(B, fTy, fn, args, 2, ""), i64Ty, ""));
-                    } else if (sym == "strdup" || sym == "getenv") {
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
-                        LLVMValueRef fn = getOrCreateFunction(M, sym.c_str(), ptrTy, {ptrTy});
-                        LLVMTypeRef fTy = LLVMFunctionType(ptrTy, &ptrTy, 1, 0);
-                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, LLVMBuildCall2(B, fTy, fn, &p0, 1, ""), i64Ty, ""));
-                    } else if (sym == "strcasecmp") {
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
-                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
-                        LLVMValueRef fn = getOrCreateFunction(M, "strcasecmp", i32Ty, {ptrTy, ptrTy});
-                        LLVMTypeRef pTys[2] = {ptrTy, ptrTy};
-                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, pTys, 2, 0);
-                        LLVMValueRef args[2] = {p0, p1};
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, LLVMBuildCall2(B, fTy, fn, args, 2, ""), i64Ty, ""));
-                    } else if (sym == "strpbrk") {
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
-                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
-                        LLVMValueRef fn = getOrCreateFunction(M, "strpbrk", ptrTy, {ptrTy, ptrTy});
-                        LLVMTypeRef pTys[2] = {ptrTy, ptrTy};
-                        LLVMTypeRef fTy = LLVMFunctionType(ptrTy, pTys, 2, 0);
-                        LLVMValueRef args[2] = {p0, p1};
-                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, LLVMBuildCall2(B, fTy, fn, args, 2, ""), i64Ty, ""));
-                    } else if (sym == "strtok_r") {
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
-                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
-                        LLVMValueRef p2 = LLVMBuildIntToPtr(B, loadReg64(cpu, 2), ptrTy, "");
-                        LLVMValueRef fn = getOrCreateFunction(M, "strtok_r", ptrTy, {ptrTy, ptrTy, ptrTy});
-                        LLVMTypeRef pTys[3] = {ptrTy, ptrTy, ptrTy};
-                        LLVMTypeRef fTy = LLVMFunctionType(ptrTy, pTys, 3, 0);
-                        LLVMValueRef args[3] = {p0, p1, p2};
-                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, LLVMBuildCall2(B, fTy, fn, args, 3, ""), i64Ty, ""));
-                    } else if (sym == "strtol" || sym == "strtoll" || sym == "strtoul" || sym == "strtoull") {
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
-                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
-                        LLVMValueRef w2 = LLVMBuildTrunc(B, loadReg64(cpu, 2), i32Ty, "");
-                        LLVMValueRef fn = getOrCreateFunction(M, sym.c_str(), i64Ty, {ptrTy, ptrTy, i32Ty});
-                        LLVMTypeRef pTys[3] = {ptrTy, ptrTy, i32Ty};
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 3, 0);
-                        LLVMValueRef args[3] = {p0, p1, w2};
-                        storeReg64(cpu, 0, LLVMBuildCall2(B, fTy, fn, args, 3, ""));
-                    } else if (sym == "atoi") {
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
-                        LLVMValueRef fn = getOrCreateFunction(M, "atoi", i32Ty, {ptrTy});
-                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, &ptrTy, 1, 0);
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, LLVMBuildCall2(B, fTy, fn, &p0, 1, ""), i64Ty, ""));
-                    } else if (sym == "posix_memalign") {
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
-                        LLVMValueRef x1 = loadReg64(cpu, 1);
-                        LLVMValueRef x2 = loadReg64(cpu, 2);
-                        LLVMValueRef fn = getOrCreateFunction(M, "posix_memalign", i32Ty, {ptrTy, i64Ty, i64Ty});
-                        LLVMTypeRef pTys[3] = {ptrTy, i64Ty, i64Ty};
-                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, pTys, 3, 0);
-                        LLVMValueRef args[3] = {p0, x1, x2};
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, LLVMBuildCall2(B, fTy, fn, args, 3, ""), i64Ty, ""));
-                    } else if (sym == "clock_gettime") {
-                        LLVMValueRef w0 = LLVMBuildTrunc(B, loadReg64(cpu, 0), i32Ty, "");
-                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
-                        LLVMValueRef fn = getOrCreateFunction(M, "clock_gettime", i32Ty, {i32Ty, ptrTy});
-                        LLVMTypeRef pTys[2] = {i32Ty, ptrTy};
-                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, pTys, 2, 0);
-                        LLVMValueRef args[2] = {w0, p1};
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, LLVMBuildCall2(B, fTy, fn, args, 2, ""), i64Ty, ""));
-                    } else if (sym == "sched_yield") {
-                        LLVMValueRef fn = getOrCreateFunction(M, "sched_yield", i32Ty, {});
-                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, nullptr, 0, 0);
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, LLVMBuildCall2(B, fTy, fn, nullptr, 0, ""), i64Ty, ""));
-                    } else if (sym == "usleep") {
-                        LLVMValueRef w0 = LLVMBuildTrunc(B, loadReg64(cpu, 0), i32Ty, "");
-                        LLVMValueRef fn = getOrCreateFunction(M, "usleep", i32Ty, {i32Ty});
-                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, &i32Ty, 1, 0);
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, LLVMBuildCall2(B, fTy, fn, &w0, 1, ""), i64Ty, ""));
-                    } else if (sym == "strndup") {
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
-                        LLVMValueRef x1 = loadReg64(cpu, 1);
-                        LLVMValueRef fn = getOrCreateFunction(M, "strndup", ptrTy, {ptrTy, i64Ty});
-                        LLVMTypeRef pTys[2] = {ptrTy, i64Ty};
-                        LLVMTypeRef fTy = LLVMFunctionType(ptrTy, pTys, 2, 0);
-                        LLVMValueRef args[2] = {p0, x1};
-                        LLVMValueRef resPtr = LLVMBuildCall2(B, fTy, fn, args, 2, "");
-                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, resPtr, i64Ty, ""));
-                    } else if (sym == "strnlen") {
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
-                        LLVMValueRef x1 = loadReg64(cpu, 1);
-                        LLVMValueRef fn = getOrCreateFunction(M, "strnlen", i64Ty, {ptrTy, i64Ty});
-                        LLVMTypeRef pTys[2] = {ptrTy, i64Ty};
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 2, 0);
-                        LLVMValueRef args[2] = {p0, x1};
-                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, args, 2, "");
-                        storeReg64(cpu, 0, res);
-                    } else if (sym == "strspn") {
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
-                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
-                        LLVMValueRef fn = getOrCreateFunction(M, "strspn", i64Ty, {ptrTy, ptrTy});
-                        LLVMTypeRef pTys[2] = {ptrTy, ptrTy};
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 2, 0);
-                        LLVMValueRef args[2] = {p0, p1};
-                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, args, 2, "");
-                        storeReg64(cpu, 0, res);
-                    } else if (sym == "strstr") {
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
-                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
-                        LLVMValueRef fn = getOrCreateFunction(M, "strstr", ptrTy, {ptrTy, ptrTy});
-                        LLVMTypeRef pTys[2] = {ptrTy, ptrTy};
-                        LLVMTypeRef fTy = LLVMFunctionType(ptrTy, pTys, 2, 0);
-                        LLVMValueRef args[2] = {p0, p1};
-                        LLVMValueRef resPtr = LLVMBuildCall2(B, fTy, fn, args, 2, "");
-                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, resPtr, i64Ty, ""));
-                    } else if (sym == "AHardwareBuffer_allocate" || sym == "AHardwareBuffer_describe" ||
-                               sym == "AHardwareBuffer_getNativeHandle" || sym == "AHardwareBuffer_getId") {
-                        uint64_t op = (sym == "AHardwareBuffer_allocate") ? 1ULL
-                                    : (sym == "AHardwareBuffer_describe") ? 2ULL
-                                    : (sym == "AHardwareBuffer_getNativeHandle") ? 3ULL : 4ULL;
-                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_ahb_stub", i64Ty, {i64Ty, i64Ty, i64Ty});
-                        LLVMTypeRef pTys[3] = {i64Ty, i64Ty, i64Ty};
-                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 3, 0);
-                        LLVMValueRef args[3] = {LLVMConstInt(i64Ty, op, 0), loadReg64(cpu, 0), loadReg64(cpu, 1)};
-                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, args, 3, "");
-                        storeReg64(cpu, 0, res);
-                    } else if (sym == "vkCreateXcbSurfaceKHR" || sym == "vkCreateXlibSurfaceKHR" ||
-                               sym == "vkCreateWaylandSurfaceKHR") {
-                        std::string hookName = "__mali_hook_" + sym;
-                        LLVMValueRef hookFn = getOrCreateFunction(M, hookName.c_str(), i32Ty, {ptrTy, ptrTy, ptrTy, ptrTy});
-                        LLVMTypeRef hSig[4] = {ptrTy, ptrTy, ptrTy, ptrTy};
-                        LLVMTypeRef hTy = LLVMFunctionType(i32Ty, hSig, 4, 0);
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
-                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
-                        LLVMValueRef p2 = LLVMBuildIntToPtr(B, loadReg64(cpu, 2), ptrTy, "");
-                        LLVMValueRef p3 = LLVMBuildIntToPtr(B, loadReg64(cpu, 3), ptrTy, "");
-                        LLVMValueRef args[4] = {p0, p1, p2, p3};
-                        LLVMValueRef res32 = LLVMBuildCall2(B, hTy, hookFn, args, 4, "");
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
-                    } else if (sym == "vkQueuePresentKHR") {
-                        LLVMValueRef hookFn = getOrCreateFunction(M, "__mali_hook_vkQueuePresentKHR", i32Ty, {ptrTy, ptrTy});
-                        LLVMTypeRef hSig[2] = {ptrTy, ptrTy};
-                        LLVMTypeRef hTy = LLVMFunctionType(i32Ty, hSig, 2, 0);
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
-                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
-                        LLVMValueRef args[2] = {p0, p1};
-                        LLVMValueRef res32 = LLVMBuildCall2(B, hTy, hookFn, args, 2, "");
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
-                    } else if (sym == "__stack_chk_fail" || sym == "abort") {
-                        LLVMValueRef abortFn = getOrCreateFunction(M, "__mali_stack_chk_fail_diag", voidTy, {ptrTy});
-                        LLVMTypeRef dTy = LLVMFunctionType(voidTy, &ptrTy, 1, 0);
-                        LLVMBuildCall2(B, dTy, abortFn, &cpu, 1, "");
-                    } else if (sym == "pthread_mutex_init" || sym == "pthread_cond_init" || sym == "pthread_rwlock_init" ||
-                               sym == "pthread_cond_wait" || sym == "pthread_join") {
-                        std::string hookName = "__mali_bionic_" + sym;
-                        LLVMValueRef hookFn = getOrCreateFunction(M, hookName.c_str(), i32Ty, {i64Ty, i64Ty});
-                        LLVMTypeRef hSig[2] = {i64Ty, i64Ty};
-                        LLVMTypeRef hTy = LLVMFunctionType(i32Ty, hSig, 2, 0);
-                        LLVMValueRef args[2] = {loadReg64(cpu, 0), loadReg64(cpu, 1)};
-                        LLVMValueRef res32 = LLVMBuildCall2(B, hTy, hookFn, args, 2, "");
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
-                    } else if (sym == "pthread_mutex_destroy" || sym == "pthread_mutex_lock" ||
-                               sym == "pthread_mutex_unlock" || sym == "pthread_mutex_trylock" ||
-                               sym == "pthread_cond_destroy" || sym == "pthread_cond_signal" ||
-                               sym == "pthread_cond_broadcast" || sym == "pthread_rwlock_destroy" ||
-                               sym == "pthread_rwlock_rdlock" || sym == "pthread_rwlock_wrlock" ||
-                               sym == "pthread_rwlock_unlock" || sym == "pthread_detach") {
-                        std::string hookName = "__mali_bionic_" + sym;
-                        LLVMValueRef hookFn = getOrCreateFunction(M, hookName.c_str(), i32Ty, {i64Ty});
-                        LLVMTypeRef hTy = LLVMFunctionType(i32Ty, &i64Ty, 1, 0);
-                        LLVMValueRef a0 = loadReg64(cpu, 0);
-                        LLVMValueRef res32 = LLVMBuildCall2(B, hTy, hookFn, &a0, 1, "");
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
-                    } else if (sym == "pthread_cond_timedwait") {
-                        LLVMValueRef hookFn = getOrCreateFunction(M, "__mali_bionic_pthread_cond_timedwait", i32Ty, {i64Ty, i64Ty, i64Ty});
-                        LLVMTypeRef hSig[3] = {i64Ty, i64Ty, i64Ty};
-                        LLVMTypeRef hTy = LLVMFunctionType(i32Ty, hSig, 3, 0);
-                        LLVMValueRef args[3] = {loadReg64(cpu, 0), loadReg64(cpu, 1), loadReg64(cpu, 2)};
-                        LLVMValueRef res32 = LLVMBuildCall2(B, hTy, hookFn, args, 3, "");
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
-                    } else if (sym == "pthread_create") {
-                        LLVMValueRef hookFn = getOrCreateFunction(M, "__mali_bionic_pthread_create", i32Ty, {i64Ty, i64Ty, i64Ty, i64Ty});
-                        LLVMTypeRef hSig[4] = {i64Ty, i64Ty, i64Ty, i64Ty};
-                        LLVMTypeRef hTy = LLVMFunctionType(i32Ty, hSig, 4, 0);
-                        LLVMValueRef args[4] = {loadReg64(cpu, 0), loadReg64(cpu, 1), loadReg64(cpu, 2), loadReg64(cpu, 3)};
-                        LLVMValueRef res32 = LLVMBuildCall2(B, hTy, hookFn, args, 4, "");
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
+                    } else if (sym == "__cxa_guard_abort") {
+                        storeReg64(cpu, 0, LLVMConstInt(i64Ty, 0, 0));
                     } else {
                         // Unavailable Android / MediaTek vendor library hooks & single-threaded stubs:
                         // Use an opaque helper call rather than compile-time constant 0 so LLVM -O1
@@ -4462,21 +4055,95 @@ int main(int argc, char **argv) {
     LLVMInitializeX86AsmPrinter();
     LLVMInitializeX86AsmParser();
 
-    // Mode 1: Full C++ 6-Pass Pipeline directly from 64-bit libGLES_mali.so
+    // Mode 1: Full C++ 6-Pass Pipeline directly from 64-bit libGLES_mali.so or libc++_shared.so
     // Usage: mali_llvm_pass_driver --lift-so <libGLES_mali.so> <out_dir>
-    if (argc >= 4 && std::strcmp(argv[1], "--lift-so") == 0) {
+    //        mali_llvm_pass_driver --lift-libcpp <libc++_shared.so> <out_dir>
+    if (argc >= 4 && (std::strcmp(argv[1], "--lift-so") == 0 || std::strcmp(argv[1], "--lift-libcpp") == 0)) {
+        bool is_libcpp = (std::strcmp(argv[1], "--lift-libcpp") == 0);
+        LifterConfig cfg;
+        cfg.is_libcpp = is_libcpp;
+        cfg.prefix = is_libcpp ? "libcpp" : "aot";
+        cfg.plt_table_name = is_libcpp ? "g_libcpp_plt_table" : "g_aot_plt_table";
+        cfg.image_base = is_libcpp ? 0x500000000ULL : 0x400000000ULL;
+        cfg.seed_all_dynsyms = is_libcpp;
+
         std::string soPath = argv[2];
         std::string outDir = argv[3];
 
-        printf("[LLVM Pass 1] ELF64LoaderAndCallGraphPass: %s\n", soPath.c_str());
+        printf("[LLVM Pass 1] ELF64LoaderAndCallGraphPass (%s): %s\n", cfg.prefix.c_str(), soPath.c_str());
         ELF64LoaderAndCallGraphPass loader;
-        if (!loader.run(soPath)) {
+        if (!loader.run(soPath, cfg.image_base, cfg.seed_all_dynsyms)) {
             fprintf(stderr, "Failed to load 64-bit ELF64 AArch64 binary: %s\n", soPath.c_str());
             return 1;
         }
         printf("  Driver version      : %s (build-id: %s)\n", loader.driver_version.c_str(), loader.build_id_short.c_str());
-        printf("  Closure functions   : %zu internal functions, %zu PLT imports\n", loader.closure_funcs.size(), loader.closure_plts.size());
-        printf("  Auto ctx malloc off : 0x%02" PRIx64 " | Vulkan HMI RVA: 0x%08" PRIx64 "\n", loader.ctx_malloc_offset, loader.hmi_rva);
+        printf("  Closure functions   : %zu internal functions, %zu PLT imports, %zu GLOB_DAT relocs\n",
+               loader.closure_funcs.size(), loader.closure_plts.size(), loader.glob_dat_relocs.size());
+        if (!is_libcpp) {
+            printf("  Auto ctx malloc off : 0x%02" PRIx64 " | Vulkan HMI RVA: 0x%08" PRIx64 "\n", loader.ctx_malloc_offset, loader.hmi_rva);
+        }
+
+        // Build deterministic PLT dispatch table index map (0..N-1) for all non-hot PLT imports
+        std::set<std::string> non_hot_syms;
+        for (const auto &kv : loader.closure_plts) {
+            if (!isHotInlinePltSym(kv.second)) non_hot_syms.insert(kv.second);
+        }
+        std::map<std::string, size_t> plt_index_map;
+        std::vector<std::string> plt_index_list;
+        plt_index_list.reserve(non_hot_syms.size());
+        for (const auto &sym : non_hot_syms) {
+            plt_index_map[sym] = plt_index_list.size();
+            plt_index_list.push_back(sym);
+        }
+
+        // Emit PLT & GLOB_DAT manifest (.inc)
+        {
+            std::string incPath = outDir + "/" + (is_libcpp ? "r54p3_libcpp_plt_imports.inc" : "r54p3_plt_imports.inc");
+            std::ofstream inc(incPath);
+            std::string macroPrefix = is_libcpp ? "LIBCPP" : "MALI";
+            inc << "// Auto-generated by mali_llvm_pass_driver from " << soPath << "\n";
+            inc << "#ifndef " << macroPrefix << "_PLT_TABLE_COUNT\n";
+            inc << "#define " << macroPrefix << "_PLT_TABLE_COUNT " << plt_index_list.size() << "\n";
+            inc << "#endif\n";
+            inc << "#ifdef " << macroPrefix << "_PLT_IMPORT\n";
+            for (size_t i = 0; i < plt_index_list.size(); ++i) {
+                inc << macroPrefix << "_PLT_IMPORT(" << i << ", \"" << plt_index_list[i] << "\")\n";
+            }
+            inc << "#endif\n";
+            inc << "#ifdef " << macroPrefix << "_GLOB_DAT_IMPORT\n";
+            for (const auto &gd : loader.glob_dat_relocs) {
+                inc << macroPrefix << "_GLOB_DAT_IMPORT(0x" << std::hex << gd.r_offset << "ULL, "
+                    << std::dec << gd.r_type << ", \"" << gd.sym_name << "\")\n";
+            }
+            inc << "#endif\n";
+            printf("  Emitted manifest    : %s (%zu PLT slots, %zu GLOB_DAT)\n",
+                   incPath.c_str(), plt_index_list.size(), loader.glob_dat_relocs.size());
+        }
+
+        if (is_libcpp) {
+            std::string expPath = outDir + "/r54p3_libcpp_exports.inc";
+            std::ofstream exp(expPath);
+            std::set<uint64_t> closure_set(loader.closure_funcs.begin(), loader.closure_funcs.end());
+            exp << "// Auto-generated by mali_llvm_pass_driver from " << soPath << "\n";
+            exp << "#ifdef LIBCPP_FUNC_EXPORT\n";
+            size_t fn_cnt = 0;
+            for (const auto &kv : loader.exported_funcs) {
+                if (closure_set.count(kv.second)) {
+                    char hbuf[16];
+                    std::snprintf(hbuf, sizeof(hbuf), "%08" PRIx64, kv.second);
+                    exp << "LIBCPP_FUNC_EXPORT(\"" << kv.first << "\", 0x" << std::hex << kv.second << "ULL, libcpp_sub_" << hbuf << ")\n";
+                    fn_cnt++;
+                }
+            }
+            exp << "#endif\n";
+            exp << "#ifdef LIBCPP_DATA_EXPORT\n";
+            for (const auto &kv : loader.exported_data) {
+                exp << "LIBCPP_DATA_EXPORT(\"" << kv.first << "\", 0x" << std::hex << kv.second << "ULL)\n";
+            }
+            exp << "#endif\n";
+            printf("  Emitted exports     : %s (%zu func exports, %zu data exports)\n",
+                   expPath.c_str(), fn_cnt, loader.exported_data.size());
+        }
 
         bool instrumentCalls = true;
         if (const char *envInst = std::getenv("MALI_AOT_INSTRUMENT_CALLS")) {
@@ -4518,7 +4185,7 @@ int main(int argc, char **argv) {
         size_t chunk_limit_bytes = chunk_mb * 1024ULL * 1024ULL;
         const char *keep_ll_env = std::getenv("MALI_AOT_KEEP_LL");
         bool keep_ll = (keep_ll_env && std::strcmp(keep_ll_env, "1") == 0);
-        std::string objPath = outDir + "/r54p3_lifted.o";
+        std::string objPath = outDir + "/" + (is_libcpp ? "r54p3_libcpp_lifted.o" : "r54p3_lifted.o");
 
         // Remove stale monolithic/chunk artifacts before lifting
         std::remove((outDir + "/mali_mbs2_unopt.ll").c_str());
@@ -4544,15 +4211,15 @@ int main(int argc, char **argv) {
         };
 
         {
-            AArch64ToLLVMIRLiftingPass lifter(loader, instrumentCalls);
+            AArch64ToLLVMIRLiftingPass lifter(loader, cfg, plt_index_map, instrumentCalls);
             size_t chunk_num = 0;
             lifter.generateChunkedModules(chunk_limit_bytes, [&](const std::string &tag, std::string irText, size_t funcs_done, size_t total_funcs) {
                 if (rc != 0) return;
                 chunk_num++;
                 total_ir_bytes += irText.size();
-                std::string chunkUnopt = outDir + "/mali_mbs2_" + tag + "_unopt.ll";
-                std::string chunkOpt   = outDir + "/mali_mbs2_" + tag + "_opt.ll";
-                std::string chunkObj   = outDir + "/mali_mbs2_" + tag + ".o";
+                std::string chunkUnopt = outDir + "/" + cfg.prefix + "_" + tag + "_unopt.ll";
+                std::string chunkOpt   = outDir + "/" + cfg.prefix + "_" + tag + "_opt.ll";
+                std::string chunkObj   = outDir + "/" + cfg.prefix + "_" + tag + ".o";
                 double pct = total_funcs ? (100.0 * static_cast<double>(funcs_done) / static_cast<double>(total_funcs)) : 100.0;
                 printf("  [Chunk %s (#%zu) | %zu/%zu funcs (%.1f%%)] %zu bytes IR -> optimizing & emitting %s\n",
                        tag.c_str(), chunk_num, funcs_done, total_funcs, pct, irText.size(), chunkObj.c_str());

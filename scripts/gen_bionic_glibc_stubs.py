@@ -344,5 +344,314 @@ def main():
         f.write("\n".join(lines) + "\n")
     print(f"Generated {out_path} ({len(lines)} lines, {len(R54P3_SYSTEM_PROPS) + len(R44P1_MTK_EXTRA_PROPS)} system properties).")
 
+    generate_plt_thunks()
+
+
+def generate_plt_thunks():
+    import os, re, subprocess
+
+    inc_files = [
+        "build-x86-64/r54p3_plt_imports.inc",
+        "build-x86-64/r54p3_libcpp_plt_imports.inc",
+    ]
+    target_syms = set()
+    for p in inc_files:
+        if os.path.exists(p):
+            txt = open(p).read()
+            target_syms.update(re.findall(r'(?:MALI|LIBCPP)_PLT_IMPORT\(\d+, "([^"]+)"\)', txt))
+            target_syms.update(re.findall(r'(?:MALI|LIBCPP)_GLOB_DAT_IMPORT\([^,]+, [^,]+, "([^"]+)"\)', txt))
+
+    c_syms = sorted(s for s in target_syms if not s.startswith("_Z"))
+
+    hdrs = """
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <ctype.h>
+#include <time.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/statfs.h>
+#include <sys/statvfs.h>
+#include <sys/time.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <sys/resource.h>
+#include <sys/utsname.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <sys/eventfd.h>
+#include <sys/timerfd.h>
+#include <sys/sendfile.h>
+#include <sys/auxv.h>
+#include <netdb.h>
+#include <dirent.h>
+#include <poll.h>
+#include <semaphore.h>
+#include <pthread.h>
+#include <sched.h>
+#include <dlfcn.h>
+#include <locale.h>
+#include <wchar.h>
+#include <wctype.h>
+#include <signal.h>
+#include <fenv.h>
+#include <pwd.h>
+#include <syslog.h>
+#include <link.h>
+#include <zlib.h>
+"""
+    pp = subprocess.run(["gcc", "-E", "-P", "-x", "c", "-"], input=hdrs, text=True, capture_output=True).stdout
+    decls = {}
+    for stmt in pp.split(";"):
+        s = " ".join(stmt.split())
+        if not s or "{" in s or "}" in s or s.startswith("typedef "):
+            continue
+        m = re.match(r"^(?:extern\s+)?(.+?)\b([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)", s)
+        if m:
+            ret, name, args = m.group(1).strip(), m.group(2), m.group(3).strip()
+            if name not in decls:
+                decls[name] = (ret, args)
+
+    # Functions handled by custom Mali/Bionic bridges (Bionic struct layouts, variadics, callbacks, WSI, etc.)
+    CUSTOM_HANDLED = {
+        "open", "open64", "__open_2", "openat", "close", "ioctl", "mmap", "mmap64", "munmap",
+        "read", "__read_chk", "write", "__write_chk", "poll", "__poll_chk", "ppoll", "__ppoll_chk",
+        "stat", "stat64", "fstat", "fstat64", "lstat", "lstat64", "access", "fcntl",
+        "printf", "fprintf", "sprintf", "snprintf", "vsnprintf", "__vsnprintf_chk", "vfprintf",
+        "sscanf", "vsscanf", "vasprintf", "swprintf", "syslog",
+        "pthread_mutex_init", "pthread_mutex_destroy", "pthread_mutex_lock",
+        "pthread_mutex_trylock", "pthread_mutex_unlock",
+        "pthread_cond_init", "pthread_cond_destroy", "pthread_cond_wait",
+        "pthread_cond_timedwait", "pthread_cond_signal", "pthread_cond_broadcast",
+        "pthread_rwlock_init", "pthread_rwlock_destroy", "pthread_rwlock_rdlock",
+        "pthread_rwlock_wrlock", "pthread_rwlock_unlock",
+        "pthread_create", "pthread_join", "pthread_detach", "pthread_once",
+        "pthread_key_create", "pthread_attr_init", "pthread_attr_destroy", "pthread_attr_setstacksize",
+        "pthread_mutexattr_init", "pthread_mutexattr_destroy", "pthread_mutexattr_settype",
+        "pthread_condattr_init", "pthread_condattr_setclock",
+        "sem_init", "sem_destroy", "sem_wait", "sem_trywait", "sem_timedwait", "sem_post", "sem_getvalue",
+        "qsort", "sigaction", "dl_iterate_phdr", "dladdr", "dlsym",
+        "div", "sincosf", "__errno", "__gnu_strerror_r", "__assert2", "__stack_chk_fail", "abort",
+        "sysconf", "__system_property_get", "property_get", "property_get_bool",
+        "__system_property_find", "__system_property_read_callback",
+        "vkCreateXcbSurfaceKHR", "vkCreateXlibSurfaceKHR", "vkCreateWaylandSurfaceKHR", "vkQueuePresentKHR",
+        "AHardwareBuffer_acquire", "AHardwareBuffer_allocate", "AHardwareBuffer_describe",
+        "AHardwareBuffer_getId", "AHardwareBuffer_getNativeHandle", "AHardwareBuffer_release",
+        "__cxa_atexit", "__cxa_finalize", "__cxa_thread_atexit_impl", "__register_atfork",
+        "__android_log_print", "__android_log_write", "android_set_abort_message",
+        "atrace_async_begin_body", "atrace_async_end_body", "atrace_begin_body",
+        "atrace_end_body", "atrace_get_enabled_tags", "atrace_int64_body",
+        "exit", "_exit", "fork", "execv", "execve", "prctl", "syscall",
+        "__fwrite_chk", "__memchr_chk", "__strchr_chk", "__strcpy_chk",
+        "__strncat_chk", "__strncpy_chk", "__strncpy_chk2",
+        "fstatfs", "statfs", "statvfs", "readdir", "getpwnam", "getpwuid",
+        "localtime", "localtime_r", "asctime", "strftime", "strftime_l",
+        "getaddrinfo", "freeaddrinfo", "recvmsg", "sendmsg",
+    }
+
+    def split_args(arg_str):
+        if not arg_str or arg_str == "void":
+            return []
+        parts = []
+        depth = 0
+        cur = []
+        for ch in arg_str:
+            if ch in "([": depth += 1
+            elif ch in ")]": depth -= 1
+            if ch == "," and depth == 0:
+                parts.append("".join(cur).strip())
+                cur = []
+            else:
+                cur.append(ch)
+        if cur:
+            parts.append("".join(cur).strip())
+        return parts
+
+    def strip_param_name(p):
+        p = re.sub(r"\b__restrict\b", "", p)
+        p = re.sub(r"\brestrict\b", "", p)
+        p = " ".join(p.split())
+        if "*" in p:
+            idx = p.rfind("*")
+            return p[:idx + 1].strip()
+        if "[" in p:
+            idx = p.find("[")
+            base = p[:idx].strip()
+            toks = base.split()
+            if len(toks) > 1 and toks[-1] not in ("int", "long", "char", "short", "unsigned", "signed", "float", "double", "void", "size_t", "ssize_t", "off_t", "off64_t", "mode_t", "pid_t", "uid_t", "gid_t", "clockid_t", "locale_t", "wint_t", "wchar_t", "fexcept_t", "nfds_t", "socklen_t", "rlim_t", "pthread_t", "pthread_key_t", "Bytef", "uInt", "uLong", "voidpf"):
+                base = " ".join(toks[:-1])
+            return base + "*"
+        toks = p.split()
+        if len(toks) > 1 and toks[-1] not in ("int", "long", "char", "short", "unsigned", "signed", "float", "double", "void", "size_t", "ssize_t", "off_t", "off64_t", "mode_t", "pid_t", "uid_t", "gid_t", "clockid_t", "locale_t", "wint_t", "wchar_t", "nfds_t", "socklen_t", "rlim_t", "pthread_t", "pthread_key_t", "Bytef", "uInt", "uLong", "voidpf"):
+            if toks[-2] not in ("struct", "enum", "union"):
+                return " ".join(toks[:-1])
+        return p
+
+    def classify_type(t):
+        t = re.sub(r"\b__restrict\b|\brestrict\b", "", t)
+        t = " ".join(t.split())
+        if "*" in t:
+            return "ptr", t
+        t = re.sub(r"\bconst\b|\bvolatile\b", "", t)
+        t = " ".join(t.split())
+        if t == "void":
+            return "void", "void"
+        if t == "float":
+            return "f32", "float"
+        if t == "double":
+            return "f64", "double"
+        if "long double" in t or "__float" in t:
+            return "unsupported", t
+        if t in ("int", "signed int", "short", "signed short", "char", "signed char", "int32_t", "int16_t", "int8_t", "pid_t", "clockid_t", "wint_t", "wchar_t"):
+            return "i32", t
+        if t in ("unsigned int", "unsigned", "unsigned short", "unsigned char", "uint32_t", "uint16_t", "uint8_t", "uid_t", "gid_t", "mode_t", "socklen_t", "wctype_t", "uInt"):
+            return "u32", t
+        if t in ("long", "long int", "signed long", "long long", "int64_t", "ssize_t", "off_t", "off64_t", "time_t", "ptrdiff_t", "intptr_t", "clock_t"):
+            return "i64", t
+        if t in ("unsigned long", "unsigned long int", "unsigned long long", "uint64_t", "size_t", "uintptr_t", "nfds_t", "rlim_t", "pthread_t", "pthread_key_t", "uLong", "fexcept_t"):
+            return "u64", t
+        return "unsupported", t
+
+    out = [
+        "// AUTO-GENERATED BY scripts/gen_bionic_glibc_stubs.py - DO NOT EDIT",
+        "#pragma once",
+        "#include <cstdint>",
+        "#include <cstring>",
+        "#include <cstdlib>",
+        "#include <cstdio>",
+        "#include <cmath>",
+        "#include <cctype>",
+        "#include <ctime>",
+        "#include <cerrno>",
+        "#include <cwchar>",
+        "#include <cwctype>",
+        "#include <clocale>",
+        "#include <unistd.h>",
+        "#include <fcntl.h>",
+        "#include <dirent.h>",
+        "#include <dlfcn.h>",
+        "#include <fenv.h>",
+        "#include <pthread.h>",
+        "#include <sched.h>",
+        "#include <signal.h>",
+        "#include <poll.h>",
+        "#include <sys/stat.h>",
+        "#include <sys/mman.h>",
+        "#include <sys/resource.h>",
+        "#include <sys/utsname.h>",
+        "#include <sys/wait.h>",
+        "#include <sys/socket.h>",
+        "#include <sys/uio.h>",
+        "#include <sys/eventfd.h>",
+        "#include <sys/timerfd.h>",
+        "#include <sys/sendfile.h>",
+        "#include <sys/auxv.h>",
+        "#include <pwd.h>",
+        "#include <syslog.h>",
+        "#include <zlib.h>",
+        "#include <string>",
+        "#include <unordered_map>",
+        "",
+        "using MaliPltFn = void(*)(AOTCPUState*);",
+        "",
+    ]
+
+    reg_lines = [
+        "static inline void mali_register_autogen_plt_thunks(std::unordered_map<std::string, MaliPltFn>& reg) {"
+    ]
+
+    gen_count = 0
+    for sym in c_syms:
+        if sym in CUSTOM_HANDLED or sym not in decls:
+            continue
+        ret_raw, args_raw = decls[sym]
+        if "..." in args_raw or "va_list" in args_raw or "__gnuc_va_list" in args_raw:
+            continue
+        ret_kind, ret_ty = classify_type(ret_raw)
+        if ret_kind == "unsupported":
+            continue
+        raw_params = split_args(args_raw)
+        if len(raw_params) > 8:
+            continue
+        parsed_params = []
+        ok = True
+        gi = 0
+        fi = 0
+        for rp in raw_params:
+            if "(*" in rp:
+                ok = False
+                break
+            pt = strip_param_name(rp)
+            pk, cty = classify_type(pt)
+            if pk == "unsupported" or pk == "void":
+                ok = False
+                break
+            if pk in ("f32", "f64"):
+                if fi >= 8:
+                    ok = False
+                    break
+                parsed_params.append((pk, cty, fi))
+                fi += 1
+            else:
+                if gi >= 8:
+                    ok = False
+                    break
+                parsed_params.append((pk, cty, gi))
+                gi += 1
+        if not ok:
+            continue
+
+        fn_name = f"__mali_plt_thunk_{sym}"
+        out.append(f"static void {fn_name}(AOTCPUState* cpu) {{")
+        if not parsed_params and ret_kind == "void":
+            out.append("    (void)cpu;")
+        call_args = []
+        for idx_p, (pk, cty, reg_i) in enumerate(parsed_params):
+            aname = f"a{idx_p}"
+            if pk == "ptr":
+                out.append(f"    {cty} {aname} = reinterpret_cast<{cty}>(static_cast<uintptr_t>(cpu->x[{reg_i}]));")
+            elif pk == "f32":
+                out.append(f"    float {aname} = 0.0f; std::memcpy(&{aname}, &cpu->v[{reg_i}], 4);")
+            elif pk == "f64":
+                out.append(f"    double {aname} = 0.0; std::memcpy(&{aname}, &cpu->v[{reg_i}], 8);")
+            else:
+                out.append(f"    {cty} {aname} = static_cast<{cty}>(cpu->x[{reg_i}]);")
+            call_args.append(aname)
+
+        call_expr = f"::{sym}({', '.join(call_args)})"
+        if ret_kind == "void":
+            out.append(f"    {call_expr};")
+        elif ret_kind == "ptr":
+            out.append(f"    auto r = {call_expr};")
+            out.append("    cpu->x[0] = reinterpret_cast<uint64_t>(r);")
+        elif ret_kind == "f32":
+            out.append(f"    float r = {call_expr}; uint64_t bits = 0; std::memcpy(&bits, &r, 4); cpu->v[0] = bits;")
+        elif ret_kind == "f64":
+            out.append(f"    double r = {call_expr}; uint64_t bits = 0; std::memcpy(&bits, &r, 8); cpu->v[0] = bits;")
+        elif ret_kind == "i32":
+            out.append(f"    auto r = {call_expr}; cpu->x[0] = static_cast<uint64_t>(static_cast<int64_t>(r));")
+        elif ret_kind == "u32":
+            out.append(f"    auto r = {call_expr}; cpu->x[0] = static_cast<uint64_t>(static_cast<uint32_t>(r));")
+        else:
+            out.append(f"    auto r = {call_expr}; cpu->x[0] = static_cast<uint64_t>(r);")
+        out.append("}")
+        reg_lines.append(f'    reg["{sym}"] = &{fn_name};')
+        gen_count += 1
+
+    reg_lines.append("}")
+    out.append("")
+    out.extend(reg_lines)
+
+    out_path = "src/r54p3_vulkan_icd/generated/mali_plt_thunks_autogen.h"
+    with open(out_path, "w") as f:
+        f.write("\n".join(out) + "\n")
+    print(f"Generated {out_path} ({gen_count} auto-generated C/POSIX/libm PLT thunks).")
+
 if __name__ == "__main__":
     main()
