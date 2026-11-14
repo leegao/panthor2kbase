@@ -601,6 +601,15 @@ static inline void computeGenericVkFormatPitchAndSize(uint32_t format, uint32_t 
 __attribute__((visibility("default")))
 void vkGetImageSubresourceLayout(void* device, uint64_t image, const void* pSubresource, void* pLayout) {
     if (!pLayout) return;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && dev->native_device) {
+        aot_forward_vkGetImageSubresourceLayout(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkImage>(image),
+            static_cast<const VkImageSubresource*>(pSubresource),
+            static_cast<VkSubresourceLayout*>(pLayout));
+        return;
+    }
     const auto* img = reinterpret_cast<const MaliIcdImage*>(image);
     // 1. Defer directly to lifted libGLES_mali.so (aot_vkGetImageSubresourceLayout @ 0x988788) when backed by a native DDK handle
     if (img && img->aot_image_handle != 0) {
@@ -1012,8 +1021,10 @@ int32_t vkGetSwapchainImagesKHR(void* /*device*/, uint64_t swapchain, uint32_t* 
 }
 
 __attribute__((visibility("default")))
-int32_t vkAcquireNextImageKHR(void* /*device*/, uint64_t swapchain, uint64_t /*timeout*/, uint64_t semaphore, uint64_t fence, uint32_t* pImageIndex) {
+int32_t vkAcquireNextImageKHR(void* device, uint64_t swapchain, uint64_t /*timeout*/, uint64_t semaphore, uint64_t fence, uint32_t* pImageIndex) {
     if (!swapchain || !pImageIndex) return -3;
+    auto* dev = static_cast<MaliIcdDevice*>(device);
+    const bool native_aot = (dev && dev->native_device != nullptr);
     auto* sc = reinterpret_cast<MaliIcdSwapchain*>(swapchain);
     if (sc->images.empty()) return -3;
     uint32_t idx = sc->next_image_idx % static_cast<uint32_t>(sc->images.size());
@@ -1021,11 +1032,11 @@ int32_t vkAcquireNextImageKHR(void* /*device*/, uint64_t swapchain, uint64_t /*t
     sc->next_image_idx = (idx + 1U) % static_cast<uint32_t>(sc->images.size());
     if (idx < sc->image_acquired.size()) sc->image_acquired[idx] = true;
     if (idx < sc->image_fences.size()) sc->image_fences[idx] = fence;
-    if (fence) {
+    if (fence && !native_aot) {
         auto* f = reinterpret_cast<MaliIcdFence*>(fence);
         f->signaled = true;
     }
-    if (semaphore) {
+    if (semaphore && !native_aot) {
         auto* s = reinterpret_cast<MaliIcdSemaphore*>(semaphore);
         if (s->is_timeline) s->counter_value++;
     }
@@ -1285,15 +1296,22 @@ int32_t vkQueuePresentKHR(void* /*queue*/, const void* pPresentInfo) {
 }
 
 __attribute__((visibility("default")))
-int32_t vkQueueWaitIdle(void* /*queue*/) {
+int32_t vkQueueWaitIdle(void* queue) {
+    auto* q = static_cast<MaliIcdQueue*>(queue);
+    if (q && q->native_queue) {
+        return aot_forward_vkQueueWaitIdle(reinterpret_cast<VkQueue>(queue));
+    }
     if (mali_kbase_emu_wait_csf_idle) mali_kbase_emu_wait_csf_idle(200000000ULL);
     return 0;
 }
 
 __attribute__((visibility("default")))
 int32_t vkDeviceWaitIdle(void* device) {
-    if (mali_kbase_emu_wait_csf_idle) mali_kbase_emu_wait_csf_idle(200000000ULL);
     auto* dev = static_cast<MaliIcdDevice*>(device);
+    if (dev && dev->native_device) {
+        return aot_forward_vkDeviceWaitIdle(reinterpret_cast<VkDevice>(device));
+    }
+    if (mali_kbase_emu_wait_csf_idle) mali_kbase_emu_wait_csf_idle(200000000ULL);
     if (dev && dev->aot_cctx_mem.size() > 0xc1 && dev->aot_cctx_mem[0xc1] != 0) {
         return -4; /* VK_ERROR_DEVICE_LOST */
     }

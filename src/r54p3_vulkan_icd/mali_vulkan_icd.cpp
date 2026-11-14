@@ -268,6 +268,13 @@ void vkGetDeviceQueue(void* device, uint32_t queueFamilyIndex, uint32_t queueInd
 __attribute__((visibility("default")))
 int32_t vkCreateBuffer(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pBuffer) {
     if (!pCreateInfo || !pBuffer) return -3;
+    if (useNativeAotFor("vkCreateBuffer")) {
+        return aot_forward_vkCreateBuffer(
+            reinterpret_cast<VkDevice>(device),
+            static_cast<const VkBufferCreateInfo*>(pCreateInfo),
+            static_cast<const VkAllocationCallbacks*>(pAllocator),
+            reinterpret_cast<VkBuffer*>(pBuffer));
+    }
     g_host_vk_allocators.registerCallbacks(pAllocator);
     const auto* bci = static_cast<const VkBufferCreateInfo*>(pCreateInfo);
     auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
@@ -309,6 +316,13 @@ int32_t vkCreateBuffer(void* device, const void* pCreateInfo, const void* pAlloc
 __attribute__((visibility("default")))
 void vkDestroyBuffer(void* device, uint64_t buffer, const void* pAllocator) {
     if (!buffer) return;
+    if (useNativeAotFor("vkDestroyBuffer")) {
+        aot_forward_vkDestroyBuffer(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkBuffer>(buffer),
+            static_cast<const VkAllocationCallbacks*>(pAllocator));
+        return;
+    }
     g_host_vk_allocators.registerCallbacks(pAllocator);
     {
         std::lock_guard<std::mutex> lk(g_icd_mutex);
@@ -330,6 +344,13 @@ void vkDestroyBuffer(void* device, uint64_t buffer, const void* pAllocator) {
 __attribute__((visibility("default")))
 void vkGetBufferMemoryRequirements(void* device, uint64_t buffer, void* pMemoryRequirements) {
     if (!buffer || !pMemoryRequirements) return;
+    if (useNativeAotFor("vkGetBufferMemoryRequirements")) {
+        aot_forward_vkGetBufferMemoryRequirements(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkBuffer>(buffer),
+            static_cast<VkMemoryRequirements*>(pMemoryRequirements));
+        return;
+    }
     auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* buf = reinterpret_cast<MaliIcdBuffer*>(buffer);
     auto* req = static_cast<VkMemoryRequirements*>(pMemoryRequirements);
@@ -410,8 +431,15 @@ VkResult vkUnmapMemory2(VkDevice device, const VkMemoryUnmapInfo* pMemoryUnmapIn
 }
 
 __attribute__((visibility("default")))
-int32_t vkBindBufferMemory(void* /*device*/, uint64_t buffer, uint64_t memory, uint64_t memoryOffset) {
+int32_t vkBindBufferMemory(void* device, uint64_t buffer, uint64_t memory, uint64_t memoryOffset) {
     if (!buffer || !memory) return -3;
+    if (useNativeAotFor("vkBindBufferMemory")) {
+        return aot_forward_vkBindBufferMemory(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkBuffer>(buffer),
+            reinterpret_cast<VkDeviceMemory>(memory),
+            memoryOffset);
+    }
     auto* buf = reinterpret_cast<MaliIcdBuffer*>(buffer);
     auto* mem = reinterpret_cast<MaliIcdDeviceMemory*>(memory);
     buf->bound_gpu_va = mem->gpu_va + memoryOffset;
@@ -430,8 +458,15 @@ int32_t vkBindBufferMemory(void* /*device*/, uint64_t buffer, uint64_t memory, u
 // storing the compiled Valhall/Bifrost OBJC into an EXEC_VA /dev/mali0 BO!
 // ============================================================================
 __attribute__((visibility("default")))
-int32_t vkCreateShaderModule(void* device, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pShaderModule) {
+int32_t vkCreateShaderModule(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pShaderModule) {
     if (!device || !pCreateInfo || !pShaderModule) return -3;
+    if (useNativeAotFor("vkCreateShaderModule")) {
+        return aot_forward_vkCreateShaderModule(
+            reinterpret_cast<VkDevice>(device),
+            static_cast<const VkShaderModuleCreateInfo*>(pCreateInfo),
+            static_cast<const VkAllocationCallbacks*>(pAllocator),
+            reinterpret_cast<VkShaderModule*>(pShaderModule));
+    }
     auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     const auto* smci = static_cast<const VkShaderModuleCreateInfo*>(pCreateInfo);
     if (!smci->pCode || smci->codeSize < 20) return -3;
@@ -440,7 +475,7 @@ int32_t vkCreateShaderModule(void* device, const void* pCreateInfo, const void* 
     mod->spirv_words.assign(smci->pCode, smci->pCode + (smci->codeSize / 4));
 
     // 1. Execute AOT-translated ARM64 vkCreateShaderModule (validates SPIR-V + computes SHA-1 via ARMv8 Crypto)
-    if (aot_vkCreateShaderModule) {
+    if (aot_vkCreateShaderModule && !dev->aot_vk_device_mem.empty()) {
         std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         auto& cpu = g_aot_rt.cpu;
         uint64_t aot_sm_handle = 0;
@@ -591,8 +626,15 @@ static void runAotMbs2PipelineCompile(MaliIcdShaderModule* mod) {
 }
 
 __attribute__((visibility("default")))
-void vkDestroyShaderModule(void* device, uint64_t shaderModule, const void* /*pAllocator*/) {
+void vkDestroyShaderModule(void* device, uint64_t shaderModule, const void* pAllocator) {
     if (!shaderModule) return;
+    if (useNativeAotFor("vkDestroyShaderModule")) {
+        aot_forward_vkDestroyShaderModule(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkShaderModule>(shaderModule),
+            static_cast<const VkAllocationCallbacks*>(pAllocator));
+        return;
+    }
     auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* mod = reinterpret_cast<MaliIcdShaderModule*>(shaderModule);
     if (dev && mod->aot_shader_module_handle != 0 && aot_vkDestroyShaderModule) {
@@ -605,8 +647,15 @@ void vkDestroyShaderModule(void* device, uint64_t shaderModule, const void* /*pA
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateDescriptorSetLayout(void* device, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pSetLayout) {
+int32_t vkCreateDescriptorSetLayout(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pSetLayout) {
     if (!pSetLayout) return -3;
+    if (useNativeAotFor("vkCreateDescriptorSetLayout")) {
+        return aot_forward_vkCreateDescriptorSetLayout(
+            reinterpret_cast<VkDevice>(device),
+            static_cast<const VkDescriptorSetLayoutCreateInfo*>(pCreateInfo),
+            static_cast<const VkAllocationCallbacks*>(pAllocator),
+            reinterpret_cast<VkDescriptorSetLayout*>(pSetLayout));
+    }
     auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* dsl = new MaliIcdDescriptorSetLayout();
     dsl->aot_handle_mem.assign(1024, 0); *reinterpret_cast<uint32_t*>(dsl->aot_handle_mem.data() + 0x90) = 2U;
@@ -637,8 +686,15 @@ int32_t vkCreateDescriptorSetLayout(void* device, const void* pCreateInfo, const
 }
 
 __attribute__((visibility("default")))
-void vkDestroyDescriptorSetLayout(void* device, uint64_t descriptorSetLayout, const void* /*pAllocator*/) {
+void vkDestroyDescriptorSetLayout(void* device, uint64_t descriptorSetLayout, const void* pAllocator) {
     if (!descriptorSetLayout || descriptorSetLayout == 0xD5100001ULL) return;
+    if (useNativeAotFor("vkDestroyDescriptorSetLayout")) {
+        aot_forward_vkDestroyDescriptorSetLayout(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkDescriptorSetLayout>(descriptorSetLayout),
+            static_cast<const VkAllocationCallbacks*>(pAllocator));
+        return;
+    }
     auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* dsl = reinterpret_cast<MaliIcdDescriptorSetLayout*>(descriptorSetLayout);
     if (dev && aot_vkDestroyDescriptorSetLayout && !dsl->aot_handle_mem.empty()) {
@@ -651,8 +707,15 @@ void vkDestroyDescriptorSetLayout(void* device, uint64_t descriptorSetLayout, co
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreatePipelineLayout(void* device, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pPipelineLayout) {
+int32_t vkCreatePipelineLayout(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pPipelineLayout) {
     if (!pPipelineLayout) return -3;
+    if (useNativeAotFor("vkCreatePipelineLayout")) {
+        return aot_forward_vkCreatePipelineLayout(
+            reinterpret_cast<VkDevice>(device),
+            static_cast<const VkPipelineLayoutCreateInfo*>(pCreateInfo),
+            static_cast<const VkAllocationCallbacks*>(pAllocator),
+            reinterpret_cast<VkPipelineLayout*>(pPipelineLayout));
+    }
     auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* pl = new MaliIcdPipelineLayout();
     pl->aot_handle_mem.assign(1600, 0); *reinterpret_cast<uint32_t*>(pl->aot_handle_mem.data() + 0x10) = 2U;
@@ -690,8 +753,15 @@ int32_t vkCreatePipelineLayout(void* device, const void* pCreateInfo, const void
 }
 
 __attribute__((visibility("default")))
-void vkDestroyPipelineLayout(void* device, uint64_t pipelineLayout, const void* /*pAllocator*/) {
+void vkDestroyPipelineLayout(void* device, uint64_t pipelineLayout, const void* pAllocator) {
     if (!pipelineLayout || pipelineLayout == 0xB1000001ULL) return;
+    if (useNativeAotFor("vkDestroyPipelineLayout")) {
+        aot_forward_vkDestroyPipelineLayout(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkPipelineLayout>(pipelineLayout),
+            static_cast<const VkAllocationCallbacks*>(pAllocator));
+        return;
+    }
     auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* pl  = reinterpret_cast<MaliIcdPipelineLayout*>(pipelineLayout);
     if (dev && aot_vkDestroyPipelineLayout && !pl->aot_handle_mem.empty()) {
@@ -743,8 +813,15 @@ int32_t vkCreateComputePipelines(void* device, uint64_t pipelineCache, uint32_t 
 }
 
 __attribute__((visibility("default")))
-void vkDestroyPipeline(void* device, uint64_t pipeline, const void* /*pAllocator*/) {
+void vkDestroyPipeline(void* device, uint64_t pipeline, const void* pAllocator) {
     if (!pipeline) return;
+    if (useNativeAotFor("vkDestroyPipeline")) {
+        aot_forward_vkDestroyPipeline(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkPipeline>(pipeline),
+            static_cast<const VkAllocationCallbacks*>(pAllocator));
+        return;
+    }
     auto* dev  = static_cast<MaliIcdDevice*>(device);
     auto* pipe = reinterpret_cast<MaliIcdPipeline*>(pipeline);
     if (dev && pipe->aot_pipeline_handle != 0 && aot_vkDestroyPipeline && !dev->aot_vk_device_mem.empty()) {
@@ -757,8 +834,15 @@ void vkDestroyPipeline(void* device, uint64_t pipeline, const void* /*pAllocator
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateDescriptorPool(void* /*device*/, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pDescriptorPool) {
+int32_t vkCreateDescriptorPool(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pDescriptorPool) {
     if (!pDescriptorPool) return -3;
+    if (useNativeAotFor("vkCreateDescriptorPool")) {
+        return aot_forward_vkCreateDescriptorPool(
+            reinterpret_cast<VkDevice>(device),
+            static_cast<const VkDescriptorPoolCreateInfo*>(pCreateInfo),
+            static_cast<const VkAllocationCallbacks*>(pAllocator),
+            reinterpret_cast<VkDescriptorPool*>(pDescriptorPool));
+    }
     auto* pool = new MaliIcdDescriptorPool();
     if (pCreateInfo && *static_cast<const uint32_t*>(pCreateInfo) == 33U) {
         pool->max_sets = std::max<uint32_t>(1U, reinterpret_cast<const uint32_t*>(pCreateInfo)[5]);
@@ -770,6 +854,13 @@ int32_t vkCreateDescriptorPool(void* /*device*/, const void* pCreateInfo, const 
 __attribute__((visibility("default")))
 void vkDestroyDescriptorPool(void* device, uint64_t descriptorPool, const void* pAllocator) {
     if (!descriptorPool || descriptorPool == 0xD8000001ULL) return;
+    if (useNativeAotFor("vkDestroyDescriptorPool")) {
+        aot_forward_vkDestroyDescriptorPool(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkDescriptorPool>(descriptorPool),
+            static_cast<const VkAllocationCallbacks*>(pAllocator));
+        return;
+    }
     auto* dev  = static_cast<MaliIcdDevice*>(device);
     auto* pool = reinterpret_cast<MaliIcdDescriptorPool*>(descriptorPool);
     if (dev && !dev->aot_vk_device_mem.empty() && pool->aot_handle >= 0x10000ULL) {
@@ -783,8 +874,14 @@ void vkDestroyDescriptorPool(void* device, uint64_t descriptorPool, const void* 
 }
 
 __attribute__((visibility("default")))
-int32_t vkAllocateDescriptorSets(void* /*device*/, const void* pAllocateInfo, uint64_t* pDescriptorSets) {
+int32_t vkAllocateDescriptorSets(void* device, const void* pAllocateInfo, uint64_t* pDescriptorSets) {
     if (!pDescriptorSets) return -3;
+    if (useNativeAotFor("vkAllocateDescriptorSets")) {
+        return aot_forward_vkAllocateDescriptorSets(
+            reinterpret_cast<VkDevice>(device),
+            static_cast<const VkDescriptorSetAllocateInfo*>(pAllocateInfo),
+            reinterpret_cast<VkDescriptorSet*>(pDescriptorSets));
+    }
     struct AllocInfo { uint32_t sType; const void* pNext; uint64_t pool; uint32_t count; const uint64_t* pLayouts; };
     const auto* ai = static_cast<const AllocInfo*>(pAllocateInfo);
     uint32_t n = (ai && ai->count > 0 && ai->count <= 4096U) ? ai->count : 1U;
@@ -795,8 +892,17 @@ int32_t vkAllocateDescriptorSets(void* /*device*/, const void* pAllocateInfo, ui
 }
 
 __attribute__((visibility("default")))
-void vkUpdateDescriptorSets(void* /*device*/, uint32_t descriptorWriteCount, const void* pDescriptorWrites,
+void vkUpdateDescriptorSets(void* device, uint32_t descriptorWriteCount, const void* pDescriptorWrites,
                             uint32_t descriptorCopyCount, const void* pDescriptorCopies) {
+    if (useNativeAotFor("vkUpdateDescriptorSets")) {
+        aot_forward_vkUpdateDescriptorSets(
+            reinterpret_cast<VkDevice>(device),
+            descriptorWriteCount,
+            static_cast<const VkWriteDescriptorSet*>(pDescriptorWrites),
+            descriptorCopyCount,
+            static_cast<const VkCopyDescriptorSet*>(pDescriptorCopies));
+        return;
+    }
     if (pDescriptorWrites && descriptorWriteCount > 0) {
         const auto* writes = static_cast<const VkWriteDescriptorSet*>(pDescriptorWrites);
         for (uint32_t i = 0; i < descriptorWriteCount; ++i) {
@@ -888,8 +994,15 @@ static void populateAotStubTexture(MaliIcdImage* img) {
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateImage(void* /*device*/, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pImage) {
+int32_t vkCreateImage(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pImage) {
     if (!pCreateInfo || !pImage) return -3;
+    if (useNativeAotFor("vkCreateImage")) {
+        return aot_forward_vkCreateImage(
+            reinterpret_cast<VkDevice>(device),
+            static_cast<const VkImageCreateInfo*>(pCreateInfo),
+            static_cast<const VkAllocationCallbacks*>(pAllocator),
+            reinterpret_cast<VkImage*>(pImage));
+    }
     struct ImgInfo {
         uint32_t sType; const void* pNext; uint32_t flags; uint32_t imageType; uint32_t format;
         uint32_t width; uint32_t height; uint32_t depth; uint32_t mipLevels; uint32_t arrayLayers;
@@ -913,7 +1026,15 @@ int32_t vkCreateImage(void* /*device*/, const void* pCreateInfo, const void* /*p
 }
 
 __attribute__((visibility("default")))
-void vkDestroyImage(void* /*device*/, uint64_t image, const void* /*pAllocator*/) {
+void vkDestroyImage(void* device, uint64_t image, const void* pAllocator) {
+    if (!image) return;
+    if (useNativeAotFor("vkDestroyImage")) {
+        aot_forward_vkDestroyImage(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkImage>(image),
+            static_cast<const VkAllocationCallbacks*>(pAllocator));
+        return;
+    }
     {
         std::lock_guard<std::mutex> lk(g_icd_mutex);
         g_images.erase(image);
@@ -922,8 +1043,15 @@ void vkDestroyImage(void* /*device*/, uint64_t image, const void* /*pAllocator*/
 }
 
 __attribute__((visibility("default")))
-void vkGetImageMemoryRequirements(void* /*device*/, uint64_t image, void* pMemoryRequirements) {
+void vkGetImageMemoryRequirements(void* device, uint64_t image, void* pMemoryRequirements) {
     if (!image || !pMemoryRequirements) return;
+    if (useNativeAotFor("vkGetImageMemoryRequirements")) {
+        aot_forward_vkGetImageMemoryRequirements(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkImage>(image),
+            static_cast<VkMemoryRequirements*>(pMemoryRequirements));
+        return;
+    }
     auto* img = reinterpret_cast<MaliIcdImage*>(image);
     auto* req = static_cast<VkMemoryRequirements*>(pMemoryRequirements);
     req->size = std::max<uint64_t>(4096ULL, (img->byte_size + 4095ULL) & ~4095ULL);
@@ -932,8 +1060,15 @@ void vkGetImageMemoryRequirements(void* /*device*/, uint64_t image, void* pMemor
 }
 
 __attribute__((visibility("default")))
-int32_t vkBindImageMemory(void* /*device*/, uint64_t image, uint64_t memory, uint64_t memoryOffset) {
+int32_t vkBindImageMemory(void* device, uint64_t image, uint64_t memory, uint64_t memoryOffset) {
     if (!image || !memory) return -3;
+    if (useNativeAotFor("vkBindImageMemory")) {
+        return aot_forward_vkBindImageMemory(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkImage>(image),
+            reinterpret_cast<VkDeviceMemory>(memory),
+            memoryOffset);
+    }
     auto* img = reinterpret_cast<MaliIcdImage*>(image);
     auto* mem = reinterpret_cast<MaliIcdDeviceMemory*>(memory);
     uint64_t va = mem->gpu_va + memoryOffset;
@@ -954,8 +1089,15 @@ int32_t vkBindImageMemory(void* /*device*/, uint64_t image, uint64_t memory, uin
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateImageView(void* /*device*/, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pView) {
+int32_t vkCreateImageView(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pView) {
     if (!pCreateInfo || !pView) return -3;
+    if (useNativeAotFor("vkCreateImageView")) {
+        return aot_forward_vkCreateImageView(
+            reinterpret_cast<VkDevice>(device),
+            static_cast<const VkImageViewCreateInfo*>(pCreateInfo),
+            static_cast<const VkAllocationCallbacks*>(pAllocator),
+            reinterpret_cast<VkImageView*>(pView));
+    }
     struct ViewInfo { uint32_t sType; const void* pNext; uint32_t flags; uint64_t image; uint32_t viewType; uint32_t format; };
     const auto* vi = static_cast<const ViewInfo*>(pCreateInfo);
     auto* iv = new MaliIcdImageView();
@@ -966,13 +1108,28 @@ int32_t vkCreateImageView(void* /*device*/, const void* pCreateInfo, const void*
 }
 
 __attribute__((visibility("default")))
-void vkDestroyImageView(void* /*device*/, uint64_t view, const void* /*pAllocator*/) {
+void vkDestroyImageView(void* device, uint64_t view, const void* pAllocator) {
+    if (!view) return;
+    if (useNativeAotFor("vkDestroyImageView")) {
+        aot_forward_vkDestroyImageView(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkImageView>(view),
+            static_cast<const VkAllocationCallbacks*>(pAllocator));
+        return;
+    }
     delete reinterpret_cast<MaliIcdImageView*>(view);
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateSampler(void* /*device*/, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pSampler) {
+int32_t vkCreateSampler(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pSampler) {
     if (!pSampler) return -3;
+    if (useNativeAotFor("vkCreateSampler")) {
+        return aot_forward_vkCreateSampler(
+            reinterpret_cast<VkDevice>(device),
+            static_cast<const VkSamplerCreateInfo*>(pCreateInfo),
+            static_cast<const VkAllocationCallbacks*>(pAllocator),
+            reinterpret_cast<VkSampler*>(pSampler));
+    }
     auto* smp = new MaliIcdSampler();
     if (pCreateInfo) {
         const auto* sci = static_cast<const VkSamplerCreateInfo*>(pCreateInfo);
@@ -992,6 +1149,13 @@ int32_t vkCreateSampler(void* /*device*/, const void* pCreateInfo, const void* /
 __attribute__((visibility("default")))
 void vkDestroySampler(void* device, uint64_t sampler, const void* pAllocator) {
     if (!sampler) return;
+    if (useNativeAotFor("vkDestroySampler")) {
+        aot_forward_vkDestroySampler(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkSampler>(sampler),
+            static_cast<const VkAllocationCallbacks*>(pAllocator));
+        return;
+    }
     auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* smp = reinterpret_cast<MaliIcdSampler*>(sampler);
     if (dev && !dev->aot_vk_device_mem.empty() && smp->aot_handle >= 0x10000ULL) {
@@ -1005,20 +1169,42 @@ void vkDestroySampler(void* device, uint64_t sampler, const void* pAllocator) {
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateRenderPass(void* /*device*/, const void* /*pCreateInfo*/, const void* /*pAllocator*/, uint64_t* pRenderPass) {
+int32_t vkCreateRenderPass(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pRenderPass) {
     if (!pRenderPass) return -3;
+    if (useNativeAotFor("vkCreateRenderPass")) {
+        return aot_forward_vkCreateRenderPass(
+            reinterpret_cast<VkDevice>(device),
+            static_cast<const VkRenderPassCreateInfo*>(pCreateInfo),
+            static_cast<const VkAllocationCallbacks*>(pAllocator),
+            reinterpret_cast<VkRenderPass*>(pRenderPass));
+    }
     *pRenderPass = reinterpret_cast<uint64_t>(new MaliIcdRenderPass());
     return 0;
 }
 
 __attribute__((visibility("default")))
-void vkDestroyRenderPass(void* /*device*/, uint64_t rp, const void* /*pAllocator*/) {
+void vkDestroyRenderPass(void* device, uint64_t rp, const void* pAllocator) {
+    if (!rp) return;
+    if (useNativeAotFor("vkDestroyRenderPass")) {
+        aot_forward_vkDestroyRenderPass(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkRenderPass>(rp),
+            static_cast<const VkAllocationCallbacks*>(pAllocator));
+        return;
+    }
     delete reinterpret_cast<MaliIcdRenderPass*>(rp);
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateFramebuffer(void* /*device*/, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pFramebuffer) {
+int32_t vkCreateFramebuffer(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pFramebuffer) {
     if (!pCreateInfo || !pFramebuffer) return -3;
+    if (useNativeAotFor("vkCreateFramebuffer")) {
+        return aot_forward_vkCreateFramebuffer(
+            reinterpret_cast<VkDevice>(device),
+            static_cast<const VkFramebufferCreateInfo*>(pCreateInfo),
+            static_cast<const VkAllocationCallbacks*>(pAllocator),
+            reinterpret_cast<VkFramebuffer*>(pFramebuffer));
+    }
     struct FbInfo {
         uint32_t sType; const void* pNext; uint32_t flags; uint64_t renderPass;
         uint32_t attachmentCount; const uint64_t* pAttachments;
@@ -1051,7 +1237,15 @@ int32_t vkCreateFramebuffer(void* /*device*/, const void* pCreateInfo, const voi
 }
 
 __attribute__((visibility("default")))
-void vkDestroyFramebuffer(void* /*device*/, uint64_t fb, const void* /*pAllocator*/) {
+void vkDestroyFramebuffer(void* device, uint64_t fb, const void* pAllocator) {
+    if (!fb) return;
+    if (useNativeAotFor("vkDestroyFramebuffer")) {
+        aot_forward_vkDestroyFramebuffer(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkFramebuffer>(fb),
+            static_cast<const VkAllocationCallbacks*>(pAllocator));
+        return;
+    }
     delete reinterpret_cast<MaliIcdFramebuffer*>(fb);
 }
 
@@ -1197,8 +1391,15 @@ int32_t vkGetQueryPoolResults(void* /*device*/, uint64_t queryPool, uint32_t fir
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateFence(void* device, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pFence) {
+int32_t vkCreateFence(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pFence) {
     if (!pFence) return -3;
+    if (useNativeAotFor("vkCreateFence")) {
+        return aot_forward_vkCreateFence(
+            reinterpret_cast<VkDevice>(device),
+            static_cast<const VkFenceCreateInfo*>(pCreateInfo),
+            static_cast<const VkAllocationCallbacks*>(pAllocator),
+            reinterpret_cast<VkFence*>(pFence));
+    }
     auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* f = new MaliIcdFence();
     f->aot_fence_mem.assign(1024, 0); *reinterpret_cast<uint32_t*>(f->aot_fence_mem.data() + 0x10) = 2U;
@@ -1224,8 +1425,15 @@ int32_t vkCreateFence(void* device, const void* pCreateInfo, const void* /*pAllo
     return 0;
 }
 __attribute__((visibility("default")))
-void vkDestroyFence(void* device, uint64_t fence, const void* /*pAllocator*/) {
+void vkDestroyFence(void* device, uint64_t fence, const void* pAllocator) {
     if (!fence) return;
+    if (useNativeAotFor("vkDestroyFence")) {
+        aot_forward_vkDestroyFence(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkFence>(fence),
+            static_cast<const VkAllocationCallbacks*>(pAllocator));
+        return;
+    }
     auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     auto* f   = reinterpret_cast<MaliIcdFence*>(fence);
     if (dev && aot_vkDestroyFence && !f->aot_fence_mem.empty()) {
@@ -1237,7 +1445,12 @@ void vkDestroyFence(void* device, uint64_t fence, const void* /*pAllocator*/) {
     delete f;
 }
 __attribute__((visibility("default")))
-int32_t vkWaitForFences(void* device, uint32_t c, const uint64_t* p, uint32_t /*all*/, uint64_t /*t*/) {
+int32_t vkWaitForFences(void* device, uint32_t c, const uint64_t* p, uint32_t all, uint64_t t) {
+    if (useNativeAotFor("vkWaitForFences")) {
+        return aot_forward_vkWaitForFences(
+            reinterpret_cast<VkDevice>(device), c,
+            reinterpret_cast<const VkFence*>(p), all, t);
+    }
     if (mali_kbase_emu_wait_csf_idle) mali_kbase_emu_wait_csf_idle(200000000ULL);
     auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (dev && dev->aot_cctx_mem.size() > 0xc1 && dev->aot_cctx_mem[0xc1] != 0) {
@@ -1256,6 +1469,11 @@ int32_t vkWaitForFences(void* device, uint32_t c, const uint64_t* p, uint32_t /*
 }
 __attribute__((visibility("default")))
 int32_t vkResetFences(void* device, uint32_t c, const uint64_t* p) {
+    if (useNativeAotFor("vkResetFences")) {
+        return aot_forward_vkResetFences(
+            reinterpret_cast<VkDevice>(device), c,
+            reinterpret_cast<const VkFence*>(p));
+    }
     auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     if (p) {
         for (uint32_t i = 0; i < c; ++i) {
@@ -1274,8 +1492,15 @@ int32_t vkResetFences(void* device, uint32_t c, const uint64_t* p) {
     return 0;
 }
 __attribute__((visibility("default")))
-int32_t vkCreateSemaphore(void* /*device*/, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pSem) {
+int32_t vkCreateSemaphore(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pSem) {
     if (!pSem) return -3;
+    if (useNativeAotFor("vkCreateSemaphore")) {
+        return aot_forward_vkCreateSemaphore(
+            reinterpret_cast<VkDevice>(device),
+            static_cast<const VkSemaphoreCreateInfo*>(pCreateInfo),
+            static_cast<const VkAllocationCallbacks*>(pAllocator),
+            reinterpret_cast<VkSemaphore*>(pSem));
+    }
     auto* sem = new MaliIcdSemaphore();
     if (pCreateInfo) {
         struct BaseIn { uint32_t sType; const BaseIn* pNext; };
@@ -1294,13 +1519,28 @@ int32_t vkCreateSemaphore(void* /*device*/, const void* pCreateInfo, const void*
     return 0;
 }
 __attribute__((visibility("default")))
-void vkDestroySemaphore(void* /*device*/, uint64_t sem, const void* /*pAllocator*/) {
-    if (sem && sem != 0x5E000001ULL) delete reinterpret_cast<MaliIcdSemaphore*>(sem);
+void vkDestroySemaphore(void* device, uint64_t sem, const void* pAllocator) {
+    if (!sem || sem == 0x5E000001ULL) return;
+    if (useNativeAotFor("vkDestroySemaphore")) {
+        aot_forward_vkDestroySemaphore(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkSemaphore>(sem),
+            static_cast<const VkAllocationCallbacks*>(pAllocator));
+        return;
+    }
+    delete reinterpret_cast<MaliIcdSemaphore*>(sem);
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateCommandPool(void* /*device*/, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pCommandPool) {
+int32_t vkCreateCommandPool(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pCommandPool) {
     if (!pCommandPool) return -3;
+    if (useNativeAotFor("vkCreateCommandPool")) {
+        return aot_forward_vkCreateCommandPool(
+            reinterpret_cast<VkDevice>(device),
+            static_cast<const VkCommandPoolCreateInfo*>(pCreateInfo),
+            static_cast<const VkAllocationCallbacks*>(pAllocator),
+            reinterpret_cast<VkCommandPool*>(pCommandPool));
+    }
     auto* pool = new MaliIcdCommandPool();
     if (pCreateInfo) {
         struct PoolCI { uint32_t sType; const void* pNext; uint32_t flags; uint32_t qfi; };
@@ -1315,6 +1555,13 @@ int32_t vkCreateCommandPool(void* /*device*/, const void* pCreateInfo, const voi
 __attribute__((visibility("default")))
 void vkDestroyCommandPool(void* device, uint64_t commandPool, const void* pAllocator) {
     if (!commandPool || commandPool == 0xC8000001ULL) return;
+    if (useNativeAotFor("vkDestroyCommandPool")) {
+        aot_forward_vkDestroyCommandPool(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkCommandPool>(commandPool),
+            static_cast<const VkAllocationCallbacks*>(pAllocator));
+        return;
+    }
     auto* dev  = static_cast<MaliIcdDevice*>(device);
     auto* pool = reinterpret_cast<MaliIcdCommandPool*>(commandPool);
     if (dev && !dev->aot_vk_device_mem.empty() && pool->aot_handle >= 0x10000ULL) {
@@ -1330,6 +1577,12 @@ void vkDestroyCommandPool(void* device, uint64_t commandPool, const void* pAlloc
 __attribute__((visibility("default")))
 int32_t vkAllocateCommandBuffers(void* device, const void* pAllocateInfo, void** pCommandBuffers) {
     if (!device || !pAllocateInfo || !pCommandBuffers) return -3;
+    if (useNativeAotFor("vkAllocateCommandBuffers")) {
+        return aot_forward_vkAllocateCommandBuffers(
+            reinterpret_cast<VkDevice>(device),
+            static_cast<const VkCommandBufferAllocateInfo*>(pAllocateInfo),
+            reinterpret_cast<VkCommandBuffer*>(pCommandBuffers));
+    }
     auto* dev  = static_cast<MaliIcdDevice*>(device);
     const auto* cbai = static_cast<const VkCommandBufferAllocateInfo*>(pAllocateInfo);
     for (uint32_t i = 0; i < cbai->commandBufferCount; ++i) {
@@ -1343,24 +1596,41 @@ int32_t vkAllocateCommandBuffers(void* device, const void* pAllocateInfo, void**
 }
 
 __attribute__((visibility("default")))
-void vkFreeCommandBuffers(void* /*device*/, uint64_t /*commandPool*/, uint32_t commandBufferCount, void* const* pCommandBuffers) {
+void vkFreeCommandBuffers(void* device, uint64_t commandPool, uint32_t commandBufferCount, void* const* pCommandBuffers) {
     if (!pCommandBuffers) return;
+    if (useNativeAotFor("vkFreeCommandBuffers")) {
+        aot_forward_vkFreeCommandBuffers(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkCommandPool>(commandPool),
+            commandBufferCount,
+            reinterpret_cast<const VkCommandBuffer*>(pCommandBuffers));
+        return;
+    }
     for (uint32_t i = 0; i < commandBufferCount; ++i) {
         delete static_cast<MaliIcdCommandBuffer*>(pCommandBuffers[i]);
     }
 }
 
 __attribute__((visibility("default")))
-int32_t vkResetCommandBuffer(void* commandBuffer, uint32_t /*flags*/) {
+int32_t vkResetCommandBuffer(void* commandBuffer, uint32_t flags) {
     if (!commandBuffer) return -3;
+    if (useNativeAotFor("vkResetCommandBuffer")) {
+        return aot_forward_vkResetCommandBuffer(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer), flags);
+    }
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     cb->cmds.clear();
     return 0;
 }
 
 __attribute__((visibility("default")))
-int32_t vkBeginCommandBuffer(void* commandBuffer, const void* /*pBeginInfo*/) {
+int32_t vkBeginCommandBuffer(void* commandBuffer, const void* pBeginInfo) {
     if (!commandBuffer) return -3;
+    if (useNativeAotFor("vkBeginCommandBuffer")) {
+        return aot_forward_vkBeginCommandBuffer(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer),
+            static_cast<const VkCommandBufferBeginInfo*>(pBeginInfo));
+    }
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     cb->cmds.clear();
     return 0;
@@ -1368,19 +1638,38 @@ int32_t vkBeginCommandBuffer(void* commandBuffer, const void* /*pBeginInfo*/) {
 
 __attribute__((visibility("default")))
 int32_t vkEndCommandBuffer(void* commandBuffer) {
-    return commandBuffer ? 0 : -3;
+    if (!commandBuffer) return -3;
+    if (useNativeAotFor("vkEndCommandBuffer")) {
+        return aot_forward_vkEndCommandBuffer(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer));
+    }
+    return 0;
 }
 
 __attribute__((visibility("default")))
-void vkCmdBindPipeline(void* commandBuffer, uint32_t /*pipelineBindPoint*/, uint64_t pipeline) {
+void vkCmdBindPipeline(void* commandBuffer, uint32_t pipelineBindPoint, uint64_t pipeline) {
     if (!commandBuffer) return;
+    if (useNativeAotFor("vkCmdBindPipeline")) {
+        aot_forward_vkCmdBindPipeline(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer),
+            static_cast<VkPipelineBindPoint>(pipelineBindPoint),
+            reinterpret_cast<VkPipeline>(pipeline));
+        return;
+    }
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     cb->current_pipeline = reinterpret_cast<MaliIcdPipeline*>(pipeline);
 }
 
 __attribute__((visibility("default")))
-void vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uint32_t /*contents*/) {
+void vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents) {
     if (!commandBuffer || !pRenderPassBegin) return;
+    if (useNativeAotFor("vkCmdBeginRenderPass")) {
+        aot_forward_vkCmdBeginRenderPass(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer),
+            static_cast<const VkRenderPassBeginInfo*>(pRenderPassBegin),
+            static_cast<VkSubpassContents>(contents));
+        return;
+    }
     struct RpBegin {
         uint32_t sType; const void* pNext; uint64_t rp; uint64_t fb;
         int32_t rx, ry; uint32_t rw, rh;
@@ -1403,14 +1692,29 @@ void vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uin
 
 __attribute__((visibility("default")))
 void vkCmdEndRenderPass(void* commandBuffer) {
-    if (commandBuffer) static_cast<MaliIcdCommandBuffer*>(commandBuffer)->active_fb = nullptr;
+    if (!commandBuffer) return;
+    if (useNativeAotFor("vkCmdEndRenderPass")) {
+        aot_forward_vkCmdEndRenderPass(reinterpret_cast<VkCommandBuffer>(commandBuffer));
+        return;
+    }
+    static_cast<MaliIcdCommandBuffer*>(commandBuffer)->active_fb = nullptr;
 }
 
 __attribute__((visibility("default")))
-void vkCmdBindDescriptorSets(void* commandBuffer, uint32_t /*pipelineBindPoint*/, uint64_t /*layout*/,
+void vkCmdBindDescriptorSets(void* commandBuffer, uint32_t pipelineBindPoint, uint64_t layout,
                              uint32_t firstSet, uint32_t descriptorSetCount, const uint64_t* pDescriptorSets,
                              uint32_t dynamicOffsetCount, const uint32_t* pDynamicOffsets) {
     if (!commandBuffer || descriptorSetCount == 0 || !pDescriptorSets) return;
+    if (useNativeAotFor("vkCmdBindDescriptorSets")) {
+        aot_forward_vkCmdBindDescriptorSets(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer),
+            static_cast<VkPipelineBindPoint>(pipelineBindPoint),
+            reinterpret_cast<VkPipelineLayout>(layout),
+            firstSet, descriptorSetCount,
+            reinterpret_cast<const VkDescriptorSet*>(pDescriptorSets),
+            dynamicOffsetCount, pDynamicOffsets);
+        return;
+    }
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     for (uint32_t i = 0; i < descriptorSetCount && (firstSet + i) < 4U; ++i) {
         cb->bound_desc_sets[firstSet + i] = reinterpret_cast<MaliIcdDescriptorSet*>(pDescriptorSets[i]);
@@ -1422,6 +1726,14 @@ void vkCmdBindDescriptorSets(void* commandBuffer, uint32_t /*pipelineBindPoint*/
 __attribute__((visibility("default")))
 void vkCmdBindVertexBuffers(void* commandBuffer, uint32_t first, uint32_t count, const uint64_t* pBuffers, const uint64_t* pOffsets) {
     if (!commandBuffer || count == 0 || !pBuffers) return;
+    if (useNativeAotFor("vkCmdBindVertexBuffers")) {
+        aot_forward_vkCmdBindVertexBuffers(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer),
+            first, count,
+            reinterpret_cast<const VkBuffer*>(pBuffers),
+            pOffsets);
+        return;
+    }
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     for (uint32_t i = 0; i < count && (first + i) < 8U; ++i) {
         auto* buf = reinterpret_cast<MaliIcdBuffer*>(pBuffers[i]);
@@ -1436,6 +1748,14 @@ void vkCmdBindVertexBuffers(void* commandBuffer, uint32_t first, uint32_t count,
 __attribute__((visibility("default")))
 void vkCmdBindIndexBuffer(void* commandBuffer, uint64_t buffer, uint64_t offset, uint32_t indexType) {
     if (!commandBuffer) return;
+    if (useNativeAotFor("vkCmdBindIndexBuffer")) {
+        aot_forward_vkCmdBindIndexBuffer(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer),
+            reinterpret_cast<VkBuffer>(buffer),
+            offset,
+            static_cast<VkIndexType>(indexType));
+        return;
+    }
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     auto* buf = reinterpret_cast<MaliIcdBuffer*>(buffer);
     cb->bound_index_bo_va   = (buf && buf->bound_gpu_va) ? (buf->bound_gpu_va + offset) : 0ULL;
@@ -1680,8 +2000,18 @@ void vkCmdCopyBuffer(void* commandBuffer, uint64_t srcBuffer, uint64_t dstBuffer
 
 __attribute__((visibility("default")))
 void vkCmdCopyBufferToImage(void* commandBuffer, uint64_t srcBuffer, uint64_t dstImage,
-                            uint32_t /*layout*/, uint32_t count, const void* pRegions) {
+                            uint32_t layout, uint32_t count, const void* pRegions) {
     if (!commandBuffer || !srcBuffer || !dstImage) return;
+    if (useNativeAotFor("vkCmdCopyBufferToImage")) {
+        aot_forward_vkCmdCopyBufferToImage(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer),
+            reinterpret_cast<VkBuffer>(srcBuffer),
+            reinterpret_cast<VkImage>(dstImage),
+            static_cast<VkImageLayout>(layout),
+            count,
+            static_cast<const VkBufferImageCopy*>(pRegions));
+        return;
+    }
     auto* cb  = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     auto* src = reinterpret_cast<MaliIcdBuffer*>(srcBuffer);
     auto* img = reinterpret_cast<MaliIcdImage*>(dstImage);
@@ -1722,10 +2052,19 @@ void vkCmdWriteTimestamp(void* commandBuffer, uint32_t /*stage*/, uint64_t query
 }
 
 __attribute__((visibility("default")))
-void vkCmdPipelineBarrier(void* commandBuffer, uint32_t srcS, uint32_t dstS, uint32_t /*f*/,
-                          uint32_t /*mc*/, const void* /*pm*/, uint32_t /*bc*/, const void* /*pb*/,
-                          uint32_t /*ic*/, const void* /*pi*/) {
+void vkCmdPipelineBarrier(void* commandBuffer, uint32_t srcS, uint32_t dstS, uint32_t f,
+                          uint32_t mc, const void* pm, uint32_t bc, const void* pb,
+                          uint32_t ic, const void* pi) {
     if (!commandBuffer) return;
+    if (useNativeAotFor("vkCmdPipelineBarrier")) {
+        aot_forward_vkCmdPipelineBarrier(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer),
+            srcS, dstS, f,
+            mc, static_cast<const VkMemoryBarrier*>(pm),
+            bc, static_cast<const VkBufferMemoryBarrier*>(pb),
+            ic, static_cast<const VkImageMemoryBarrier*>(pi));
+        return;
+    }
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     MaliIcdRecordedCmd cmd{};
     cmd.type = MaliIcdRecordedCmd::CMD_PIPELINE_BARRIER;

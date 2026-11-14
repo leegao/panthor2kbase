@@ -1295,6 +1295,12 @@ struct MaliAotGlobalRuntime {
                     max_bw = 8192U;
                     *reinterpret_cast<uint32_t*>(mapper.base + 0x0314158cULL) = max_bw;
                 }
+                if (*reinterpret_cast<uint32_t*>(mapper.base + 0x03141590ULL) == 0U) {
+                    *reinterpret_cast<uint32_t*>(mapper.base + 0x03141590ULL) = 4096U;
+                }
+                if (*reinterpret_cast<uint32_t*>(mapper.base + 0x03141594ULL) == 0U) {
+                    *reinterpret_cast<uint32_t*>(mapper.base + 0x03141594ULL) = 16U;
+                }
                 for (size_t idx = 0; idx < kFormatCount; ++idx) {
                     int8_t* sc_byte = reinterpret_cast<int8_t*>(cfg_blob + idx * kFormatStride + 32);
                     if (*sc_byte < 0) {

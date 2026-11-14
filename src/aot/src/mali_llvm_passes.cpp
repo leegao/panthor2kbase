@@ -1652,7 +1652,7 @@ public:
         uint32_t w_add = 0, w_adrp = 0;
         uint64_t adrp_pc = 0;
         unsigned adrp_reg = tbl_reg;
-        for (int64_t p = static_cast<int64_t>(ldrb_pc) - 4; p >= static_cast<int64_t>(faddr) && p >= static_cast<int64_t>(pc) - 256; p -= 4) {
+        for (int64_t p = static_cast<int64_t>(ldrb_pc) - 4; p >= static_cast<int64_t>(faddr) && p >= static_cast<int64_t>(pc) - 8192; p -= 4) {
             uint32_t w = readU32(loader.elf, static_cast<uint64_t>(p));
             if (w_add == 0 && (w & 0xFF80001FU) == (0x91000000U | tbl_reg)) {
                 w_add = w;
