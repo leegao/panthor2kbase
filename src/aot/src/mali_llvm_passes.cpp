@@ -1622,10 +1622,11 @@ public:
         std::vector<uint64_t> targets;
         if (pc < faddr + 20) return targets;
 
+        unsigned br_reg = (readU32(loader.elf, pc) >> 5) & 0x1FU;
         uint32_t w_ldrb = 0, w_adr = 0;
         uint64_t ldrb_pc = 0, adr_pc = 0;
         uint32_t elem_sz = 0;
-        for (uint64_t back = 4; back <= 24 && pc >= faddr + back; back += 4) {
+        for (uint64_t back = 4; back <= 128 && pc >= faddr + back; back += 4) {
             uint32_t w = readU32(loader.elf, pc - back);
             if (w_ldrb == 0 && (w & 0xFFE00C00U) == 0x38600800U) {
                 w_ldrb = w;
@@ -1639,7 +1640,7 @@ public:
                 w_ldrb = w;
                 ldrb_pc = pc - back;
                 elem_sz = 4;
-            } else if (w_adr == 0 && (w & 0x9F000000U) == 0x10000000U) {
+            } else if (w_adr == 0 && (w & 0x9F00001FU) == (0x10000000U | br_reg)) {
                 w_adr = w;
                 adr_pc = pc - back;
             }
@@ -1666,7 +1667,7 @@ public:
         if (w_add == 0 || w_adrp == 0) return targets;
 
         int max_idx = -1;
-        for (int64_t p = static_cast<int64_t>(ldrb_pc) - 4; p >= static_cast<int64_t>(faddr) && p >= static_cast<int64_t>(pc) - 64; p -= 4) {
+        for (int64_t p = static_cast<int64_t>(ldrb_pc) - 4; p >= static_cast<int64_t>(faddr) && p >= static_cast<int64_t>(ldrb_pc) - 128; p -= 4) {
             uint32_t w = readU32(loader.elf, static_cast<uint64_t>(p));
             if ((w & 0x7F80001FU) == 0x7100001FU) {
                 max_idx = static_cast<int>((w >> 10) & 0xFFFU);
@@ -2126,10 +2127,12 @@ public:
                     unsigned opc = (insn >> 22) & 3;
 
                     // Load-Acquire / Store-Release / Exclusive (LDAR, LDARB, LDARH, LDAXR, STLR, STLRB, STLRH, STLXR)
-                    if (((insn >> 24) & 0x3FU) == 0x08U) {
+                    // and ARMv8.3-RCPC LDAPR / LDAPRB / LDAPRH ((insn & 0x3FFFFC00) == 0x38BFC000).
+                    if (((insn >> 24) & 0x3FU) == 0x08U || (insn & 0x3FFFFC00U) == 0x38BFC000U) {
                         stats.atomic_ops_lifted++;
-                        unsigned L = (insn >> 22) & 1;
-                        unsigned o2 = (insn >> 23) & 1;
+                        bool is_ldapr = (insn & 0x3FFFFC00U) == 0x38BFC000U;
+                        unsigned L = is_ldapr ? 1U : ((insn >> 22) & 1);
+                        unsigned o2 = is_ldapr ? 1U : ((insn >> 23) & 1);
                         std::string addr_val = loadGprOrSp(rn, true);
                         std::string ptr_v = newTmp("at_ptr");
                         emit(ptr_v + " = inttoptr i64 " + addr_val + " to ptr");
@@ -4004,6 +4007,105 @@ void runBionicToGlibcLibcLoweringPass(LLVMModuleRef M, PassStats &stats) {
                         LLVMTypeRef fTy = LLVMFunctionType(i64Ty, &i64Ty, 1, 0);
                         LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, &x0, 1, "");
                         storeReg64(cpu, 0, res);
+                    } else if (sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED2Ev" ||
+                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev") {
+                        LLVMValueRef x0 = loadReg64(cpu, 0);
+                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_libcpp_string_dtor", i64Ty, {i64Ty});
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, &i64Ty, 1, 0);
+                        storeReg64(cpu, 0, LLVMBuildCall2(B, fTy, fn, &x0, 1, ""));
+                    } else if (sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKc" ||
+                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKc" ||
+                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSERKS5_" ||
+                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSEc" ||
+                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc" ||
+                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7reserveEm" ||
+                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE2atEm") {
+                        const char* hname = "__mali_libcpp_string_assign_cstr";
+                        if (sym.find("6append") != std::string::npos) hname = "__mali_libcpp_string_append_cstr";
+                        else if (sym.find("aSERKS5_") != std::string::npos) hname = "__mali_libcpp_string_assign_str";
+                        else if (sym.find("aSEc") != std::string::npos) hname = "__mali_libcpp_string_assign_char";
+                        else if (sym.find("9push_backEc") != std::string::npos) hname = "__mali_libcpp_string_push_back";
+                        else if (sym.find("7reserveEm") != std::string::npos) hname = "__mali_libcpp_string_reserve";
+                        else if (sym.find("2atEm") != std::string::npos) hname = "__mali_libcpp_string_at";
+                        LLVMValueRef args[2] = {loadReg64(cpu, 0), loadReg64(cpu, 1)};
+                        LLVMValueRef fn = getOrCreateFunction(M, hname, i64Ty, {i64Ty, i64Ty});
+                        LLVMTypeRef pTys[2] = {i64Ty, i64Ty};
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 2, 0);
+                        storeReg64(cpu, 0, LLVMBuildCall2(B, fTy, fn, args, 2, ""));
+                    } else if (sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKcm" ||
+                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm" ||
+                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKc") {
+                        const char* hname = "__mali_libcpp_string_assign_n";
+                        if (sym.find("6append") != std::string::npos) hname = "__mali_libcpp_string_append_n";
+                        else if (sym.find("6insertEmPKc") != std::string::npos) hname = "__mali_libcpp_string_insert_cstr";
+                        LLVMValueRef args[3] = {loadReg64(cpu, 0), loadReg64(cpu, 1), loadReg64(cpu, 2)};
+                        LLVMValueRef fn = getOrCreateFunction(M, hname, i64Ty, {i64Ty, i64Ty, i64Ty});
+                        LLVMTypeRef pTys[3] = {i64Ty, i64Ty, i64Ty};
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 3, 0);
+                        storeReg64(cpu, 0, LLVMBuildCall2(B, fTy, fn, args, 3, ""));
+                    } else if (sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKcm" ||
+                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7replaceEmmPKc") {
+                        const char* hname = (sym.find("7replace") != std::string::npos)
+                                          ? "__mali_libcpp_string_replace_cstr"
+                                          : "__mali_libcpp_string_insert_n";
+                        LLVMValueRef args[4] = {loadReg64(cpu, 0), loadReg64(cpu, 1), loadReg64(cpu, 2), loadReg64(cpu, 3)};
+                        LLVMValueRef fn = getOrCreateFunction(M, hname, i64Ty, {i64Ty, i64Ty, i64Ty, i64Ty});
+                        LLVMTypeRef pTys[4] = {i64Ty, i64Ty, i64Ty, i64Ty};
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 4, 0);
+                        storeReg64(cpu, 0, LLVMBuildCall2(B, fTy, fn, args, 4, ""));
+                    } else if (sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7replaceEmmPKcm" ||
+                               sym == "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC2ERKS5_mmRKS4_") {
+                        const char* hname = (sym.find("7replace") != std::string::npos)
+                                          ? "__mali_libcpp_string_replace_n"
+                                          : "__mali_libcpp_string_substr_ctor";
+                        LLVMValueRef args[5] = {loadReg64(cpu, 0), loadReg64(cpu, 1), loadReg64(cpu, 2), loadReg64(cpu, 3), loadReg64(cpu, 4)};
+                        LLVMValueRef fn = getOrCreateFunction(M, hname, i64Ty, {i64Ty, i64Ty, i64Ty, i64Ty, i64Ty});
+                        LLVMTypeRef pTys[5] = {i64Ty, i64Ty, i64Ty, i64Ty, i64Ty};
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 5, 0);
+                        storeReg64(cpu, 0, LLVMBuildCall2(B, fTy, fn, args, 5, ""));
+                    } else if (sym == "_ZNSt3__1plIcNS_11char_traitsIcEENS_9allocatorIcEEEENS_12basic_stringIT_T0_T1_EEPKS6_RKS9_") {
+                        LLVMValueRef args[3] = {loadReg64(cpu, 8), loadReg64(cpu, 0), loadReg64(cpu, 1)};
+                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_libcpp_string_plus_cstr_str", i64Ty, {i64Ty, i64Ty, i64Ty});
+                        LLVMTypeRef pTys[3] = {i64Ty, i64Ty, i64Ty};
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 3, 0);
+                        LLVMBuildCall2(B, fTy, fn, args, 3, "");
+                    } else if (sym == "_ZNSt3__111__call_onceERVmPvPFvS2_E") {
+                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_libcpp_call_once", voidTy, {ptrTy});
+                        LLVMTypeRef fTy = LLVMFunctionType(voidTy, &ptrTy, 1, 0);
+                        LLVMBuildCall2(B, fTy, fn, &cpu, 1, "");
+                    } else if (sym == "_ZNSt3__16thread20hardware_concurrencyEv") {
+                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_libcpp_hardware_concurrency", i64Ty, {});
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, nullptr, 0, 0);
+                        storeReg64(cpu, 0, LLVMBuildCall2(B, fTy, fn, nullptr, 0, ""));
+                    } else if (sym == "_ZNSt3__16chrono12steady_clock3nowEv") {
+                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_libcpp_steady_clock_now", i64Ty, {});
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, nullptr, 0, 0);
+                        storeReg64(cpu, 0, LLVMBuildCall2(B, fTy, fn, nullptr, 0, ""));
+                    } else if (sym == "_ZNSt3__16chrono12system_clock3nowEv") {
+                        LLVMValueRef fn = getOrCreateFunction(M, "__mali_libcpp_system_clock_now", i64Ty, {});
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, nullptr, 0, 0);
+                        storeReg64(cpu, 0, LLVMBuildCall2(B, fTy, fn, nullptr, 0, ""));
+                    } else if (sym == "_ZNSt3__15mutex4lockEv" || sym == "_ZNSt3__15mutex6unlockEv" || sym == "_ZNSt3__15mutexD1Ev" ||
+                               sym == "_ZNSt3__115recursive_mutex4lockEv" || sym == "_ZNSt3__115recursive_mutex6unlockEv" || sym == "_ZNSt3__115recursive_mutexD1Ev") {
+                        const char* hname = "__mali_bionic_pthread_mutex_lock";
+                        if (sym.find("unlock") != std::string::npos) hname = "__mali_bionic_pthread_mutex_unlock";
+                        else if (sym.find("D1Ev") != std::string::npos) hname = "__mali_bionic_pthread_mutex_destroy";
+                        LLVMValueRef a0 = loadReg64(cpu, 0);
+                        LLVMValueRef hookFn = getOrCreateFunction(M, hname, i32Ty, {i64Ty});
+                        LLVMTypeRef hTy = LLVMFunctionType(i32Ty, &i64Ty, 1, 0);
+                        LLVMValueRef res32 = LLVMBuildCall2(B, hTy, hookFn, &a0, 1, "");
+                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
+                    } else if (sym == "_ZNSt3__118condition_variable10notify_oneEv" ||
+                               sym == "_ZNSt3__118condition_variable10notify_allEv" ||
+                               sym == "_ZNSt3__118condition_variableD1Ev") {
+                        const char* hname = "__mali_bionic_pthread_cond_signal";
+                        if (sym.find("notify_all") != std::string::npos) hname = "__mali_bionic_pthread_cond_broadcast";
+                        else if (sym.find("D1Ev") != std::string::npos) hname = "__mali_bionic_pthread_cond_destroy";
+                        LLVMValueRef a0 = loadReg64(cpu, 0);
+                        LLVMValueRef hookFn = getOrCreateFunction(M, hname, i32Ty, {i64Ty});
+                        LLVMTypeRef hTy = LLVMFunctionType(i32Ty, &i64Ty, 1, 0);
+                        LLVMValueRef res32 = LLVMBuildCall2(B, hTy, hookFn, &a0, 1, "");
+                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
                     } else if (sym == "access") {
                         LLVMValueRef args[2] = {loadReg64(cpu, 0), loadReg64(cpu, 1)};
                         LLVMValueRef fn = getOrCreateFunction(M, "bionic_mali_access_stub", i64Ty, {i64Ty, i64Ty});
@@ -4045,7 +4147,7 @@ void runBionicToGlibcLibcLoweringPass(LLVMModuleRef M, PassStats &stats) {
                         LLVMValueRef res32 = LLVMBuildCall2(B, fTy, fn, args, 2, "");
                         storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
                         stats.kbase_uapi_lowered++;
-                    } else if (sym == "strncpy" || sym == "__strncpy_chk2") {
+                    } else if (sym == "strncpy" || sym == "__strncpy_chk" || sym == "__strncpy_chk2") {
                         LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
                         LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
                         LLVMValueRef x2 = loadReg64(cpu, 2);
@@ -4055,6 +4157,101 @@ void runBionicToGlibcLibcLoweringPass(LLVMModuleRef M, PassStats &stats) {
                         LLVMValueRef args[3] = {p0, p1, x2};
                         LLVMValueRef resPtr = LLVMBuildCall2(B, fTy, fn, args, 3, "");
                         storeReg64(cpu, 0, LLVMBuildPtrToInt(B, resPtr, i64Ty, ""));
+                    } else if (sym == "strcpy" || sym == "__strcpy_chk") {
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
+                        LLVMValueRef fn = getOrCreateFunction(M, "strcpy", ptrTy, {ptrTy, ptrTy});
+                        LLVMTypeRef pTys[2] = {ptrTy, ptrTy};
+                        LLVMTypeRef fTy = LLVMFunctionType(ptrTy, pTys, 2, 0);
+                        LLVMValueRef args[2] = {p0, p1};
+                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, LLVMBuildCall2(B, fTy, fn, args, 2, ""), i64Ty, ""));
+                    } else if (sym == "memchr" || sym == "__memchr_chk") {
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef w1 = LLVMBuildTrunc(B, loadReg64(cpu, 1), i32Ty, "");
+                        LLVMValueRef x2 = loadReg64(cpu, 2);
+                        LLVMValueRef fn = getOrCreateFunction(M, "memchr", ptrTy, {ptrTy, i32Ty, i64Ty});
+                        LLVMTypeRef pTys[3] = {ptrTy, i32Ty, i64Ty};
+                        LLVMTypeRef fTy = LLVMFunctionType(ptrTy, pTys, 3, 0);
+                        LLVMValueRef args[3] = {p0, w1, x2};
+                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, LLVMBuildCall2(B, fTy, fn, args, 3, ""), i64Ty, ""));
+                    } else if (sym == "__strchr_chk") {
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef w1 = LLVMBuildTrunc(B, loadReg64(cpu, 1), i32Ty, "");
+                        LLVMValueRef fn = getOrCreateFunction(M, "strchr", ptrTy, {ptrTy, i32Ty});
+                        LLVMTypeRef pTys[2] = {ptrTy, i32Ty};
+                        LLVMTypeRef fTy = LLVMFunctionType(ptrTy, pTys, 2, 0);
+                        LLVMValueRef args[2] = {p0, w1};
+                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, LLVMBuildCall2(B, fTy, fn, args, 2, ""), i64Ty, ""));
+                    } else if (sym == "strdup" || sym == "getenv") {
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef fn = getOrCreateFunction(M, sym.c_str(), ptrTy, {ptrTy});
+                        LLVMTypeRef fTy = LLVMFunctionType(ptrTy, &ptrTy, 1, 0);
+                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, LLVMBuildCall2(B, fTy, fn, &p0, 1, ""), i64Ty, ""));
+                    } else if (sym == "strcasecmp") {
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
+                        LLVMValueRef fn = getOrCreateFunction(M, "strcasecmp", i32Ty, {ptrTy, ptrTy});
+                        LLVMTypeRef pTys[2] = {ptrTy, ptrTy};
+                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, pTys, 2, 0);
+                        LLVMValueRef args[2] = {p0, p1};
+                        storeReg64(cpu, 0, LLVMBuildZExt(B, LLVMBuildCall2(B, fTy, fn, args, 2, ""), i64Ty, ""));
+                    } else if (sym == "strpbrk") {
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
+                        LLVMValueRef fn = getOrCreateFunction(M, "strpbrk", ptrTy, {ptrTy, ptrTy});
+                        LLVMTypeRef pTys[2] = {ptrTy, ptrTy};
+                        LLVMTypeRef fTy = LLVMFunctionType(ptrTy, pTys, 2, 0);
+                        LLVMValueRef args[2] = {p0, p1};
+                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, LLVMBuildCall2(B, fTy, fn, args, 2, ""), i64Ty, ""));
+                    } else if (sym == "strtok_r") {
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
+                        LLVMValueRef p2 = LLVMBuildIntToPtr(B, loadReg64(cpu, 2), ptrTy, "");
+                        LLVMValueRef fn = getOrCreateFunction(M, "strtok_r", ptrTy, {ptrTy, ptrTy, ptrTy});
+                        LLVMTypeRef pTys[3] = {ptrTy, ptrTy, ptrTy};
+                        LLVMTypeRef fTy = LLVMFunctionType(ptrTy, pTys, 3, 0);
+                        LLVMValueRef args[3] = {p0, p1, p2};
+                        storeReg64(cpu, 0, LLVMBuildPtrToInt(B, LLVMBuildCall2(B, fTy, fn, args, 3, ""), i64Ty, ""));
+                    } else if (sym == "strtol" || sym == "strtoll" || sym == "strtoul" || sym == "strtoull") {
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
+                        LLVMValueRef w2 = LLVMBuildTrunc(B, loadReg64(cpu, 2), i32Ty, "");
+                        LLVMValueRef fn = getOrCreateFunction(M, sym.c_str(), i64Ty, {ptrTy, ptrTy, i32Ty});
+                        LLVMTypeRef pTys[3] = {ptrTy, ptrTy, i32Ty};
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 3, 0);
+                        LLVMValueRef args[3] = {p0, p1, w2};
+                        storeReg64(cpu, 0, LLVMBuildCall2(B, fTy, fn, args, 3, ""));
+                    } else if (sym == "atoi") {
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef fn = getOrCreateFunction(M, "atoi", i32Ty, {ptrTy});
+                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, &ptrTy, 1, 0);
+                        storeReg64(cpu, 0, LLVMBuildZExt(B, LLVMBuildCall2(B, fTy, fn, &p0, 1, ""), i64Ty, ""));
+                    } else if (sym == "posix_memalign") {
+                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
+                        LLVMValueRef x1 = loadReg64(cpu, 1);
+                        LLVMValueRef x2 = loadReg64(cpu, 2);
+                        LLVMValueRef fn = getOrCreateFunction(M, "posix_memalign", i32Ty, {ptrTy, i64Ty, i64Ty});
+                        LLVMTypeRef pTys[3] = {ptrTy, i64Ty, i64Ty};
+                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, pTys, 3, 0);
+                        LLVMValueRef args[3] = {p0, x1, x2};
+                        storeReg64(cpu, 0, LLVMBuildZExt(B, LLVMBuildCall2(B, fTy, fn, args, 3, ""), i64Ty, ""));
+                    } else if (sym == "clock_gettime") {
+                        LLVMValueRef w0 = LLVMBuildTrunc(B, loadReg64(cpu, 0), i32Ty, "");
+                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
+                        LLVMValueRef fn = getOrCreateFunction(M, "clock_gettime", i32Ty, {i32Ty, ptrTy});
+                        LLVMTypeRef pTys[2] = {i32Ty, ptrTy};
+                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, pTys, 2, 0);
+                        LLVMValueRef args[2] = {w0, p1};
+                        storeReg64(cpu, 0, LLVMBuildZExt(B, LLVMBuildCall2(B, fTy, fn, args, 2, ""), i64Ty, ""));
+                    } else if (sym == "sched_yield") {
+                        LLVMValueRef fn = getOrCreateFunction(M, "sched_yield", i32Ty, {});
+                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, nullptr, 0, 0);
+                        storeReg64(cpu, 0, LLVMBuildZExt(B, LLVMBuildCall2(B, fTy, fn, nullptr, 0, ""), i64Ty, ""));
+                    } else if (sym == "usleep") {
+                        LLVMValueRef w0 = LLVMBuildTrunc(B, loadReg64(cpu, 0), i32Ty, "");
+                        LLVMValueRef fn = getOrCreateFunction(M, "usleep", i32Ty, {i32Ty});
+                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, &i32Ty, 1, 0);
+                        storeReg64(cpu, 0, LLVMBuildZExt(B, LLVMBuildCall2(B, fTy, fn, &w0, 1, ""), i64Ty, ""));
                     } else if (sym == "strndup") {
                         LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
                         LLVMValueRef x1 = loadReg64(cpu, 1);
@@ -4165,9 +4362,12 @@ void runBionicToGlibcLibcLoweringPass(LLVMModuleRef M, PassStats &stats) {
                         storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
                     } else {
                         // Unavailable Android / MediaTek vendor library hooks & single-threaded stubs:
-                        // __android_log_print, __android_log_write, property_get*, gpud*,
-                        // pthread_mutex_lock/unlock, getenv, prctl, clock_gettime, fprintf, fwrite, fflush, usleep
-                        storeReg64(cpu, 0, LLVMConstInt(i64Ty, 0, 0));
+                        // Use an opaque helper call rather than compile-time constant 0 so LLVM -O1
+                        // cannot fold a subsequent pointer dereference into `unreachable`.
+                        LLVMValueRef stubFn = getOrCreateFunction(M, "__mali_unhandled_plt_stub", i64Ty, {ptrTy});
+                        LLVMTypeRef sTy = LLVMFunctionType(i64Ty, &ptrTy, 1, 0);
+                        LLVMValueRef res = LLVMBuildCall2(B, sTy, stubFn, &cpu, 1, "");
+                        storeReg64(cpu, 0, res);
                         stats.external_stubs_lowered++;
                     }
                     LLVMInstructionEraseFromParent(inst);
