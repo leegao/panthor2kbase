@@ -358,6 +358,18 @@ VkResult vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice, c
         swapchain_ext.specVersion = VK_KHR_SWAPCHAIN_SPEC_VERSION;
         exts.push_back(swapchain_ext);
     }
+    auto ensureDeviceExt = [&](const char* name, uint32_t ver) {
+        for (const auto& e : exts) {
+            if (std::strcmp(e.extensionName, name) == 0) return;
+        }
+        VkExtensionProperties ext{};
+        std::snprintf(ext.extensionName, sizeof(ext.extensionName), "%s", name);
+        ext.specVersion = ver;
+        exts.push_back(ext);
+    };
+    ensureDeviceExt("VK_KHR_external_memory_fd", 1U);
+    ensureDeviceExt("VK_EXT_external_memory_dma_buf", 1U);
+    ensureDeviceExt("VK_EXT_image_drm_format_modifier", 2U);
     if (!pProperties) {
         *pPropertyCount = static_cast<uint32_t>(exts.size());
         return VK_SUCCESS;

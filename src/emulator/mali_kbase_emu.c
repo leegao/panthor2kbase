@@ -3455,6 +3455,52 @@ int mali_kbase_emu_poll_direct(void *fds, unsigned long nfds, int timeout)
    return 0;
 }
 
+__attribute__((visibility("default")))
+bool mali_kbase_emu_is_emulated_fd(int fd)
+{
+   return is_emulated_mali_fd(fd);
+}
+
+__attribute__((visibility("default")))
+int mali_kbase_emu_stat_direct(const char *pathname, struct stat *statbuf)
+{
+   return stat(pathname, statbuf);
+}
+
+__attribute__((visibility("default")))
+int mali_kbase_emu_fstat_direct(int fd, struct stat *statbuf)
+{
+   if (!statbuf) {
+      errno = EFAULT;
+      return -1;
+   }
+   bool is_mali = is_emulated_mali_fd(fd);
+   bool is_char_aux = false;
+   if (!is_mali && fd >= 0 && fd < EMU_MAX_FDS) {
+      int aux = g_aux_fd_map[fd];
+      is_char_aux = (aux == EMU_AUX_FD_DMA_HEAP || aux == EMU_AUX_FD_ASHMEM || aux == EMU_AUX_FD_SW_SYNC);
+   }
+   if (is_mali || is_char_aux) {
+      if (fstat(fd, statbuf) != 0)
+         memset(statbuf, 0, sizeof(*statbuf));
+      statbuf->st_mode = S_IFCHR | 0666;
+      statbuf->st_nlink = 1;
+      statbuf->st_rdev = makedev(226, 128);
+      if (statbuf->st_blksize == 0)
+         statbuf->st_blksize = 4096;
+      if (statbuf->st_ino == 0)
+         statbuf->st_ino = 10128;
+      return 0;
+   }
+   return fstat(fd, statbuf);
+}
+
+__attribute__((visibility("default")))
+int mali_kbase_emu_access_direct(const char *pathname, int mode)
+{
+   return access(pathname, mode);
+}
+
 static const struct kbase_ko_host_abi g_ko_host_abi = {
    .os_copy_from_user   = host_abi_os_copy_from_user,
    .os_copy_to_user     = host_abi_os_copy_to_user,

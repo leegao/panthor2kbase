@@ -5,6 +5,9 @@
 // VK_KHR_swapchain) over /dev/mali0 GPU backbuffers.
 // ============================================================================
 #include "mali_icd_internal.h"
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <unistd.h>
 
 extern "C" {
 
@@ -34,6 +37,30 @@ struct MaliXcbLib {
                                                    uint16_t width, uint16_t height, int16_t dst_x, int16_t dst_y,
                                                    uint8_t left_pad, uint8_t depth, uint32_t data_len, const uint8_t* data);
     typedef int (*pfn_xcb_flush)(void* c);
+    typedef struct { unsigned int sequence; } xcb_shm_query_version_cookie_t;
+    struct xcb_shm_query_version_reply_t {
+        uint8_t  response_type;
+        uint8_t  shared_pixmaps;
+        uint16_t sequence;
+        uint32_t length;
+        uint16_t major_version;
+        uint16_t minor_version;
+        uint16_t uid;
+        uint16_t gid;
+        uint8_t  pixmap_format;
+        uint8_t  pad0[15];
+    };
+    typedef xcb_shm_query_version_cookie_t (*pfn_xcb_shm_query_version)(void* c);
+    typedef xcb_shm_query_version_reply_t* (*pfn_xcb_shm_query_version_reply)(void* c, xcb_shm_query_version_cookie_t cookie, void** e);
+    typedef xcb_void_cookie_t (*pfn_xcb_shm_attach)(void* c, uint32_t shmseg, uint32_t shmid, uint8_t read_only);
+    typedef xcb_void_cookie_t (*pfn_xcb_shm_detach)(void* c, uint32_t shmseg);
+    typedef xcb_void_cookie_t (*pfn_xcb_shm_put_image)(void* c, uint32_t drawable, uint32_t gc,
+                                                       uint16_t total_width, uint16_t total_height,
+                                                       uint16_t src_x, uint16_t src_y,
+                                                       uint16_t src_width, uint16_t src_height,
+                                                       int16_t dst_x, int16_t dst_y,
+                                                       uint8_t depth, uint8_t format, uint8_t send_event,
+                                                       uint32_t shmseg, uint32_t offset);
 
     pfn_xcb_generate_id        generate_id = nullptr;
     pfn_xcb_get_geometry       get_geometry = nullptr;
@@ -42,6 +69,14 @@ struct MaliXcbLib {
     pfn_xcb_free_gc            free_gc = nullptr;
     pfn_xcb_put_image          put_image = nullptr;
     pfn_xcb_flush              flush = nullptr;
+
+    void*                           shm_handle = nullptr;
+    bool                            shm_probed = false;
+    pfn_xcb_shm_query_version       shm_query_version = nullptr;
+    pfn_xcb_shm_query_version_reply shm_query_version_reply = nullptr;
+    pfn_xcb_shm_attach              shm_attach = nullptr;
+    pfn_xcb_shm_detach              shm_detach = nullptr;
+    pfn_xcb_shm_put_image           shm_put_image = nullptr;
 
     bool ensureLoaded() {
         if (handle) return true;
@@ -56,6 +91,21 @@ struct MaliXcbLib {
         put_image          = reinterpret_cast<pfn_xcb_put_image>(dlsym(handle, "xcb_put_image"));
         flush              = reinterpret_cast<pfn_xcb_flush>(dlsym(handle, "xcb_flush"));
         return generate_id && get_geometry && get_geometry_reply && create_gc && put_image && flush;
+    }
+
+    bool ensureShmLoaded() {
+        if (shm_probed) return shm_query_version && shm_query_version_reply && shm_attach && shm_detach && shm_put_image;
+        shm_probed = true;
+        if (!ensureLoaded()) return false;
+        shm_handle = dlopen("libxcb-shm.so.0", RTLD_LAZY | RTLD_LOCAL);
+        if (!shm_handle) shm_handle = dlopen("libxcb-shm.so", RTLD_LAZY | RTLD_LOCAL);
+        if (!shm_handle) return false;
+        shm_query_version       = reinterpret_cast<pfn_xcb_shm_query_version>(dlsym(shm_handle, "xcb_shm_query_version"));
+        shm_query_version_reply = reinterpret_cast<pfn_xcb_shm_query_version_reply>(dlsym(shm_handle, "xcb_shm_query_version_reply"));
+        shm_attach              = reinterpret_cast<pfn_xcb_shm_attach>(dlsym(shm_handle, "xcb_shm_attach"));
+        shm_detach              = reinterpret_cast<pfn_xcb_shm_detach>(dlsym(shm_handle, "xcb_shm_detach"));
+        shm_put_image           = reinterpret_cast<pfn_xcb_shm_put_image>(dlsym(shm_handle, "xcb_shm_put_image"));
+        return shm_query_version && shm_query_version_reply && shm_attach && shm_detach && shm_put_image;
     }
 
     bool queryWindowGeometry(void* conn, uint32_t win, uint32_t* out_w, uint32_t* out_h, uint8_t* out_depth) {
@@ -241,6 +291,12 @@ struct MaliIcdSwapchain {
     uint32_t                   xcb_window = 0;
     uint32_t                   xcb_gc     = 0;
     uint8_t                    xcb_depth  = 24;
+    uint32_t                   xcb_shm_seg = 0;
+    int                        xcb_shmid   = -1;
+    uint8_t*                   xcb_shm_addr = nullptr;
+    size_t                     xcb_shm_sz   = 0;
+    bool                       xcb_shm_checked = false;
+    bool                       xcb_shm_ok      = false;
     bool                       is_wayland = false;
     void*                      wl_display = nullptr;
     void*                      wl_surface = nullptr;
@@ -250,8 +306,15 @@ struct MaliIcdSwapchain {
     int                        wl_shm_fd  = -1;
     uint32_t*                  wl_shm_map = nullptr;
     size_t                     wl_shm_sz  = 0;
+    std::vector<void*>         wl_pools;
+    std::vector<void*>         wl_buffers;
+    std::vector<int>           wl_shm_fds;
+    std::vector<uint32_t*>     wl_shm_maps;
+    std::vector<size_t>        wl_shm_szs;
     std::vector<MaliIcdImage*> images;
     std::vector<int>           dmabuf_fds;
+    std::vector<bool>          image_acquired;
+    std::vector<uint64_t>      image_fences;
 };
 
 
@@ -432,9 +495,11 @@ int32_t vkCreatePipelineCache(void* device, const void* pCreateInfo, const void*
             clean_ci.pInitialData = src_ci->pInitialData;
         }
         uint64_t aot_pc = 0;
-        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        auto& tctx = maliGetThreadGuestContext();
+        GuestStackFrameGuard frame(tctx);
+        const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
         int32_t res = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
-            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkCreatePipelineCache,
+            tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCreatePipelineCache,
             dev->aot_vk_device_mem.data(), &clean_ci, uint64_t(0), &aot_pc);
         g_aot_rt.lifted_vk_calls_executed++;
         if (res == 0 && aot_pc != 0) {
@@ -442,7 +507,22 @@ int32_t vkCreatePipelineCache(void* device, const void* pCreateInfo, const void*
             return 0;
         }
     }
-    *pPipelineCache = 0xCA000001ULL;
+    auto* pc = new MaliIcdPipelineCache();
+    if (pCreateInfo) {
+        const auto* ci = static_cast<const VkPipelineCacheCreateInfo*>(pCreateInfo);
+        if (ci->initialDataSize > 0 && ci->pInitialData) {
+            const auto* raw = static_cast<const uint8_t*>(ci->pInitialData);
+            pc->payload.assign(raw, raw + ci->initialDataSize);
+        }
+    }
+    if (pc->payload.size() < 32) {
+        pc->payload.assign(32, 0);
+        uint32_t hdr[4] = {32U, 1U /* VK_PIPELINE_CACHE_HEADER_VERSION_ONE */, 0x13B5U, 0xb8031030U};
+        std::memcpy(pc->payload.data(), hdr, sizeof(hdr));
+        static const uint8_t kUuid[16] = {0x52,0x35,0x34,0x50,0x33,0x4D,0x41,0x4C,0x49,0x47,0x36,0x31,0x35,0x00,0x00,0x01};
+        std::memcpy(pc->payload.data() + 16, kUuid, 16);
+    }
+    *pPipelineCache = reinterpret_cast<uint64_t>(pc);
     return 0;
 }
 
@@ -451,28 +531,51 @@ void vkDestroyPipelineCache(void* device, uint64_t pipelineCache, const void* /*
     if (!pipelineCache || pipelineCache == 0xCA000001ULL) return;
     auto* dev = static_cast<MaliIcdDevice*>(device);
     if (dev && aot_vkDestroyPipelineCache && !dev->aot_vk_device_mem.empty()) {
-        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        auto& tctx = maliGetThreadGuestContext();
+        GuestStackFrameGuard frame(tctx);
+        const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
         mali_aapcs64::invokeLiftedAapcs64<void>(
-            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkDestroyPipelineCache,
+            tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkDestroyPipelineCache,
             dev->aot_vk_device_mem.data(), pipelineCache, uint64_t(0));
         g_aot_rt.lifted_vk_calls_executed++;
+        return;
     }
+    auto* pc = reinterpret_cast<MaliIcdPipelineCache*>(pipelineCache);
+    if (pc->magic == 0x50434143484531ULL) delete pc;
 }
 
 __attribute__((visibility("default")))
 int32_t vkGetPipelineCacheData(void* device, uint64_t pipelineCache, size_t* pDataSize, void* pData) {
+    if (!pDataSize) return -3;
     auto* dev = static_cast<MaliIcdDevice*>(device);
     if (dev && pipelineCache && pipelineCache != 0xCA000001ULL &&
         aot_vkGetPipelineCacheData && !dev->aot_vk_device_mem.empty()) {
-        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        auto& tctx = maliGetThreadGuestContext();
+        GuestStackFrameGuard frame(tctx);
+        const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
         int32_t res = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
-            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkGetPipelineCacheData,
+            tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkGetPipelineCacheData,
             dev->aot_vk_device_mem.data(), pipelineCache, pDataSize, pData);
         g_aot_rt.lifted_vk_calls_executed++;
         return res;
     }
-    if (pDataSize) *pDataSize = 0;
-    return 0;
+    if (!pipelineCache || pipelineCache == 0xCA000001ULL) {
+        *pDataSize = 0;
+        return 0;
+    }
+    const auto* pc = reinterpret_cast<const MaliIcdPipelineCache*>(pipelineCache);
+    if (pc->magic != 0x50434143484531ULL) {
+        *pDataSize = 0;
+        return 0;
+    }
+    if (!pData) {
+        *pDataSize = pc->payload.size();
+        return 0;
+    }
+    size_t to_copy = std::min(*pDataSize, pc->payload.size());
+    if (to_copy > 0) std::memcpy(pData, pc->payload.data(), to_copy);
+    *pDataSize = to_copy;
+    return (to_copy < pc->payload.size()) ? 5 /* VK_INCOMPLETE */ : 0;
 }
 
 __attribute__((visibility("default")))
@@ -480,12 +583,23 @@ int32_t vkMergePipelineCaches(void* device, uint64_t dstCache, uint32_t srcCache
     auto* dev = static_cast<MaliIcdDevice*>(device);
     if (dev && dstCache && dstCache != 0xCA000001ULL &&
         aot_vkMergePipelineCaches && !dev->aot_vk_device_mem.empty()) {
-        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        auto& tctx = maliGetThreadGuestContext();
+        GuestStackFrameGuard frame(tctx);
+        const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
         int32_t res = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
-            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkMergePipelineCaches,
+            tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkMergePipelineCaches,
             dev->aot_vk_device_mem.data(), dstCache, srcCacheCount, pSrcCaches);
         g_aot_rt.lifted_vk_calls_executed++;
         return res;
+    }
+    auto* dst = reinterpret_cast<MaliIcdPipelineCache*>(dstCache);
+    if (dst && dst->magic == 0x50434143484531ULL && pSrcCaches) {
+        for (uint32_t i = 0; i < srcCacheCount; ++i) {
+            const auto* src = reinterpret_cast<const MaliIcdPipelineCache*>(pSrcCaches[i]);
+            if (src && src != dst && src->magic == 0x50434143484531ULL && src->payload.size() > 32) {
+                dst->payload.insert(dst->payload.end(), src->payload.begin() + 32, src->payload.end());
+            }
+        }
     }
     return 0;
 }
@@ -534,6 +648,10 @@ void vkGetImageSubresourceLayout(void* device, uint64_t image, const void* pSubr
     uint32_t fmt = img ? img->format : 37U;
     uint64_t pitch = 0, total_sz = 0;
     computeGenericVkFormatPitchAndSize(fmt, w, h, &pitch, &total_sz);
+    if (img && img->row_pitch > 0) {
+        pitch = img->row_pitch;
+        total_sz = pitch * h;
+    }
     l->offset     = 0;
     l->rowPitch   = pitch;
     l->size       = total_sz;
@@ -798,13 +916,13 @@ int32_t vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const void* 
         uint64_t umm_flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR | BASE_MEM_SAME_VA;
         uint64_t w_gpu_va = 0;
         if (aot_kbase_mem_import && !dev->kctx_mem.empty()) {
-            std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
-            auto& cpu = g_aot_rt.cpu;
+            auto& tctx = maliGetThreadGuestContext();
+            GuestStackFrameGuard frame(tctx);
+            auto& cpu = tctx.cpu;
             uint64_t va_pages = 0;
             // Exact r54p3 base_mem_import_padded (0x01c6a260) AAPCS64 signature:
             //   x0 = kctx, w1 = type (BASE_MEM_IMPORT_TYPE_UMM = 2), x2 = &dmabuf_fd (phandle),
             //   x3 = in_flags, w4 = padding (0), x5 = &va_pages -> returns (gpu_va | (out_flags & 0xFFF)) in x0
-            g_aot_rt.resetGuestStackLocked();
             cpu.x[0] = reinterpret_cast<uint64_t>(dev->kctx_mem.data());
             cpu.x[1] = 2ULL; // BASE_MEM_IMPORT_TYPE_UMM
             cpu.x[2] = reinterpret_cast<uint64_t>(&dmabuf_fd);
@@ -828,6 +946,8 @@ int32_t vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const void* 
         img->width        = sc->width;
         img->height       = sc->height;
         img->format       = sc->format;
+        img->row_pitch    = sc->width * 4U;
+        img->dmabuf_fd    = dmabuf_fd;
         img->byte_size    = byte_sz;
         img->bound_gpu_va = w_gpu_va;
         sc->images.push_back(img);
@@ -835,6 +955,15 @@ int32_t vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const void* 
             std::lock_guard<std::mutex> lk(g_icd_mutex);
             g_images[reinterpret_cast<uint64_t>(img)] = {img->bound_gpu_va, img->width, img->height};
         }
+    }
+    sc->image_acquired.assign(sc->images.size(), false);
+    sc->image_fences.assign(sc->images.size(), 0ULL);
+    if (sc->is_wayland) {
+        sc->wl_pools.assign(sc->images.size(), nullptr);
+        sc->wl_buffers.assign(sc->images.size(), nullptr);
+        sc->wl_shm_fds.assign(sc->images.size(), -1);
+        sc->wl_shm_maps.assign(sc->images.size(), nullptr);
+        sc->wl_shm_szs.assign(sc->images.size(), 0);
     }
     mali_icd_log("vkCreateSwapchainKHR -> swapchain=%p extent=%ux%u format=%u images=%u xcb_conn=%p xcb_win=0x%x is_wayland=%d wl_display=%p wl_surface=%p",
                  static_cast<void*>(sc), sc->width, sc->height, sc->format,
@@ -848,6 +977,39 @@ __attribute__((visibility("default")))
 void vkDestroySwapchainKHR(void* /*device*/, uint64_t swapchain, const void* /*pAllocator*/) {
     auto* sc = reinterpret_cast<MaliIcdSwapchain*>(swapchain);
     if (!sc) return;
+    if (mali_kbase_emu_wait_csf_idle) mali_kbase_emu_wait_csf_idle(200000000ULL);
+    if (sc->xcb_conn) {
+        if (sc->xcb_shm_ok && sc->xcb_shm_seg && g_xcb_lib.shm_detach) {
+            g_xcb_lib.shm_detach(sc->xcb_conn, sc->xcb_shm_seg);
+        }
+        if (sc->xcb_gc && g_xcb_lib.free_gc) {
+            g_xcb_lib.free_gc(sc->xcb_conn, sc->xcb_gc);
+        }
+        if (g_xcb_lib.flush) g_xcb_lib.flush(sc->xcb_conn);
+    }
+    if (sc->xcb_shm_addr && sc->xcb_shm_addr != reinterpret_cast<uint8_t*>(-1)) {
+        shmdt(sc->xcb_shm_addr);
+        sc->xcb_shm_addr = nullptr;
+    }
+    if (sc->xcb_shmid >= 0) {
+        shmctl(sc->xcb_shmid, IPC_RMID, nullptr);
+        sc->xcb_shmid = -1;
+    }
+    for (size_t i = 0; i < sc->wl_buffers.size(); ++i) {
+        if (sc->wl_buffers[i] && g_wayland_lib.proxy_destroy) g_wayland_lib.proxy_destroy(sc->wl_buffers[i]);
+        if (i < sc->wl_pools.size() && sc->wl_pools[i] && g_wayland_lib.proxy_destroy) g_wayland_lib.proxy_destroy(sc->wl_pools[i]);
+        if (i < sc->wl_shm_maps.size() && sc->wl_shm_maps[i] && i < sc->wl_shm_szs.size() && sc->wl_shm_szs[i] > 0) {
+            munmap(sc->wl_shm_maps[i], sc->wl_shm_szs[i]);
+        }
+        if (i < sc->wl_shm_fds.size() && sc->wl_shm_fds[i] >= 0) close(sc->wl_shm_fds[i]);
+    }
+    if (sc->wl_buffer && g_wayland_lib.proxy_destroy) g_wayland_lib.proxy_destroy(sc->wl_buffer);
+    if (sc->wl_pool && g_wayland_lib.proxy_destroy) g_wayland_lib.proxy_destroy(sc->wl_pool);
+    if (sc->wl_shm_map && sc->wl_shm_sz > 0) munmap(sc->wl_shm_map, sc->wl_shm_sz);
+    if (sc->wl_shm_fd >= 0) close(sc->wl_shm_fd);
+    for (int fd : sc->dmabuf_fds) {
+        if (fd >= 0) close(fd);
+    }
     for (auto* img : sc->images) {
         {
             std::lock_guard<std::mutex> lk(g_icd_mutex);
@@ -876,11 +1038,31 @@ int32_t vkGetSwapchainImagesKHR(void* /*device*/, uint64_t swapchain, uint32_t* 
 }
 
 __attribute__((visibility("default")))
-int32_t vkAcquireNextImageKHR(void* /*device*/, uint64_t swapchain, uint64_t /*timeout*/, uint64_t /*semaphore*/, uint64_t /*fence*/, uint32_t* pImageIndex) {
+int32_t vkAcquireNextImageKHR(void* /*device*/, uint64_t swapchain, uint64_t /*timeout*/, uint64_t semaphore, uint64_t fence, uint32_t* pImageIndex) {
     if (!swapchain || !pImageIndex) return -3;
     auto* sc = reinterpret_cast<MaliIcdSwapchain*>(swapchain);
-    *pImageIndex = sc->next_image_idx;
-    sc->next_image_idx = (sc->next_image_idx + 1U) % static_cast<uint32_t>(sc->images.size());
+    if (sc->images.empty()) return -3;
+    uint32_t idx = sc->next_image_idx % static_cast<uint32_t>(sc->images.size());
+    *pImageIndex = idx;
+    sc->next_image_idx = (idx + 1U) % static_cast<uint32_t>(sc->images.size());
+    if (idx < sc->image_acquired.size()) sc->image_acquired[idx] = true;
+    if (idx < sc->image_fences.size()) sc->image_fences[idx] = fence;
+    if (fence) {
+        auto* f = reinterpret_cast<MaliIcdFence*>(fence);
+        f->signaled = true;
+    }
+    if (semaphore) {
+        auto* s = reinterpret_cast<MaliIcdSemaphore*>(semaphore);
+        if (s->is_timeline) s->counter_value++;
+    }
+    if (!sc->is_wayland && sc->xcb_conn && sc->xcb_window) {
+        uint32_t cur_w = sc->width, cur_h = sc->height;
+        if (g_xcb_lib.queryWindowGeometry(sc->xcb_conn, sc->xcb_window, &cur_w, &cur_h, nullptr)) {
+            if (cur_w != sc->width || cur_h != sc->height) {
+                return 1000001003; // VK_SUBOPTIMAL_KHR
+            }
+        }
+    }
     return 0;
 }
 
@@ -906,9 +1088,11 @@ int32_t vkQueuePresentKHR(void* /*queue*/, const void* pPresentInfo) {
     static uint32_t s_present_frame_idx = 0;
     const char* dump_ppm = getenv("MALI_VKCUBE_DUMP_PPM");
     const char* dump_dir = getenv("MALI_VKCUBE_DUMP_DIR");
+    int32_t overall_res = 0;
     for (uint32_t i = 0; i < pi->swapchainCount; ++i) {
         auto* sc = reinterpret_cast<MaliIcdSwapchain*>(pi->pSwapchains[i]);
         uint32_t idx = pi->pImageIndices ? pi->pImageIndices[i] : 0U;
+        int32_t sc_res = 0;
         std::string target_ppm;
         if (dump_dir && dump_dir[0]) {
             target_ppm = std::string(dump_dir) + "/vkcube_frame_" + std::to_string(s_present_frame_idx++) + ".ppm";
@@ -916,11 +1100,17 @@ int32_t vkQueuePresentKHR(void* /*queue*/, const void* pPresentInfo) {
             target_ppm = dump_ppm;
         }
         if (sc && idx < sc->images.size()) {
+            if (idx < sc->image_acquired.size()) sc->image_acquired[idx] = false;
             const auto* img = sc->images[idx];
             if (img && img->bound_gpu_va) {
-                // 1a. Live Wayland wl_shm window presentation (vkcube --wsi wayland / vkgears -wayland)
+                uint32_t stride_px = (img->row_pitch >= img->width * 4U && (img->row_pitch % 4U) == 0)
+                                         ? (img->row_pitch / 4U)
+                                         : img->width;
+                bool is_bgra = (img->format == 44U || img->format == 50U);
+
+                // 1a. Live Wayland wl_shm window presentation (per-slot wl_buffer/wl_shm_pool)
                 if (sc->is_wayland && sc->wl_display && sc->wl_surface && g_wayland_lib.ensureLoaded()) {
-                    if (!sc->wl_buffer) {
+                    if (!sc->wl_shm) {
                         void* reg = g_wayland_lib.proxy_marshal_constructor(
                             sc->wl_display, 1U /* WL_DISPLAY_GET_REGISTRY */,
                             g_wayland_lib.registry_interface, nullptr);
@@ -933,41 +1123,58 @@ int32_t vkQueuePresentKHR(void* /*queue*/, const void* pPresentInfo) {
                             g_wayland_lib.display_roundtrip(sc->wl_display);
                             if (g_wayland_lib.proxy_destroy) g_wayland_lib.proxy_destroy(reg);
                         }
-                        if (sc->wl_shm) {
-                            sc->wl_shm_sz = static_cast<size_t>(img->width) * img->height * 4U;
-                            sc->wl_shm_fd = memfd_create("mali_aot_wl_shm", 0);
-                            if (sc->wl_shm_fd >= 0 && ftruncate(sc->wl_shm_fd, static_cast<off_t>(sc->wl_shm_sz)) == 0) {
-                                void* mp = mmap(nullptr, sc->wl_shm_sz, PROT_READ | PROT_WRITE, MAP_SHARED, sc->wl_shm_fd, 0);
-                                if (mp != MAP_FAILED) {
-                                    sc->wl_shm_map = static_cast<uint32_t*>(mp);
-                                    sc->wl_pool = g_wayland_lib.proxy_marshal_constructor(
-                                        sc->wl_shm, 0U /* WL_SHM_CREATE_POOL */,
-                                        g_wayland_lib.shm_pool_interface, nullptr,
-                                        sc->wl_shm_fd, static_cast<int32_t>(sc->wl_shm_sz));
-                                    if (sc->wl_pool) {
-                                        sc->wl_buffer = g_wayland_lib.proxy_marshal_constructor(
-                                            sc->wl_pool, 0U /* WL_SHM_POOL_CREATE_BUFFER */,
-                                            g_wayland_lib.buffer_interface, nullptr,
-                                            0, static_cast<int32_t>(img->width), static_cast<int32_t>(img->height),
-                                            static_cast<int32_t>(img->width * 4U), 1U /* WL_SHM_FORMAT_XRGB8888 */);
+                    }
+                    if (sc->wl_shm && idx < sc->wl_buffers.size() && !sc->wl_buffers[idx]) {
+                        size_t sz = static_cast<size_t>(img->width) * img->height * 4U;
+                        int fd = memfd_create("mali_aot_wl_shm", 0);
+                        if (fd >= 0 && ftruncate(fd, static_cast<off_t>(sz)) == 0) {
+                            void* mp = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                            if (mp != MAP_FAILED) {
+                                sc->wl_shm_fds[idx] = fd;
+                                sc->wl_shm_maps[idx] = static_cast<uint32_t*>(mp);
+                                sc->wl_shm_szs[idx] = sz;
+                                void* pool = g_wayland_lib.proxy_marshal_constructor(
+                                    sc->wl_shm, 0U /* WL_SHM_CREATE_POOL */,
+                                    g_wayland_lib.shm_pool_interface, nullptr,
+                                    fd, static_cast<int32_t>(sz));
+                                sc->wl_pools[idx] = pool;
+                                if (pool) {
+                                    sc->wl_buffers[idx] = g_wayland_lib.proxy_marshal_constructor(
+                                        pool, 0U /* WL_SHM_POOL_CREATE_BUFFER */,
+                                        g_wayland_lib.buffer_interface, nullptr,
+                                        0, static_cast<int32_t>(img->width), static_cast<int32_t>(img->height),
+                                        static_cast<int32_t>(img->width * 4U), 1U /* WL_SHM_FORMAT_XRGB8888 */);
+                                }
+                            } else {
+                                close(fd);
+                            }
+                        } else if (fd >= 0) {
+                            close(fd);
+                        }
+                    }
+                    if (idx < sc->wl_buffers.size() && sc->wl_buffers[idx] && sc->wl_shm_maps[idx]) {
+                        const uint32_t* src_px = reinterpret_cast<const uint32_t*>(img->bound_gpu_va);
+                        uint32_t* dst_px = sc->wl_shm_maps[idx];
+                        if (is_bgra && stride_px == img->width) {
+                            std::memcpy(dst_px, src_px, static_cast<size_t>(img->width) * img->height * 4U);
+                        } else {
+                            for (uint32_t y = 0; y < img->height; ++y) {
+                                const uint32_t* srow = src_px + y * stride_px;
+                                uint32_t* drow = dst_px + y * img->width;
+                                if (is_bgra) {
+                                    std::memcpy(drow, srow, img->width * 4U);
+                                } else {
+                                    for (uint32_t x = 0; x < img->width; ++x) {
+                                        uint32_t v = srow[x];
+                                        uint32_t r = v & 0xFFU;
+                                        uint32_t g = (v >> 8) & 0xFFU;
+                                        uint32_t b = (v >> 16) & 0xFFU;
+                                        drow[x] = (0xFFU << 24) | (r << 16) | (g << 8) | b;
                                     }
                                 }
                             }
                         }
-                    }
-                    if (sc->wl_buffer && sc->wl_shm_map) {
-                        const uint32_t* src_px = reinterpret_cast<const uint32_t*>(img->bound_gpu_va);
-                        uint32_t total_px = img->width * img->height;
-                        // Internal /dev/mali0 MFBD tile writeback is canonical RGBA8 (byte0=R, byte1=G, byte2=B, byte3=A);
-                        // convert to WL_SHM_FORMAT_XRGB8888 ((0xFF << 24) | (R << 16) | (G << 8) | B).
-                        for (uint32_t p = 0; p < total_px; ++p) {
-                            uint32_t v = src_px[p];
-                            uint32_t r = v & 0xFFU;
-                            uint32_t g = (v >> 8) & 0xFFU;
-                            uint32_t b = (v >> 16) & 0xFFU;
-                            sc->wl_shm_map[p] = (0xFFU << 24) | (r << 16) | (g << 8) | b;
-                        }
-                        g_wayland_lib.proxy_marshal(sc->wl_surface, 1U /* WL_SURFACE_ATTACH */, sc->wl_buffer, 0, 0);
+                        g_wayland_lib.proxy_marshal(sc->wl_surface, 1U /* WL_SURFACE_ATTACH */, sc->wl_buffers[idx], 0, 0);
                         g_wayland_lib.proxy_marshal(sc->wl_surface, 2U /* WL_SURFACE_DAMAGE */, 0, 0,
                                                     static_cast<int32_t>(img->width), static_cast<int32_t>(img->height));
                         g_wayland_lib.proxy_marshal(sc->wl_surface, 6U /* WL_SURFACE_COMMIT */);
@@ -975,35 +1182,98 @@ int32_t vkQueuePresentKHR(void* /*queue*/, const void* pPresentInfo) {
                     }
                 }
 
-                // 1b. Live XCB window presentation (vkcube --wsi xcb / vkgears)
+                // 1b. Live XCB window presentation (MIT-SHM fast path with xcb_put_image fallback)
                 if (sc->xcb_conn && sc->xcb_window && g_xcb_lib.ensureLoaded()) {
                     if (sc->xcb_gc == 0) {
                         sc->xcb_gc = g_xcb_lib.generate_id(sc->xcb_conn);
                         g_xcb_lib.create_gc(sc->xcb_conn, sc->xcb_gc, sc->xcb_window, 0, nullptr);
                     }
-                    const uint32_t* src_px = reinterpret_cast<const uint32_t*>(img->bound_gpu_va);
-                    std::vector<uint32_t> bgra_px(img->width * img->height);
-                    for (uint32_t p = 0; p < img->width * img->height; ++p) {
-                        uint32_t v = src_px[p];
-                        uint32_t r = v & 0xFFU;
-                        uint32_t g = (v >> 8) & 0xFFU;
-                        uint32_t b = (v >> 16) & 0xFFU;
-                        uint32_t a = (v >> 24) & 0xFFU;
-                        bgra_px[p] = (a << 24) | (r << 16) | (g << 8) | b;
+                    if (!sc->xcb_shm_checked) {
+                        sc->xcb_shm_checked = true;
+                        if (g_xcb_lib.ensureShmLoaded()) {
+                            auto ck = g_xcb_lib.shm_query_version(sc->xcb_conn);
+                            auto* rep = g_xcb_lib.shm_query_version_reply(sc->xcb_conn, ck, nullptr);
+                            if (rep) {
+                                std::free(rep);
+                                size_t shm_sz = static_cast<size_t>(img->width) * img->height * 4U;
+                                int shmid = shmget(IPC_PRIVATE, shm_sz, IPC_CREAT | 0600);
+                                if (shmid >= 0) {
+                                    void* addr = shmat(shmid, nullptr, 0);
+                                    if (addr != reinterpret_cast<void*>(-1)) {
+                                        sc->xcb_shmid = shmid;
+                                        sc->xcb_shm_addr = static_cast<uint8_t*>(addr);
+                                        sc->xcb_shm_sz = shm_sz;
+                                        sc->xcb_shm_seg = g_xcb_lib.generate_id(sc->xcb_conn);
+                                        g_xcb_lib.shm_attach(sc->xcb_conn, sc->xcb_shm_seg, static_cast<uint32_t>(shmid), 0);
+                                        shmctl(shmid, IPC_RMID, nullptr);
+                                        sc->xcb_shmid = -1;
+                                        sc->xcb_shm_ok = true;
+                                    } else {
+                                        shmctl(shmid, IPC_RMID, nullptr);
+                                    }
+                                }
+                            }
+                        }
                     }
-                    const uint32_t* x11_px = bgra_px.data();
-                    // Send in horizontal bands so large windows (e.g. 500x500 = 1 MB) never exceed X11 max request size (256 KiB)
-                    uint32_t rows_per_band = std::max<uint32_t>(1U, (65536U) / (img->width * 4U));
-                    for (uint32_t y = 0; y < img->height; y += rows_per_band) {
-                        uint32_t band_h = std::min<uint32_t>(rows_per_band, img->height - y);
-                        g_xcb_lib.put_image(sc->xcb_conn, 2 /* XCB_IMAGE_FORMAT_Z_PIXMAP */,
-                                            sc->xcb_window, sc->xcb_gc,
-                                            static_cast<uint16_t>(img->width), static_cast<uint16_t>(band_h),
-                                            0, static_cast<int16_t>(y), 0, sc->xcb_depth ? sc->xcb_depth : 24,
-                                            img->width * band_h * 4U,
-                                            reinterpret_cast<const uint8_t*>(x11_px + y * img->width));
+
+                    const uint32_t* src_px = reinterpret_cast<const uint32_t*>(img->bound_gpu_va);
+                    auto convertToX11 = [&](uint32_t* dst_px) {
+                        if (is_bgra && stride_px == img->width) {
+                            std::memcpy(dst_px, src_px, static_cast<size_t>(img->width) * img->height * 4U);
+                        } else {
+                            for (uint32_t y = 0; y < img->height; ++y) {
+                                const uint32_t* srow = src_px + y * stride_px;
+                                uint32_t* drow = dst_px + y * img->width;
+                                if (is_bgra) {
+                                    std::memcpy(drow, srow, img->width * 4U);
+                                } else {
+                                    for (uint32_t x = 0; x < img->width; ++x) {
+                                        uint32_t v = srow[x];
+                                        uint32_t r = v & 0xFFU;
+                                        uint32_t g = (v >> 8) & 0xFFU;
+                                        uint32_t b = (v >> 16) & 0xFFU;
+                                        uint32_t a = (v >> 24) & 0xFFU;
+                                        drow[x] = (a << 24) | (r << 16) | (g << 8) | b;
+                                    }
+                                }
+                            }
+                        }
+                    };
+
+                    if (sc->xcb_shm_ok && sc->xcb_shm_addr &&
+                        sc->xcb_shm_sz >= static_cast<size_t>(img->width) * img->height * 4U) {
+                        convertToX11(reinterpret_cast<uint32_t*>(sc->xcb_shm_addr));
+                        g_xcb_lib.shm_put_image(sc->xcb_conn, sc->xcb_window, sc->xcb_gc,
+                                                static_cast<uint16_t>(img->width), static_cast<uint16_t>(img->height),
+                                                0, 0,
+                                                static_cast<uint16_t>(img->width), static_cast<uint16_t>(img->height),
+                                                0, 0,
+                                                sc->xcb_depth ? sc->xcb_depth : 24,
+                                                2 /* XCB_IMAGE_FORMAT_Z_PIXMAP */, 0,
+                                                sc->xcb_shm_seg, 0);
+                    } else {
+                        std::vector<uint32_t> bgra_px(static_cast<size_t>(img->width) * img->height);
+                        convertToX11(bgra_px.data());
+                        const uint32_t* x11_px = bgra_px.data();
+                        uint32_t rows_per_band = std::max<uint32_t>(1U, (65536U) / (img->width * 4U));
+                        for (uint32_t y = 0; y < img->height; y += rows_per_band) {
+                            uint32_t band_h = std::min<uint32_t>(rows_per_band, img->height - y);
+                            g_xcb_lib.put_image(sc->xcb_conn, 2 /* XCB_IMAGE_FORMAT_Z_PIXMAP */,
+                                                sc->xcb_window, sc->xcb_gc,
+                                                static_cast<uint16_t>(img->width), static_cast<uint16_t>(band_h),
+                                                0, static_cast<int16_t>(y), 0, sc->xcb_depth ? sc->xcb_depth : 24,
+                                                img->width * band_h * 4U,
+                                                reinterpret_cast<const uint8_t*>(x11_px + y * img->width));
+                        }
                     }
                     g_xcb_lib.flush(sc->xcb_conn);
+
+                    uint32_t cur_w = sc->width, cur_h = sc->height;
+                    if (g_xcb_lib.queryWindowGeometry(sc->xcb_conn, sc->xcb_window, &cur_w, &cur_h, nullptr)) {
+                        if (cur_w != sc->width || cur_h != sc->height) {
+                            sc_res = 1000001003; // VK_SUBOPTIMAL_KHR
+                        }
+                    }
                 }
 
                 // 2. Optional PPM frame dump
@@ -1012,19 +1282,24 @@ int32_t vkQueuePresentKHR(void* /*queue*/, const void* pPresentInfo) {
                     if (out) {
                         out << "P6\n" << img->width << " " << img->height << "\n255\n";
                         const uint32_t* px = reinterpret_cast<const uint32_t*>(img->bound_gpu_va);
-                        for (uint32_t p = 0; p < img->width * img->height; ++p) {
-                            uint8_t rgb[3] = {
-                                static_cast<uint8_t>(px[p] & 0xFFU),
-                                static_cast<uint8_t>((px[p] >> 8) & 0xFFU),
-                                static_cast<uint8_t>((px[p] >> 16) & 0xFFU)
-                            };
-                            out.write(reinterpret_cast<const char*>(rgb), 3);
+                        for (uint32_t y = 0; y < img->height; ++y) {
+                            const uint32_t* row = px + y * stride_px;
+                            for (uint32_t x = 0; x < img->width; ++x) {
+                                uint32_t v = row[x];
+                                uint8_t rgb[3] = {
+                                    static_cast<uint8_t>(is_bgra ? ((v >> 16) & 0xFFU) : (v & 0xFFU)),
+                                    static_cast<uint8_t>((v >> 8) & 0xFFU),
+                                    static_cast<uint8_t>(is_bgra ? (v & 0xFFU) : ((v >> 16) & 0xFFU))
+                                };
+                                out.write(reinterpret_cast<const char*>(rgb), 3);
+                            }
                         }
                     }
                 }
             }
         }
-        if (pi->pResults) pi->pResults[i] = 0;
+        if (pi->pResults) pi->pResults[i] = sc_res;
+        if (sc_res != 0 && overall_res == 0) overall_res = sc_res;
     }
     static uint64_t s_total_presents = 0;
     ++s_total_presents;
@@ -1032,7 +1307,7 @@ int32_t vkQueuePresentKHR(void* /*queue*/, const void* pPresentInfo) {
         mali_icd_log("vkQueuePresentKHR frame=%lu swapchains=%u",
                      static_cast<unsigned long>(s_total_presents), pi->swapchainCount);
     }
-    return 0;
+    return overall_res;
 }
 
 __attribute__((visibility("default")))
@@ -1115,9 +1390,11 @@ int32_t vkCreateEvent(void* device, const void* pCreateInfo, const void* pAlloca
         uint64_t aot_ev = 0;
         int32_t res = 0;
         {
-            std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+            auto& tctx = maliGetThreadGuestContext();
+            GuestStackFrameGuard frame(tctx);
+            const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
             res = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
-                g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkCreateEvent,
+                tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCreateEvent,
                 dev->aot_vk_device_mem.data(), ci_ptr, pAllocator, &aot_ev);
             g_aot_rt.lifted_vk_calls_executed++;
         }
@@ -1137,9 +1414,11 @@ void vkDestroyEvent(void* device, uint64_t event, const void* pAllocator) {
     auto* dev = static_cast<MaliIcdDevice*>(device);
     if (dev && aot_vkDestroyEvent && !dev->aot_vk_device_mem.empty() &&
         (*reinterpret_cast<const uint8_t*>(event) == 0x0aU)) {
-        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        auto& tctx = maliGetThreadGuestContext();
+        GuestStackFrameGuard frame(tctx);
+        const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
         mali_aapcs64::invokeLiftedAapcs64<void>(
-            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkDestroyEvent,
+            tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkDestroyEvent,
             dev->aot_vk_device_mem.data(), event, pAllocator);
         g_aot_rt.lifted_vk_calls_executed++;
         return;
@@ -1152,9 +1431,11 @@ int32_t vkGetEventStatus(void* device, uint64_t event) {
     auto* dev = static_cast<MaliIcdDevice*>(device);
     if (dev && aot_vkGetEventStatus && !dev->aot_vk_device_mem.empty() &&
         (*reinterpret_cast<const uint8_t*>(event) == 0x0aU)) {
-        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        auto& tctx = maliGetThreadGuestContext();
+        GuestStackFrameGuard frame(tctx);
+        const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
         int32_t res = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
-            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkGetEventStatus,
+            tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkGetEventStatus,
             dev->aot_vk_device_mem.data(), event);
         g_aot_rt.lifted_vk_calls_executed++;
         return res;
@@ -1170,9 +1451,11 @@ int32_t vkSetEvent(void* device, uint64_t event) {
     auto* dev = static_cast<MaliIcdDevice*>(device);
     if (dev && aot_vkSetEvent && !dev->aot_vk_device_mem.empty() &&
         (*reinterpret_cast<const uint8_t*>(event) == 0x0aU)) {
-        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        auto& tctx = maliGetThreadGuestContext();
+        GuestStackFrameGuard frame(tctx);
+        const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
         int32_t res = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
-            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkSetEvent,
+            tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkSetEvent,
             dev->aot_vk_device_mem.data(), event);
         g_aot_rt.lifted_vk_calls_executed++;
         return res;
@@ -1186,9 +1469,11 @@ int32_t vkResetEvent(void* device, uint64_t event) {
     auto* dev = static_cast<MaliIcdDevice*>(device);
     if (dev && aot_vkResetEvent && !dev->aot_vk_device_mem.empty() &&
         (*reinterpret_cast<const uint8_t*>(event) == 0x0aU)) {
-        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
+        auto& tctx = maliGetThreadGuestContext();
+        GuestStackFrameGuard frame(tctx);
+        const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
         int32_t res = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
-            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkResetEvent,
+            tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkResetEvent,
             dev->aot_vk_device_mem.data(), event);
         g_aot_rt.lifted_vk_calls_executed++;
         return res;
@@ -1197,11 +1482,36 @@ int32_t vkResetEvent(void* device, uint64_t event) {
     return 0;
 }
 __attribute__((visibility("default")))
-void vkCmdSetEvent(void* /*commandBuffer*/, uint64_t /*event*/, uint32_t /*stageMask*/) {}
+void vkCmdSetEvent(void* commandBuffer, uint64_t event, uint32_t stageMask) {
+    if (!commandBuffer) return;
+    auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
+    MaliIcdRecordedCmd cmd{};
+    cmd.type = MaliIcdRecordedCmd::CMD_SET_EVENT;
+    cmd.event_handle = event;
+    cmd.src_stage_mask = stageMask;
+    cb->cmds.push_back(cmd);
+}
 __attribute__((visibility("default")))
-void vkCmdResetEvent(void* /*commandBuffer*/, uint64_t /*event*/, uint32_t /*stageMask*/) {}
+void vkCmdResetEvent(void* commandBuffer, uint64_t event, uint32_t stageMask) {
+    if (!commandBuffer) return;
+    auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
+    MaliIcdRecordedCmd cmd{};
+    cmd.type = MaliIcdRecordedCmd::CMD_RESET_EVENT;
+    cmd.event_handle = event;
+    cmd.src_stage_mask = stageMask;
+    cb->cmds.push_back(cmd);
+}
 __attribute__((visibility("default")))
-void vkCmdWaitEvents(void* /*commandBuffer*/, uint32_t /*eventCount*/, const uint64_t* /*pEvents*/, uint32_t /*srcStageMask*/, uint32_t /*dstStageMask*/, uint32_t /*memoryBarrierCount*/, const void* /*pMemoryBarriers*/, uint32_t /*bufferMemoryBarrierCount*/, const void* /*pBufferMemoryBarriers*/, uint32_t /*imageMemoryBarrierCount*/, const void* /*pImageMemoryBarriers*/) {}
+void vkCmdWaitEvents(void* commandBuffer, uint32_t eventCount, const uint64_t* pEvents, uint32_t srcStageMask, uint32_t dstStageMask, uint32_t /*memoryBarrierCount*/, const void* /*pMemoryBarriers*/, uint32_t /*bufferMemoryBarrierCount*/, const void* /*pBufferMemoryBarriers*/, uint32_t /*imageMemoryBarrierCount*/, const void* /*pImageMemoryBarriers*/) {
+    if (!commandBuffer) return;
+    auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
+    MaliIcdRecordedCmd cmd{};
+    cmd.type = MaliIcdRecordedCmd::CMD_WAIT_EVENTS;
+    cmd.src_stage_mask = srcStageMask;
+    cmd.dst_stage_mask = dstStageMask;
+    if (pEvents && eventCount > 0) cmd.wait_events.assign(pEvents, pEvents + eventCount);
+    cb->cmds.push_back(cmd);
+}
 __attribute__((visibility("default")))
 int32_t vkGetPhysicalDeviceSurfaceCapabilities2KHR(void* physicalDevice, const void* pSurfaceInfo, void* pSurfaceCapabilities) {
     if (!pSurfaceInfo || !pSurfaceCapabilities) return -3;
@@ -1225,5 +1535,35 @@ int32_t vkGetPhysicalDeviceSurfaceFormats2KHR(void* physicalDevice, const void* 
     return (n < 4U) ? 5 : 0;
 }
 
+__attribute__((visibility("default")))
+int32_t vkGetImageDrmFormatModifierPropertiesEXT(void* /*device*/, uint64_t /*image*/, void* pProperties) {
+    if (!pProperties) return -3;
+    struct DrmModProps { uint32_t sType; void* pNext; uint64_t drmFormatModifier; };
+    auto* props = static_cast<DrmModProps*>(pProperties);
+    props->drmFormatModifier = 0ULL; // DRM_FORMAT_MOD_LINEAR
+    return 0;
+}
+
+__attribute__((visibility("default")))
+int32_t vkGetMemoryFdKHR(void* /*device*/, const void* pGetFdInfo, int* pFd) {
+    if (!pGetFdInfo || !pFd) return -3;
+    struct GetFdInfo { uint32_t sType; const void* pNext; uint64_t memory; uint32_t handleType; };
+    const auto* info = static_cast<const GetFdInfo*>(pGetFdInfo);
+    auto* mem = reinterpret_cast<MaliIcdDeviceMemory*>(info->memory);
+    if (mem && mem->dmabuf_fd >= 0) {
+        *pFd = dup(mem->dmabuf_fd);
+        return (*pFd >= 0) ? 0 : -1;
+    }
+    int fd = memfd_create("mali_icd_ext_mem", 0);
+    if (fd < 0) return -1;
+    if (mem && mem->size_bytes > 0) {
+        if (ftruncate(fd, static_cast<off_t>(mem->size_bytes)) != 0) {
+            close(fd);
+            return -1;
+        }
+    }
+    *pFd = fd;
+    return 0;
+}
 
 } // extern "C"

@@ -25,6 +25,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include "mali_kbase_uapi.h"
 #include "lifted_kbase_ko.h"
 
@@ -189,6 +190,10 @@ void *mali_kbase_emu_mmap_direct(void *addr, size_t length, int prot, int flags,
 int mali_kbase_emu_munmap_direct(void *addr, size_t length);
 ssize_t mali_kbase_emu_read_direct(int fd, void *buf, size_t count);
 int mali_kbase_emu_poll_direct(void *fds, unsigned long nfds, int timeout);
+int mali_kbase_emu_stat_direct(const char *pathname, struct stat *statbuf);
+int mali_kbase_emu_fstat_direct(int fd, struct stat *statbuf);
+int mali_kbase_emu_access_direct(const char *pathname, int mode);
+bool mali_kbase_emu_is_emulated_fd(int fd);
 
 #ifdef __cplusplus
 }

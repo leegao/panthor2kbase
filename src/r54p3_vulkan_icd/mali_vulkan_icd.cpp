@@ -711,6 +711,7 @@ int32_t vkCreateComputePipelines(void* device, uint64_t pipelineCache, uint32_t 
             runAotMbs2PipelineCompile(pipe->shader_mod);
             pipe->exec_bo_gpu_va = pipe->shader_mod->exec_bo_gpu_va;
             pipe->objc_bytes     = pipe->shader_mod->objc_words.size() * sizeof(uint64_t);
+            pipe->cs_spirv_words = pipe->shader_mod->spirv_words;
         }
         auto* pl = reinterpret_cast<MaliIcdPipelineLayout*>(cis[i].layout);
         if (dev && aot_vkCreateComputePipelines && !dev->aot_vk_device_mem.empty() &&
@@ -1098,11 +1099,18 @@ VkResult vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCach
                     pipe->vs_mod         = sm;
                     pipe->exec_bo_gpu_va = sm->exec_bo_gpu_va;
                     pipe->objc_bytes     = sm->objc_words.size() * sizeof(uint64_t);
+                    pipe->vs_spirv_words = sm->spirv_words;
+                    pipe->vs_has_ubo     = sm->has_ubo_load;
                 }
                 if (gis[i].pStages[st].stage == 0x10U) {
-                    pipe->fs_mod        = sm;
-                    pipe->fs_exec_bo_va = sm->exec_bo_gpu_va;
-                    pipe->fs_objc_bytes = sm->objc_words.size() * sizeof(uint64_t);
+                    pipe->fs_mod              = sm;
+                    pipe->fs_exec_bo_va       = sm->exec_bo_gpu_va;
+                    pipe->fs_objc_bytes       = sm->objc_words.size() * sizeof(uint64_t);
+                    pipe->fs_spirv_words      = sm->spirv_words;
+                    pipe->has_frag_const      = sm->has_const_color;
+                    std::memcpy(pipe->frag_const_color, sm->const_color, sizeof(pipe->frag_const_color));
+                    pipe->fs_has_ubo          = sm->has_ubo_load;
+                    pipe->fs_has_image_sample = sm->has_image_sample;
                 }
             }
         }
@@ -1702,13 +1710,15 @@ void vkCmdWriteTimestamp(void* commandBuffer, uint32_t /*stage*/, uint64_t query
 }
 
 __attribute__((visibility("default")))
-void vkCmdPipelineBarrier(void* commandBuffer, uint32_t /*srcS*/, uint32_t /*dstS*/, uint32_t /*f*/,
+void vkCmdPipelineBarrier(void* commandBuffer, uint32_t srcS, uint32_t dstS, uint32_t /*f*/,
                           uint32_t /*mc*/, const void* /*pm*/, uint32_t /*bc*/, const void* /*pb*/,
                           uint32_t /*ic*/, const void* /*pi*/) {
     if (!commandBuffer) return;
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     MaliIcdRecordedCmd cmd{};
     cmd.type = MaliIcdRecordedCmd::CMD_PIPELINE_BARRIER;
+    cmd.src_stage_mask = srcS;
+    cmd.dst_stage_mask = dstS;
     cb->cmds.push_back(cmd);
 }
 
@@ -1833,6 +1843,23 @@ VkResult vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* 
                     if (cmd.query_pool && cmd.query_index < cmd.query_pool->results.size()) {
                         cmd.query_pool->results[cmd.query_index] = s_ts;
                     }
+                } else if (cmd.type == MaliIcdRecordedCmd::CMD_PIPELINE_BARRIER) {
+                    if (mali_kbase_emu_wait_csf_idle) mali_kbase_emu_wait_csf_idle(50000000ULL);
+                } else if (cmd.type == MaliIcdRecordedCmd::CMD_SET_EVENT) {
+                    if (cmd.event_handle && cmd.event_handle != 0xE7000001ULL) {
+                        reinterpret_cast<MaliIcdEvent*>(cmd.event_handle)->signaled = true;
+                    }
+                } else if (cmd.type == MaliIcdRecordedCmd::CMD_RESET_EVENT) {
+                    if (cmd.event_handle && cmd.event_handle != 0xE7000001ULL) {
+                        reinterpret_cast<MaliIcdEvent*>(cmd.event_handle)->signaled = false;
+                    }
+                } else if (cmd.type == MaliIcdRecordedCmd::CMD_WAIT_EVENTS) {
+                    if (mali_kbase_emu_wait_csf_idle) mali_kbase_emu_wait_csf_idle(50000000ULL);
+                    for (uint64_t ev : cmd.wait_events) {
+                        if (ev && ev != 0xE7000001ULL) {
+                            reinterpret_cast<MaliIcdEvent*>(ev)->signaled = true;
+                        }
+                    }
                 } else if (cmd.type == MaliIcdRecordedCmd::CMD_DRAW_INDEXED ||
                            cmd.type == MaliIcdRecordedCmd::CMD_DRAW) {
                     // Submit Valhall CSF IDVS + FRAGMENT job into ring_bo_va -> KBASE_IOCTL_CS_QUEUE_KICK
@@ -1859,21 +1886,39 @@ VkResult vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* 
                         s_gfx_pkt.rp_draw_idx    = cmd.rp_draw_idx;
                         s_gfx_pkt.ubo_va         = cmd.desc_set ? (cmd.desc_set->bound_buffer_va[0] + cmd.dynamic_offset) : 0ULL;
                         s_gfx_pkt.ubo_range      = cmd.desc_set ? cmd.desc_set->bound_buffer_range[0] : 0ULL;
-                        if (cmd.pipeline && cmd.pipeline->fs_mod && cmd.pipeline->fs_mod->has_const_color) {
+                        s_gfx_pkt.has_frag_const = 0U;
+                        s_gfx_pkt.frag_const_rgba8 = 0U;
+                        s_gfx_pkt.fs_spirv_ptr = nullptr;
+                        s_gfx_pkt.fs_spirv_words = 0U;
+                        s_gfx_pkt.vs_spirv_ptr = nullptr;
+                        s_gfx_pkt.vs_spirv_words = 0U;
+                        s_gfx_pkt.vertex_bindings = nullptr;
+                        s_gfx_pkt.vertex_binding_count = 0U;
+                        s_gfx_pkt.vertex_attrs = nullptr;
+                        s_gfx_pkt.vertex_attr_count = 0U;
+                        if (cmd.pipeline && cmd.pipeline->has_frag_const) {
                             s_gfx_pkt.has_frag_const = 1U;
-                            uint32_t r8 = static_cast<uint32_t>(std::clamp(cmd.pipeline->fs_mod->const_color[0], 0.0f, 1.0f) * 255.0f + 0.5f);
-                            uint32_t g8 = static_cast<uint32_t>(std::clamp(cmd.pipeline->fs_mod->const_color[1], 0.0f, 1.0f) * 255.0f + 0.5f);
-                            uint32_t b8 = static_cast<uint32_t>(std::clamp(cmd.pipeline->fs_mod->const_color[2], 0.0f, 1.0f) * 255.0f + 0.5f);
-                            uint32_t a8 = static_cast<uint32_t>(std::clamp(cmd.pipeline->fs_mod->const_color[3], 0.0f, 1.0f) * 255.0f + 0.5f);
+                            uint32_t r8 = static_cast<uint32_t>(std::clamp(cmd.pipeline->frag_const_color[0], 0.0f, 1.0f) * 255.0f + 0.5f);
+                            uint32_t g8 = static_cast<uint32_t>(std::clamp(cmd.pipeline->frag_const_color[1], 0.0f, 1.0f) * 255.0f + 0.5f);
+                            uint32_t b8 = static_cast<uint32_t>(std::clamp(cmd.pipeline->frag_const_color[2], 0.0f, 1.0f) * 255.0f + 0.5f);
+                            uint32_t a8 = static_cast<uint32_t>(std::clamp(cmd.pipeline->frag_const_color[3], 0.0f, 1.0f) * 255.0f + 0.5f);
                             s_gfx_pkt.frag_const_rgba8 = (a8 << 24) | (b8 << 16) | (g8 << 8) | r8;
                         }
-                        if (cmd.pipeline && cmd.pipeline->fs_mod && !cmd.pipeline->fs_mod->spirv_words.empty()) {
-                            s_gfx_pkt.fs_spirv_ptr   = cmd.pipeline->fs_mod->spirv_words.data();
-                            s_gfx_pkt.fs_spirv_words = static_cast<uint32_t>(cmd.pipeline->fs_mod->spirv_words.size());
+                        if (cmd.pipeline && !cmd.pipeline->fs_spirv_words.empty()) {
+                            s_gfx_pkt.fs_spirv_ptr   = cmd.pipeline->fs_spirv_words.data();
+                            s_gfx_pkt.fs_spirv_words = static_cast<uint32_t>(cmd.pipeline->fs_spirv_words.size());
                         }
-                        if (cmd.pipeline && cmd.pipeline->vs_mod && !cmd.pipeline->vs_mod->spirv_words.empty()) {
-                            s_gfx_pkt.vs_spirv_ptr   = cmd.pipeline->vs_mod->spirv_words.data();
-                            s_gfx_pkt.vs_spirv_words = static_cast<uint32_t>(cmd.pipeline->vs_mod->spirv_words.size());
+                        if (cmd.pipeline && !cmd.pipeline->vs_spirv_words.empty()) {
+                            s_gfx_pkt.vs_spirv_ptr   = cmd.pipeline->vs_spirv_words.data();
+                            s_gfx_pkt.vs_spirv_words = static_cast<uint32_t>(cmd.pipeline->vs_spirv_words.size());
+                        }
+                        if (cmd.pipeline && !cmd.pipeline->vertex_bindings.empty()) {
+                            s_gfx_pkt.vertex_bindings      = cmd.pipeline->vertex_bindings.data();
+                            s_gfx_pkt.vertex_binding_count = static_cast<uint32_t>(cmd.pipeline->vertex_bindings.size());
+                        }
+                        if (cmd.pipeline && !cmd.pipeline->vertex_attrs.empty()) {
+                            s_gfx_pkt.vertex_attrs      = cmd.pipeline->vertex_attrs.data();
+                            s_gfx_pkt.vertex_attr_count = static_cast<uint32_t>(cmd.pipeline->vertex_attrs.size());
                         }
                         uint64_t* srt_ptr = reinterpret_cast<uint64_t*>(dev->srt_bo_va);
                         srt_ptr[0] = reinterpret_cast<uint64_t>(&s_gfx_pkt);
@@ -2452,7 +2497,20 @@ int32_t vkQueueSubmit2(void* queue, uint32_t submitCount, const void* pSubmits, 
 }
 
 __attribute__((visibility("default")))
-void vkCmdPipelineBarrier2(void* /*commandBuffer*/, const void* /*pDependencyInfo*/) {}
+void vkCmdPipelineBarrier2(void* commandBuffer, const void* pDependencyInfo) {
+    if (!commandBuffer) return;
+    auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
+    MaliIcdRecordedCmd cmd{};
+    cmd.type = MaliIcdRecordedCmd::CMD_PIPELINE_BARRIER;
+    if (pDependencyInfo) {
+        const auto* dep = static_cast<const VkDependencyInfo*>(pDependencyInfo);
+        if (dep->memoryBarrierCount > 0 && dep->pMemoryBarriers) {
+            cmd.src_stage_mask = static_cast<uint32_t>(dep->pMemoryBarriers[0].srcStageMask);
+            cmd.dst_stage_mask = static_cast<uint32_t>(dep->pMemoryBarriers[0].dstStageMask);
+        }
+    }
+    cb->cmds.push_back(cmd);
+}
 
 __attribute__((visibility("default")))
 int32_t vkGetSemaphoreCounterValue(void* /*device*/, uint64_t semaphore, uint64_t* pValue) {
@@ -2670,6 +2728,9 @@ PFN_vkVoidFunction vkGetDeviceProcAddr(void* /*device*/, const char* pName) {
     if (std::strcmp(pName, "vkAcquireNextImageKHR") == 0)       return reinterpret_cast<PFN_vkVoidFunction>(&vkAcquireNextImageKHR);
     if (std::strcmp(pName, "vkAcquireNextImage2KHR") == 0)      return reinterpret_cast<PFN_vkVoidFunction>(&vkAcquireNextImage2KHR);
     if (std::strcmp(pName, "vkQueuePresentKHR") == 0)           return reinterpret_cast<PFN_vkVoidFunction>(&vkQueuePresentKHR);
+    if (std::strcmp(pName, "vkGetMemoryFdKHR") == 0)            return reinterpret_cast<PFN_vkVoidFunction>(&vkGetMemoryFdKHR);
+    if (std::strcmp(pName, "vkGetImageDrmFormatModifierPropertiesEXT") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(&vkGetImageDrmFormatModifierPropertiesEXT);
     if (std::strcmp(pName, "vkCmdClearAttachments") == 0)       return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdClearAttachments);
     if (std::strcmp(pName, "vkCmdClearColorImage") == 0)        return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdClearColorImage);
     if (std::strcmp(pName, "vkCmdClearDepthStencilImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&vkCmdClearDepthStencilImage);

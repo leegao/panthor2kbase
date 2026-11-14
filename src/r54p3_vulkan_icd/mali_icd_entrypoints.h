@@ -92,4 +92,6 @@ void vkCmdResetEvent(void* /*commandBuffer*/, uint64_t /*event*/, uint32_t /*sta
 void vkCmdWaitEvents(void* /*commandBuffer*/, uint32_t /*eventCount*/, const uint64_t* /*pEvents*/, uint32_t /*srcStageMask*/, uint32_t /*dstStageMask*/, uint32_t /*memoryBarrierCount*/, const void* /*pMemoryBarriers*/, uint32_t /*bufferMemoryBarrierCount*/, const void* /*pBufferMemoryBarriers*/, uint32_t /*imageMemoryBarrierCount*/, const void* /*pImageMemoryBarriers*/);
 int32_t vkGetPhysicalDeviceSurfaceCapabilities2KHR(void* physicalDevice, const void* pSurfaceInfo, void* pSurfaceCapabilities);
 int32_t vkGetPhysicalDeviceSurfaceFormats2KHR(void* physicalDevice, const void* pSurfaceInfo, uint32_t* pSurfaceFormatCount, void* pSurfaceFormats);
+int32_t vkGetImageDrmFormatModifierPropertiesEXT(void* /*device*/, uint64_t /*image*/, void* pProperties);
+int32_t vkGetMemoryFdKHR(void* /*device*/, const void* pGetFdInfo, int* pFd);
 } // extern "C"

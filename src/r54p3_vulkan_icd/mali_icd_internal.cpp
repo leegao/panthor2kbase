@@ -5,6 +5,10 @@
 // ============================================================================
 #define AOT_SO_PROFILER_IMPLEMENTATION
 #include "mali_icd_internal.h"
+#include <sys/stat.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <unordered_set>
 
 bool mali_icd_log_enabled() {
     static int s_enabled = -1;
@@ -282,10 +286,31 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, reinterpret_cast<VkShaderModule>(vs_mod), "main", nullptr},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, reinterpret_cast<VkShaderModule>(fs_mod), "main", nullptr}
     };
-    VkVertexInputBindingDescription vbind{0, pkt.stride_bytes ? pkt.stride_bytes : 16U, VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription vattr{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0};
-    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, nullptr, 0, 1, &vbind, 1, &vattr};
-    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, nullptr, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FALSE};
+    std::vector<VkVertexInputBindingDescription> vbinds;
+    std::vector<VkVertexInputAttributeDescription> vattrs;
+    if (pkt.vertex_bindings && pkt.vertex_binding_count > 0) {
+        for (uint32_t b = 0; b < pkt.vertex_binding_count; ++b) {
+            vbinds.push_back({pkt.vertex_bindings[b].binding, pkt.vertex_bindings[b].stride,
+                              static_cast<VkVertexInputRate>(pkt.vertex_bindings[b].input_rate)});
+        }
+    } else if (pkt.vertex_bo_va != 0) {
+        vbinds.push_back({0, pkt.stride_bytes ? pkt.stride_bytes : 16U, VK_VERTEX_INPUT_RATE_VERTEX});
+    }
+    if (pkt.vertex_attrs && pkt.vertex_attr_count > 0) {
+        for (uint32_t a = 0; a < pkt.vertex_attr_count; ++a) {
+            vattrs.push_back({pkt.vertex_attrs[a].location, pkt.vertex_attrs[a].binding,
+                              static_cast<VkFormat>(pkt.vertex_attrs[a].format), pkt.vertex_attrs[a].offset});
+        }
+    } else if (pkt.vertex_bo_va != 0) {
+        vattrs.push_back({0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0});
+    }
+    VkPipelineVertexInputStateCreateInfo vi{
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, nullptr, 0,
+        static_cast<uint32_t>(vbinds.size()), vbinds.empty() ? nullptr : vbinds.data(),
+        static_cast<uint32_t>(vattrs.size()), vattrs.empty() ? nullptr : vattrs.data()
+    };
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, nullptr, 0,
+        static_cast<VkPrimitiveTopology>(pkt.topology <= 10U ? pkt.topology : 3U), VK_FALSE};
     VkViewport vp{0.0f, 0.0f, static_cast<float>(W), static_cast<float>(H), 0.0f, 1.0f};
     VkRect2D sc{{0, 0}, {W, H}};
     VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, nullptr, 0, 1, &vp, 1, &sc};
@@ -299,9 +324,92 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
     VkPipelineColorBlendAttachmentState cba{};
     cba.colorWriteMask = 0xFU;
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, nullptr, 0, VK_FALSE, VK_LOGIC_OP_COPY, 1, &cba, {0,0,0,0}};
+    // Build a descriptor set layout matching the SPIR-V bindings used by vs_spv and fs_spv
+    std::unordered_map<uint32_t, uint32_t> binding_types;
+    auto scanSpirvBindings = [&](const std::vector<uint32_t>& spv) {
+        if (spv.size() < 5) return;
+        std::unordered_map<uint32_t, uint32_t> var_binding;
+        std::unordered_map<uint32_t, uint32_t> ptr_sc;
+        std::unordered_map<uint32_t, uint32_t> ptr_pointee;
+        std::unordered_set<uint32_t> buffer_blocks;
+        size_t p = 5;
+        while (p < spv.size()) {
+            uint16_t wc = static_cast<uint16_t>(spv[p] >> 16);
+            uint16_t op = static_cast<uint16_t>(spv[p] & 0xFFFFU);
+            if (wc == 0 || p + wc > spv.size()) break;
+            if (op == 71U /* OpDecorate */ && wc >= 3) {
+                uint32_t target = spv[p + 1], dec = spv[p + 2];
+                if (dec == 33U /* Binding */ && wc >= 4) var_binding[target] = spv[p + 3];
+                else if (dec == 3U /* BufferBlock */) buffer_blocks.insert(target);
+            } else if (op == 32U /* OpTypePointer */ && wc >= 4) {
+                ptr_sc[spv[p + 1]] = spv[p + 2];
+                ptr_pointee[spv[p + 1]] = spv[p + 3];
+            } else if (op == 59U /* OpVariable */ && wc >= 4) {
+                uint32_t pt = spv[p + 1], id = spv[p + 2], sc = spv[p + 3];
+                auto bit = var_binding.find(id);
+                if (bit != var_binding.end()) {
+                    uint32_t dtype = 6U; // UNIFORM_BUFFER
+                    if (sc == 12U /* StorageBuffer */) dtype = 7U;
+                    else if (sc == 0U /* UniformConstant */) dtype = 1U; // COMBINED_IMAGE_SAMPLER
+                    else if (sc == 2U /* Uniform */) {
+                        auto pit = ptr_pointee.find(pt);
+                        if (pit != ptr_pointee.end() && buffer_blocks.count(pit->second)) dtype = 7U;
+                    }
+                    binding_types[bit->second] = dtype;
+                }
+            }
+            p += wc;
+        }
+    };
+    scanSpirvBindings(vs_spv);
+    scanSpirvBindings(fs_spv);
+
+    uint64_t draw_dsl = 0, draw_pl = 0, draw_dp = 0, draw_ds = 0;
+    int32_t plrc = 0;
+    if (!binding_types.empty()) {
+        struct DSLB { uint32_t binding; uint32_t descriptorType; uint32_t descriptorCount; uint32_t stageFlags; const void* pImm; };
+        struct DSLCI { uint32_t sType; const void* pNext; uint32_t flags; uint32_t bindingCount; const void* pBindings; };
+        struct PLCI { uint32_t sType; const void* pNext; uint32_t flags; uint32_t setLayoutCount; const uint64_t* pSetLayouts; uint32_t pcCount; const void* pPc; };
+        struct DPS { uint32_t type; uint32_t count; };
+        struct DPCI { uint32_t sType; const void* pNext; uint32_t flags; uint32_t maxSets; uint32_t poolSizeCount; const void* pPoolSizes; };
+        struct DSAI { uint32_t sType; const void* pNext; uint64_t descriptorPool; uint32_t descriptorSetCount; const uint64_t* pSetLayouts; };
+        struct DBI { uint64_t buffer; uint64_t offset; uint64_t range; };
+        struct DII { uint64_t sampler; uint64_t imageView; uint32_t imageLayout; };
+        struct WDS { uint32_t sType; const void* pNext; uint64_t dstSet; uint32_t dstBinding; uint32_t dstArrayElement; uint32_t descriptorCount; uint32_t descriptorType; const void* pImg; const void* pBuf; const void* pTex; };
+        std::vector<DSLB> dslbs;
+        for (const auto& kv : binding_types) {
+            dslbs.push_back({kv.first, kv.second, 1U, 0x7FFFFFFFU, nullptr});
+        }
+        DSLCI dslci{32, nullptr, 0, static_cast<uint32_t>(dslbs.size()), dslbs.data()};
+        if (reinterpret_cast<HostSpirvExecutor::PFN_vkCreateDescriptorSetLayout>(gipa(inst, "vkCreateDescriptorSetLayout"))(dev, &dslci, nullptr, &draw_dsl) == 0 && draw_dsl) {
+            PLCI plci{30, nullptr, 0, 1, &draw_dsl, 0, nullptr};
+            plrc = reinterpret_cast<HostSpirvExecutor::PFN_vkCreatePipelineLayout>(gipa(inst, "vkCreatePipelineLayout"))(dev, &plci, nullptr, &draw_pl);
+            DPS dps[3] = {{6U, 8U}, {7U, 8U}, {1U, 8U}};
+            DPCI dpci{33, nullptr, 0, 1U, 3U, dps};
+            if (reinterpret_cast<HostSpirvExecutor::PFN_vkCreateDescriptorPool>(gipa(inst, "vkCreateDescriptorPool"))(dev, &dpci, nullptr, &draw_dp) == 0 && draw_dp) {
+                DSAI dsai{34, nullptr, draw_dp, 1U, &draw_dsl};
+                if (reinterpret_cast<HostSpirvExecutor::PFN_vkAllocateDescriptorSets>(gipa(inst, "vkAllocateDescriptorSets"))(dev, &dsai, &draw_ds) == 0 && draw_ds) {
+                    DBI ubo_dbi{exec.ubo_buf, 0, HostSpirvExecutor::kUboCapacityBytes};
+                    DBI ssbo_dbi{exec.buf_in, 0, HostSpirvExecutor::kBufferCapacityBytes};
+                    DII img_dii{exec.dummy_sampler, exec.dummy_img_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                    std::vector<WDS> wds;
+                    for (const auto& kv : binding_types) {
+                        if (kv.second == 6U) wds.push_back({35, nullptr, draw_ds, kv.first, 0, 1, 6U, nullptr, &ubo_dbi, nullptr});
+                        else if (kv.second == 1U && exec.dummy_sampler && exec.dummy_img_view) wds.push_back({35, nullptr, draw_ds, kv.first, 0, 1, 1U, &img_dii, nullptr, nullptr});
+                        else if (kv.second == 7U) wds.push_back({35, nullptr, draw_ds, kv.first, 0, 1, 7U, nullptr, &ssbo_dbi, nullptr});
+                    }
+                    if (!wds.empty()) {
+                        reinterpret_cast<HostSpirvExecutor::PFN_vkUpdateDescriptorSets>(gipa(inst, "vkUpdateDescriptorSets"))(dev, static_cast<uint32_t>(wds.size()), wds.data(), 0, nullptr);
+                    }
+                }
+            }
+        }
+    }
     uint64_t gfx_pl = 0;
-    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 0, nullptr, 0, nullptr};
-    int32_t plrc = reinterpret_cast<HostSpirvExecutor::PFN_vkCreatePipelineLayout>(gipa(inst, "vkCreatePipelineLayout"))(dev, &plci, nullptr, &gfx_pl);
+    if (!draw_pl && !exec.gfx_pipeline_layout) {
+        VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 0, nullptr, 0, nullptr};
+        plrc = reinterpret_cast<HostSpirvExecutor::PFN_vkCreatePipelineLayout>(gipa(inst, "vkCreatePipelineLayout"))(dev, &plci, nullptr, &gfx_pl);
+    }
 
     VkGraphicsPipelineCreateInfo gpci{};
     gpci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -309,18 +417,23 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
     gpci.pVertexInputState = &vi; gpci.pInputAssemblyState = &ia;
     gpci.pViewportState = &vps; gpci.pRasterizationState = &rs;
     gpci.pMultisampleState = &ms; gpci.pColorBlendState = &cb;
-    gpci.layout = reinterpret_cast<VkPipelineLayout>(gfx_pl ? gfx_pl : exec.pipeline_layout);
+    uint64_t active_pl = draw_pl ? draw_pl : (exec.gfx_pipeline_layout ? exec.gfx_pipeline_layout : (gfx_pl ? gfx_pl : exec.pipeline_layout));
+    gpci.layout = reinterpret_cast<VkPipelineLayout>(active_pl);
     gpci.renderPass = reinterpret_cast<VkRenderPass>(rp);
     gpci.basePipelineIndex = -1;
     int32_t gprc = reinterpret_cast<PFN_vkCreateGraphicsPipelines>(gipa(inst, "vkCreateGraphicsPipelines"))(dev, 0, 1, &gpci, nullptr, &pipe);
     if (gprc != 0 || pipe == 0) {
         std::fprintf(stderr, "[HostSpirvExecutor] vkCreateGraphicsPipelines failed rc=%d dev='%s' pipe=%llu rp=%llu(rc=%d) fb=%llu(rc=%d) gfx_pl=%llu(rc=%d) vs=%llu(%zu) fs=%llu(%zu) has_fc=%u\n",
                      gprc, exec.device_name.c_str(), (unsigned long long)pipe, (unsigned long long)rp, rprc, (unsigned long long)fb, fbrc,
-                     (unsigned long long)gfx_pl, plrc, (unsigned long long)vs_mod, vs_spv.size(), (unsigned long long)fs_mod, fs_spv.size(), pkt.has_frag_const);
+                     (unsigned long long)active_pl, plrc, (unsigned long long)vs_mod, vs_spv.size(), (unsigned long long)fs_mod, fs_spv.size(), pkt.has_frag_const);
     }
 
     bool ok = false;
     if (gprc == 0 && pipe != 0) {
+        if (pkt.ubo_va && exec.mapped_ubo) {
+            size_t ubytes = pkt.ubo_range ? std::min<size_t>(pkt.ubo_range, HostSpirvExecutor::kUboCapacityBytes) : HostSpirvExecutor::kUboCapacityBytes;
+            std::memcpy(exec.mapped_ubo, reinterpret_cast<const void*>(pkt.ubo_va), ubytes);
+        }
         size_t vbytes = std::min<size_t>(pkt.vertex_bo_size, HostSpirvExecutor::kBufferCapacityBytes / 2);
         if (pkt.vertex_bo_va && vbytes && exec.mapped_in) {
             std::memcpy(exec.mapped_in, reinterpret_cast<const void*>(pkt.vertex_bo_va), vbytes);
@@ -341,8 +454,15 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
         VkRenderPassBeginInfo rpbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, nullptr, reinterpret_cast<VkRenderPass>(rp), reinterpret_cast<VkFramebuffer>(fb), {{0,0},{W,H}}, 1, &clr};
         reinterpret_cast<PFN_vkCmdBeginRenderPass>(gipa(inst, "vkCmdBeginRenderPass"))(exec.cmd_buf, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
         reinterpret_cast<HostSpirvExecutor::PFN_vkCmdBindPipeline>(gipa(inst, "vkCmdBindPipeline"))(exec.cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-        uint64_t vb_off = 0;
-        reinterpret_cast<PFN_vkCmdBindVertexBuffers>(gipa(inst, "vkCmdBindVertexBuffers"))(exec.cmd_buf, 0, 1, &exec.buf_in, &vb_off);
+        uint64_t bind_ds = draw_ds ? draw_ds : exec.gfx_desc_set;
+        if (bind_ds && active_pl) {
+            reinterpret_cast<HostSpirvExecutor::PFN_vkCmdBindDescriptorSets>(gipa(inst, "vkCmdBindDescriptorSets"))(
+                exec.cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, active_pl, 0, 1, &bind_ds, 0, nullptr);
+        }
+        if (pkt.vertex_bo_va) {
+            uint64_t vb_off = 0;
+            reinterpret_cast<PFN_vkCmdBindVertexBuffers>(gipa(inst, "vkCmdBindVertexBuffers"))(exec.cmd_buf, 0, 1, &exec.buf_in, &vb_off);
+        }
         if (pkt.is_indexed && pkt.index_bo_va) {
             reinterpret_cast<PFN_vkCmdBindIndexBuffer>(gipa(inst, "vkCmdBindIndexBuffer"))(exec.cmd_buf, exec.buf_in, ioff, pkt.index_type);
             reinterpret_cast<PFN_vkCmdDrawIndexed>(gipa(inst, "vkCmdDrawIndexed"))(exec.cmd_buf, pkt.count, pkt.instance_count ? pkt.instance_count : 1U, pkt.first_index, pkt.vertex_offset, 0);
@@ -364,10 +484,23 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
         }
     }
     if (pipe) reinterpret_cast<HostSpirvExecutor::PFN_vkDestroyPipeline>(gipa(inst, "vkDestroyPipeline"))(dev, pipe, nullptr);
-    if (gfx_pl) {
+    if (draw_pl || gfx_pl) {
         typedef void (*PFN_vkDestroyPipelineLayout)(void*, uint64_t, const void*);
         auto destroyPL = reinterpret_cast<PFN_vkDestroyPipelineLayout>(gipa(inst, "vkDestroyPipelineLayout"));
-        if (destroyPL) destroyPL(dev, gfx_pl, nullptr);
+        if (destroyPL) {
+            if (draw_pl) destroyPL(dev, draw_pl, nullptr);
+            if (gfx_pl) destroyPL(dev, gfx_pl, nullptr);
+        }
+    }
+    if (draw_dp) {
+        typedef void (*PFN_vkDestroyDescriptorPool)(void*, uint64_t, const void*);
+        auto destroyDP = reinterpret_cast<PFN_vkDestroyDescriptorPool>(gipa(inst, "vkDestroyDescriptorPool"));
+        if (destroyDP) destroyDP(dev, draw_dp, nullptr);
+    }
+    if (draw_dsl) {
+        typedef void (*PFN_vkDestroyDescriptorSetLayout)(void*, uint64_t, const void*);
+        auto destroyDSL = reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(gipa(inst, "vkDestroyDescriptorSetLayout"));
+        if (destroyDSL) destroyDSL(dev, draw_dsl, nullptr);
     }
     reinterpret_cast<PFN_vkDestroyFramebuffer>(gipa(inst, "vkDestroyFramebuffer"))(dev, fb, nullptr);
     reinterpret_cast<PFN_vkDestroyRenderPass>(gipa(inst, "vkDestroyRenderPass"))(dev, rp, nullptr);
@@ -465,6 +598,54 @@ extern "C" uint64_t bionic_mali_read_stub(uint64_t fd, uint64_t buf_addr, uint64
 extern "C" uint64_t bionic_mali_poll_stub(uint64_t fds_addr, uint64_t nfds, uint64_t timeout) {
     return static_cast<uint64_t>(static_cast<int64_t>(mali_kbase_emu_poll_direct(reinterpret_cast<void*>(fds_addr), static_cast<unsigned long>(nfds), static_cast<int>(timeout))));
 }
+namespace {
+void writeBionicStat64(void* dst_buf, const struct stat& st) {
+    if (!dst_buf) return;
+    uint8_t* p = static_cast<uint8_t*>(dst_buf);
+    std::memset(p, 0, 128); // AArch64 Bionic struct stat layout is 128 bytes
+    auto put64 = [&](size_t off, uint64_t v) { std::memcpy(p + off, &v, 8); };
+    auto put32 = [&](size_t off, uint32_t v) { std::memcpy(p + off, &v, 4); };
+    put64(0x00, static_cast<uint64_t>(st.st_dev));
+    put64(0x08, static_cast<uint64_t>(st.st_ino));
+    put32(0x10, static_cast<uint32_t>(st.st_mode));
+    put32(0x14, static_cast<uint32_t>(st.st_nlink));
+    put32(0x18, static_cast<uint32_t>(st.st_uid));
+    put32(0x1c, static_cast<uint32_t>(st.st_gid));
+    put64(0x20, static_cast<uint64_t>(st.st_rdev));
+    put64(0x30, static_cast<uint64_t>(static_cast<int64_t>(st.st_size)));
+    put32(0x38, static_cast<uint32_t>(static_cast<int32_t>(st.st_blksize)));
+    put64(0x40, static_cast<uint64_t>(static_cast<int64_t>(st.st_blocks)));
+    put64(0x48, static_cast<uint64_t>(static_cast<int64_t>(st.st_atim.tv_sec)));
+    put64(0x50, static_cast<uint64_t>(static_cast<int64_t>(st.st_atim.tv_nsec)));
+    put64(0x58, static_cast<uint64_t>(static_cast<int64_t>(st.st_mtim.tv_sec)));
+    put64(0x60, static_cast<uint64_t>(static_cast<int64_t>(st.st_mtim.tv_nsec)));
+    put64(0x68, static_cast<uint64_t>(static_cast<int64_t>(st.st_ctim.tv_sec)));
+    put64(0x70, static_cast<uint64_t>(static_cast<int64_t>(st.st_ctim.tv_nsec)));
+}
+} // namespace
+extern "C" uint64_t bionic_mali_fstat_stub(uint64_t fd, uint64_t buf_addr) {
+    struct stat st{};
+    int rc = mali_kbase_emu_fstat_direct(static_cast<int>(fd), &st);
+    if (rc == 0 && buf_addr) {
+        writeBionicStat64(reinterpret_cast<void*>(buf_addr), st);
+    }
+    return (rc == 0) ? 0ULL : static_cast<uint64_t>(-1LL);
+}
+extern "C" uint64_t bionic_mali_stat_stub(uint64_t path_addr, uint64_t buf_addr) {
+    struct stat st{};
+    int rc = mali_kbase_emu_stat_direct(reinterpret_cast<const char*>(path_addr), &st);
+    if (rc == 0 && buf_addr) {
+        writeBionicStat64(reinterpret_cast<void*>(buf_addr), st);
+    }
+    return (rc == 0) ? 0ULL : static_cast<uint64_t>(-1LL);
+}
+extern "C" uint64_t bionic_mali_access_stub(uint64_t path_addr, uint64_t mode) {
+    int rc = mali_kbase_emu_access_direct(reinterpret_cast<const char*>(path_addr), static_cast<int>(mode));
+    return (rc == 0) ? 0ULL : static_cast<uint64_t>(-1LL);
+}
+extern "C" int access(const char* pathname, int mode) noexcept {
+    return mali_kbase_emu_access_direct(pathname, mode);
+}
 extern "C" void __mali_stack_chk_fail_diag(AOTCPUState* cpu) {
     std::fprintf(stderr, "[MALI_ICD_ERROR] Bionic __stack_chk_fail! SP=0x%016lx LR=0x%016lx\n",
                  cpu->sp, cpu->x[30]);
@@ -496,6 +677,103 @@ extern "C" void aot_unhandled_plt(AOTCPUState* cpu, uint64_t target_va) {
     }
     if (target_va == IMAGE_BASE + 0x01c9ec50ULL) {
         aot_cmpbe_v2_compile_single_shader(cpu);
+        return;
+    }
+    if (target_va == IMAGE_BASE + 0x01c680b0ULL) {
+        // cmemp_hoard_back_hmem_alloc(x0, x1=hunk*, x2=out_size*)
+        auto* hunk = reinterpret_cast<uint64_t*>(cpu->x[1]);
+        auto* out_sz = reinterpret_cast<uint64_t*>(cpu->x[2]);
+        uint64_t sz = hunk[2];
+        void* p = std::malloc(std::max<size_t>(sz, 16));
+        if (p) {
+            hunk[1] = reinterpret_cast<uint64_t>(p);
+            hunk[3] = reinterpret_cast<uint64_t>(p);
+            if (out_sz) *out_sz = sz;
+            cpu->x[0] = 0;
+        } else {
+            hunk[1] = 0;
+            hunk[2] = 0;
+            hunk[3] = 0;
+            if (out_sz) *out_sz = 0;
+            cpu->x[0] = 2;
+        }
+        return;
+    }
+    if (target_va == IMAGE_BASE + 0x01c68110ULL || target_va == IMAGE_BASE + 0x01c68130ULL) {
+        // cmemp_hoard_back_hmem_commit / query
+        auto* hunk = reinterpret_cast<uint64_t*>(cpu->x[1]);
+        auto* out_sz = reinterpret_cast<uint64_t*>(cpu->x[2]);
+        if (out_sz) *out_sz = hunk[2];
+        cpu->x[0] = 0;
+        return;
+    }
+    if (target_va == IMAGE_BASE + 0x01c68150ULL) {
+        // cmemp_hoard_back_hmem_free
+        auto* hunk = reinterpret_cast<uint64_t*>(cpu->x[1]);
+        std::free(reinterpret_cast<void*>(hunk[3]));
+        cpu->x[0] = 0;
+        return;
+    }
+    if (target_va == IMAGE_BASE + 0x01c68160ULL) {
+        // cmemp_hoard_back_hmem_map
+        auto* hunk = reinterpret_cast<uint64_t*>(cpu->x[1]);
+        auto* out_map = reinterpret_cast<uint64_t*>(cpu->x[2]);
+        if (out_map) {
+            out_map[1] = hunk[1];
+            out_map[2] = 0;
+        }
+        cpu->x[0] = 0;
+        return;
+    }
+    if (target_va == IMAGE_BASE + 0x01c68180ULL ||
+        target_va == IMAGE_BASE + 0x01c68190ULL ||
+        target_va == IMAGE_BASE + 0x01c681a0ULL) {
+        cpu->x[0] = 0;
+        return;
+    }
+    if (target_va == IMAGE_BASE + 0x01c67af0ULL && aot_kbase_mem_alloc) {
+        // cmemp_hoard_back_base_alloc(x0=kctx, x1=hunk*, x2=out_commit_sz*, x3=extent, x4=flags)
+        auto* hunk = reinterpret_cast<uint64_t*>(cpu->x[1]);
+        auto* out_sz = reinterpret_cast<uint64_t*>(cpu->x[2]);
+        uint64_t va_pages = std::max<uint64_t>(1ULL, (hunk[2] + 4095ULL) >> 12);
+        uint64_t commit_pages = out_sz ? ((std::max<uint64_t>(1ULL, *out_sz) + 4095ULL) >> 12) : va_pages;
+        uint64_t flags = cpu->x[4] & 0xFFFF00003FFFFFFFULL;
+        cpu->x[1] = va_pages;
+        cpu->x[2] = commit_pages;
+        cpu->x[3] = 0;
+        cpu->x[4] = flags & ~0x10000ULL;
+        cpu->x[5] = 0;
+        cpu->x[6] = 0;
+        cpu->x[7] = 0;
+        aot_kbase_mem_alloc(cpu);
+        uint64_t raw_va = cpu->x[0];
+        hunk[3] = raw_va;
+        if (raw_va == 0 || raw_va == ~0ULL) {
+            hunk[1] = 0;
+            hunk[2] = 0;
+            if (out_sz) *out_sz = 0;
+            cpu->x[0] = 3;
+        } else {
+            hunk[1] = raw_va & ~0xFFFULL;
+            hunk[2] = va_pages << 12;
+            if (out_sz) *out_sz = commit_pages << 12;
+            cpu->x[0] = 0;
+        }
+        return;
+    }
+    if (target_va == IMAGE_BASE + 0x01c67c20ULL || target_va == IMAGE_BASE + 0x01c67c90ULL) {
+        auto* hunk = reinterpret_cast<uint64_t*>(cpu->x[1]);
+        auto* out_sz = reinterpret_cast<uint64_t*>(cpu->x[2]);
+        if (out_sz) *out_sz = hunk[2];
+        cpu->x[0] = 0;
+        return;
+    }
+    if (target_va == IMAGE_BASE + 0x01ae2980ULL ||
+        target_va == IMAGE_BASE + 0x01ae2220ULL ||
+        target_va == IMAGE_BASE + 0x01c35540ULL ||
+        (target_va >= IMAGE_BASE + 0x01c67ac0ULL && target_va <= IMAGE_BASE + 0x01c67ff0ULL)) {
+        // Indirectly-called internal helpers not yet lifted in r54p3_lifted.o
+        cpu->x[0] = 0;
         return;
     }
     if (g_host_vk_allocators.tryDispatch(cpu, target_va)) {
@@ -544,6 +822,12 @@ extern "C" void aot_host_hle_dispatch(AOTCPUState* cpu, uint64_t target_va) {
 }
 
 MaliAotGlobalRuntime g_aot_rt;
+
+MaliThreadGuestContext& maliGetThreadGuestContext() {
+    thread_local MaliThreadGuestContext tctx;
+    tctx.ensureAllocated(reinterpret_cast<uint64_t>(g_aot_rt.tls_mem));
+    return tctx;
+}
 
 struct MaliBionicPthreadLaunchArg {
     uint64_t guest_fn_va;
@@ -620,10 +904,10 @@ IcdImageMap  g_images;
 // Helper: Allocate a /dev/mali0 BO via AOT aot_kbase_mem_alloc or ioctl
 uint64_t icdAllocKbaseBo(MaliIcdDevice* dev, uint64_t pages, uint64_t flags) {
     int32_t fd = (dev && dev->mali_fd >= 0) ? dev->mali_fd : 100;
-    std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
-    auto& cpu = g_aot_rt.cpu;
     if (aot_kbase_version_check_csf && aot_kbase_mem_alloc && dev && !dev->kctx_mem.empty()) {
-        g_aot_rt.resetGuestStackLocked();
+        auto& tctx = maliGetThreadGuestContext();
+        GuestStackFrameGuard frame(tctx);
+        auto& cpu = tctx.cpu;
         uint64_t* sp_args = reinterpret_cast<uint64_t*>(cpu.sp);
         sp_args[0] = 0;
         sp_args[1] = 0;

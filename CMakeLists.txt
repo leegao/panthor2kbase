@@ -348,8 +348,12 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
    # AOT binaries
    add_executable(test_vulkan_samples_compliance
       src/aot/tests/test_vulkan_samples_compliance.cpp
+      src/r54p3_vulkan_icd/valhall_spirv_lifter.cpp
    )
-   target_include_directories(test_vulkan_samples_compliance PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/include")
+   target_include_directories(test_vulkan_samples_compliance PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd"
+   )
    set_target_properties(test_vulkan_samples_compliance PROPERTIES
       CXX_STANDARD 20
       RUNTIME_OUTPUT_DIRECTORY "${AOT_DIR}"

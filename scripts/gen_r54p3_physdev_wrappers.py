@@ -89,6 +89,65 @@ DEVICE_COMMANDS = [
     "vkCmdDrawIndirect",
     "vkCmdDrawIndexedIndirect",
     "vkCmdDispatch",
+    "vkCreatePipelineCache",
+    "vkDestroyPipelineCache",
+    "vkGetPipelineCacheData",
+    "vkMergePipelineCaches",
+    "vkCreateEvent",
+    "vkDestroyEvent",
+    "vkGetEventStatus",
+    "vkSetEvent",
+    "vkResetEvent",
+    "vkCmdSetEvent",
+    "vkCmdResetEvent",
+    "vkCmdWaitEvents",
+    "vkCmdPipelineBarrier",
+    "vkCmdPipelineBarrier2",
+    "vkCreateFence",
+    "vkDestroyFence",
+    "vkResetFences",
+    "vkGetFenceStatus",
+    "vkWaitForFences",
+    "vkCreateSemaphore",
+    "vkDestroySemaphore",
+    "vkGetSemaphoreCounterValue",
+    "vkSignalSemaphore",
+    "vkWaitSemaphores",
+    "vkCreateCommandPool",
+    "vkDestroyCommandPool",
+    "vkResetCommandPool",
+    "vkCreateDescriptorPool",
+    "vkDestroyDescriptorPool",
+    "vkResetDescriptorPool",
+    "vkCreateDescriptorSetLayout",
+    "vkDestroyDescriptorSetLayout",
+    "vkAllocateDescriptorSets",
+    "vkFreeDescriptorSets",
+    "vkUpdateDescriptorSets",
+    "vkCreatePipelineLayout",
+    "vkDestroyPipelineLayout",
+    "vkCreateShaderModule",
+    "vkDestroyShaderModule",
+    "vkFlushMappedMemoryRanges",
+    "vkInvalidateMappedMemoryRanges",
+    "vkCreateQueryPool",
+    "vkDestroyQueryPool",
+    "vkGetQueryPoolResults",
+    "vkCmdBeginRenderPass",
+    "vkCmdEndRenderPass",
+    "vkCmdNextSubpass",
+    "vkCmdCopyBuffer",
+    "vkCmdCopyImage",
+    "vkCmdBlitImage",
+    "vkCmdCopyBufferToImage",
+    "vkCmdCopyImageToBuffer",
+    "vkCmdFillBuffer",
+    "vkCmdUpdateBuffer",
+    "vkCmdPushConstants",
+    "vkCmdBeginQuery",
+    "vkCmdEndQuery",
+    "vkCmdResetQueryPool",
+    "vkCmdWriteTimestamp",
 ]
 
 
@@ -164,30 +223,36 @@ def emit_physdev_wrappers(cmds: dict[str, tuple[str, list[tuple[str, str]]]]) ->
         if first_type == "VkPhysicalDevice":
             lines.append(f"    auto* pdev = icdGetPhysicalDevice({first_arg});")
             lines.append(f"    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_{name} && pdev) {{")
-            lines.append("        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);")
+            lines.append("        auto& tctx = maliGetThreadGuestContext();")
+            lines.append("        GuestStackFrameGuard frame(tctx);")
+            lines.append("        const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));")
             lines.append("        void* aot_pd = pdev->getAotHandle();")
             aot_first = "aot_pd"
         elif first_type == "VkInstance":
             lines.append(f"    auto* inst = icdGetInstance({first_arg});")
             lines.append(f"    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_{name} && inst) {{")
-            lines.append("        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);")
+            lines.append("        auto& tctx = maliGetThreadGuestContext();")
+            lines.append("        GuestStackFrameGuard frame(tctx);")
+            lines.append("        const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));")
             lines.append("        void* aot_inst = inst->getAotHandle();")
             aot_first = "aot_inst"
         else:
             lines.append(f"    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_{name}) {{")
-            lines.append("        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);")
+            lines.append("        auto& tctx = maliGetThreadGuestContext();")
+            lines.append("        GuestStackFrameGuard frame(tctx);")
+            lines.append("        const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));")
             aot_first = first_arg
 
         call_args = ", ".join([aot_first] + rest_args)
         if ret_type == "void":
             lines.append("        mali_aapcs64::invokeLiftedAapcs64<void>(")
-            lines.append(f"            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_{name},")
+            lines.append(f"            tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_{name},")
             lines.append(f"            {call_args});")
             lines.append("        g_aot_rt.lifted_vk_calls_executed++;")
             lines.append("        return;")
         else:
             lines.append(f"        {ret_type} r = mali_aapcs64::invokeLiftedAapcs64<{ret_type}>(")
-            lines.append(f"            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_{name},")
+            lines.append(f"            tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_{name},")
             lines.append(f"            {call_args});")
             lines.append("        g_aot_rt.lifted_vk_calls_executed++;")
             lines.append("        return r;")
@@ -211,17 +276,19 @@ def emit_physdev_wrappers(cmds: dict[str, tuple[str, list[tuple[str, str]]]]) ->
         lines.append("    g_aot_rt.ensureInitialized();")
         lines.append(f"    auto* pdev = icdGetPhysicalDevice({first_arg});")
         lines.append(f"    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_{name} && pdev) {{")
-        lines.append("        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);")
+        lines.append("        auto& tctx = maliGetThreadGuestContext();")
+        lines.append("        GuestStackFrameGuard frame(tctx);")
+        lines.append("        const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));")
         lines.append("        void* aot_pd = pdev->getAotHandle();")
         if ret_type == "void":
             lines.append("        mali_aapcs64::invokeLiftedAapcs64<void>(")
-            lines.append(f"            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_{name},")
+            lines.append(f"            tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_{name},")
             lines.append(f"            {call_args});")
             lines.append("        g_aot_rt.lifted_vk_calls_executed++;")
             lines.append("        return;")
         else:
             lines.append(f"        {ret_type} r = mali_aapcs64::invokeLiftedAapcs64<{ret_type}>(")
-            lines.append(f"            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_{name},")
+            lines.append(f"            tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_{name},")
             lines.append(f"            {call_args});")
             lines.append("        g_aot_rt.lifted_vk_calls_executed++;")
             lines.append("        return r;")
@@ -248,8 +315,13 @@ def emit_device_wrappers(cmds: dict[str, tuple[str, list[tuple[str, str]]]]) -> 
     for name in DEVICE_COMMANDS:
         ret_type, params = cmds[name]
         sig = ", ".join(f"{t} {a}" for t, a in params)
-        arg_names = ", ".join(a.split("[")[0] for _, a in params)
+        raw_names = [a.split("[")[0] for _, a in params]
+        first_type, first_arg = params[0]
+        if first_type in ("VkPhysicalDevice", "VkInstance", "VkDevice", "VkQueue", "VkCommandBuffer"):
+            raw_names[0] = f"reinterpret_cast<{first_type}>(resolveAotHandle({first_arg}))"
+        arg_names = ", ".join(raw_names)
         lines.append(f"static inline {ret_type} aot_forward_{name}({sig}) {{")
+        lines.append("    g_aot_rt.ensureInitialized();")
         lines.append(f"    if (!aot_{name}) {{")
         if ret_type == "VkResult":
             lines.append("        return VK_ERROR_EXTENSION_NOT_PRESENT;")
@@ -258,15 +330,17 @@ def emit_device_wrappers(cmds: dict[str, tuple[str, list[tuple[str, str]]]]) -> 
         else:
             lines.append(f"        return {ret_type}{{}};")
         lines.append("    }")
-        lines.append("    std::lock_guard<std::mutex> lock(g_aot_rt.mtx);")
+        lines.append("    auto& tctx = maliGetThreadGuestContext();")
+        lines.append("    GuestStackFrameGuard frame(tctx);")
+        lines.append("    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));")
         if ret_type == "void":
             lines.append("    mali_aapcs64::invokeLiftedAapcs64<void>(")
-            lines.append(f"        g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_{name},")
+            lines.append(f"        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_{name},")
             lines.append(f"        {arg_names});")
             lines.append("    g_aot_rt.lifted_vk_calls_executed++;")
         else:
             lines.append(f"    {ret_type} r = mali_aapcs64::invokeLiftedAapcs64<{ret_type}>(")
-            lines.append(f"        g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_{name},")
+            lines.append(f"        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_{name},")
             lines.append(f"        {arg_names});")
             lines.append("    g_aot_rt.lifted_vk_calls_executed++;")
             lines.append("    return r;")

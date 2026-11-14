@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <sys/eventfd.h>
 
 #include "xf86drm.h"
 #include "panthor_drm.h"
@@ -1323,6 +1324,197 @@ vkGetPhysicalDeviceWaylandPresentationSupportKHR(VkPhysicalDevice physicalDevice
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
+vkEnumerateInstanceVersion(uint32_t *pApiVersion)
+{
+   if (!pApiVersion)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   *pApiVersion = VK_MAKE_API_VERSION(0, 1, 3, 296);
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceSparseImageFormatProperties(VkPhysicalDevice physicalDevice,
+                                               VkFormat format,
+                                               VkImageType type,
+                                               VkSampleCountFlagBits samples,
+                                               VkImageUsageFlags usage,
+                                               VkImageTiling tiling,
+                                               uint32_t *pPropertyCount,
+                                               VkSparseImageFormatProperties *pProperties)
+{
+   (void)physicalDevice; (void)format; (void)type; (void)samples;
+   (void)usage; (void)tiling; (void)pProperties;
+   if (pPropertyCount)
+      *pPropertyCount = 0;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceSparseImageFormatProperties2(VkPhysicalDevice physicalDevice,
+                                                const VkPhysicalDeviceSparseImageFormatInfo2 *pFormatInfo,
+                                                uint32_t *pPropertyCount,
+                                                VkSparseImageFormatProperties2 *pProperties)
+{
+   (void)physicalDevice; (void)pFormatInfo; (void)pProperties;
+   if (pPropertyCount)
+      *pPropertyCount = 0;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkBindImageMemory2(VkDevice device, uint32_t bindInfoCount, const VkBindImageMemoryInfo *pBindInfos)
+{
+   for (uint32_t i = 0; i < bindInfoCount; ++i) {
+      VkResult r = vkBindImageMemory(device, pBindInfos[i].image, pBindInfos[i].memory, pBindInfos[i].memoryOffset);
+      if (r != VK_SUCCESS)
+         return r;
+   }
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkBindBufferMemory2(VkDevice device, uint32_t bindInfoCount, const VkBindBufferMemoryInfo *pBindInfos)
+{
+   for (uint32_t i = 0; i < bindInfoCount; ++i) {
+      VkResult r = vkBindBufferMemory(device, pBindInfos[i].buffer, pBindInfos[i].memory, pBindInfos[i].memoryOffset);
+      if (r != VK_SUCCESS)
+         return r;
+   }
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkGetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR *pGetFdInfo, int *pFd)
+{
+   (void)device; (void)pGetFdInfo;
+   if (!pFd) return VK_ERROR_OUT_OF_HOST_MEMORY;
+   int fd = memfd_create("panvk_dmabuf", MFD_CLOEXEC);
+   if (fd < 0) fd = eventfd(0, EFD_CLOEXEC);
+   else if (ftruncate(fd, 4096) != 0) {}
+   *pFd = fd;
+   return (fd >= 0) ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkGetMemoryFdPropertiesKHR(VkDevice device, VkExternalMemoryHandleTypeFlagBits handleType,
+                           int fd, VkMemoryFdPropertiesKHR *pMemoryFdProperties)
+{
+   (void)device; (void)handleType; (void)fd;
+   if (pMemoryFdProperties)
+      pMemoryFdProperties->memoryTypeBits = 0x7U;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkGetImageDrmFormatModifierPropertiesEXT(VkDevice device, VkImage image,
+                                         VkImageDrmFormatModifierPropertiesEXT *pProperties)
+{
+   (void)device; (void)image;
+   if (pProperties)
+      pProperties->drmFormatModifier = 0ULL; /* DRM_FORMAT_MOD_LINEAR */
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkGetFenceFdKHR(VkDevice device, const VkFenceGetFdInfoKHR *pGetFdInfo, int *pFd)
+{
+   (void)device; (void)pGetFdInfo;
+   if (!pFd) return VK_ERROR_OUT_OF_HOST_MEMORY;
+   *pFd = eventfd(1, EFD_CLOEXEC | EFD_NONBLOCK);
+   return (*pFd >= 0) ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkImportFenceFdKHR(VkDevice device, const VkImportFenceFdInfoKHR *pImportFenceFdInfo)
+{
+   (void)device;
+   if (pImportFenceFdInfo && pImportFenceFdInfo->fd >= 0 &&
+       !(pImportFenceFdInfo->flags & VK_FENCE_IMPORT_TEMPORARY_BIT)) {
+      close(pImportFenceFdInfo->fd);
+   }
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkGetSemaphoreFdKHR(VkDevice device, const VkSemaphoreGetFdInfoKHR *pGetFdInfo, int *pFd)
+{
+   (void)device; (void)pGetFdInfo;
+   if (!pFd) return VK_ERROR_OUT_OF_HOST_MEMORY;
+   *pFd = eventfd(1, EFD_CLOEXEC | EFD_NONBLOCK);
+   return (*pFd >= 0) ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkImportSemaphoreFdKHR(VkDevice device, const VkImportSemaphoreFdInfoKHR *pImportSemaphoreFdInfo)
+{
+   (void)device;
+   if (pImportSemaphoreFdInfo && pImportSemaphoreFdInfo->fd >= 0 &&
+       !(pImportSemaphoreFdInfo->flags & VK_SEMAPHORE_IMPORT_TEMPORARY_BIT)) {
+      close(pImportSemaphoreFdInfo->fd);
+   }
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkFlushMappedMemoryRanges(VkDevice device, uint32_t memoryRangeCount, const VkMappedMemoryRange *pMemoryRanges)
+{
+   (void)device; (void)memoryRangeCount; (void)pMemoryRanges;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkInvalidateMappedMemoryRanges(VkDevice device, uint32_t memoryRangeCount, const VkMappedMemoryRange *pMemoryRanges)
+{
+   (void)device; (void)memoryRangeCount; (void)pMemoryRanges;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetDeviceQueue2(VkDevice device, const VkDeviceQueueInfo2 *pQueueInfo, VkQueue *pQueue)
+{
+   if (pQueue && pQueueInfo)
+      vkGetDeviceQueue(device, pQueueInfo->queueFamilyIndex, pQueueInfo->queueIndex, pQueue);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkGetQueryPoolResults(VkDevice device, VkQueryPool queryPool, uint32_t firstQuery,
+                      uint32_t queryCount, size_t dataSize, void *pData,
+                      VkDeviceSize stride, VkQueryResultFlags flags)
+{
+   (void)device; (void)queryPool; (void)firstQuery; (void)queryCount; (void)stride; (void)flags;
+   if (pData && dataSize > 0) memset(pData, 0, dataSize);
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkGetPhysicalDeviceSurfaceCapabilities2KHR(VkPhysicalDevice physicalDevice,
+                                           const VkPhysicalDeviceSurfaceInfo2KHR *pSurfaceInfo,
+                                           VkSurfaceCapabilities2KHR *pSurfaceCapabilities)
+{
+   if (!pSurfaceInfo || !pSurfaceCapabilities) return VK_ERROR_INITIALIZATION_FAILED;
+   return vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, pSurfaceInfo->surface,
+                                                    &pSurfaceCapabilities->surfaceCapabilities);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkGetPhysicalDeviceSurfaceFormats2KHR(VkPhysicalDevice physicalDevice,
+                                      const VkPhysicalDeviceSurfaceInfo2KHR *pSurfaceInfo,
+                                      uint32_t *pSurfaceFormatCount,
+                                      VkSurfaceFormat2KHR *pSurfaceFormats)
+{
+   if (!pSurfaceInfo || !pSurfaceFormatCount) return VK_ERROR_INITIALIZATION_FAILED;
+   if (!pSurfaceFormats) {
+      return vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, pSurfaceInfo->surface, pSurfaceFormatCount, NULL);
+   }
+   VkSurfaceFormatKHR tmp[16];
+   uint32_t cnt = *pSurfaceFormatCount < 16 ? *pSurfaceFormatCount : 16;
+   VkResult r = vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, pSurfaceInfo->surface, &cnt, tmp);
+   for (uint32_t i = 0; i < cnt; ++i) {
+      pSurfaceFormats[i].surfaceFormat = tmp[i];
+   }
+   *pSurfaceFormatCount = cnt;
+   return r;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
 vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *pSupportedVersion)
 {
    if (!pSupportedVersion)
@@ -1350,6 +1542,7 @@ vkGetInstanceProcAddr(VkInstance instance, const char *pName)
       return NULL;
    if (strcmp(pName, "vkGetInstanceProcAddr") == 0) return (PFN_vkVoidFunction)vkGetInstanceProcAddr;
    if (strcmp(pName, "vkGetDeviceProcAddr") == 0) return (PFN_vkVoidFunction)vkGetDeviceProcAddr;
+   if (strcmp(pName, "vkEnumerateInstanceVersion") == 0) return (PFN_vkVoidFunction)vkEnumerateInstanceVersion;
    if (strcmp(pName, "vkEnumerateInstanceExtensionProperties") == 0) return (PFN_vkVoidFunction)vkEnumerateInstanceExtensionProperties;
    if (strcmp(pName, "vkEnumerateDeviceExtensionProperties") == 0) return (PFN_vkVoidFunction)vkEnumerateDeviceExtensionProperties;
    if (strcmp(pName, "vkCreateInstance") == 0) return (PFN_vkVoidFunction)vkCreateInstance;
@@ -1366,6 +1559,18 @@ vkGetInstanceProcAddr(VkInstance instance, const char *pName)
    if (strcmp(pName, "vkUnmapMemory") == 0) return (PFN_vkVoidFunction)vkUnmapMemory;
    if (strcmp(pName, "vkFreeMemory") == 0) return (PFN_vkVoidFunction)vkFreeMemory;
    if (strcmp(pName, "vkGetDeviceQueue") == 0) return (PFN_vkVoidFunction)vkGetDeviceQueue;
+   if (strcmp(pName, "vkGetDeviceQueue2") == 0) return (PFN_vkVoidFunction)vkGetDeviceQueue2;
+   if (strcmp(pName, "vkFlushMappedMemoryRanges") == 0) return (PFN_vkVoidFunction)vkFlushMappedMemoryRanges;
+   if (strcmp(pName, "vkInvalidateMappedMemoryRanges") == 0) return (PFN_vkVoidFunction)vkInvalidateMappedMemoryRanges;
+   if (strcmp(pName, "vkBindImageMemory2") == 0 || strcmp(pName, "vkBindImageMemory2KHR") == 0) return (PFN_vkVoidFunction)vkBindImageMemory2;
+   if (strcmp(pName, "vkBindBufferMemory2") == 0 || strcmp(pName, "vkBindBufferMemory2KHR") == 0) return (PFN_vkVoidFunction)vkBindBufferMemory2;
+   if (strcmp(pName, "vkGetMemoryFdKHR") == 0) return (PFN_vkVoidFunction)vkGetMemoryFdKHR;
+   if (strcmp(pName, "vkGetMemoryFdPropertiesKHR") == 0) return (PFN_vkVoidFunction)vkGetMemoryFdPropertiesKHR;
+   if (strcmp(pName, "vkGetImageDrmFormatModifierPropertiesEXT") == 0) return (PFN_vkVoidFunction)vkGetImageDrmFormatModifierPropertiesEXT;
+   if (strcmp(pName, "vkGetFenceFdKHR") == 0) return (PFN_vkVoidFunction)vkGetFenceFdKHR;
+   if (strcmp(pName, "vkImportFenceFdKHR") == 0) return (PFN_vkVoidFunction)vkImportFenceFdKHR;
+   if (strcmp(pName, "vkGetSemaphoreFdKHR") == 0) return (PFN_vkVoidFunction)vkGetSemaphoreFdKHR;
+   if (strcmp(pName, "vkImportSemaphoreFdKHR") == 0) return (PFN_vkVoidFunction)vkImportSemaphoreFdKHR;
    if (strcmp(pName, "vkQueueSubmit") == 0) return (PFN_vkVoidFunction)vkQueueSubmit;
    if (strcmp(pName, "vkQueueWaitIdle") == 0) return (PFN_vkVoidFunction)vkQueueWaitIdle;
    if (strcmp(pName, "vkDeviceWaitIdle") == 0) return (PFN_vkVoidFunction)vkDeviceWaitIdle;
@@ -1425,6 +1630,11 @@ vkGetInstanceProcAddr(VkInstance instance, const char *pName)
    if (strcmp(pName, "vkGetPhysicalDeviceImageFormatProperties2") == 0 ||
        strcmp(pName, "vkGetPhysicalDeviceImageFormatProperties2KHR") == 0)
       return (PFN_vkVoidFunction)vkGetPhysicalDeviceImageFormatProperties2;
+   if (strcmp(pName, "vkGetPhysicalDeviceSparseImageFormatProperties") == 0)
+      return (PFN_vkVoidFunction)vkGetPhysicalDeviceSparseImageFormatProperties;
+   if (strcmp(pName, "vkGetPhysicalDeviceSparseImageFormatProperties2") == 0 ||
+       strcmp(pName, "vkGetPhysicalDeviceSparseImageFormatProperties2KHR") == 0)
+      return (PFN_vkVoidFunction)vkGetPhysicalDeviceSparseImageFormatProperties2;
    if (strcmp(pName, "vkGetPhysicalDeviceExternalFenceProperties") == 0 ||
        strcmp(pName, "vkGetPhysicalDeviceExternalFencePropertiesKHR") == 0)
       return (PFN_vkVoidFunction)vkGetPhysicalDeviceExternalFenceProperties;
@@ -1458,13 +1668,21 @@ vkGetInstanceProcAddr(VkInstance instance, const char *pName)
    if (strcmp(pName, "vkCreateDescriptorPool") == 0 ||
        strcmp(pName, "vkCreateSampler") == 0 ||
        strcmp(pName, "vkCreatePipelineCache") == 0 ||
-       strcmp(pName, "vkCreateEvent") == 0)
+       strcmp(pName, "vkCreateEvent") == 0 ||
+       strcmp(pName, "vkCreateQueryPool") == 0)
       return (PFN_vkVoidFunction)panvk_create_dummy_obj;
    if (strcmp(pName, "vkDestroyDescriptorPool") == 0 ||
        strcmp(pName, "vkDestroySampler") == 0 ||
        strcmp(pName, "vkDestroyPipelineCache") == 0 ||
-       strcmp(pName, "vkDestroyEvent") == 0)
+       strcmp(pName, "vkDestroyEvent") == 0 ||
+       strcmp(pName, "vkDestroyQueryPool") == 0)
       return (PFN_vkVoidFunction)panvk_destroy_dummy_obj;
+   if (strcmp(pName, "vkGetQueryPoolResults") == 0)
+      return (PFN_vkVoidFunction)vkGetQueryPoolResults;
+   if (strcmp(pName, "vkGetPhysicalDeviceSurfaceCapabilities2KHR") == 0)
+      return (PFN_vkVoidFunction)vkGetPhysicalDeviceSurfaceCapabilities2KHR;
+   if (strcmp(pName, "vkGetPhysicalDeviceSurfaceFormats2KHR") == 0)
+      return (PFN_vkVoidFunction)vkGetPhysicalDeviceSurfaceFormats2KHR;
    if (strcmp(pName, "vkCreateXcbSurfaceKHR") == 0 ||
        strcmp(pName, "vkCreateXlibSurfaceKHR") == 0 ||
        strcmp(pName, "vkCreateWaylandSurfaceKHR") == 0)

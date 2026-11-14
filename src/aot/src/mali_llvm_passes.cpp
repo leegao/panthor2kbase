@@ -3085,6 +3085,9 @@ public:
         emitRaw("declare i64 @bionic_mali_munmap_stub(i64, i64)");
         emitRaw("declare i64 @bionic_mali_read_stub(i64, i64, i64)");
         emitRaw("declare i64 @bionic_mali_poll_stub(i64, i64, i64)");
+        emitRaw("declare i64 @bionic_mali_stat_stub(i64, i64)");
+        emitRaw("declare i64 @bionic_mali_fstat_stub(i64, i64)");
+        emitRaw("declare i64 @bionic_mali_access_stub(i64, i64)");
         emitRaw("declare void @aot_unhandled_plt(ptr, i64)");
         emitRaw("declare void @aot_so_trace_fn_enter(ptr, i64, ptr)");
         emitRaw("declare void @aot_so_trace_fn_exit(ptr, i64, ptr)");
@@ -3931,24 +3934,28 @@ void runBionicToGlibcLibcLoweringPass(LLVMModuleRef M, PassStats &stats) {
                         LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, &x0, 1, "");
                         storeReg64(cpu, 0, res);
                     } else if (sym == "access") {
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
-                        LLVMValueRef w1 = LLVMBuildTrunc(B, loadReg64(cpu, 1), i32Ty, "");
-                        LLVMValueRef fn = getOrCreateFunction(M, "access", i32Ty, {ptrTy, i32Ty});
-                        LLVMTypeRef pTys[2] = {ptrTy, i32Ty};
-                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, pTys, 2, 0);
-                        LLVMValueRef args[2] = {p0, w1};
-                        LLVMValueRef res32 = LLVMBuildCall2(B, fTy, fn, args, 2, "");
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
+                        LLVMValueRef args[2] = {loadReg64(cpu, 0), loadReg64(cpu, 1)};
+                        LLVMValueRef fn = getOrCreateFunction(M, "bionic_mali_access_stub", i64Ty, {i64Ty, i64Ty});
+                        LLVMTypeRef pTys[2] = {i64Ty, i64Ty};
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 2, 0);
+                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, args, 2, "");
+                        storeReg64(cpu, 0, res);
                         stats.kbase_uapi_lowered++;
-                    } else if (sym == "stat") {
-                        LLVMValueRef p0 = LLVMBuildIntToPtr(B, loadReg64(cpu, 0), ptrTy, "");
-                        LLVMValueRef p1 = LLVMBuildIntToPtr(B, loadReg64(cpu, 1), ptrTy, "");
-                        LLVMValueRef fn = getOrCreateFunction(M, "stat", i32Ty, {ptrTy, ptrTy});
-                        LLVMTypeRef pTys[2] = {ptrTy, ptrTy};
-                        LLVMTypeRef fTy = LLVMFunctionType(i32Ty, pTys, 2, 0);
-                        LLVMValueRef args[2] = {p0, p1};
-                        LLVMValueRef res32 = LLVMBuildCall2(B, fTy, fn, args, 2, "");
-                        storeReg64(cpu, 0, LLVMBuildZExt(B, res32, i64Ty, ""));
+                    } else if (sym == "stat" || sym == "stat64" || sym == "lstat" || sym == "lstat64") {
+                        LLVMValueRef args[2] = {loadReg64(cpu, 0), loadReg64(cpu, 1)};
+                        LLVMValueRef fn = getOrCreateFunction(M, "bionic_mali_stat_stub", i64Ty, {i64Ty, i64Ty});
+                        LLVMTypeRef pTys[2] = {i64Ty, i64Ty};
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 2, 0);
+                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, args, 2, "");
+                        storeReg64(cpu, 0, res);
+                        stats.kbase_uapi_lowered++;
+                    } else if (sym == "fstat" || sym == "fstat64") {
+                        LLVMValueRef args[2] = {loadReg64(cpu, 0), loadReg64(cpu, 1)};
+                        LLVMValueRef fn = getOrCreateFunction(M, "bionic_mali_fstat_stub", i64Ty, {i64Ty, i64Ty});
+                        LLVMTypeRef pTys[2] = {i64Ty, i64Ty};
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, pTys, 2, 0);
+                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, args, 2, "");
+                        storeReg64(cpu, 0, res);
                         stats.kbase_uapi_lowered++;
                     } else if (sym == "dup") {
                         LLVMValueRef w0 = LLVMBuildTrunc(B, loadReg64(cpu, 0), i32Ty, "");
