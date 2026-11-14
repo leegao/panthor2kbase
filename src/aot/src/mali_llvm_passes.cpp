@@ -1175,20 +1175,6 @@ private:
             if (faddr == 0) faddr = vk_ent.second;
             if (isExecAddr(faddr)) q.push_back(faddr);
         }
-        // Default to lifting the entire libGLES_mali.so (all discovered functions in func_by_addr)
-        // so C++ vtables, function pointers, and indirect call targets are never missing.
-        // Set MALI_AOT_SEEDED_ONLY=1 or MALI_AOT_FULL_CLOSURE=0 to restrict to seeded closure.
-        const char *env_seeded_only = std::getenv("MALI_AOT_SEEDED_ONLY");
-        const char *env_full_top = std::getenv("MALI_AOT_FULL_CLOSURE");
-        bool lift_entire_so = (!env_seeded_only || std::strcmp(env_seeded_only, "1") != 0) &&
-                              (!env_full_top || std::strcmp(env_full_top, "0") != 0);
-        if (lift_entire_so) {
-            for (const auto &kv : func_by_addr) {
-                if (isExecAddr(kv.first) && !plt_map.count(kv.first)) {
-                    q.push_back(kv.first);
-                }
-            }
-        }
         std::set<uint64_t> visited;
         while (!q.empty()) {
             uint64_t faddr = q.front();

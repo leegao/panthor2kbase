@@ -534,6 +534,20 @@ void aot_forward_vkGetImageSubresourceLayout(VkDevice device, VkImage image, con
     g_aot_rt.lifted_vk_calls_executed++;
 }
 
+void aot_forward_vkGetDeviceImageSubresourceLayoutKHR(VkDevice device, const VkDeviceImageSubresourceInfo* pInfo, VkSubresourceLayout2* pLayout) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkGetDeviceImageSubresourceLayoutKHR) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkGetDeviceImageSubresourceLayoutKHR,
+        reinterpret_cast<VkDevice>(resolveAotHandle(device)), pInfo, pLayout);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
 VkResult aot_forward_vkBindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory, VkDeviceSize memoryOffset) {
     g_aot_rt.ensureInitialized();
     if (!aot_vkBindImageMemory) {

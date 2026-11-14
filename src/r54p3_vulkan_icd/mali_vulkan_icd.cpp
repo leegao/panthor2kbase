@@ -2604,10 +2604,10 @@ __attribute__((visibility("default")))
 void vkGetDeviceImageSubresourceLayoutKHR(void* device, const void* pInfo, void* pLayout) {
     if (!pLayout) return;
     auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
-    if (dev && !dev->aot_vk_device_mem.empty() && aot_vkGetDeviceImageSubresourceLayout && pInfo) {
-        aot_forward_vkGetDeviceImageSubresourceLayout(
+    if (dev && !dev->aot_vk_device_mem.empty() && aot_vkGetDeviceImageSubresourceLayoutKHR && pInfo) {
+        aot_forward_vkGetDeviceImageSubresourceLayoutKHR(
             reinterpret_cast<VkDevice>(dev->aot_vk_device_mem.data()),
-            static_cast<const VkDeviceImageSubresourceLayoutInfo*>(pInfo),
+            static_cast<const VkDeviceImageSubresourceInfo*>(pInfo),
             static_cast<VkSubresourceLayout2*>(pLayout));
         return;
     }

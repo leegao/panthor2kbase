@@ -80,6 +80,7 @@ DEVICE_COMMANDS = [
     "vkDestroyImage",
     "vkGetImageMemoryRequirements",
     "vkGetImageSubresourceLayout",
+    "vkGetDeviceImageSubresourceLayoutKHR",
     "vkBindImageMemory",
     "vkGetDeviceBufferMemoryRequirements",
     "vkGetDeviceImageMemoryRequirements",
