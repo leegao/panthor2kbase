@@ -313,6 +313,8 @@ struct MaliIcdSwapchain {
     std::vector<uint32_t*>     wl_shm_maps;
     std::vector<size_t>        wl_shm_szs;
     std::vector<MaliIcdImage*> images;
+    std::vector<VkImage>       native_images;
+    std::vector<VkDeviceMemory> native_mems;
     std::vector<int>           dmabuf_fds;
     std::vector<bool>          image_acquired;
     std::vector<uint64_t>      image_fences;
@@ -920,55 +922,120 @@ int32_t vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const void* 
     uint32_t img_count = std::max<uint32_t>(2U, sci->minImageCount);
     uint64_t byte_sz = std::max<uint64_t>(4096ULL, (uint64_t(sc->width) * sc->height * 4ULL + 4095ULL) & ~4095ULL);
 
-    // Allocate WSI swapchain images via /dev/dma_heap/system + /dev/mali0 UMM import (aot_kbase_mem_import)
-    int heap_fd = static_cast<int>(bionic_mali_open_stub(reinterpret_cast<uint64_t>("/dev/dma_heap/system"), 2));
-    for (uint32_t i = 0; i < img_count; ++i) {
-        DmaHeapAllocationData dreq{byte_sz, 0, 2, 0};
-        bionic_mali_kbase_ioctl_stub(heap_fd, DMA_HEAP_IOCTL_ALLOC, reinterpret_cast<uint64_t>(&dreq));
-        int dmabuf_fd = static_cast<int>(dreq.fd);
-        sc->dmabuf_fds.push_back(dmabuf_fd);
+    if (dev && dev->native_device) {
+        VkDevice native_dev = reinterpret_cast<VkDevice>(dev->native_device);
+        for (uint32_t i = 0; i < img_count; ++i) {
+            VkImageCreateInfo img_ci{};
+            img_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            img_ci.imageType = VK_IMAGE_TYPE_2D;
+            img_ci.format = static_cast<VkFormat>(sc->format);
+            img_ci.extent = {sc->width, sc->height, 1U};
+            img_ci.mipLevels = 1U;
+            img_ci.arrayLayers = 1U;
+            img_ci.samples = VK_SAMPLE_COUNT_1_BIT;
+            img_ci.tiling = VK_IMAGE_TILING_LINEAR;
+            img_ci.usage = sci->imageUsage ? static_cast<VkImageUsageFlags>(sci->imageUsage)
+                                           : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+            img_ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            img_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-        uint64_t umm_flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR | BASE_MEM_SAME_VA;
-        uint64_t w_gpu_va = 0;
-        if (aot_kbase_mem_import && !dev->kctx_mem.empty()) {
-            auto& tctx = maliGetThreadGuestContext();
-            GuestStackFrameGuard frame(tctx);
-            auto& cpu = tctx.cpu;
-            uint64_t va_pages = 0;
-            // Exact r54p3 base_mem_import_padded (0x01c6a260) AAPCS64 signature:
-            //   x0 = kctx, w1 = type (BASE_MEM_IMPORT_TYPE_UMM = 2), x2 = &dmabuf_fd (phandle),
-            //   x3 = in_flags, w4 = padding (0), x5 = &va_pages -> returns (gpu_va | (out_flags & 0xFFF)) in x0
-            cpu.x[0] = reinterpret_cast<uint64_t>(dev->kctx_mem.data());
-            cpu.x[1] = 2ULL; // BASE_MEM_IMPORT_TYPE_UMM
-            cpu.x[2] = reinterpret_cast<uint64_t>(&dmabuf_fd);
-            cpu.x[3] = umm_flags;
-            cpu.x[4] = 0ULL;
-            cpu.x[5] = reinterpret_cast<uint64_t>(&va_pages);
-            aot_kbase_mem_import(&cpu);
-        }
-        {
-            int32_t mfd = (dev && dev->mali_fd >= 0) ? dev->mali_fd : 100;
-            KbaseIoctlMemImport imp{};
-            imp.in.flags = umm_flags;
-            imp.in.phandle = reinterpret_cast<uint64_t>(&dmabuf_fd);
-            imp.in.type = BASE_MEM_IMPORT_TYPE_UMM;
-            bionic_mali_kbase_ioctl_stub(static_cast<uint64_t>(mfd), 0xc0188016U, reinterpret_cast<uint64_t>(&imp));
-            uint64_t req_pages = std::max<uint64_t>(imp.out.va_pages, (byte_sz + 4095ULL) / 4096ULL);
-            w_gpu_va = bionic_mali_mmap_stub(0, req_pages * 4096ULL, PROT_READ | PROT_WRITE, MAP_SHARED, static_cast<uint64_t>(mfd), imp.out.gpu_va);
-        }
+            VkImage native_img = VK_NULL_HANDLE;
+            VkResult rc = aot_forward_vkCreateImage(native_dev, &img_ci, nullptr, &native_img);
+            if (rc != VK_SUCCESS || !native_img) {
+                mali_icd_log("vkCreateSwapchainKHR(native_aot): aot_forward_vkCreateImage failed rc=%d", static_cast<int>(rc));
+                delete sc;
+                return static_cast<int32_t>(rc ? rc : VK_ERROR_OUT_OF_DEVICE_MEMORY);
+            }
 
-        auto* img = new MaliIcdImage();
-        img->width        = sc->width;
-        img->height       = sc->height;
-        img->format       = sc->format;
-        img->row_pitch    = sc->width * 4U;
-        img->dmabuf_fd    = dmabuf_fd;
-        img->byte_size    = byte_sz;
-        img->bound_gpu_va = w_gpu_va;
-        sc->images.push_back(img);
-        {
-            std::lock_guard<std::mutex> lk(g_icd_mutex);
-            g_images[reinterpret_cast<uint64_t>(img)] = {img->bound_gpu_va, img->width, img->height};
+            VkMemoryRequirements mem_reqs{};
+            aot_forward_vkGetImageMemoryRequirements(native_dev, native_img, &mem_reqs);
+            uint32_t mem_type_idx = mem_reqs.memoryTypeBits ? static_cast<uint32_t>(__builtin_ctz(mem_reqs.memoryTypeBits)) : 0U;
+
+            VkMemoryAllocateInfo alloc_info{};
+            alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            alloc_info.allocationSize = std::max<uint64_t>(mem_reqs.size, byte_sz);
+            alloc_info.memoryTypeIndex = mem_type_idx;
+
+            VkDeviceMemory native_mem = VK_NULL_HANDLE;
+            rc = aot_forward_vkAllocateMemory(native_dev, &alloc_info, nullptr, &native_mem);
+            if (rc != VK_SUCCESS || !native_mem) {
+                aot_forward_vkDestroyImage(native_dev, native_img, nullptr);
+                mali_icd_log("vkCreateSwapchainKHR(native_aot): aot_forward_vkAllocateMemory failed rc=%d", static_cast<int>(rc));
+                delete sc;
+                return static_cast<int32_t>(rc ? rc : VK_ERROR_OUT_OF_DEVICE_MEMORY);
+            }
+
+            rc = aot_forward_vkBindImageMemory(native_dev, native_img, native_mem, 0);
+            void* mapped_ptr = nullptr;
+            if (rc == VK_SUCCESS) {
+                rc = aot_forward_vkMapMemory(native_dev, native_mem, 0, alloc_info.allocationSize, 0, &mapped_ptr);
+            }
+            VkImageSubresource subres{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
+            VkSubresourceLayout layout{};
+            aot_forward_vkGetImageSubresourceLayout(native_dev, native_img, &subres, &layout);
+
+            auto* img = new MaliIcdImage();
+            img->width        = sc->width;
+            img->height       = sc->height;
+            img->format       = sc->format;
+            img->row_pitch    = layout.rowPitch ? static_cast<uint32_t>(layout.rowPitch) : (sc->width * 4U);
+            img->byte_size    = alloc_info.allocationSize;
+            img->bound_gpu_va = mapped_ptr ? (reinterpret_cast<uint64_t>(mapped_ptr) + layout.offset) : 0ULL;
+            sc->images.push_back(img);
+            sc->native_images.push_back(native_img);
+            sc->native_mems.push_back(native_mem);
+        }
+    } else {
+        // Allocate WSI swapchain images via /dev/dma_heap/system + /dev/mali0 UMM import (aot_kbase_mem_import)
+        int heap_fd = static_cast<int>(bionic_mali_open_stub(reinterpret_cast<uint64_t>("/dev/dma_heap/system"), 2));
+        for (uint32_t i = 0; i < img_count; ++i) {
+            DmaHeapAllocationData dreq{byte_sz, 0, 2, 0};
+            bionic_mali_kbase_ioctl_stub(heap_fd, DMA_HEAP_IOCTL_ALLOC, reinterpret_cast<uint64_t>(&dreq));
+            int dmabuf_fd = static_cast<int>(dreq.fd);
+            sc->dmabuf_fds.push_back(dmabuf_fd);
+
+            uint64_t umm_flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR | BASE_MEM_SAME_VA;
+            uint64_t w_gpu_va = 0;
+            if (aot_kbase_mem_import && !dev->kctx_mem.empty()) {
+                auto& tctx = maliGetThreadGuestContext();
+                GuestStackFrameGuard frame(tctx);
+                auto& cpu = tctx.cpu;
+                uint64_t va_pages = 0;
+                // Exact r54p3 base_mem_import_padded (0x01c6a260) AAPCS64 signature:
+                //   x0 = kctx, w1 = type (BASE_MEM_IMPORT_TYPE_UMM = 2), x2 = &dmabuf_fd (phandle),
+                //   x3 = in_flags, w4 = padding (0), x5 = &va_pages -> returns (gpu_va | (out_flags & 0xFFF)) in x0
+                cpu.x[0] = reinterpret_cast<uint64_t>(dev->kctx_mem.data());
+                cpu.x[1] = 2ULL; // BASE_MEM_IMPORT_TYPE_UMM
+                cpu.x[2] = reinterpret_cast<uint64_t>(&dmabuf_fd);
+                cpu.x[3] = umm_flags;
+                cpu.x[4] = 0ULL;
+                cpu.x[5] = reinterpret_cast<uint64_t>(&va_pages);
+                aot_kbase_mem_import(&cpu);
+            }
+            {
+                int32_t mfd = (dev && dev->mali_fd >= 0) ? dev->mali_fd : 100;
+                KbaseIoctlMemImport imp{};
+                imp.in.flags = umm_flags;
+                imp.in.phandle = reinterpret_cast<uint64_t>(&dmabuf_fd);
+                imp.in.type = BASE_MEM_IMPORT_TYPE_UMM;
+                bionic_mali_kbase_ioctl_stub(static_cast<uint64_t>(mfd), 0xc0188016U, reinterpret_cast<uint64_t>(&imp));
+                uint64_t req_pages = std::max<uint64_t>(imp.out.va_pages, (byte_sz + 4095ULL) / 4096ULL);
+                w_gpu_va = bionic_mali_mmap_stub(0, req_pages * 4096ULL, PROT_READ | PROT_WRITE, MAP_SHARED, static_cast<uint64_t>(mfd), imp.out.gpu_va);
+            }
+
+            auto* img = new MaliIcdImage();
+            img->width        = sc->width;
+            img->height       = sc->height;
+            img->format       = sc->format;
+            img->row_pitch    = sc->width * 4U;
+            img->dmabuf_fd    = dmabuf_fd;
+            img->byte_size    = byte_sz;
+            img->bound_gpu_va = w_gpu_va;
+            sc->images.push_back(img);
+            {
+                std::lock_guard<std::mutex> lk(g_icd_mutex);
+                g_images[reinterpret_cast<uint64_t>(img)] = {img->bound_gpu_va, img->width, img->height};
+            }
         }
     }
     sc->image_acquired.assign(sc->images.size(), false);
@@ -1025,6 +1092,16 @@ void vkDestroySwapchainKHR(void* /*device*/, uint64_t swapchain, const void* /*p
     for (int fd : sc->dmabuf_fds) {
         if (fd >= 0) close(fd);
     }
+    if (sc->device && sc->device->native_device && !sc->native_images.empty()) {
+        VkDevice native_dev = reinterpret_cast<VkDevice>(sc->device->native_device);
+        for (size_t i = 0; i < sc->native_images.size(); ++i) {
+            if (sc->native_images[i]) aot_forward_vkDestroyImage(native_dev, sc->native_images[i], nullptr);
+            if (i < sc->native_mems.size() && sc->native_mems[i]) {
+                aot_forward_vkUnmapMemory(native_dev, sc->native_mems[i]);
+                aot_forward_vkFreeMemory(native_dev, sc->native_mems[i], nullptr);
+            }
+        }
+    }
     for (auto* img : sc->images) {
         {
             std::lock_guard<std::mutex> lk(g_icd_mutex);
@@ -1046,7 +1123,9 @@ int32_t vkGetSwapchainImagesKHR(void* /*device*/, uint64_t swapchain, uint32_t* 
     }
     uint32_t n = std::min(*pSwapchainImageCount, total);
     for (uint32_t i = 0; i < n; ++i) {
-        pSwapchainImages[i] = reinterpret_cast<uint64_t>(sc->images[i]);
+        pSwapchainImages[i] = (i < sc->native_images.size() && sc->native_images[i])
+            ? reinterpret_cast<uint64_t>(sc->native_images[i])
+            : reinterpret_cast<uint64_t>(sc->images[i]);
     }
     *pSwapchainImageCount = n;
     return (n < total) ? 5 : 0;
@@ -1064,6 +1143,19 @@ int32_t vkAcquireNextImageKHR(void* device, uint64_t swapchain, uint64_t /*timeo
     sc->next_image_idx = (idx + 1U) % static_cast<uint32_t>(sc->images.size());
     if (idx < sc->image_acquired.size()) sc->image_acquired[idx] = true;
     if (idx < sc->image_fences.size()) sc->image_fences[idx] = fence;
+    if (native_aot && (semaphore || fence) && dev->queue.native_queue) {
+        VkSemaphore sig_sem = reinterpret_cast<VkSemaphore>(semaphore);
+        VkSubmitInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        if (semaphore) {
+            si.signalSemaphoreCount = 1U;
+            si.pSignalSemaphores = &sig_sem;
+        }
+        aot_forward_vkQueueSubmit(reinterpret_cast<VkQueue>(&dev->queue),
+                                  semaphore ? 1U : 0U,
+                                  semaphore ? &si : nullptr,
+                                  reinterpret_cast<VkFence>(fence));
+    }
     if (fence && !native_aot) {
         auto* f = reinterpret_cast<MaliIcdFence*>(fence);
         f->signaled = true;

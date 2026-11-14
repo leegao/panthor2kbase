@@ -2238,9 +2238,126 @@ public:
                     unsigned vr = (insn >> 26) & 1;
                     unsigned opc = (insn >> 22) & 3;
 
+                    // Compare-and-Swap (CAS / CASA / CASL / CASAL): (insn & 0x3FA07C00) == 0x08A07C00
+                    if ((insn & 0x3FA07C00U) == 0x08A07C00U) {
+                        stats.atomic_ops_lifted++;
+                        unsigned cs_sz = (insn >> 30) & 3U;
+                        unsigned rs = (insn >> 16) & 0x1FU;
+                        unsigned L = (insn >> 22) & 1U;
+                        unsigned o0 = (insn >> 15) & 1U;
+                        const char* succ_ord = (L && o0) ? "seq_cst" : (L ? "acquire" : (o0 ? "release" : "monotonic"));
+                        const char* fail_ord = L ? "acquire" : "monotonic";
+                        std::string addr_val = loadGprOrSp(rn, true);
+                        std::string ptr_v = newTmp("cas_ptr");
+                        emit(ptr_v + " = inttoptr i64 " + addr_val + " to ptr");
+                        std::string mty = "i" + std::to_string(8U << cs_sz);
+                        std::string cmp_v = loadGpr(rs, cs_sz == 3);
+                        std::string new_v = loadGpr(rd, cs_sz == 3);
+                        if (cs_sz < 2) {
+                            std::string c_tr = newTmp("cas_ctr"), n_tr = newTmp("cas_ntr");
+                            emit(c_tr + " = trunc i32 " + cmp_v + " to " + mty);
+                            emit(n_tr + " = trunc i32 " + new_v + " to " + mty);
+                            cmp_v = c_tr;
+                            new_v = n_tr;
+                        }
+                        std::string cx = newTmp("cas_res"), old_v = newTmp("cas_old");
+                        emit(cx + " = cmpxchg ptr " + ptr_v + ", " + mty + " " + cmp_v + ", " + mty + " " + new_v + " " + succ_ord + " " + fail_ord + ", align " + std::to_string(1U << cs_sz));
+                        emit(old_v + " = extractvalue { " + mty + ", i1 } " + cx + ", 0");
+                        if (rs != 31U) {
+                            if (cs_sz < 2) {
+                                std::string zx = newTmp("cas_zx");
+                                emit(zx + " = zext " + mty + " " + old_v + " to i32");
+                                old_v = zx;
+                            }
+                            storeGpr(rs, old_v, cs_sz == 3);
+                        }
+                        continue;
+                    }
+
+                    // LSE Atomics (LDADD*, LDCLR*, LDEOR*, LDSET*, LDSMAX*, LDSMIN*, LDUMAX*, LDUMIN*, SWP*)
+                    if (((insn >> 24) & 0x3FU) == 0x38U && ((insn >> 21) & 1U) == 1U && ((insn >> 10) & 3U) == 0U &&
+                        (((insn >> 15) & 1U) == 0U || ((insn >> 12) & 0xFU) == 0x8U)) {
+                        stats.atomic_ops_lifted++;
+                        unsigned rs = (insn >> 16) & 0x1FU;
+                        unsigned lse_op = (insn >> 12) & 0xFU;
+                        std::string addr_val = loadGprOrSp(rn, true);
+                        std::string ptr_v = newTmp("lse_ptr");
+                        emit(ptr_v + " = inttoptr i64 " + addr_val + " to ptr");
+                        std::string mty = "i" + std::to_string(8U << size);
+                        std::string val = loadGpr(rs, size == 3);
+                        if (size < 2) {
+                            std::string tr = newTmp("lse_tr");
+                            emit(tr + " = trunc i32 " + val + " to " + mty);
+                            val = tr;
+                        }
+                        const char* rmw_op = "add";
+                        if (lse_op == 0x8U) rmw_op = "xchg";
+                        else if (lse_op == 0x1U) {
+                            std::string inv = newTmp("lse_inv");
+                            emit(inv + " = xor " + mty + " " + val + ", -1");
+                            val = inv;
+                            rmw_op = "and";
+                        } else if (lse_op == 0x2U) rmw_op = "xor";
+                        else if (lse_op == 0x3U) rmw_op = "or";
+                        else if (lse_op == 0x4U) rmw_op = "max";
+                        else if (lse_op == 0x5U) rmw_op = "min";
+                        else if (lse_op == 0x6U) rmw_op = "umax";
+                        else if (lse_op == 0x7U) rmw_op = "umin";
+                        std::string old_v = newTmp("lse_old");
+                        emit(old_v + " = atomicrmw " + std::string(rmw_op) + " ptr " + ptr_v + ", " + mty + " " + val + " seq_cst, align " + std::to_string(1U << size));
+                        if (size < 2) {
+                            std::string zx = newTmp("lse_zx");
+                            emit(zx + " = zext " + mty + " " + old_v + " to i32");
+                            old_v = zx;
+                        }
+                        storeGpr(rd, old_v, size == 3);
+                        continue;
+                    }
+
+                    // ARMv8.4-RCPC2 LDAPUR / STLUR
+                    if (((insn >> 24) & 0x3FU) == 0x19U && ((insn >> 21) & 1U) == 0U && ((insn >> 10) & 3U) == 0U && vr == 0) {
+                        stats.atomic_ops_lifted++;
+                        int64_t imm9 = sext64((insn >> 12) & 0x1FFU, 9);
+                        std::string base_val = loadGprOrSp(rn, true);
+                        std::string addr_val = newTmp("rcpc_a");
+                        emit(addr_val + " = add i64 " + base_val + ", " + std::to_string(imm9));
+                        std::string ptr_v = newTmp("rcpc_p");
+                        emit(ptr_v + " = inttoptr i64 " + addr_val + " to ptr");
+                        std::string mty = "i" + std::to_string(8U << size);
+                        if (opc == 0) {
+                            std::string val = loadGpr(rd, size == 3);
+                            if (size < 2) {
+                                std::string tr = newTmp("stlur_tr");
+                                emit(tr + " = trunc i32 " + val + " to " + mty);
+                                val = tr;
+                            }
+                            emit("store atomic " + mty + " " + val + ", ptr " + ptr_v + " release, align " + std::to_string(1U << size));
+                        } else if (opc == 1) {
+                            std::string lv = newTmp("ldapur");
+                            emit(lv + " = load atomic " + mty + ", ptr " + ptr_v + " acquire, align " + std::to_string(1U << size));
+                            if (size < 2) {
+                                std::string zx = newTmp("ldapur_zx");
+                                emit(zx + " = zext " + mty + " " + lv + " to i32");
+                                lv = zx;
+                            }
+                            storeGpr(rd, lv, size == 3);
+                        } else if (opc == 2 && size < 3) {
+                            std::string lv = newTmp("ldapurs"), sx = newTmp("ldapurs_sx");
+                            emit(lv + " = load atomic " + mty + ", ptr " + ptr_v + " acquire, align " + std::to_string(1U << size));
+                            emit(sx + " = sext " + mty + " " + lv + " to i64");
+                            storeGpr(rd, sx, true);
+                        } else if (opc == 3 && size < 2) {
+                            std::string lv = newTmp("ldapursw"), sx = newTmp("ldapursw_sx");
+                            emit(lv + " = load atomic " + mty + ", ptr " + ptr_v + " acquire, align " + std::to_string(1U << size));
+                            emit(sx + " = sext " + mty + " " + lv + " to i32");
+                            storeGpr(rd, sx, false);
+                        }
+                        continue;
+                    }
+
                     // Load-Acquire / Store-Release / Exclusive (LDAR, LDARB, LDARH, LDAXR, STLR, STLRB, STLRH, STLXR)
                     // and ARMv8.3-RCPC LDAPR / LDAPRB / LDAPRH ((insn & 0x3FFFFC00) == 0x38BFC000).
-                    if (((insn >> 24) & 0x3FU) == 0x08U || (insn & 0x3FFFFC00U) == 0x38BFC000U) {
+                    if ((((insn >> 24) & 0x3FU) == 0x08U && ((insn >> 21) & 1U) == 0U) || (insn & 0x3FFFFC00U) == 0x38BFC000U) {
                         stats.atomic_ops_lifted++;
                         bool is_ldapr = (insn & 0x3FFFFC00U) == 0x38BFC000U;
                         unsigned L = is_ldapr ? 1U : ((insn >> 22) & 1);
@@ -2435,22 +2552,77 @@ public:
 
                     if (((insn >> 23) & 0x1F) == 0x18 || ((insn >> 23) & 0x1F) == 0x19) {
                         stats.simd_ops_lifted++;
+                        unsigned post_idx = (insn >> 23) & 1U;
+                        unsigned L = (insn >> 22) & 1U;
+                        unsigned Q = (insn >> 30) & 1U;
+                        unsigned ld_op = (insn >> 12) & 0xFU;
+                        unsigned esz_log = (insn >> 10) & 3U;
+                        unsigned esz = 1U << esz_log;
+                        unsigned reg_bytes = Q ? 16U : 8U;
+                        unsigned nregs = 1U;
+                        bool is_struct = true;
+                        if (ld_op == 0x0U) { nregs = 4; is_struct = true; }
+                        else if (ld_op == 0x2U) { nregs = 4; is_struct = false; }
+                        else if (ld_op == 0x4U) { nregs = 3; is_struct = true; }
+                        else if (ld_op == 0x6U) { nregs = 3; is_struct = false; }
+                        else if (ld_op == 0x7U) { nregs = 1; is_struct = false; }
+                        else if (ld_op == 0x8U) { nregs = 2; is_struct = true; }
+                        else if (ld_op == 0xAU) { nregs = 2; is_struct = false; }
                         std::string addr_val = loadGprOrSp(rn, true);
-                        for (unsigned r_idx = 0; r_idx < 4; ++r_idx) {
-                            emit("store i128 0, ptr %reg_v" + std::to_string((rd + r_idx) & 31) + ", align 16");
-                        }
-                        for (unsigned lane = 0; lane < 4; ++lane) {
-                            for (unsigned r_idx = 0; r_idx < 4; ++r_idx) {
-                                unsigned vreg = (rd + r_idx) & 31;
-                                unsigned m_off = (lane * 4 + r_idx) * 4;
-                                std::string ma = newTmp("ld4_a"), mp = newTmp("ld4_p"), mv = newTmp("ld4_v");
-                                std::string cv = loadVec(vreg, "<4 x i32>"), nv = newTmp("ld4_nv");
-                                emit(ma + " = add i64 " + addr_val + ", " + std::to_string(m_off));
+                        if (!is_struct) {
+                            std::string rty = Q ? "i128" : "i64";
+                            for (unsigned r_idx = 0; r_idx < nregs; ++r_idx) {
+                                unsigned vreg = (rd + r_idx) & 31U;
+                                std::string ma = newTmp("ld1_a"), mp = newTmp("ld1_p");
+                                emit(ma + " = add i64 " + addr_val + ", " + std::to_string(r_idx * reg_bytes));
                                 emit(mp + " = inttoptr i64 " + ma + " to ptr");
-                                emit(mv + " = load i32, ptr " + mp + ", align 1");
-                                emit(nv + " = insertelement <4 x i32> " + cv + ", i32 " + mv + ", i32 " + std::to_string(lane));
-                                storeVec(vreg, "<4 x i32>", nv, false);
+                                if (L) {
+                                    std::string mv = newTmp("ld1_v");
+                                    emit(mv + " = load " + rty + ", ptr " + mp + ", align 1");
+                                    storeVec(vreg, rty, mv, Q == 0);
+                                } else {
+                                    std::string vv = loadVec(vreg, rty);
+                                    emit("store " + rty + " " + vv + ", ptr " + mp + ", align 1");
+                                }
                             }
+                        } else {
+                            unsigned lanes = reg_bytes / esz;
+                            std::string ety = "i" + std::to_string(esz * 8U);
+                            std::string vty = "<" + std::to_string(lanes) + " x " + ety + ">";
+                            if (L) {
+                                for (unsigned r_idx = 0; r_idx < nregs; ++r_idx) {
+                                    emit("store i128 0, ptr %reg_v" + std::to_string((rd + r_idx) & 31U) + ", align 16");
+                                }
+                            }
+                            for (unsigned lane = 0; lane < lanes; ++lane) {
+                                for (unsigned r_idx = 0; r_idx < nregs; ++r_idx) {
+                                    unsigned vreg = (rd + r_idx) & 31U;
+                                    unsigned m_off = (lane * nregs + r_idx) * esz;
+                                    std::string ma = newTmp("ldn_a"), mp = newTmp("ldn_p");
+                                    emit(ma + " = add i64 " + addr_val + ", " + std::to_string(m_off));
+                                    emit(mp + " = inttoptr i64 " + ma + " to ptr");
+                                    if (L) {
+                                        std::string mv = newTmp("ldn_v"), cv = loadVec(vreg, vty), nv = newTmp("ldn_nv");
+                                        emit(mv + " = load " + ety + ", ptr " + mp + ", align 1");
+                                        emit(nv + " = insertelement " + vty + " " + cv + ", " + ety + " " + mv + ", i32 " + std::to_string(lane));
+                                        storeVec(vreg, vty, nv, Q == 0);
+                                    } else {
+                                        std::string cv = loadVec(vreg, vty), ev = newTmp("stn_e");
+                                        emit(ev + " = extractelement " + vty + " " + cv + ", i32 " + std::to_string(lane));
+                                        emit("store " + ety + " " + ev + ", ptr " + mp + ", align 1");
+                                    }
+                                }
+                            }
+                        }
+                        if (post_idx) {
+                            std::string wb = newTmp("ldst_wb");
+                            if (rm == 31U) {
+                                emit(wb + " = add i64 " + addr_val + ", " + std::to_string(nregs * reg_bytes));
+                            } else {
+                                std::string off_v = loadGpr(rm, true);
+                                emit(wb + " = add i64 " + addr_val + ", " + off_v);
+                            }
+                            storeGprOrSp(rn, wb, true);
                         }
                         continue;
                     }
@@ -2673,10 +2845,16 @@ public:
                             emit(fv + " = " + (opcode == 2 ? "sitofp " : "uitofp ") + ty + " " + iv + " to " + f_ty);
                             emit(bv + " = bitcast " + f_ty + " " + fv + " to " + f_int_ty);
                             storeVec(rd, f_int_ty, bv);
-                        } else if (rmode == 3 && (opcode == 0 || opcode == 1)) {
-                            // FCVTZS (opcode==0) / FCVTZU (opcode==1)
+                        } else if (opcode == 0 || opcode == 1) {
+                            // FCVT{N,P,M,Z}{S,U}
                             std::string bv = loadVec(rn, f_int_ty), fv = newTmp("fcvt_f"), iv = newTmp("fcvt_i");
                             emit(fv + " = bitcast " + f_int_ty + " " + bv + " to " + f_ty);
+                            if (rmode != 3) {
+                                const char* rfn = (rmode == 0) ? "roundeven" : ((rmode == 1) ? "ceil" : "floor");
+                                std::string rf = newTmp("fcvt_r");
+                                emit(rf + " = call " + f_ty + " @llvm." + std::string(rfn) + "." + (fp64 ? "f64" : "f32") + "(" + f_ty + " " + fv + ")");
+                                fv = rf;
+                            }
                             emit(iv + " = " + (opcode == 0 ? "fptosi " : "fptoui ") + f_ty + " " + fv + " to " + ty);
                             storeGpr(rd, iv, is64);
                         }
@@ -2708,6 +2886,13 @@ public:
                                 emit(r_f + " = fneg " + f_ty + " " + vn_f);
                                 emit(r_i + " = bitcast " + f_ty + " " + r_f + " to " + f_int_ty);
                                 storeVec(rd, f_int_ty, r_i);
+                            } else if (opc1 == 3) {
+                                // FSQRT
+                                std::string vn_f = newTmp("fsqrt_in"), r_f = newTmp("fsqrt_r"), r_i = newTmp("fsqrt_i");
+                                emit(vn_f + " = bitcast " + f_int_ty + " " + vn_i + " to " + f_ty);
+                                emit(r_f + " = call " + f_ty + " @llvm.sqrt." + (fp64 ? "f64" : "f32") + "(" + f_ty + " " + vn_f + ")");
+                                emit(r_i + " = bitcast " + f_ty + " " + r_f + " to " + f_int_ty);
+                                storeVec(rd, f_int_ty, r_i);
                             } else if (opc1 == 4 || opc1 == 5) {
                                 // FCVT single <-> double
                                 std::string vn_f = newTmp("fcvt_in"), r_f = newTmp("fcvt_out"), r_i = newTmp("fcvt_bi");
@@ -2723,6 +2908,20 @@ public:
                                 } else {
                                     storeVec(rd, f_int_ty, vn_i);
                                 }
+                            } else if (opc1 >= 8 && opc1 <= 15) {
+                                // FRINTN(8), FRINTP(9), FRINTM(10), FRINTZ(11), FRINTA(12), FRINTX(14), FRINTI(15)
+                                const char* rfn = "nearbyint";
+                                if (opc1 == 8) rfn = "roundeven";
+                                else if (opc1 == 9) rfn = "ceil";
+                                else if (opc1 == 10) rfn = "floor";
+                                else if (opc1 == 11) rfn = "trunc";
+                                else if (opc1 == 12) rfn = "round";
+                                else if (opc1 == 14) rfn = "rint";
+                                std::string vn_f = newTmp("frint_in"), r_f = newTmp("frint_r"), r_i = newTmp("frint_i");
+                                emit(vn_f + " = bitcast " + f_int_ty + " " + vn_i + " to " + f_ty);
+                                emit(r_f + " = call " + f_ty + " @llvm." + std::string(rfn) + "." + (fp64 ? "f64" : "f32") + "(" + f_ty + " " + vn_f + ")");
+                                emit(r_i + " = bitcast " + f_ty + " " + r_f + " to " + f_int_ty);
+                                storeVec(rd, f_int_ty, r_i);
                             } else {
                                 storeVec(rd, f_int_ty, vn_i);
                             }
@@ -2747,6 +2946,34 @@ public:
                             emit("store i1 " + feq + ", ptr %flag_z, align 1");
                             emit("store i1 " + fc_val + ", ptr %flag_c, align 1");
                             emit("store i1 " + funo + ", ptr %flag_v, align 1");
+                            continue;
+                        }
+                        if ((low6 & 0x3U) == 0x1U) {
+                            // FCCMP / FCCMPE
+                            unsigned cond = (insn >> 12) & 0xFU;
+                            unsigned nzcv = insn & 0xFU;
+                            std::string c_ok = evalCond(cond);
+                            std::string vn_i = loadVec(rn, f_int_ty), vm_i = loadVec(rm, f_int_ty);
+                            std::string vn_f = newTmp("fcc_a"), vm_f = newTmp("fcc_b");
+                            emit(vn_f + " = bitcast " + f_int_ty + " " + vn_i + " to " + f_ty);
+                            emit(vm_f + " = bitcast " + f_int_ty + " " + vm_i + " to " + f_ty);
+                            std::string flt = newTmp("fcc_lt"), feq = newTmp("fcc_eq"), fgt = newTmp("fcc_gt"), funo = newTmp("fcc_un");
+                            std::string fc_t = newTmp("fcc_ct"), fc_val = newTmp("fcc_c");
+                            emit(flt + " = fcmp olt " + f_ty + " " + vn_f + ", " + vm_f);
+                            emit(feq + " = fcmp oeq " + f_ty + " " + vn_f + ", " + vm_f);
+                            emit(fgt + " = fcmp ogt " + f_ty + " " + vn_f + ", " + vm_f);
+                            emit(funo + " = fcmp uno " + f_ty + " " + vn_f + ", " + vm_f);
+                            emit(fc_t + " = or i1 " + feq + ", " + fgt);
+                            emit(fc_val + " = or i1 " + fc_t + ", " + funo);
+                            std::string sn = newTmp("fcc_sn"), sz_f = newTmp("fcc_sz"), sc = newTmp("fcc_sc"), sv = newTmp("fcc_sv");
+                            emit(sn + " = select i1 " + c_ok + ", i1 " + flt + ", i1 " + ((nzcv & 8) ? "true" : "false"));
+                            emit(sz_f + " = select i1 " + c_ok + ", i1 " + feq + ", i1 " + ((nzcv & 4) ? "true" : "false"));
+                            emit(sc + " = select i1 " + c_ok + ", i1 " + fc_val + ", i1 " + ((nzcv & 2) ? "true" : "false"));
+                            emit(sv + " = select i1 " + c_ok + ", i1 " + funo + ", i1 " + ((nzcv & 1) ? "true" : "false"));
+                            emit("store i1 " + sn + ", ptr %flag_n, align 1");
+                            emit("store i1 " + sz_f + ", ptr %flag_z, align 1");
+                            emit("store i1 " + sc + ", ptr %flag_c, align 1");
+                            emit("store i1 " + sv + ", ptr %flag_v, align 1");
                             continue;
                         }
                         if ((low6 & 0x7U) == 0x4U) {
@@ -3088,21 +3315,47 @@ public:
                         }
                     }
 
-                    // AdvSIMD vector logical (AND, BIC, ORR, EOR)
+                    // AdvSIMD vector logical (AND, BIC, ORR, ORN, EOR, BSL, BIT, BIF)
                     if (((insn >> 24) & 0x1F) == 0x0E && ((insn >> 21) & 1) == 1 && ((insn >> 10) & 0x3F) == 0x07) {
-                        std::string n = loadVec(rn, "i128"), m = loadVec(rm, "i128"), res = newTmp("vlog");
-                        if (U == 0 && sz == 1) {
+                        std::string lty = Q ? "i128" : "i64";
+                        std::string n = loadVec(rn, lty), m = loadVec(rm, lty), res = newTmp("vlog");
+                        if (U == 0 && sz == 0) {
+                            emit(res + " = and " + lty + " " + n + ", " + m);
+                        } else if (U == 0 && sz == 1) {
                             std::string nm = newTmp("vnot");
-                            emit(nm + " = xor i128 " + m + ", -1");
-                            emit(res + " = and i128 " + n + ", " + nm);
+                            emit(nm + " = xor " + lty + " " + m + ", -1");
+                            emit(res + " = and " + lty + " " + n + ", " + nm);
                         } else if (U == 0 && sz == 2) {
-                            emit(res + " = or i128 " + n + ", " + m);
-                        } else if (U == 0 && sz == 0) {
-                            emit(res + " = and i128 " + n + ", " + m);
+                            emit(res + " = or " + lty + " " + n + ", " + m);
+                        } else if (U == 0 && sz == 3) {
+                            std::string nm = newTmp("vorn");
+                            emit(nm + " = xor " + lty + " " + m + ", -1");
+                            emit(res + " = or " + lty + " " + n + ", " + nm);
+                        } else if (U == 1 && sz == 0) {
+                            emit(res + " = xor " + lty + " " + n + ", " + m);
+                        } else if (U == 1 && sz == 1) {
+                            // BSL Vd, Vn, Vm: (Vn & Vd) | (Vm & ~Vd)
+                            std::string d = loadVec(rd, lty), nd = newTmp("bsl_nd"), t1 = newTmp("bsl_1"), t2 = newTmp("bsl_2");
+                            emit(nd + " = xor " + lty + " " + d + ", -1");
+                            emit(t1 + " = and " + lty + " " + n + ", " + d);
+                            emit(t2 + " = and " + lty + " " + m + ", " + nd);
+                            emit(res + " = or " + lty + " " + t1 + ", " + t2);
+                        } else if (U == 1 && sz == 2) {
+                            // BIT Vd, Vn, Vm: (Vn & Vm) | (Vd & ~Vm)
+                            std::string d = loadVec(rd, lty), nm = newTmp("bit_nm"), t1 = newTmp("bit_1"), t2 = newTmp("bit_2");
+                            emit(nm + " = xor " + lty + " " + m + ", -1");
+                            emit(t1 + " = and " + lty + " " + n + ", " + m);
+                            emit(t2 + " = and " + lty + " " + d + ", " + nm);
+                            emit(res + " = or " + lty + " " + t1 + ", " + t2);
                         } else {
-                            emit(res + " = xor i128 " + n + ", " + m);
+                            // BIF Vd, Vn, Vm: (Vn & ~Vm) | (Vd & Vm)
+                            std::string d = loadVec(rd, lty), nm = newTmp("bif_nm"), t1 = newTmp("bif_1"), t2 = newTmp("bif_2");
+                            emit(nm + " = xor " + lty + " " + m + ", -1");
+                            emit(t1 + " = and " + lty + " " + n + ", " + nm);
+                            emit(t2 + " = and " + lty + " " + d + ", " + m);
+                            emit(res + " = or " + lty + " " + t1 + ", " + t2);
                         }
-                        storeVec(rd, "i128", res, false);
+                        storeVec(rd, lty, res, Q == 0);
                         continue;
                     }
 
@@ -3190,8 +3443,8 @@ public:
                         continue;
                     }
 
-                    // AdvSIMD USHLL
-                    if (((insn >> 23) & 0x3F) == 0x1E && ((insn >> 10) & 1) == 1) {
+                    // AdvSIMD SSHLL (U=0) / USHLL (U=1)
+                    if (((insn >> 23) & 0x3F) == 0x1E && ((insn >> 10) & 0x3F) == 0x29 && ((insn >> 19) & 0xFU) != 0) {
                         unsigned immh = (insn >> 19) & 0xF;
                         unsigned immb = (insn >> 16) & 7;
                         unsigned l = 31 - __builtin_clz(immh);
@@ -3208,7 +3461,7 @@ public:
                             m_ss << "i32 " << (i + (Q ? lanes : 0));
                         }
                         emit(shuf + " = shufflevector " + src_ty + " " + src_v + ", " + src_ty + " poison, <" + std::to_string(lanes) + " x i32> <" + m_ss.str() + ">");
-                        emit(zx + " = zext " + half_ty + " " + shuf + " to " + dst_ty);
+                        emit(zx + " = " + (U ? "zext " : "sext ") + half_ty + " " + shuf + " to " + dst_ty);
                         if (sh > 0) {
                             std::string sh_v = newTmp("ushll_sh");
                             std::ostringstream sp_ss;
@@ -3298,11 +3551,98 @@ public:
                             } else {
                                 storeVec(rd, vty, neg_v, Q == 0);
                             }
+                        } else if (opcode == 0x00 && U == 0 && esz < 8) {
+                            // REV64
+                            unsigned per64 = 8U / esz;
+                            std::string vin = loadVec(rn, vty), res = newTmp("vrev64");
+                            std::ostringstream idx_ss;
+                            for (unsigned i = 0; i < lanes; ++i) {
+                                if (i > 0) idx_ss << ", ";
+                                unsigned base = (i / per64) * per64;
+                                unsigned rev_i = base + (per64 - 1 - (i % per64));
+                                idx_ss << "i32 " << rev_i;
+                            }
+                            emit(res + " = shufflevector " + vty + " " + vin + ", " + vty + " poison, <" + std::to_string(lanes) + " x i32> <" + idx_ss.str() + ">");
+                            storeVec(rd, vty, res, Q == 0);
+                        } else if (opcode == 0x01 && U == 0 && esz == 1) {
+                            // REV16 (16-bit byte swap in i8 lanes)
+                            std::string vin = loadVec(rn, vty), res = newTmp("vrev16");
+                            std::ostringstream idx_ss;
+                            for (unsigned i = 0; i < lanes; ++i) {
+                                if (i > 0) idx_ss << ", ";
+                                idx_ss << "i32 " << (i ^ 1U);
+                            }
+                            emit(res + " = shufflevector " + vty + " " + vin + ", " + vty + " poison, <" + std::to_string(lanes) + " x i32> <" + idx_ss.str() + ">");
+                            storeVec(rd, vty, res, Q == 0);
+                        } else if (opcode == 0x12 && U == 0 && sz < 3) {
+                            // XTN / XTN2
+                            unsigned nlanes = 8U / esz;
+                            std::string src_ty = "<" + std::to_string(nlanes) + " x i" + std::to_string(esz * 16U) + ">";
+                            std::string half_ty = "<" + std::to_string(nlanes) + " x i" + std::to_string(esz * 8U) + ">";
+                            std::string full_ty = "<" + std::to_string(nlanes * 2) + " x i" + std::to_string(esz * 8U) + ">";
+                            std::string vin = loadVec(rn, src_ty), tr = newTmp("vxtn");
+                            emit(tr + " = trunc " + src_ty + " " + vin + " to " + half_ty);
+                            if (Q == 0) {
+                                storeVec(rd, half_ty, tr, true);
+                            } else {
+                                std::string lo_v = loadVec(rd, half_ty);
+                                std::string res = newTmp("vxtn2");
+                                std::ostringstream idx_ss;
+                                for (unsigned i = 0; i < nlanes * 2; ++i) {
+                                    if (i > 0) idx_ss << ", ";
+                                    idx_ss << "i32 " << i;
+                                }
+                                emit(res + " = shufflevector " + half_ty + " " + lo_v + ", " + half_ty + " " + tr + ", <" + std::to_string(nlanes * 2) + " x i32> <" + idx_ss.str() + ">");
+                                storeVec(rd, full_ty, res, false);
+                            }
+                        } else if (opcode == 0x14 && sz < 3) {
+                            // SQXTN (U=0) / UQXTN (U=1)
+                            unsigned nlanes = 8U / esz;
+                            std::string src_sty = "i" + std::to_string(esz * 16U);
+                            std::string dst_sty = "i" + std::to_string(esz * 8U);
+                            std::string src_ty = "<" + std::to_string(nlanes) + " x " + src_sty + ">";
+                            std::string half_ty = "<" + std::to_string(nlanes) + " x " + dst_sty + ">";
+                            std::string full_ty = "<" + std::to_string(nlanes * 2) + " x " + dst_sty + ">";
+                            std::string vin = loadVec(rn, src_ty);
+                            int64_t lo_b = U ? 0 : -(1LL << (esz * 8U - 1U));
+                            int64_t hi_b = U ? ((1LL << (esz * 8U)) - 1LL) : ((1LL << (esz * 8U - 1U)) - 1LL);
+                            std::ostringstream lo_ss, hi_ss;
+                            lo_ss << "<"; hi_ss << "<";
+                            for (unsigned i = 0; i < nlanes; ++i) {
+                                if (i > 0) { lo_ss << ", "; hi_ss << ", "; }
+                                lo_ss << src_sty << " " << lo_b;
+                                hi_ss << src_sty << " " << hi_b;
+                            }
+                            lo_ss << ">"; hi_ss << ">";
+                            std::string bty_n = "<" + std::to_string(nlanes) + " x i1>";
+                            std::string c_hi = newTmp("qxt_chi"), c_lo = newTmp("qxt_clo"), s1 = newTmp("qxt_s1"), s2 = newTmp("qxt_s2"), tr = newTmp("qxt_tr");
+                            emit(c_hi + " = icmp " + (U ? "ugt " : "sgt ") + src_ty + " " + vin + ", " + hi_ss.str());
+                            emit(s1 + " = select " + bty_n + " " + c_hi + ", " + src_ty + " " + hi_ss.str() + ", " + src_ty + " " + vin);
+                            if (U) {
+                                emit(tr + " = trunc " + src_ty + " " + s1 + " to " + half_ty);
+                            } else {
+                                emit(c_lo + " = icmp slt " + src_ty + " " + s1 + ", " + lo_ss.str());
+                                emit(s2 + " = select " + bty_n + " " + c_lo + ", " + src_ty + " " + lo_ss.str() + ", " + src_ty + " " + s1);
+                                emit(tr + " = trunc " + src_ty + " " + s2 + " to " + half_ty);
+                            }
+                            if (Q == 0) {
+                                storeVec(rd, half_ty, tr, true);
+                            } else {
+                                std::string lo_v = loadVec(rd, half_ty);
+                                std::string res = newTmp("qxt2");
+                                std::ostringstream idx_ss;
+                                for (unsigned i = 0; i < nlanes * 2; ++i) {
+                                    if (i > 0) idx_ss << ", ";
+                                    idx_ss << "i32 " << i;
+                                }
+                                emit(res + " = shufflevector " + half_ty + " " + lo_v + ", " + half_ty + " " + tr + ", <" + std::to_string(nlanes * 2) + " x i32> <" + idx_ss.str() + ">");
+                                storeVec(rd, full_ty, res, false);
+                            }
                         }
                         continue;
                     }
 
-                    // AdvSIMD Across Lanes: ADDV / UMAXV
+                    // AdvSIMD Across Lanes: ADDV / SMAXV / UMAXV / SMINV / UMINV
                     if (((insn >> 24) & 0x1F) == 0x0E && ((insn >> 17) & 0x1F) == 0x18 && ((insn >> 10) & 3) == 2) {
                         unsigned opcode = (insn >> 12) & 0x1F;
                         unsigned esz = 1U << sz;
@@ -3310,28 +3650,56 @@ public:
                         std::string vty = "<" + std::to_string(lanes) + " x i" + std::to_string(esz * 8) + ">";
                         std::string sty = "i" + std::to_string(esz * 8);
                         std::string vin = loadVec(rn, vty), res = newTmp("vred");
-                        std::string intr = (opcode == 0x1B) ? "add" : "umax";
-                        emit(res + " = call " + sty + " @llvm.vector.reduce." + intr + ".v" + std::to_string(lanes) + "i" + std::to_string(esz * 8) + "(" + vty + " " + vin + ")");
+                        const char* intr = "add";
+                        if (opcode == 0x1B) intr = "add";
+                        else if (opcode == 0x0A) intr = U ? "umax" : "smax";
+                        else if (opcode == 0x1A) intr = U ? "umin" : "smin";
+                        emit(res + " = call " + sty + " @llvm.vector.reduce." + std::string(intr) + ".v" + std::to_string(lanes) + "i" + std::to_string(esz * 8) + "(" + vty + " " + vin + ")");
                         storeVec(rd, sty, res);
                         continue;
                     }
 
-                    // AdvSIMD TBL
+                    // AdvSIMD TBL / TBX
                     if (((insn >> 24) & 0xBF) == 0x0E && ((insn >> 21) & 1) == 0 && ((insn >> 15) & 1) == 0 && ((insn >> 10) & 3) == 0) {
-                        std::string tbl_v = loadVec(rn, "<16 x i8>"), idx_v = loadVec(rm, "<16 x i8>");
-                        std::string cur_out = "zeroinitializer";
-                        for (unsigned i = 0; i < 16; ++i) {
-                            std::string ie = newTmp("tbl_i"), ic = newTmp("tbl_c"), cl = newTmp("tbl_cl");
-                            std::string tv = newTmp("tbl_v"), sv = newTmp("tbl_s"), nout = newTmp("tbl_o");
-                            emit(ie + " = extractelement <16 x i8> " + idx_v + ", i32 " + std::to_string(i));
-                            emit(ic + " = icmp ult i8 " + ie + ", 16");
-                            emit(cl + " = and i8 " + ie + ", 15");
-                            emit(tv + " = extractelement <16 x i8> " + tbl_v + ", i8 " + cl);
-                            emit(sv + " = select i1 " + ic + ", i8 " + tv + ", i8 0");
-                            emit(nout + " = insertelement <16 x i8> " + cur_out + ", i8 " + sv + ", i32 " + std::to_string(i));
+                        unsigned len = ((insn >> 13) & 3U) + 1U;
+                        unsigned is_tbx = (insn >> 12) & 1U;
+                        unsigned nbytes = Q ? 16U : 8U;
+                        std::string vty = "<" + std::to_string(nbytes) + " x i8>";
+                        std::vector<std::string> tbl_regs;
+                        for (unsigned t = 0; t < len; ++t) {
+                            tbl_regs.push_back(loadVec((rn + t) & 31U, "<16 x i8>"));
+                        }
+                        std::string idx_v = loadVec(rm, vty);
+                        std::string base_out = is_tbx ? loadVec(rd, vty) : "zeroinitializer";
+                        std::string cur_out = base_out;
+                        for (unsigned i = 0; i < nbytes; ++i) {
+                            std::string ie = newTmp("tbl_i");
+                            emit(ie + " = extractelement " + vty + " " + idx_v + ", i32 " + std::to_string(i));
+                            std::string fallback = "0";
+                            if (is_tbx) {
+                                fallback = newTmp("tbx_fb");
+                                emit(fallback + " = extractelement " + vty + " " + base_out + ", i32 " + std::to_string(i));
+                            }
+                            std::string acc = fallback;
+                            for (unsigned t = 0; t < len; ++t) {
+                                std::string ic = newTmp("tbl_c"), cl = newTmp("tbl_cl"), tv = newTmp("tbl_v"), sel = newTmp("tbl_s");
+                                emit(ic + " = icmp ult i8 " + ie + ", " + std::to_string((t + 1U) * 16U));
+                                std::string ge = newTmp("tbl_ge"), in_rng = ic;
+                                if (t > 0) {
+                                    emit(ge + " = icmp uge i8 " + ie + ", " + std::to_string(t * 16U));
+                                    in_rng = newTmp("tbl_ir");
+                                    emit(in_rng + " = and i1 " + ic + ", " + ge);
+                                }
+                                emit(cl + " = and i8 " + ie + ", 15");
+                                emit(tv + " = extractelement <16 x i8> " + tbl_regs[t] + ", i8 " + cl);
+                                emit(sel + " = select i1 " + in_rng + ", i8 " + tv + ", i8 " + acc);
+                                acc = sel;
+                            }
+                            std::string nout = newTmp("tbl_o");
+                            emit(nout + " = insertelement " + vty + " " + cur_out + ", i8 " + acc + ", i32 " + std::to_string(i));
                             cur_out = nout;
                         }
-                        storeVec(rd, "<16 x i8>", cur_out, false);
+                        storeVec(rd, vty, cur_out, Q == 0);
                         continue;
                     }
                 }
@@ -3446,7 +3814,41 @@ public:
         emitRaw("declare i16 @llvm.vector.reduce.umax.v4i16(<4 x i16>)");
         emitRaw("declare i16 @llvm.vector.reduce.umax.v8i16(<8 x i16>)");
         emitRaw("declare i32 @llvm.vector.reduce.umax.v2i32(<2 x i32>)");
-        emitRaw("declare i32 @llvm.vector.reduce.umax.v4i32(<4 x i32>)\n");
+        emitRaw("declare i32 @llvm.vector.reduce.umax.v4i32(<4 x i32>)");
+        emitRaw("declare i8 @llvm.vector.reduce.smax.v8i8(<8 x i8>)");
+        emitRaw("declare i8 @llvm.vector.reduce.smax.v16i8(<16 x i8>)");
+        emitRaw("declare i16 @llvm.vector.reduce.smax.v4i16(<4 x i16>)");
+        emitRaw("declare i16 @llvm.vector.reduce.smax.v8i16(<8 x i16>)");
+        emitRaw("declare i32 @llvm.vector.reduce.smax.v2i32(<2 x i32>)");
+        emitRaw("declare i32 @llvm.vector.reduce.smax.v4i32(<4 x i32>)");
+        emitRaw("declare i8 @llvm.vector.reduce.smin.v8i8(<8 x i8>)");
+        emitRaw("declare i8 @llvm.vector.reduce.smin.v16i8(<16 x i8>)");
+        emitRaw("declare i16 @llvm.vector.reduce.smin.v4i16(<4 x i16>)");
+        emitRaw("declare i16 @llvm.vector.reduce.smin.v8i16(<8 x i16>)");
+        emitRaw("declare i32 @llvm.vector.reduce.smin.v2i32(<2 x i32>)");
+        emitRaw("declare i32 @llvm.vector.reduce.smin.v4i32(<4 x i32>)");
+        emitRaw("declare i8 @llvm.vector.reduce.umin.v8i8(<8 x i8>)");
+        emitRaw("declare i8 @llvm.vector.reduce.umin.v16i8(<16 x i8>)");
+        emitRaw("declare i16 @llvm.vector.reduce.umin.v4i16(<4 x i16>)");
+        emitRaw("declare i16 @llvm.vector.reduce.umin.v8i16(<8 x i16>)");
+        emitRaw("declare i32 @llvm.vector.reduce.umin.v2i32(<2 x i32>)");
+        emitRaw("declare i32 @llvm.vector.reduce.umin.v4i32(<4 x i32>)");
+        emitRaw("declare float @llvm.sqrt.f32(float)");
+        emitRaw("declare double @llvm.sqrt.f64(double)");
+        emitRaw("declare float @llvm.roundeven.f32(float)");
+        emitRaw("declare double @llvm.roundeven.f64(double)");
+        emitRaw("declare float @llvm.ceil.f32(float)");
+        emitRaw("declare double @llvm.ceil.f64(double)");
+        emitRaw("declare float @llvm.floor.f32(float)");
+        emitRaw("declare double @llvm.floor.f64(double)");
+        emitRaw("declare float @llvm.trunc.f32(float)");
+        emitRaw("declare double @llvm.trunc.f64(double)");
+        emitRaw("declare float @llvm.round.f32(float)");
+        emitRaw("declare double @llvm.round.f64(double)");
+        emitRaw("declare float @llvm.rint.f32(float)");
+        emitRaw("declare double @llvm.rint.f64(double)");
+        emitRaw("declare float @llvm.nearbyint.f32(float)");
+        emitRaw("declare double @llvm.nearbyint.f64(double)\n");
 
         if (!is_runtime_chunk) {
             emitRaw("declare void @" + cfg.prefix + "_indirect_dispatch(ptr, i64)");

@@ -3164,13 +3164,7 @@ int munmap(void *addr, size_t length)
 {
    static __thread int in_munmap = 0;
    init_orig_syscalls();
-   if (!in_munmap && (g_kfile.state == EMU_KFILE_KCTX_READY || count_open_kfiles_locked() > 0)) {
-      in_munmap = 1;
-      int r = panthor_kbase_adapter_munmap(addr, length);
-      in_munmap = 0;
-      return r;
-   }
-   if (addr != NULL) {
+   if (addr != NULL && !in_munmap) {
       pthread_mutex_lock(&g_emu_lock);
       for (int k = -1; k < EMU_MAX_KFILES; k++) {
          struct emu_kfile *kf = (k < 0) ? &g_default_kfile : g_kfiles[k];
@@ -3196,9 +3190,13 @@ int munmap(void *addr, size_t length)
             }
          }
       }
-      int rc = orig_munmap(addr, length);
       pthread_mutex_unlock(&g_emu_lock);
-      return rc;
+   }
+   if (!in_munmap && (g_kfile.state == EMU_KFILE_KCTX_READY || count_open_kfiles_locked() > 0)) {
+      in_munmap = 1;
+      int r = panthor_kbase_adapter_munmap(addr, length);
+      in_munmap = 0;
+      return r;
    }
    return orig_munmap(addr, length);
 }
