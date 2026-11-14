@@ -846,6 +846,12 @@ struct MaliIcdImageMapper {
                                 static uint64_t s_mali_stack_guard = 0x595a2b8f4d414c49ULL;
                                 *target = reinterpret_cast<uint64_t>(&s_mali_stack_guard);
                             } else {
+                                if (const char* log_env = std::getenv("MALI_AOT_ICD_LOG")) {
+                                    if (log_env[0] != '0') {
+                                        std::fprintf(stderr, "[GLOB_DAT_UNRESOLVED] sym='%s' r_type=%u rva=0x%llx\n",
+                                                     sym_name, r_type, static_cast<unsigned long long>(cur_offset));
+                                    }
+                                }
                                 *target = ext_glob_stub_va;
                             }
                         }
@@ -887,6 +893,12 @@ struct MaliIcdImageMapper {
                             static uint64_t s_mali_stack_guard = 0x595a2b8f4d414c49ULL;
                             *target = reinterpret_cast<uint64_t>(&s_mali_stack_guard);
                         } else {
+                            if (const char* log_env = std::getenv("MALI_AOT_ICD_LOG")) {
+                                if (log_env[0] != '0') {
+                                    std::fprintf(stderr, "[GLOB_DAT_UNRESOLVED] sym='%s' r_type=%u rva=0x%llx\n",
+                                                 sym_name, r_type, static_cast<unsigned long long>(r_offset));
+                                }
+                            }
                             *target = ext_glob_stub_va;
                         }
                     }

@@ -1007,11 +1007,58 @@ void mali_init_plt_tables() {
     });
 }
 
+} // extern "C"
+
+static constexpr uint64_t SYNTH_GLOB_VA_BASE = 0x600010000ULL;
+
+static void thunk_glob_free(AOTCPUState* cpu) { std::free(reinterpret_cast<void*>(static_cast<uintptr_t>(cpu->x[0]))); }
+static void thunk_glob_malloc(AOTCPUState* cpu) { cpu->x[0] = reinterpret_cast<uint64_t>(std::malloc(static_cast<size_t>(cpu->x[0]))); }
+static void thunk_glob_calloc(AOTCPUState* cpu) { cpu->x[0] = reinterpret_cast<uint64_t>(std::calloc(static_cast<size_t>(cpu->x[0]), static_cast<size_t>(cpu->x[1]))); }
+static void thunk_glob_realloc(AOTCPUState* cpu) { cpu->x[0] = reinterpret_cast<uint64_t>(std::realloc(reinterpret_cast<void*>(static_cast<uintptr_t>(cpu->x[0])), static_cast<size_t>(cpu->x[1]))); }
+
+template <double (*Fn)(double)>
+static void thunk_libm_d1(AOTCPUState* cpu) {
+    double a0 = 0.0; std::memcpy(&a0, &cpu->v[0], 8);
+    double r = Fn(a0); std::memcpy(&cpu->v[0], &r, 8);
+}
+template <double (*Fn)(double, double)>
+static void thunk_libm_d2(AOTCPUState* cpu) {
+    double a0 = 0.0, a1 = 0.0;
+    std::memcpy(&a0, &cpu->v[0], 8); std::memcpy(&a1, &cpu->v[1], 8);
+    double r = Fn(a0, a1); std::memcpy(&cpu->v[0], &r, 8);
+}
+
+struct SynthGlobEntry { const char* name; MaliPltFn fn; };
+static const SynthGlobEntry kSynthGlobEntries[] = {
+    {"free", &thunk_glob_free},
+    {"malloc", &thunk_glob_malloc},
+    {"calloc", &thunk_glob_calloc},
+    {"realloc", &thunk_glob_realloc},
+    {"acos", &thunk_libm_d1<std::acos>},
+    {"asin", &thunk_libm_d1<std::asin>},
+    {"atan", &thunk_libm_d1<std::atan>},
+    {"atan2", &thunk_libm_d2<std::atan2>},
+    {"cosh", &thunk_libm_d1<std::cosh>},
+    {"exp", &thunk_libm_d1<std::exp>},
+    {"log", &thunk_libm_d1<std::log>},
+    {"log10", &thunk_libm_d1<std::log10>},
+    {"sinh", &thunk_libm_d1<std::sinh>},
+    {"sqrt", &thunk_libm_d1<std::sqrt>},
+    {"tan", &thunk_libm_d1<std::tan>},
+    {"tanh", &thunk_libm_d1<std::tanh>},
+};
+
+extern "C" {
+
 uint64_t mali_resolve_glob_dat_symbol(const char* sym_name, int64_t addend) {
     if (!sym_name || !sym_name[0]) return 0;
     if (std::strcmp(sym_name, "stderr") == 0) return reinterpret_cast<uint64_t>(&stderr);
     if (std::strcmp(sym_name, "stdout") == 0) return reinterpret_cast<uint64_t>(&stdout);
     if (std::strcmp(sym_name, "stdin") == 0) return reinterpret_cast<uint64_t>(&stdin);
+    if (std::strcmp(sym_name, "_ZN4aidl7android8hardware8graphics9allocator10IAllocator10descriptorE") == 0) {
+        static const char* s_aidl_desc = "android.hardware.graphics.allocator.IAllocator";
+        return reinterpret_cast<uint64_t>(&s_aidl_desc);
+    }
 
     auto dit = g_libcpp_data_rvas.find(sym_name);
     if (dit != g_libcpp_data_rvas.end()) {
@@ -1025,6 +1072,11 @@ uint64_t mali_resolve_glob_dat_symbol(const char* sym_name, int64_t addend) {
     if (pit != g_aot_plt_index_by_name.end()) {
         return SYNTH_PLT_VA_BASE + pit->second * 4ULL;
     }
+    for (size_t i = 0; i < sizeof(kSynthGlobEntries) / sizeof(kSynthGlobEntries[0]); ++i) {
+        if (std::strcmp(sym_name, kSynthGlobEntries[i].name) == 0) {
+            return SYNTH_GLOB_VA_BASE + static_cast<uint64_t>(i) * 4ULL;
+        }
+    }
     return 0;
 }
 
@@ -1034,6 +1086,14 @@ bool mali_dispatch_synth_plt_va(AOTCPUState* cpu, uint64_t target_va) {
         ((target_va - SYNTH_PLT_VA_BASE) & 3ULL) == 0) {
         uint64_t idx = (target_va - SYNTH_PLT_VA_BASE) / 4ULL;
         g_aot_plt_table[idx](cpu);
+        return true;
+    }
+    constexpr size_t kGlobCount = sizeof(kSynthGlobEntries) / sizeof(kSynthGlobEntries[0]);
+    if (target_va >= SYNTH_GLOB_VA_BASE &&
+        target_va < SYNTH_GLOB_VA_BASE + static_cast<uint64_t>(kGlobCount) * 4ULL &&
+        ((target_va - SYNTH_GLOB_VA_BASE) & 3ULL) == 0) {
+        uint64_t idx = (target_va - SYNTH_GLOB_VA_BASE) / 4ULL;
+        kSynthGlobEntries[idx].fn(cpu);
         return true;
     }
     return false;

@@ -469,9 +469,21 @@ void vkCmdInsertDebugUtilsLabelEXT(void* commandBuffer, const void* pLabelInfo) 
 }
 
 
+static inline bool mali_wsi_native_aot_enabled() {
+    const char* env = std::getenv("MALI_ICD_NATIVE_AOT");
+    return env && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
+
 __attribute__((visibility("default")))
-int32_t vkCreatePipelineCache(void* device, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pPipelineCache) {
+int32_t vkCreatePipelineCache(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pPipelineCache) {
     if (!pPipelineCache) return -3;
+    if (mali_wsi_native_aot_enabled()) {
+        return aot_forward_vkCreatePipelineCache(
+            reinterpret_cast<VkDevice>(device),
+            static_cast<const VkPipelineCacheCreateInfo*>(pCreateInfo),
+            static_cast<const VkAllocationCallbacks*>(pAllocator),
+            reinterpret_cast<VkPipelineCache*>(pPipelineCache));
+    }
     auto* dev = static_cast<MaliIcdDevice*>(device);
     if (dev && aot_vkCreatePipelineCache && !dev->aot_vk_device_mem.empty()) {
         VkPipelineCacheCreateInfo clean_ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0U, 0, nullptr};
@@ -509,8 +521,15 @@ int32_t vkCreatePipelineCache(void* device, const void* pCreateInfo, const void*
 }
 
 __attribute__((visibility("default")))
-void vkDestroyPipelineCache(void* device, uint64_t pipelineCache, const void* /*pAllocator*/) {
+void vkDestroyPipelineCache(void* device, uint64_t pipelineCache, const void* pAllocator) {
     if (!pipelineCache || pipelineCache == 0xCA000001ULL) return;
+    if (mali_wsi_native_aot_enabled()) {
+        aot_forward_vkDestroyPipelineCache(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkPipelineCache>(pipelineCache),
+            static_cast<const VkAllocationCallbacks*>(pAllocator));
+        return;
+    }
     auto* dev = static_cast<MaliIcdDevice*>(device);
     if (dev && aot_vkDestroyPipelineCache && !dev->aot_vk_device_mem.empty()) {
         aot_forward_vkDestroyPipelineCache(
@@ -526,6 +545,12 @@ void vkDestroyPipelineCache(void* device, uint64_t pipelineCache, const void* /*
 __attribute__((visibility("default")))
 int32_t vkGetPipelineCacheData(void* device, uint64_t pipelineCache, size_t* pDataSize, void* pData) {
     if (!pDataSize) return -3;
+    if (mali_wsi_native_aot_enabled()) {
+        return aot_forward_vkGetPipelineCacheData(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkPipelineCache>(pipelineCache),
+            pDataSize, pData);
+    }
     auto* dev = static_cast<MaliIcdDevice*>(device);
     if (dev && pipelineCache && pipelineCache != 0xCA000001ULL &&
         aot_vkGetPipelineCacheData && !dev->aot_vk_device_mem.empty()) {
@@ -555,6 +580,13 @@ int32_t vkGetPipelineCacheData(void* device, uint64_t pipelineCache, size_t* pDa
 
 __attribute__((visibility("default")))
 int32_t vkMergePipelineCaches(void* device, uint64_t dstCache, uint32_t srcCacheCount, const uint64_t* pSrcCaches) {
+    if (mali_wsi_native_aot_enabled()) {
+        return aot_forward_vkMergePipelineCaches(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkPipelineCache>(dstCache),
+            srcCacheCount,
+            reinterpret_cast<const VkPipelineCache*>(pSrcCaches));
+    }
     auto* dev = static_cast<MaliIcdDevice*>(device);
     if (dev && dstCache && dstCache != 0xCA000001ULL &&
         aot_vkMergePipelineCaches && !dev->aot_vk_device_mem.empty()) {

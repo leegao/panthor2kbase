@@ -3053,18 +3053,83 @@ public:
                         continue;
                     }
 
-                    // AdvSIMD Three-Same (ADD / SUB / CMEQ / CMGT / CMHI)
+                    // AdvSIMD Three-Same (ADD / SUB / CMEQ / CMTST / CMGT / CMHI / CMGE / CMHS / SSHL / USHL / SMAX / UMAX / SMIN / UMIN / MUL)
                     if (((insn >> 24) & 0x1F) == 0x0E && ((insn >> 21) & 1) == 1 && ((insn >> 10) & 1) == 1) {
                         unsigned opcode = (insn >> 11) & 0x1F;
+                        unsigned bits = 8U << sz;
                         unsigned lanes = (Q ? 16U : 8U) >> sz;
-                        std::string vty = "<" + std::to_string(lanes) + " x i" + std::to_string(8U << sz) + ">";
-                        std::string a = loadVec(rn, vty), b = loadVec(rm, vty), res = newTmp("vadd");
+                        std::string sty = "i" + std::to_string(bits);
+                        std::string vty = "<" + std::to_string(lanes) + " x " + sty + ">";
+                        std::string bty = "<" + std::to_string(lanes) + " x i1>";
+                        std::string a = loadVec(rn, vty), b = loadVec(rm, vty), res = newTmp("v3same");
+                        auto splatConst = [&](int64_t val) {
+                            std::ostringstream ss;
+                            ss << "<";
+                            for (unsigned i = 0; i < lanes; ++i) {
+                                if (i > 0) ss << ", ";
+                                ss << sty << " " << val;
+                            }
+                            ss << ">";
+                            return ss.str();
+                        };
                         if (opcode == 0x10) {
                             emit(res + " = " + (U ? "sub " : "add ") + vty + " " + a + ", " + b);
                         } else if (opcode == 0x11 && U == 1) {
                             std::string cmp_v = newTmp("vcmeq");
                             emit(cmp_v + " = icmp eq " + vty + " " + a + ", " + b);
-                            emit(res + " = sext <" + std::to_string(lanes) + " x i1> " + cmp_v + " to " + vty);
+                            emit(res + " = sext " + bty + " " + cmp_v + " to " + vty);
+                        } else if (opcode == 0x11 && U == 0) {
+                            std::string and_v = newTmp("vcmtst_a"), cmp_v = newTmp("vcmtst");
+                            emit(and_v + " = and " + vty + " " + a + ", " + b);
+                            emit(cmp_v + " = icmp ne " + vty + " " + and_v + ", zeroinitializer");
+                            emit(res + " = sext " + bty + " " + cmp_v + " to " + vty);
+                        } else if (opcode == 0x06) {
+                            std::string cmp_v = newTmp("vcmgt");
+                            emit(cmp_v + " = icmp " + (U ? "ugt " : "sgt ") + vty + " " + a + ", " + b);
+                            emit(res + " = sext " + bty + " " + cmp_v + " to " + vty);
+                        } else if (opcode == 0x07) {
+                            std::string cmp_v = newTmp("vcmge");
+                            emit(cmp_v + " = icmp " + (U ? "uge " : "sge ") + vty + " " + a + ", " + b);
+                            emit(res + " = sext " + bty + " " + cmp_v + " to " + vty);
+                        } else if (opcode == 0x08) {
+                            // SSHL (U=0) / USHL (U=1): shift amount is signed i8 in low byte of each lane.
+                            std::string sh_s = b;
+                            if (sz > 0) {
+                                std::string sh_tr = newTmp("vshl_tr");
+                                sh_s = newTmp("vshl_sx");
+                                emit(sh_tr + " = trunc " + vty + " " + b + " to <" + std::to_string(lanes) + " x i8>");
+                                emit(sh_s + " = sext <" + std::to_string(lanes) + " x i8> " + sh_tr + " to " + vty);
+                            }
+                            std::string width_v = splatConst(static_cast<int64_t>(bits));
+                            std::string maxsh_v = splatConst(static_cast<int64_t>(bits - 1));
+                            std::string is_neg = newTmp("vshl_isneg");
+                            std::string pos_lt = newTmp("vshl_plt"), pos_amt = newTmp("vshl_pamt");
+                            std::string shl_raw = newTmp("vshl_l"), shl_res = newTmp("vshl_lr");
+                            std::string neg_s = newTmp("vshl_ns"), neg_lt = newTmp("vshl_nlt"), neg_amt = newTmp("vshl_namt");
+                            std::string rsh_res = newTmp("vshl_rr");
+                            emit(is_neg + " = icmp slt " + vty + " " + sh_s + ", zeroinitializer");
+                            emit(pos_lt + " = icmp slt " + vty + " " + sh_s + ", " + width_v);
+                            emit(pos_amt + " = select " + bty + " " + pos_lt + ", " + vty + " " + sh_s + ", " + vty + " zeroinitializer");
+                            emit(shl_raw + " = shl " + vty + " " + a + ", " + pos_amt);
+                            emit(shl_res + " = select " + bty + " " + pos_lt + ", " + vty + " " + shl_raw + ", " + vty + " zeroinitializer");
+                            emit(neg_s + " = sub " + vty + " zeroinitializer, " + sh_s);
+                            emit(neg_lt + " = icmp ult " + vty + " " + neg_s + ", " + width_v);
+                            emit(neg_amt + " = select " + bty + " " + neg_lt + ", " + vty + " " + neg_s + ", " + vty + " " + maxsh_v);
+                            if (U) {
+                                std::string rsh_raw = newTmp("vshl_r");
+                                emit(rsh_raw + " = lshr " + vty + " " + a + ", " + neg_amt);
+                                emit(rsh_res + " = select " + bty + " " + neg_lt + ", " + vty + " " + rsh_raw + ", " + vty + " zeroinitializer");
+                            } else {
+                                emit(rsh_res + " = ashr " + vty + " " + a + ", " + neg_amt);
+                            }
+                            emit(res + " = select " + bty + " " + is_neg + ", " + vty + " " + rsh_res + ", " + vty + " " + shl_res);
+                        } else if (opcode == 0x0c || opcode == 0x0d) {
+                            std::string pred = (opcode == 0x0c) ? (U ? "ugt " : "sgt ") : (U ? "ult " : "slt ");
+                            std::string cmp_v = newTmp("vmx");
+                            emit(cmp_v + " = icmp " + pred + vty + " " + a + ", " + b);
+                            emit(res + " = select " + bty + " " + cmp_v + ", " + vty + " " + a + ", " + vty + " " + b);
+                        } else if (opcode == 0x13 && U == 0) {
+                            emit(res + " = mul " + vty + " " + a + ", " + b);
                         } else {
                             emit(res + " = add " + vty + " " + a + ", " + b);
                         }
