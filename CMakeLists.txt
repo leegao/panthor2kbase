@@ -402,6 +402,7 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
 
    add_library(r54p3_vulkan_icd SHARED
       src/r54p3_vulkan_icd/generated/mali_aot_forwarders_autogen.cpp
+      src/r54p3_vulkan_icd/generated/mali_plt_thunks_autogen.cpp
       src/r54p3_vulkan_icd/mali_icd_internal.cpp
       src/r54p3_vulkan_icd/mali_icd_physdev.cpp
       src/r54p3_vulkan_icd/mali_icd_wsi.cpp

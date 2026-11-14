@@ -7,6 +7,8 @@
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
+#include <fcntl.h>
 #include <mutex>
 #include <semaphore.h>
 #include <sys/prctl.h>
@@ -786,200 +788,158 @@ MaliPltFn g_libcpp_plt_table[LIBCPP_PLT_TABLE_COUNT > 0 ? LIBCPP_PLT_TABLE_COUNT
 #undef LIBCPP_PLT_IMPORT
 };
 
+struct LibcppFuncExportDesc { const char* sym; uint64_t rva; MaliPltFn fn; };
+static constexpr LibcppFuncExportDesc kLibcppFuncExports[] = {
+#define LIBCPP_FUNC_EXPORT(sym, rva, fn) { sym, rva, &fn },
+#include "r54p3_libcpp_exports.inc"
+#undef LIBCPP_FUNC_EXPORT
+};
+
+struct LibcppDataExportDesc { const char* sym; uint64_t rva; };
+static constexpr LibcppDataExportDesc kLibcppDataExports[] = {
+#define LIBCPP_DATA_EXPORT(sym, rva) { sym, rva },
+#include "r54p3_libcpp_exports.inc"
+#undef LIBCPP_DATA_EXPORT
+};
+
+struct CustomPltDesc { const char* name; MaliPltFn fn; };
+static constexpr CustomPltDesc kCustomThunks[] = {
+    {"openat", &thunk_openat},
+    {"write", &thunk_write},
+    {"__write_chk", &thunk_write},
+    {"ppoll", &thunk_ppoll},
+    {"__ppoll_chk", &thunk_ppoll},
+    {"fcntl", &thunk_fcntl},
+    {"fwrite", &thunk_fwrite},
+    {"__fwrite_chk", &thunk_fwrite},
+    {"memchr", &thunk_memchr},
+    {"__memchr_chk", &thunk_memchr},
+    {"strchr", &thunk_strchr},
+    {"__strchr_chk", &thunk_strchr},
+    {"strcpy", &thunk_strcpy},
+    {"__strcpy_chk", &thunk_strcpy},
+    {"strncpy", &thunk_strncpy},
+    {"__strncpy_chk", &thunk_strncpy},
+    {"__strncpy_chk2", &thunk_strncpy},
+    {"strncat", &thunk_strncat},
+    {"__strncat_chk", &thunk_strncat},
+    {"snprintf", &thunk_snprintf},
+    {"sprintf", &thunk_sprintf},
+    {"vsnprintf", &thunk_vsnprintf},
+    {"__vsnprintf_chk", &thunk_vsnprintf_chk},
+    {"fprintf", &thunk_fprintf},
+    {"printf", &thunk_printf},
+    {"vfprintf", &thunk_vfprintf},
+    {"sscanf", &thunk_sscanf},
+    {"pthread_mutex_init", &thunk_pthread_mutex_init},
+    {"pthread_mutex_destroy", &thunk_pthread_mutex_destroy},
+    {"pthread_mutex_lock", &thunk_pthread_mutex_lock},
+    {"pthread_mutex_trylock", &thunk_pthread_mutex_trylock},
+    {"pthread_mutex_unlock", &thunk_pthread_mutex_unlock},
+    {"pthread_cond_init", &thunk_pthread_cond_init},
+    {"pthread_cond_destroy", &thunk_pthread_cond_destroy},
+    {"pthread_cond_wait", &thunk_pthread_cond_wait},
+    {"pthread_cond_timedwait", &thunk_pthread_cond_timedwait},
+    {"pthread_cond_signal", &thunk_pthread_cond_signal},
+    {"pthread_cond_broadcast", &thunk_pthread_cond_broadcast},
+    {"pthread_rwlock_init", &thunk_pthread_rwlock_init},
+    {"pthread_rwlock_destroy", &thunk_pthread_rwlock_destroy},
+    {"pthread_rwlock_rdlock", &thunk_pthread_rwlock_rdlock},
+    {"pthread_rwlock_wrlock", &thunk_pthread_rwlock_wrlock},
+    {"pthread_rwlock_unlock", &thunk_pthread_rwlock_unlock},
+    {"pthread_create", &thunk_pthread_create},
+    {"pthread_join", &thunk_pthread_join},
+    {"pthread_detach", &thunk_pthread_detach},
+    {"pthread_once", &thunk_pthread_once},
+    {"pthread_key_create", &thunk_pthread_key_create},
+    {"pthread_mutexattr_init", &thunk_pthread_mutexattr_init},
+    {"pthread_mutexattr_destroy", &thunk_pthread_mutexattr_destroy},
+    {"pthread_mutexattr_settype", &thunk_pthread_mutexattr_settype},
+    {"sem_init", &thunk_sem_init},
+    {"sem_destroy", &thunk_sem_destroy},
+    {"sem_wait", &thunk_sem_wait},
+    {"sem_trywait", &thunk_sem_trywait},
+    {"sem_timedwait", &thunk_sem_timedwait},
+    {"sem_post", &thunk_sem_post},
+    {"sem_getvalue", &thunk_sem_getvalue},
+    {"qsort", &thunk_qsort},
+    {"div", &thunk_div},
+    {"sincosf", &thunk_sincosf},
+    {"__errno", &thunk_errno},
+    {"__gnu_strerror_r", &thunk_gnu_strerror_r},
+    {"__stack_chk_fail", &thunk_stack_chk_fail},
+    {"abort", &thunk_stack_chk_fail},
+    {"__assert2", &thunk_stack_chk_fail},
+    {"sysconf", &thunk_sysconf},
+    {"__system_property_get", &thunk_system_property_get},
+    {"property_get", &thunk_property_get},
+    {"property_get_bool", &thunk_property_get_bool},
+    {"vkCreateXcbSurfaceKHR", &thunk_vkCreateXcbSurfaceKHR},
+    {"vkCreateXlibSurfaceKHR", &thunk_vkCreateXlibSurfaceKHR},
+    {"vkCreateWaylandSurfaceKHR", &thunk_vkCreateWaylandSurfaceKHR},
+    {"vkQueuePresentKHR", &thunk_vkQueuePresentKHR},
+    {"AHardwareBuffer_allocate", &thunk_ahb_alloc},
+    {"AHardwareBuffer_describe", &thunk_ahb_desc},
+    {"AHardwareBuffer_getNativeHandle", &thunk_ahb_nh},
+    {"AHardwareBuffer_getId", &thunk_ahb_id},
+    {"_ZNSt3__113__hash_memoryEPKvm", &thunk_hash_memory},
+    {"__android_log_print", &thunk_android_log},
+    {"__android_log_write", &thunk_android_log},
+    {"dlsym", &thunk_dlsym},
+    {"dladdr", &thunk_dladdr},
+    {"dl_iterate_phdr", &thunk_dl_iterate_phdr},
+    {"sigaction", &thunk_sigaction},
+    {"localtime", &thunk_localtime},
+    {"localtime_r", &thunk_localtime_r},
+    {"strftime", &thunk_strftime},
+    {"readdir", &thunk_readdir},
+    {"getpwuid", &thunk_getpwuid},
+    {"getpwnam", &thunk_getpwnam},
+    {"prctl", &thunk_prctl},
+    {"syscall", &thunk_syscall},
+    {"_ZN7android8hardware11hidl_stringC1EPKc", &thunk_hidl_string_ctor},
+    {"_ZN7android8hardware11hidl_stringD1Ev", &thunk_hidl_string_dtor},
+};
+
+static inline void register_libcpp_symbol(
+    const char* sym, uint64_t rva, MaliPltFn fn,
+    std::unordered_map<std::string, MaliPltFn>* reg,
+    std::unordered_map<std::string, uint64_t>& rva_map) {
+    std::string s(sym);
+    if (reg) (*reg)[s] = fn;
+    rva_map[s] = rva;
+    size_t p = s.find("St6__ndk1");
+    if (p != std::string::npos) {
+        std::string a = s;
+        a.replace(p, 9, "St3__1");
+        if (reg) (*reg)[a] = fn;
+        rva_map[a] = rva;
+    }
+}
+
 void mali_init_plt_tables() {
     std::call_once(g_plt_init_once, []() {
         std::unordered_map<std::string, MaliPltFn> reg;
 
-        // 1. Auto-generated C/POSIX/libm thunks from system headers
+        // 1. Auto-generated C/POSIX/libm + redirect/noop/alias thunks
         mali_register_autogen_plt_thunks(reg);
 
-        // 2. Lifted libc++_shared.so exported functions (registered under both St6__ndk1 and St3__1!)
-#define LIBCPP_FUNC_EXPORT(sym, rva, fn)                                      \
-        do {                                                                  \
-            std::string s(sym);                                               \
-            reg[s] = &fn;                                                     \
-            g_libcpp_func_rvas[s] = (rva);                                    \
-            size_t p = s.find("St6__ndk1");                                   \
-            if (p != std::string::npos) {                                     \
-                std::string a = s;                                            \
-                a.replace(p, 9, "St3__1");                                    \
-                reg[a] = &fn;                                                 \
-                g_libcpp_func_rvas[a] = (rva);                                \
-            }                                                                 \
-        } while (0);
-#define LIBCPP_DATA_EXPORT(sym, rva)                                          \
-        do {                                                                  \
-            std::string s(sym);                                               \
-            g_libcpp_data_rvas[s] = (rva);                                    \
-            size_t p = s.find("St6__ndk1");                                   \
-            if (p != std::string::npos) {                                     \
-                std::string a = s;                                            \
-                a.replace(p, 9, "St3__1");                                    \
-                g_libcpp_data_rvas[a] = (rva);                                \
-            }                                                                 \
-        } while (0);
-#include "r54p3_libcpp_exports.inc"
-#undef LIBCPP_FUNC_EXPORT
-#undef LIBCPP_DATA_EXPORT
+        // 2. Lifted libc++_shared.so exported functions & data (St6__ndk1 + St3__1)
+        for (const auto& e : kLibcppFuncExports) {
+            register_libcpp_symbol(e.sym, e.rva, e.fn, &reg, g_libcpp_func_rvas);
+        }
+        for (const auto& e : kLibcppDataExports) {
+            register_libcpp_symbol(e.sym, e.rva, nullptr, nullptr, g_libcpp_data_rvas);
+        }
 
         // 3. Custom Mali/Bionic/POSIX/variadic/pthread/sem/WSI overrides
-        reg["open"] = &thunk_open;
-        reg["open64"] = &thunk_open;
-        reg["__open_2"] = &thunk_open;
-        reg["openat"] = &thunk_openat;
-        reg["close"] = &thunk_close;
-        reg["ioctl"] = &thunk_ioctl;
-        reg["mmap"] = &thunk_mmap;
-        reg["mmap64"] = &thunk_mmap;
-        reg["munmap"] = &thunk_munmap;
-        reg["read"] = &thunk_read;
-        reg["__read_chk"] = &thunk_read;
-        reg["write"] = &thunk_write;
-        reg["__write_chk"] = &thunk_write;
-        reg["poll"] = &thunk_poll;
-        reg["__poll_chk"] = &thunk_poll;
-        reg["ppoll"] = &thunk_ppoll;
-        reg["__ppoll_chk"] = &thunk_ppoll;
-        reg["stat"] = &thunk_stat;
-        reg["stat64"] = &thunk_stat;
-        reg["fstat"] = &thunk_fstat;
-        reg["fstat64"] = &thunk_fstat;
-        reg["lstat"] = &thunk_stat;
-        reg["access"] = &thunk_access;
-        reg["fcntl"] = &thunk_fcntl;
-
-        reg["fwrite"] = &thunk_fwrite;
-        reg["__fwrite_chk"] = &thunk_fwrite;
-        reg["memchr"] = &thunk_memchr;
-        reg["__memchr_chk"] = &thunk_memchr;
-        reg["strchr"] = &thunk_strchr;
-        reg["__strchr_chk"] = &thunk_strchr;
-        reg["strcpy"] = &thunk_strcpy;
-        reg["__strcpy_chk"] = &thunk_strcpy;
-        reg["strncpy"] = &thunk_strncpy;
-        reg["__strncpy_chk"] = &thunk_strncpy;
-        reg["__strncpy_chk2"] = &thunk_strncpy;
-        reg["strncat"] = &thunk_strncat;
-        reg["__strncat_chk"] = &thunk_strncat;
-
-        reg["snprintf"] = &thunk_snprintf;
-        reg["sprintf"] = &thunk_sprintf;
-        reg["vsnprintf"] = &thunk_vsnprintf;
-        reg["__vsnprintf_chk"] = &thunk_vsnprintf_chk;
-        reg["fprintf"] = &thunk_fprintf;
-        reg["printf"] = &thunk_printf;
-        reg["vfprintf"] = &thunk_vfprintf;
-        reg["sscanf"] = &thunk_sscanf;
-
-        reg["pthread_mutex_init"] = &thunk_pthread_mutex_init;
-        reg["pthread_mutex_destroy"] = &thunk_pthread_mutex_destroy;
-        reg["pthread_mutex_lock"] = &thunk_pthread_mutex_lock;
-        reg["pthread_mutex_trylock"] = &thunk_pthread_mutex_trylock;
-        reg["pthread_mutex_unlock"] = &thunk_pthread_mutex_unlock;
-        reg["pthread_cond_init"] = &thunk_pthread_cond_init;
-        reg["pthread_cond_destroy"] = &thunk_pthread_cond_destroy;
-        reg["pthread_cond_wait"] = &thunk_pthread_cond_wait;
-        reg["pthread_cond_timedwait"] = &thunk_pthread_cond_timedwait;
-        reg["pthread_cond_signal"] = &thunk_pthread_cond_signal;
-        reg["pthread_cond_broadcast"] = &thunk_pthread_cond_broadcast;
-        reg["pthread_rwlock_init"] = &thunk_pthread_rwlock_init;
-        reg["pthread_rwlock_destroy"] = &thunk_pthread_rwlock_destroy;
-        reg["pthread_rwlock_rdlock"] = &thunk_pthread_rwlock_rdlock;
-        reg["pthread_rwlock_wrlock"] = &thunk_pthread_rwlock_wrlock;
-        reg["pthread_rwlock_unlock"] = &thunk_pthread_rwlock_unlock;
-        reg["pthread_create"] = &thunk_pthread_create;
-        reg["pthread_join"] = &thunk_pthread_join;
-        reg["pthread_detach"] = &thunk_pthread_detach;
-        reg["pthread_once"] = &thunk_pthread_once;
-        reg["pthread_key_create"] = &thunk_pthread_key_create;
-        reg["pthread_attr_init"] = &thunk_pthread_noop0;
-        reg["pthread_attr_destroy"] = &thunk_pthread_noop0;
-        reg["pthread_attr_setstacksize"] = &thunk_pthread_noop0;
-        reg["pthread_mutexattr_init"] = &thunk_pthread_mutexattr_init;
-        reg["pthread_mutexattr_destroy"] = &thunk_pthread_mutexattr_destroy;
-        reg["pthread_mutexattr_settype"] = &thunk_pthread_mutexattr_settype;
-        reg["pthread_condattr_init"] = &thunk_pthread_noop0;
-        reg["pthread_condattr_setclock"] = &thunk_pthread_noop0;
-        reg["pthread_setname_np"] = &thunk_pthread_noop0;
-        reg["pthread_setschedparam"] = &thunk_pthread_noop0;
-
-        reg["sem_init"] = &thunk_sem_init;
-        reg["sem_destroy"] = &thunk_sem_destroy;
-        reg["sem_wait"] = &thunk_sem_wait;
-        reg["sem_trywait"] = &thunk_sem_trywait;
-        reg["sem_timedwait"] = &thunk_sem_timedwait;
-        reg["sem_post"] = &thunk_sem_post;
-        reg["sem_getvalue"] = &thunk_sem_getvalue;
-
-        reg["qsort"] = &thunk_qsort;
-        reg["div"] = &thunk_div;
-        reg["sincosf"] = &thunk_sincosf;
-        reg["__errno"] = &thunk_errno;
-        reg["__gnu_strerror_r"] = &thunk_gnu_strerror_r;
-        reg["__stack_chk_fail"] = &thunk_stack_chk_fail;
-        reg["abort"] = &thunk_stack_chk_fail;
-        reg["__assert2"] = &thunk_stack_chk_fail;
-        reg["sysconf"] = &thunk_sysconf;
-        reg["__system_property_get"] = &thunk_system_property_get;
-        reg["property_get"] = &thunk_property_get;
-        reg["property_get_bool"] = &thunk_property_get_bool;
-        reg["__system_property_find"] = &thunk_noop0;
-        reg["__system_property_read_callback"] = &thunk_noop0;
-
-        reg["vkCreateXcbSurfaceKHR"] = &thunk_vkCreateXcbSurfaceKHR;
-        reg["vkCreateXlibSurfaceKHR"] = &thunk_vkCreateXlibSurfaceKHR;
-        reg["vkCreateWaylandSurfaceKHR"] = &thunk_vkCreateWaylandSurfaceKHR;
-        reg["vkQueuePresentKHR"] = &thunk_vkQueuePresentKHR;
-
-        reg["AHardwareBuffer_allocate"] = &thunk_ahb_alloc;
-        reg["AHardwareBuffer_describe"] = &thunk_ahb_desc;
-        reg["AHardwareBuffer_getNativeHandle"] = &thunk_ahb_nh;
-        reg["AHardwareBuffer_getId"] = &thunk_ahb_id;
-        reg["AHardwareBuffer_acquire"] = &thunk_noop0;
-        reg["AHardwareBuffer_release"] = &thunk_noop0;
-
-        reg["_ZNSt3__113__hash_memoryEPKvm"] = &thunk_hash_memory;
-        reg["__cxa_atexit"] = &thunk_noop0;
-        reg["__cxa_finalize"] = &thunk_noop0;
-        reg["__cxa_thread_atexit_impl"] = &thunk_noop0;
-        reg["__register_atfork"] = &thunk_noop0;
-        reg["__android_log_print"] = &thunk_android_log;
-        reg["__android_log_write"] = &thunk_android_log;
-        reg["android_set_abort_message"] = &thunk_noop0;
-        reg["atrace_async_begin_body"] = &thunk_noop0;
-        reg["atrace_async_end_body"] = &thunk_noop0;
-        reg["atrace_begin_body"] = &thunk_noop0;
-        reg["atrace_end_body"] = &thunk_noop0;
-        reg["atrace_get_enabled_tags"] = &thunk_noop0;
-        reg["atrace_int64_body"] = &thunk_noop0;
-
-        reg["dlsym"] = &thunk_dlsym;
-        reg["dladdr"] = &thunk_dladdr;
-        reg["dl_iterate_phdr"] = &thunk_dl_iterate_phdr;
-        reg["sigaction"] = &thunk_sigaction;
-        reg["localtime"] = &thunk_localtime;
-        reg["localtime_r"] = &thunk_localtime_r;
-        reg["strftime"] = &thunk_strftime;
-        reg["readdir"] = &thunk_readdir;
-        reg["getpwuid"] = &thunk_getpwuid;
-        reg["getpwnam"] = &thunk_getpwnam;
-        reg["prctl"] = &thunk_prctl;
-        reg["syscall"] = &thunk_syscall;
-        reg["fork"] = &thunk_enosys;
-        reg["execv"] = &thunk_enosys;
-        reg["execve"] = &thunk_enosys;
-        reg["syslog"] = &thunk_noop0;
-        reg["pixel_gpu_flags_mali_protected_tls_cache"] = &thunk_noop0;
-        reg["fstatfs"] = &thunk_noop0;
-        reg["statfs"] = &thunk_noop0;
-        reg["statvfs"] = &thunk_noop0;
-        reg["AServiceManager_checkService"] = &thunk_noop0;
-        reg["CreateDmabufHeapBufferAllocator"] = &thunk_noop0;
-        reg["DmabufHeapAlloc2"] = &thunk_noop0;
-        reg["android_load_sphal_library"] = &thunk_noop0;
-        reg["_ZN7android8hardware11hidl_stringC1EPKc"] = &thunk_hidl_string_ctor;
-        reg["_ZN7android8hardware11hidl_stringD1Ev"] = &thunk_hidl_string_dtor;
-        reg["__emutls_get_address"] = &thunk_noop0;
+        for (const auto& e : kCustomThunks) {
+            reg[e.name] = e.fn;
+        }
+        (void)thunk_open; (void)thunk_close; (void)thunk_ioctl; (void)thunk_mmap;
+        (void)thunk_munmap; (void)thunk_read; (void)thunk_poll; (void)thunk_stat;
+        (void)thunk_fstat; (void)thunk_access; (void)thunk_pthread_noop0;
+        (void)thunk_noop0; (void)thunk_enosys;
 
         // 4. Populate g_aot_plt_table & g_libcpp_plt_table
         for (int i = 0; i < MALI_PLT_TABLE_COUNT; ++i) {
