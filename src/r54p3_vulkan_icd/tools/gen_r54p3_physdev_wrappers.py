@@ -4,10 +4,12 @@
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[3]
 VK_XML = ROOT / "specs" / "vk.xml"
 PHYSDEV_OUT = ROOT / "src" / "r54p3_vulkan_icd" / "generated" / "mali_physdev_wrappers_autogen.inc"
 DEVICE_OUT = ROOT / "src" / "r54p3_vulkan_icd" / "generated" / "mali_device_wrappers_autogen.inc"
+FORWARDERS_H_OUT = ROOT / "src" / "r54p3_vulkan_icd" / "generated" / "mali_aot_forwarders_autogen.h"
+FORWARDERS_CPP_OUT = ROOT / "src" / "r54p3_vulkan_icd" / "generated" / "mali_aot_forwarders_autogen.cpp"
 
 # Keyed purely by Vulkan command name; signatures come from specs/vk.xml.
 PHYSDEV_COMMANDS = [
@@ -40,12 +42,25 @@ MANUAL_PHYSDEV_FORWARDERS: list[str] = [
     "vkEnumerateDeviceExtensionProperties",
     "vkGetPhysicalDeviceProperties",
     "vkGetPhysicalDeviceProperties2",
+    "vkGetPhysicalDeviceToolProperties",
+]
+
+INSTANCE_COMMANDS: list[str] = [
+    "vkEnumerateInstanceVersion",
+    "vkEnumerateInstanceLayerProperties",
+    "vkEnumerateInstanceExtensionProperties",
+    "vkCreateInstance",
+    "vkDestroyInstance",
+    "vkEnumeratePhysicalDevices",
+    "vkCreateDebugUtilsMessengerEXT",
+    "vkDestroyDebugUtilsMessengerEXT",
 ]
 
 DEVICE_COMMANDS = [
     "vkCreateDevice",
     "vkDestroyDevice",
     "vkGetDeviceQueue",
+    "vkGetDeviceQueue2",
     "vkDeviceWaitIdle",
     "vkQueueWaitIdle",
     "vkQueueSubmit",
@@ -59,11 +74,18 @@ DEVICE_COMMANDS = [
     "vkCreateBuffer",
     "vkDestroyBuffer",
     "vkGetBufferMemoryRequirements",
+    "vkGetBufferDeviceAddress",
     "vkBindBufferMemory",
     "vkCreateImage",
     "vkDestroyImage",
     "vkGetImageMemoryRequirements",
+    "vkGetImageSubresourceLayout",
     "vkBindImageMemory",
+    "vkGetDeviceBufferMemoryRequirements",
+    "vkGetDeviceImageMemoryRequirements",
+    "vkGetDeviceImageSparseMemoryRequirements",
+    "vkGetDeviceGroupPeerMemoryFeatures",
+    "vkGetRenderingAreaGranularityKHR",
     "vkCreateImageView",
     "vkDestroyImageView",
     "vkCreateSampler",
@@ -148,6 +170,21 @@ DEVICE_COMMANDS = [
     "vkCmdEndQuery",
     "vkCmdResetQueryPool",
     "vkCmdWriteTimestamp",
+    "vkCreatePrivateDataSlot",
+    "vkDestroyPrivateDataSlot",
+    "vkSetPrivateData",
+    "vkGetPrivateData",
+    "vkSetDebugUtilsObjectNameEXT",
+    "vkCmdBeginDebugUtilsLabelEXT",
+    "vkCmdEndDebugUtilsLabelEXT",
+    "vkCmdInsertDebugUtilsLabelEXT",
+    "vkCmdSetBlendConstants",
+    "vkCmdSetDepthBias",
+    "vkCmdSetDepthBounds",
+    "vkCmdSetLineWidth",
+    "vkCmdSetStencilCompareMask",
+    "vkCmdSetStencilReference",
+    "vkCmdSetStencilWriteMask",
 ]
 
 
@@ -264,42 +301,6 @@ def emit_physdev_wrappers(cmds: dict[str, tuple[str, list[tuple[str, str]]]]) ->
         lines.append("}")
         lines.append("")
 
-    for name in MANUAL_PHYSDEV_FORWARDERS:
-        ret_type, params = cmds[name]
-        sig = ", ".join(f"{t} {a}" for t, a in params)
-        first_type, first_arg = params[0]
-        rest_args = [a for _, a in params[1:]]
-        assert first_type == "VkPhysicalDevice"
-        call_args = ", ".join(["aot_pd"] + rest_args)
-
-        lines.append(f"static inline {ret_type} aot_forward_{name}({sig}) {{")
-        lines.append("    g_aot_rt.ensureInitialized();")
-        lines.append(f"    auto* pdev = icdGetPhysicalDevice({first_arg});")
-        lines.append(f"    if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_{name} && pdev) {{")
-        lines.append("        auto& tctx = maliGetThreadGuestContext();")
-        lines.append("        GuestStackFrameGuard frame(tctx);")
-        lines.append("        const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));")
-        lines.append("        void* aot_pd = pdev->getAotHandle();")
-        if ret_type == "void":
-            lines.append("        mali_aapcs64::invokeLiftedAapcs64<void>(")
-            lines.append(f"            tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_{name},")
-            lines.append(f"            {call_args});")
-            lines.append("        g_aot_rt.lifted_vk_calls_executed++;")
-            lines.append("        return;")
-        else:
-            lines.append(f"        {ret_type} r = mali_aapcs64::invokeLiftedAapcs64<{ret_type}>(")
-            lines.append(f"            tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_{name},")
-            lines.append(f"            {call_args});")
-            lines.append("        g_aot_rt.lifted_vk_calls_executed++;")
-            lines.append("        return r;")
-        lines.append("    }")
-        if ret_type == "VkResult":
-            lines.append("    return VK_ERROR_INITIALIZATION_FAILED;")
-        elif ret_type != "void":
-            lines.append(f"    return {ret_type}{{}};")
-        lines.append("}")
-        lines.append("")
-
     PHYSDEV_OUT.write_text("\n".join(lines), encoding="utf-8")
     print(f"Generated {len(PHYSDEV_COMMANDS)} physical-device wrappers -> {PHYSDEV_OUT}")
 
@@ -351,10 +352,91 @@ def emit_device_wrappers(cmds: dict[str, tuple[str, list[tuple[str, str]]]]) -> 
     print(f"Generated {len(DEVICE_COMMANDS)} typed device/cmd wrappers -> {DEVICE_OUT}")
 
 
+def emit_forwarders(cmds: dict[str, tuple[str, list[tuple[str, str]]]]) -> None:
+    all_forward_cmds: list[str] = []
+    seen: set[str] = set()
+    for name in INSTANCE_COMMANDS + MANUAL_PHYSDEV_FORWARDERS + DEVICE_COMMANDS:
+        if name not in seen:
+            seen.add(name)
+            all_forward_cmds.append(name)
+
+    h_lines = [
+        "// ============================================================================",
+        "// AUTO-GENERATED BY src/r54p3_vulkan_icd/tools/gen_r54p3_physdev_wrappers.py FROM specs/vk.xml",
+        "// DO NOT EDIT. Typed <vulkan/vulkan.h> forwarding declarations into r54p3_lifted.o.",
+        "// ============================================================================",
+        "#pragma once",
+        "#include <vulkan/vulkan.h>",
+        "",
+    ]
+    cpp_lines = [
+        "// ============================================================================",
+        "// AUTO-GENERATED BY src/r54p3_vulkan_icd/tools/gen_r54p3_physdev_wrappers.py FROM specs/vk.xml",
+        "// DO NOT EDIT. Typed <vulkan/vulkan.h> forwarding definitions into r54p3_lifted.o.",
+        "// ============================================================================",
+        '#include "../mali_icd_internal.h"',
+        '#include "mali_aot_forwarders_autogen.h"',
+        "",
+    ]
+
+    for name in all_forward_cmds:
+        ret_type, params = cmds[name]
+        sig = ", ".join(f"{t} {a}" for t, a in params)
+        raw_names = [a.split("[")[0] for _, a in params]
+        first_type, first_arg = params[0]
+        setup_lines: list[str] = []
+        if first_type == "VkPhysicalDevice":
+            setup_lines.append(f"    auto* pdev_obj = icdGetPhysicalDevice({first_arg});")
+            setup_lines.append(f"    VkPhysicalDevice aot_first = reinterpret_cast<VkPhysicalDevice>(pdev_obj ? pdev_obj->getAotHandle() : resolveAotHandle({first_arg}));")
+            raw_names[0] = "aot_first"
+        elif first_type == "VkInstance":
+            setup_lines.append(f"    auto* inst_obj = icdGetInstance({first_arg});")
+            setup_lines.append(f"    VkInstance aot_first = reinterpret_cast<VkInstance>(inst_obj ? inst_obj->getAotHandle() : resolveAotHandle({first_arg}));")
+            raw_names[0] = "aot_first"
+        elif first_type in ("VkDevice", "VkQueue", "VkCommandBuffer"):
+            raw_names[0] = f"reinterpret_cast<{first_type}>(resolveAotHandle({first_arg}))"
+        arg_names = ", ".join(raw_names)
+
+        h_lines.append(f"{ret_type} aot_forward_{name}({sig});")
+
+        cpp_lines.append(f"{ret_type} aot_forward_{name}({sig}) {{")
+        cpp_lines.append("    g_aot_rt.ensureInitialized();")
+        cpp_lines.append(f"    if (!aot_{name}) {{")
+        if ret_type == "VkResult":
+            cpp_lines.append("        return VK_ERROR_EXTENSION_NOT_PRESENT;")
+        elif ret_type == "void":
+            cpp_lines.append("        return;")
+        else:
+            cpp_lines.append(f"        return {ret_type}{{}};")
+        cpp_lines.append("    }")
+        cpp_lines.extend(setup_lines)
+        cpp_lines.append("    auto& tctx = maliGetThreadGuestContext();")
+        cpp_lines.append("    GuestStackFrameGuard frame(tctx);")
+        cpp_lines.append("    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));")
+        if ret_type == "void":
+            cpp_lines.append("    mali_aapcs64::invokeLiftedAapcs64<void>(")
+            cpp_lines.append(f"        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_{name},")
+            cpp_lines.append(f"        {arg_names});")
+            cpp_lines.append("    g_aot_rt.lifted_vk_calls_executed++;")
+        else:
+            cpp_lines.append(f"    {ret_type} r = mali_aapcs64::invokeLiftedAapcs64<{ret_type}>(")
+            cpp_lines.append(f"        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_{name},")
+            cpp_lines.append(f"        {arg_names});")
+            cpp_lines.append("    g_aot_rt.lifted_vk_calls_executed++;")
+            cpp_lines.append("    return r;")
+        cpp_lines.append("}")
+        cpp_lines.append("")
+
+    FORWARDERS_H_OUT.write_text("\n".join(h_lines), encoding="utf-8")
+    FORWARDERS_CPP_OUT.write_text("\n".join(cpp_lines), encoding="utf-8")
+    print(f"Generated {len(all_forward_cmds)} typed auto-forwarders -> {FORWARDERS_H_OUT} & {FORWARDERS_CPP_OUT}")
+
+
 def main() -> None:
     cmds = load_vk_commands(VK_XML)
     emit_physdev_wrappers(cmds)
     emit_device_wrappers(cmds)
+    emit_forwarders(cmds)
 
 
 if __name__ == "__main__":

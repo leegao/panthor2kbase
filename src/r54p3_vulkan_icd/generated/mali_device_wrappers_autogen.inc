@@ -46,6 +46,20 @@ static inline void aot_forward_vkGetDeviceQueue(VkDevice device, uint32_t queueF
     g_aot_rt.lifted_vk_calls_executed++;
 }
 
+static inline void aot_forward_vkGetDeviceQueue2(VkDevice device, const VkDeviceQueueInfo2* pQueueInfo, VkQueue* pQueue) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkGetDeviceQueue2) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkGetDeviceQueue2,
+        reinterpret_cast<VkDevice>(resolveAotHandle(device)), pQueueInfo, pQueue);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
 static inline VkResult aot_forward_vkDeviceWaitIdle(VkDevice device) {
     g_aot_rt.ensureInitialized();
     if (!aot_vkDeviceWaitIdle) {
@@ -237,6 +251,21 @@ static inline void aot_forward_vkGetBufferMemoryRequirements(VkDevice device, Vk
     g_aot_rt.lifted_vk_calls_executed++;
 }
 
+static inline VkDeviceAddress aot_forward_vkGetBufferDeviceAddress(VkDevice device, const VkBufferDeviceAddressInfo* pInfo) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkGetBufferDeviceAddress) {
+        return VkDeviceAddress{};
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    VkDeviceAddress r = mali_aapcs64::invokeLiftedAapcs64<VkDeviceAddress>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkGetBufferDeviceAddress,
+        reinterpret_cast<VkDevice>(resolveAotHandle(device)), pInfo);
+    g_aot_rt.lifted_vk_calls_executed++;
+    return r;
+}
+
 static inline VkResult aot_forward_vkBindBufferMemory(VkDevice device, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize memoryOffset) {
     g_aot_rt.ensureInitialized();
     if (!aot_vkBindBufferMemory) {
@@ -295,6 +324,20 @@ static inline void aot_forward_vkGetImageMemoryRequirements(VkDevice device, VkI
     g_aot_rt.lifted_vk_calls_executed++;
 }
 
+static inline void aot_forward_vkGetImageSubresourceLayout(VkDevice device, VkImage image, const VkImageSubresource* pSubresource, VkSubresourceLayout* pLayout) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkGetImageSubresourceLayout) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkGetImageSubresourceLayout,
+        reinterpret_cast<VkDevice>(resolveAotHandle(device)), image, pSubresource, pLayout);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
 static inline VkResult aot_forward_vkBindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory, VkDeviceSize memoryOffset) {
     g_aot_rt.ensureInitialized();
     if (!aot_vkBindImageMemory) {
@@ -308,6 +351,76 @@ static inline VkResult aot_forward_vkBindImageMemory(VkDevice device, VkImage im
         reinterpret_cast<VkDevice>(resolveAotHandle(device)), image, memory, memoryOffset);
     g_aot_rt.lifted_vk_calls_executed++;
     return r;
+}
+
+static inline void aot_forward_vkGetDeviceBufferMemoryRequirements(VkDevice device, const VkDeviceBufferMemoryRequirements* pInfo, VkMemoryRequirements2* pMemoryRequirements) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkGetDeviceBufferMemoryRequirements) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkGetDeviceBufferMemoryRequirements,
+        reinterpret_cast<VkDevice>(resolveAotHandle(device)), pInfo, pMemoryRequirements);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
+static inline void aot_forward_vkGetDeviceImageMemoryRequirements(VkDevice device, const VkDeviceImageMemoryRequirements* pInfo, VkMemoryRequirements2* pMemoryRequirements) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkGetDeviceImageMemoryRequirements) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkGetDeviceImageMemoryRequirements,
+        reinterpret_cast<VkDevice>(resolveAotHandle(device)), pInfo, pMemoryRequirements);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
+static inline void aot_forward_vkGetDeviceImageSparseMemoryRequirements(VkDevice device, const VkDeviceImageMemoryRequirements* pInfo, uint32_t* pSparseMemoryRequirementCount, VkSparseImageMemoryRequirements2* pSparseMemoryRequirements) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkGetDeviceImageSparseMemoryRequirements) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkGetDeviceImageSparseMemoryRequirements,
+        reinterpret_cast<VkDevice>(resolveAotHandle(device)), pInfo, pSparseMemoryRequirementCount, pSparseMemoryRequirements);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
+static inline void aot_forward_vkGetDeviceGroupPeerMemoryFeatures(VkDevice device, uint32_t heapIndex, uint32_t localDeviceIndex, uint32_t remoteDeviceIndex, VkPeerMemoryFeatureFlags* pPeerMemoryFeatures) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkGetDeviceGroupPeerMemoryFeatures) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkGetDeviceGroupPeerMemoryFeatures,
+        reinterpret_cast<VkDevice>(resolveAotHandle(device)), heapIndex, localDeviceIndex, remoteDeviceIndex, pPeerMemoryFeatures);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
+static inline void aot_forward_vkGetRenderingAreaGranularityKHR(VkDevice device, const VkRenderingAreaInfo* pRenderingAreaInfo, VkExtent2D* pGranularity) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkGetRenderingAreaGranularityKHR) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkGetRenderingAreaGranularityKHR,
+        reinterpret_cast<VkDevice>(resolveAotHandle(device)), pRenderingAreaInfo, pGranularity);
+    g_aot_rt.lifted_vk_calls_executed++;
 }
 
 static inline VkResult aot_forward_vkCreateImageView(VkDevice device, const VkImageViewCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkImageView* pView) {
@@ -1521,5 +1634,218 @@ static inline void aot_forward_vkCmdWriteTimestamp(VkCommandBuffer commandBuffer
     mali_aapcs64::invokeLiftedAapcs64<void>(
         tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdWriteTimestamp,
         reinterpret_cast<VkCommandBuffer>(resolveAotHandle(commandBuffer)), pipelineStage, queryPool, query);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
+static inline VkResult aot_forward_vkCreatePrivateDataSlot(VkDevice device, const VkPrivateDataSlotCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkPrivateDataSlot* pPrivateDataSlot) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkCreatePrivateDataSlot) {
+        return VK_ERROR_EXTENSION_NOT_PRESENT;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    VkResult r = mali_aapcs64::invokeLiftedAapcs64<VkResult>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCreatePrivateDataSlot,
+        reinterpret_cast<VkDevice>(resolveAotHandle(device)), pCreateInfo, pAllocator, pPrivateDataSlot);
+    g_aot_rt.lifted_vk_calls_executed++;
+    return r;
+}
+
+static inline void aot_forward_vkDestroyPrivateDataSlot(VkDevice device, VkPrivateDataSlot privateDataSlot, const VkAllocationCallbacks* pAllocator) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkDestroyPrivateDataSlot) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkDestroyPrivateDataSlot,
+        reinterpret_cast<VkDevice>(resolveAotHandle(device)), privateDataSlot, pAllocator);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
+static inline VkResult aot_forward_vkSetPrivateData(VkDevice device, VkObjectType objectType, uint64_t objectHandle, VkPrivateDataSlot privateDataSlot, uint64_t data) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkSetPrivateData) {
+        return VK_ERROR_EXTENSION_NOT_PRESENT;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    VkResult r = mali_aapcs64::invokeLiftedAapcs64<VkResult>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkSetPrivateData,
+        reinterpret_cast<VkDevice>(resolveAotHandle(device)), objectType, objectHandle, privateDataSlot, data);
+    g_aot_rt.lifted_vk_calls_executed++;
+    return r;
+}
+
+static inline void aot_forward_vkGetPrivateData(VkDevice device, VkObjectType objectType, uint64_t objectHandle, VkPrivateDataSlot privateDataSlot, uint64_t* pData) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkGetPrivateData) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkGetPrivateData,
+        reinterpret_cast<VkDevice>(resolveAotHandle(device)), objectType, objectHandle, privateDataSlot, pData);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
+static inline VkResult aot_forward_vkSetDebugUtilsObjectNameEXT(VkDevice device, const VkDebugUtilsObjectNameInfoEXT* pNameInfo) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkSetDebugUtilsObjectNameEXT) {
+        return VK_ERROR_EXTENSION_NOT_PRESENT;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    VkResult r = mali_aapcs64::invokeLiftedAapcs64<VkResult>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkSetDebugUtilsObjectNameEXT,
+        reinterpret_cast<VkDevice>(resolveAotHandle(device)), pNameInfo);
+    g_aot_rt.lifted_vk_calls_executed++;
+    return r;
+}
+
+static inline void aot_forward_vkCmdBeginDebugUtilsLabelEXT(VkCommandBuffer commandBuffer, const VkDebugUtilsLabelEXT* pLabelInfo) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkCmdBeginDebugUtilsLabelEXT) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdBeginDebugUtilsLabelEXT,
+        reinterpret_cast<VkCommandBuffer>(resolveAotHandle(commandBuffer)), pLabelInfo);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
+static inline void aot_forward_vkCmdEndDebugUtilsLabelEXT(VkCommandBuffer commandBuffer) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkCmdEndDebugUtilsLabelEXT) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdEndDebugUtilsLabelEXT,
+        reinterpret_cast<VkCommandBuffer>(resolveAotHandle(commandBuffer)));
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
+static inline void aot_forward_vkCmdInsertDebugUtilsLabelEXT(VkCommandBuffer commandBuffer, const VkDebugUtilsLabelEXT* pLabelInfo) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkCmdInsertDebugUtilsLabelEXT) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdInsertDebugUtilsLabelEXT,
+        reinterpret_cast<VkCommandBuffer>(resolveAotHandle(commandBuffer)), pLabelInfo);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
+static inline void aot_forward_vkCmdSetBlendConstants(VkCommandBuffer commandBuffer, const float blendConstants[4]) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkCmdSetBlendConstants) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdSetBlendConstants,
+        reinterpret_cast<VkCommandBuffer>(resolveAotHandle(commandBuffer)), blendConstants);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
+static inline void aot_forward_vkCmdSetDepthBias(VkCommandBuffer commandBuffer, float depthBiasConstantFactor, float depthBiasClamp, float depthBiasSlopeFactor) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkCmdSetDepthBias) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdSetDepthBias,
+        reinterpret_cast<VkCommandBuffer>(resolveAotHandle(commandBuffer)), depthBiasConstantFactor, depthBiasClamp, depthBiasSlopeFactor);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
+static inline void aot_forward_vkCmdSetDepthBounds(VkCommandBuffer commandBuffer, float minDepthBounds, float maxDepthBounds) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkCmdSetDepthBounds) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdSetDepthBounds,
+        reinterpret_cast<VkCommandBuffer>(resolveAotHandle(commandBuffer)), minDepthBounds, maxDepthBounds);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
+static inline void aot_forward_vkCmdSetLineWidth(VkCommandBuffer commandBuffer, float lineWidth) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkCmdSetLineWidth) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdSetLineWidth,
+        reinterpret_cast<VkCommandBuffer>(resolveAotHandle(commandBuffer)), lineWidth);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
+static inline void aot_forward_vkCmdSetStencilCompareMask(VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask, uint32_t compareMask) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkCmdSetStencilCompareMask) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdSetStencilCompareMask,
+        reinterpret_cast<VkCommandBuffer>(resolveAotHandle(commandBuffer)), faceMask, compareMask);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
+static inline void aot_forward_vkCmdSetStencilReference(VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask, uint32_t reference) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkCmdSetStencilReference) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdSetStencilReference,
+        reinterpret_cast<VkCommandBuffer>(resolveAotHandle(commandBuffer)), faceMask, reference);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
+static inline void aot_forward_vkCmdSetStencilWriteMask(VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask, uint32_t writeMask) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkCmdSetStencilWriteMask) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdSetStencilWriteMask,
+        reinterpret_cast<VkCommandBuffer>(resolveAotHandle(commandBuffer)), faceMask, writeMask);
     g_aot_rt.lifted_vk_calls_executed++;
 }

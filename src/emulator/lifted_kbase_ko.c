@@ -206,9 +206,72 @@ void lifted_ko_trace_fn_enter(LiftedKbaseCPU *cpu, uint32_t profile_id, const ch
         cpu->max_call_depth = cpu->call_depth;
     }
     if (flags & LIFTED_KO_DEBUG_TRACE_CALLS) {
-        fprintf(stderr, "[KO_TRACE] %*s-> %s::%s(x0=0x%llx, x1=0x%llx, x2=0x%llx) [pc=0x%06llx sp=0x%llx lr=0x%llx depth=%u]\n",
+        char fmt_buf[160];
+        char fmt_extra[192];
+        const char *fmt_suffix = "";
+        int fmt_idx = -1;
+        if (fn_name) {
+            if (strcmp(fn_name, "printk") == 0 || strcmp(fn_name, "_printk") == 0 ||
+                strcmp(fn_name, "vprintk") == 0 || strcmp(fn_name, "panic") == 0 ||
+                strcmp(fn_name, "puts") == 0 || strcmp(fn_name, "printf") == 0) {
+                fmt_idx = 0;
+            } else if (strcmp(fn_name, "dev_err") == 0 || strcmp(fn_name, "_dev_err") == 0 ||
+                       strcmp(fn_name, "dev_warn") == 0 || strcmp(fn_name, "_dev_warn") == 0 ||
+                       strcmp(fn_name, "dev_info") == 0 || strcmp(fn_name, "_dev_info") == 0 ||
+                       strcmp(fn_name, "dev_dbg") == 0 || strcmp(fn_name, "_dev_dbg") == 0 ||
+                       strcmp(fn_name, "dev_notice") == 0 || strcmp(fn_name, "_dev_notice") == 0 ||
+                       strcmp(fn_name, "dev_crit") == 0 || strcmp(fn_name, "_dev_crit") == 0 ||
+                       strcmp(fn_name, "dev_emerg") == 0 || strcmp(fn_name, "_dev_emerg") == 0 ||
+                       strcmp(fn_name, "dev_alert") == 0 || strcmp(fn_name, "_dev_alert") == 0 ||
+                       strcmp(fn_name, "seq_printf") == 0 || strcmp(fn_name, "seq_vprintf") == 0 ||
+                       strcmp(fn_name, "sprintf") == 0 || strcmp(fn_name, "vsprintf") == 0 ||
+                       strcmp(fn_name, "kasprintf") == 0 || strcmp(fn_name, "kvasprintf") == 0 ||
+                       strcmp(fn_name, "fprintf") == 0 || strcmp(fn_name, "trace_printk") == 0) {
+                fmt_idx = 1;
+            } else if (strcmp(fn_name, "snprintf") == 0 || strcmp(fn_name, "vsnprintf") == 0 ||
+                       strcmp(fn_name, "scnprintf") == 0 || strcmp(fn_name, "vscnprintf") == 0) {
+                fmt_idx = 2;
+            }
+        }
+        if (fmt_idx >= 0 && cpu->x[fmt_idx] >= 0x10000ULL) {
+            uintptr_t pg_sz = (uintptr_t)sysconf(_SC_PAGESIZE);
+            if (pg_sz == 0) pg_sz = 4096ULL;
+            uint64_t addr = cpu->x[fmt_idx];
+            const char *p = (const char *)(uintptr_t)addr;
+            uintptr_t last_pg = ~(uintptr_t)0;
+            size_t oi = 0;
+            for (size_t i = 0; i < 64 && oi + 4 < sizeof(fmt_buf); ++i) {
+                uintptr_t cur_addr = (uintptr_t)addr + i;
+                uintptr_t pg = cur_addr & ~(pg_sz - 1ULL);
+                if (pg != last_pg) {
+                    if (msync((void *)pg, pg_sz, MS_ASYNC) != 0) {
+                        if (i == 0) { oi = 0; }
+                        break;
+                    }
+                    last_pg = pg;
+                }
+                unsigned char c = (unsigned char)p[i];
+                if (c == '\0') break;
+                if (c == '\n') { fmt_buf[oi++] = '\\'; fmt_buf[oi++] = 'n'; }
+                else if (c == '\r') { fmt_buf[oi++] = '\\'; fmt_buf[oi++] = 'r'; }
+                else if (c == '\t') { fmt_buf[oi++] = '\\'; fmt_buf[oi++] = 't'; }
+                else if (c == '\\' || c == '"') { fmt_buf[oi++] = '\\'; fmt_buf[oi++] = (char)c; }
+                else if (c >= 0x20 && c < 0x7f) { fmt_buf[oi++] = (char)c; }
+                else { fmt_buf[oi++] = '.'; }
+                if (i == 63 && p[64] != '\0' && oi + 4 <= sizeof(fmt_buf)) {
+                    fmt_buf[oi++] = '.'; fmt_buf[oi++] = '.'; fmt_buf[oi++] = '.';
+                }
+            }
+            fmt_buf[oi] = '\0';
+            if (oi > 0) {
+                snprintf(fmt_extra, sizeof(fmt_extra), " fmt=\"%s\"", fmt_buf);
+                fmt_suffix = fmt_extra;
+            }
+        }
+        fprintf(stderr, "[KO_TRACE] %*s-> %s::%s(x0=0x%llx, x1=0x%llx, x2=0x%llx)%s [pc=0x%06llx sp=0x%llx lr=0x%llx depth=%u]\n",
                 (int)(depth * 2U), "", prof_str, fn_name ? fn_name : "<fn>",
                 (unsigned long long)cpu->x[0], (unsigned long long)cpu->x[1], (unsigned long long)cpu->x[2],
+                fmt_suffix,
                 (unsigned long long)entry_pc, (unsigned long long)cpu->sp, (unsigned long long)cpu->x[30], depth);
     }
 }
@@ -444,34 +507,10 @@ static bool check_redzone_intact(const struct LiftedKoHeapBlockHdr *hdr) {
 }
 
 void *lifted_ko_heap_alloc(LiftedKbaseCPU *cpu, size_t sz) {
-    if (!cpu) return NULL;
     size_t aligned_sz = (sz + 15U) & ~15ULL;
     size_t total = sizeof(struct LiftedKoHeapBlockHdr) + aligned_sz + 16U;
-    if ((size_t)cpu->heap.used + total > sizeof(cpu->heap.arena)) {
-        size_t off = 0;
-        while (off + sizeof(struct LiftedKoHeapBlockHdr) <= cpu->heap.used) {
-            struct LiftedKoHeapBlockHdr *fhdr = (struct LiftedKoHeapBlockHdr *)&cpu->heap.arena[off];
-            if (fhdr->magic != LIFTED_KO_HEAP_MAGIC) break;
-            size_t blk_aligned = ((size_t)fhdr->payload_size + 15U) & ~15ULL;
-            size_t blk_total = sizeof(struct LiftedKoHeapBlockHdr) + blk_aligned + 16U;
-            if (fhdr->state == LIFTED_KO_STATE_FREED && blk_aligned == aligned_sz) {
-                fhdr->state = LIFTED_KO_STATE_ALLOCATED;
-                fhdr->payload_size = (uint32_t)sz;
-                fhdr->alloc_seq = ++cpu->heap.alloc_count;
-                fhdr->alloc_guest_pc = cpu->cur_pc ? cpu->cur_pc : cpu->x[30];
-                fhdr->alloc_fn = cpu->cur_fn ? cpu->cur_fn : "kmalloc";
-                fhdr->alloc_host_bt[0] = __builtin_return_address(0);
-#if defined(__GLIBC__)
-                (void)backtrace(fhdr->alloc_host_bt, 4);
-#endif
-                void *payload = (uint8_t *)fhdr + sizeof(struct LiftedKoHeapBlockHdr);
-                memset(payload, 0, aligned_sz);
-                memset((uint8_t *)payload + aligned_sz, LIFTED_KO_REDZONE_BYTE, 16U);
-                return payload;
-            }
-            off += blk_total;
-        }
-        lifted_ko_print_stacktrace(cpu, "HEAP ARENA EXHAUSTION in lifted_ko_heap_alloc", NULL);
+    if (!cpu || (size_t)cpu->heap.used + total > sizeof(cpu->heap.arena)) {
+        if (cpu) lifted_ko_print_stacktrace(cpu, "HEAP ARENA EXHAUSTION in lifted_ko_heap_alloc", NULL);
         return NULL;
     }
     uint8_t *base = &cpu->heap.arena[cpu->heap.used];

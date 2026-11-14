@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <vector>
 
 #define AOT_SO_DEBUG_RECORD_STACKFRAMES (1U << 0)
@@ -331,12 +333,84 @@ void aot_so_trace_fn_enter(void* cpu_ptr, uint64_t fn_va, const char* fn_name) {
         aot_so_prof_detail::g_so_max_call_depth = aot_so_prof_detail::g_so_call_depth;
     }
     if ((flags & AOT_SO_DEBUG_TRACE_CALLS) && !aot_so_prof_detail::is_std_trace_suppressed(fn_name)) {
-        std::fprintf(stderr, "[SO_TRACE] %*s-> %s(x0=0x%llx, x1=0x%llx, x2=0x%llx) [va=0x%llx sp=0x%llx lr=0x%llx depth=%u]\n",
+        auto read_cstr_preview = [](uint64_t addr, char* out, size_t out_sz) -> bool {
+            if (!out || out_sz < 8 || addr < 0x10000ULL) return false;
+            uintptr_t pg_sz = static_cast<uintptr_t>(::sysconf(_SC_PAGESIZE));
+            if (pg_sz == 0) pg_sz = 4096ULL;
+            const char* p = reinterpret_cast<const char*>(static_cast<uintptr_t>(addr));
+            uintptr_t last_pg = ~0ULL;
+            size_t oi = 0;
+            for (size_t i = 0; i < 64 && oi + 4 < out_sz; ++i) {
+                uintptr_t cur_addr = static_cast<uintptr_t>(addr) + i;
+                uintptr_t pg = cur_addr & ~(pg_sz - 1ULL);
+                if (pg != last_pg) {
+                    if (::msync(reinterpret_cast<void*>(pg), pg_sz, MS_ASYNC) != 0) {
+                        if (i == 0) return false;
+                        break;
+                    }
+                    last_pg = pg;
+                }
+                unsigned char c = static_cast<unsigned char>(p[i]);
+                if (c == '\0') {
+                    out[oi] = '\0';
+                    return oi > 0;
+                }
+                if (c == '\n') { out[oi++] = '\\'; out[oi++] = 'n'; }
+                else if (c == '\r') { out[oi++] = '\\'; out[oi++] = 'r'; }
+                else if (c == '\t') { out[oi++] = '\\'; out[oi++] = 't'; }
+                else if (c == '\\' || c == '"') { out[oi++] = '\\'; out[oi++] = static_cast<char>(c); }
+                else if (c >= 0x20 && c < 0x7f) { out[oi++] = static_cast<char>(c); }
+                else { out[oi++] = '.'; }
+                if (i == 63 && p[64] != '\0' && oi + 4 <= out_sz) {
+                    out[oi++] = '.'; out[oi++] = '.'; out[oi++] = '.';
+                }
+            }
+            out[oi] = '\0';
+            return oi > 0;
+        };
+        auto fmt_arg_index = [](const char* name) -> int {
+            if (!name) return -1;
+            char base[128];
+            size_t bi = 0;
+            while (name[bi] && name[bi] != '(' && bi + 1 < sizeof(base)) {
+                base[bi] = name[bi];
+                ++bi;
+            }
+            base[bi] = '\0';
+            if (std::strcmp(base, "printf") == 0 || std::strcmp(base, "vprintf") == 0 ||
+                std::strcmp(base, "puts") == 0 || std::strcmp(base, "fputs") == 0 ||
+                std::strcmp(base, "perror") == 0) return 0;
+            if (std::strcmp(base, "fprintf") == 0 || std::strcmp(base, "vfprintf") == 0 ||
+                std::strcmp(base, "sprintf") == 0 || std::strcmp(base, "vsprintf") == 0 ||
+                std::strcmp(base, "dprintf") == 0 || std::strcmp(base, "vdprintf") == 0 ||
+                std::strcmp(base, "asprintf") == 0 || std::strcmp(base, "vasprintf") == 0 ||
+                std::strcmp(base, "sscanf") == 0 || std::strcmp(base, "vsscanf") == 0 ||
+                std::strcmp(base, "__printf_chk") == 0 || std::strcmp(base, "__vprintf_chk") == 0) return 1;
+            if (std::strcmp(base, "snprintf") == 0 || std::strcmp(base, "vsnprintf") == 0 ||
+                std::strcmp(base, "syslog") == 0 || std::strcmp(base, "vsyslog") == 0 ||
+                std::strcmp(base, "__fprintf_chk") == 0 || std::strcmp(base, "__vfprintf_chk") == 0 ||
+                std::strcmp(base, "__dprintf_chk") == 0 || std::strcmp(base, "__vdprintf_chk") == 0 ||
+                std::strcmp(base, "__asprintf_chk") == 0 || std::strcmp(base, "__vasprintf_chk") == 0 ||
+                std::strcmp(base, "__android_log_print") == 0 || std::strcmp(base, "__android_log_vprint") == 0) return 2;
+            if (std::strcmp(base, "__sprintf_chk") == 0 || std::strcmp(base, "__vsprintf_chk") == 0) return 3;
+            if (std::strcmp(base, "__snprintf_chk") == 0 || std::strcmp(base, "__vsnprintf_chk") == 0) return 4;
+            return -1;
+        };
+        char fmt_buf[160];
+        const char* fmt_suffix = "";
+        char fmt_extra[192];
+        int fmt_idx = fmt_arg_index(fn_name);
+        if (fmt_idx >= 0 && cpu && read_cstr_preview(cpu->x[fmt_idx], fmt_buf, sizeof(fmt_buf))) {
+            std::snprintf(fmt_extra, sizeof(fmt_extra), " fmt=\"%s\"", fmt_buf);
+            fmt_suffix = fmt_extra;
+        }
+        std::fprintf(stderr, "[SO_TRACE] %*s-> %s(x0=0x%llx, x1=0x%llx, x2=0x%llx)%s [va=0x%llx sp=0x%llx lr=0x%llx depth=%u]\n",
                      static_cast<int>(depth * 2U), "",
                      fn_name ? fn_name : "<sub_unknown>",
                      static_cast<unsigned long long>(cpu ? cpu->x[0] : 0ULL),
                      static_cast<unsigned long long>(cpu ? cpu->x[1] : 0ULL),
                      static_cast<unsigned long long>(cpu ? cpu->x[2] : 0ULL),
+                     fmt_suffix,
                      static_cast<unsigned long long>(fn_va),
                      static_cast<unsigned long long>(cpu ? cpu->sp : 0ULL),
                      static_cast<unsigned long long>(cpu ? cpu->x[30] : 0ULL),

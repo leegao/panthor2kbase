@@ -108,7 +108,7 @@ struct LiftedKoHeap {
     uint32_t free_count;
     uint32_t double_free_errors;
     uint32_t uaf_errors;
-    uint8_t arena[262144] __attribute__((aligned(16)));
+    uint8_t arena[65536] __attribute__((aligned(16)));
 };
 
 struct LiftedKbaseCPU {

@@ -4,6 +4,7 @@
 // queries (including VP_DXVK_d3d11_level_11_1_baseline & vkgears sample counts).
 // ============================================================================
 #include "mali_icd_internal.h"
+#include "generated/mali_aot_forwarders_autogen.h"
 
 // ============================================================================
 // Section 5: Exported Vulkan ICD Functions
@@ -15,11 +16,8 @@ int32_t vkEnumerateInstanceVersion(uint32_t* pApiVersion) {
     if (!pApiVersion) return -3;
     g_aot_rt.ensureInitialized();
     if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkEnumerateInstanceVersion) {
-        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
-        int32_t r = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
-            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkEnumerateInstanceVersion, pApiVersion);
-        g_aot_rt.lifted_vk_calls_executed++;
-        if (r == 0 && *pApiVersion != 0) return 0;
+        VkResult r = aot_forward_vkEnumerateInstanceVersion(pApiVersion);
+        if (r == VK_SUCCESS && *pApiVersion != 0) return 0;
     }
     *pApiVersion = g_aot_rt.aot_queried_api_version;
     return 0;
@@ -141,22 +139,13 @@ int32_t vkCreateInstance(const void* pCreateInfo, const void* pAllocator, void**
     inst->phys_dev.parent_instance = inst;
 
     if (!g_aot_rt.mapper.so_path_loaded.empty() && aot_vkCreateInstance && aot_vkEnumeratePhysicalDevices) {
-        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
-
         std::vector<VkExtensionProperties> nat_exts;
         if (aot_vkEnumerateInstanceExtensionProperties) {
             uint32_t nat_cnt = 0;
-            if (mali_aapcs64::invokeLiftedAapcs64<int32_t>(
-                    g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size,
-                    aot_vkEnumerateInstanceExtensionProperties,
-                    static_cast<const char*>(nullptr), &nat_cnt,
-                    static_cast<VkExtensionProperties*>(nullptr)) == 0 &&
+            if (aot_forward_vkEnumerateInstanceExtensionProperties(nullptr, &nat_cnt, nullptr) == VK_SUCCESS &&
                 nat_cnt > 0 && nat_cnt <= 256) {
                 nat_exts.resize(nat_cnt);
-                mali_aapcs64::invokeLiftedAapcs64<int32_t>(
-                    g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size,
-                    aot_vkEnumerateInstanceExtensionProperties,
-                    static_cast<const char*>(nullptr), &nat_cnt, nat_exts.data());
+                aot_forward_vkEnumerateInstanceExtensionProperties(nullptr, &nat_cnt, nat_exts.data());
                 nat_exts.resize(nat_cnt);
             }
         }
@@ -188,27 +177,18 @@ int32_t vkCreateInstance(const void* pCreateInfo, const void* pAllocator, void**
 
         const VkAllocationCallbacks* sidecar_alloc = icdGetSidecarAllocator(
             static_cast<const VkAllocationCallbacks*>(pAllocator));
-        void* aot_inst = nullptr;
-        int32_t r = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
-            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkCreateInstance,
-            &aot_ci, sidecar_alloc, &aot_inst);
-        g_aot_rt.lifted_vk_calls_executed++;
-        if (r == 0 && aot_inst != nullptr) {
+        VkInstance aot_inst = VK_NULL_HANDLE;
+        VkResult r = aot_forward_vkCreateInstance(&aot_ci, sidecar_alloc, &aot_inst);
+        if (r == VK_SUCCESS && aot_inst != VK_NULL_HANDLE) {
             icdSetSidecar(aot_inst, MALI_SIDECAR_TAG_INSTANCE, inst);
             inst->native_instance = aot_inst;
 
             uint32_t pd_count = 0;
-            int32_t pr = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
-                g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkEnumeratePhysicalDevices,
-                aot_inst, &pd_count, static_cast<void**>(nullptr));
-            g_aot_rt.lifted_vk_calls_executed++;
-            if (pr == 0 && pd_count > 0 && pd_count <= 16) {
-                std::vector<void*> native_pds(pd_count, nullptr);
-                pr = mali_aapcs64::invokeLiftedAapcs64<int32_t>(
-                    g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkEnumeratePhysicalDevices,
-                    aot_inst, &pd_count, native_pds.data());
-                g_aot_rt.lifted_vk_calls_executed++;
-                if ((pr == 0 || pr == 5) && pd_count > 0) {
+            VkResult pr = aot_forward_vkEnumeratePhysicalDevices(aot_inst, &pd_count, nullptr);
+            if (pr == VK_SUCCESS && pd_count > 0 && pd_count <= 16) {
+                std::vector<VkPhysicalDevice> native_pds(pd_count, VK_NULL_HANDLE);
+                pr = aot_forward_vkEnumeratePhysicalDevices(aot_inst, &pd_count, native_pds.data());
+                if ((pr == VK_SUCCESS || pr == VK_INCOMPLETE) && pd_count > 0) {
                     for (uint32_t i = 0; i < pd_count; ++i) {
                         if (!native_pds[i]) continue;
                         MaliIcdPhysicalDevice* pd_sidecar = nullptr;
@@ -267,15 +247,11 @@ __attribute__((visibility("default")))
 void vkDestroyInstance(void* instance, const void* pAllocator) {
     auto* inst = icdGetInstance(instance);
     if (!inst) return;
-    void* aot_inst = inst->native_instance;
+    VkInstance aot_inst = static_cast<VkInstance>(inst->native_instance);
     if (aot_inst && !g_aot_rt.mapper.so_path_loaded.empty() && aot_vkDestroyInstance) {
-        std::lock_guard<std::mutex> lock(g_aot_rt.mtx);
         const VkAllocationCallbacks* sidecar_alloc = icdGetSidecarAllocator(
             static_cast<const VkAllocationCallbacks*>(pAllocator));
-        mali_aapcs64::invokeLiftedAapcs64<void>(
-            g_aot_rt.cpu, g_aot_rt.stack_mem, g_aot_rt.stack_size, aot_vkDestroyInstance,
-            aot_inst, sidecar_alloc);
-        g_aot_rt.lifted_vk_calls_executed++;
+        aot_forward_vkDestroyInstance(aot_inst, sidecar_alloc);
     }
     delete inst;
 }
