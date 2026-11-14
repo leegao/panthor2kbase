@@ -24,7 +24,19 @@ VkResult vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInf
     if (!pDevice) return VK_ERROR_INITIALIZATION_FAILED;
     g_aot_rt.ensureInitialized();
     if (useNativeAotFor("vkCreateDevice")) {
-        return aot_forward_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
+        VkDevice aot_dev = VK_NULL_HANDLE;
+        VkResult r = aot_forward_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, &aot_dev);
+        if (r != VK_SUCCESS || aot_dev == VK_NULL_HANDLE) return r;
+        auto* dev = new MaliIcdDevice();
+        dev->loader_magic = ICD_LOADER_MAGIC;
+        dev->sidecar_tag = MALI_SIDECAR_TAG_DEVICE;
+        dev->native_device = aot_dev;
+        dev->phys_dev = icdGetPhysicalDevice(physicalDevice);
+        dev->queue.loader_magic = ICD_LOADER_MAGIC;
+        dev->queue.sidecar_tag = MALI_SIDECAR_TAG_QUEUE;
+        dev->queue.parent_device = dev;
+        *pDevice = reinterpret_cast<VkDevice>(dev);
+        return VK_SUCCESS;
     }
 
     auto* dev = new MaliIcdDevice();
@@ -184,7 +196,12 @@ VkResult vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInf
 __attribute__((visibility("default")))
 void vkDestroyDevice(VkDevice device, const VkAllocationCallbacks* pAllocator) {
     if (useNativeAotFor("vkDestroyDevice")) {
+        auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
         aot_forward_vkDestroyDevice(device, pAllocator);
+        if (dev && dev->loader_magic == ICD_LOADER_MAGIC &&
+            dev->sidecar_tag == MALI_SIDECAR_TAG_DEVICE && dev->native_device) {
+            delete dev;
+        }
         return;
     }
     const char* log_env = std::getenv("MALI_AOT_ICD_LOG");
@@ -231,6 +248,14 @@ __attribute__((visibility("default")))
 void vkGetDeviceQueue(void* device, uint32_t queueFamilyIndex, uint32_t queueIndex, void** pQueue) {
     if (!device || !pQueue) return;
     auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
+    if (useNativeAotFor("vkGetDeviceQueue") && dev->native_device) {
+        VkQueue native_q = VK_NULL_HANDLE;
+        aot_forward_vkGetDeviceQueue(
+            reinterpret_cast<VkDevice>(device), queueFamilyIndex, queueIndex, &native_q);
+        dev->queue.native_queue = native_q;
+        *pQueue = &dev->queue;
+        return;
+    }
     if (aot_vkGetDeviceQueue && !dev->aot_vk_device_mem.empty() && queueIndex == 0) {
         aot_forward_vkGetDeviceQueue(
             reinterpret_cast<VkDevice>(dev->aot_vk_device_mem.data()),

@@ -134,9 +134,10 @@ fi
 if [ -f "$OUT_DIR/r54p3_lifted.o" ] && [ "${MALI_AOT_FORCE_RELIFT:-0}" != "1" ] && [ "$STAMP_OK" -eq 1 ] && [ "$OUT_DIR/r54p3_lifted.o" -nt "$PASS_DRIVER" ] && [ "$OUT_DIR/r54p3_lifted.o" -nt "$ROOT_DIR/src/mali_llvm_passes.cpp" ]; then
     echo "[Cache] Reusing up-to-date $OUT_DIR/r54p3_lifted.o (set MALI_AOT_FORCE_RELIFT=1 to force full re-lift)"
 elif [ -n "$SO_PATH" ] && [ -f "$SO_PATH" ]; then
-    export MALI_AOT_CHUNK_MB=20
-    export MALI_AOT_JOBS=8
-    "$PASS_DRIVER" --lift-so "$SO_PATH" "$OUT_DIR" --hook-Vulkan-calls -j 8
+    export MALI_AOT_CHUNK_MB="${MALI_AOT_CHUNK_MB:-40}"
+    export MALI_AOT_JOBS="${MALI_AOT_JOBS:-8}"
+    export MALI_AOT_KEEP_LL="${MALI_AOT_KEEP_LL:-0}"
+    "$PASS_DRIVER" --lift-so "$SO_PATH" "$OUT_DIR" --hook-Vulkan-calls -j "$MALI_AOT_JOBS"
     if [ -n "$CUR_STAMP" ]; then
         echo "$CUR_STAMP" > "$STAMP_FILE"
     fi
@@ -145,7 +146,7 @@ elif [ ! -f "$OUT_DIR/r54p3_lifted.o" ]; then
     exit 1
 fi
 
-if [ "${MALI_AOT_KEEP_LL:-1}" = "0" ]; then
+if [ "${MALI_AOT_KEEP_LL:-0}" = "0" ]; then
     rm -f "$OUT_DIR/mali_mbs2_unopt.ll" "$OUT_DIR/mali_mbs2_opt.ll" "$OUT_DIR"/mali_mbs2_chunk_*.ll "$OUT_DIR"/mali_mbs2_wrappers_*.ll
 fi
 

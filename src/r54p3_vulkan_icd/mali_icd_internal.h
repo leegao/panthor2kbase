@@ -1989,7 +1989,8 @@ static inline void* resolveAotHandle(void* handle) {
     const uintptr_t addr = reinterpret_cast<uintptr_t>(handle);
     if (addr < 0x10000ULL || (addr & 0x7ULL) != 0ULL) return handle;
     const auto* words = static_cast<const uint64_t*>(handle);
-    if (words[0] != ICD_LOADER_MAGIC) return handle;
+    // Note: libvulkan.so.1 overwrites words[0] (VK_LOADER_DATA) with its dispatch table pointer,
+    // so identify MaliIcd* wrapper structs by their 64-bit sidecar_tag in words[1].
     switch (words[1]) {
         case MALI_SIDECAR_TAG_INSTANCE: {
             const auto* s = static_cast<const MaliIcdInstance*>(handle);

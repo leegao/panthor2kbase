@@ -1182,29 +1182,35 @@ private:
         }
         std::set<uint64_t> visited;
         std::set<uint64_t> scanned_vtables;
-        auto seedVtableSlots = [&](uint64_t base_addr, int depth) {
+        uint64_t relro_lo = 0, relro_hi = 0;
+        if (sections.count(".data.rel.ro")) {
+            relro_lo = sections[".data.rel.ro"].offset;
+            relro_hi = relro_lo + sections[".data.rel.ro"].size;
+        }
+        std::set<uint64_t> vtable_seeded_funcs;
+        auto seedVtableSlots = [&](uint64_t base_addr) {
             if (base_addr == 0 || (base_addr & 7ULL) != 0 || isExecAddr(base_addr)) return;
             if (!scanned_vtables.insert(base_addr).second) return;
-            for (uint64_t slot = base_addr; slot < base_addr + 0x400ULL && slot + 8 <= elf.size(); slot += 8) {
-                if (!relocated_data_slots.count(slot)) break;
-                uint64_t ptr = readU64(elf, slot) & 0xFFFFFFFFFFFFULL;
-                if (func_by_addr.count(ptr)) {
-                    if (!visited.count(ptr)) q.push_back(ptr);
-                } else if (depth == 0 && !isExecAddr(ptr) && relocated_data_slots.count(ptr)) {
-                    // 1-level indirection for dispatch tables of vtable pointers (e.g. 0x2fee4d0).
-                    if (scanned_vtables.insert(ptr).second) {
-                        for (uint64_t sub = ptr; sub < ptr + 0x200ULL && sub + 8 <= elf.size(); sub += 8) {
-                            if (!relocated_data_slots.count(sub)) break;
-                            uint64_t fptr = readU64(elf, sub) & 0xFFFFFFFFFFFFULL;
-                            if (func_by_addr.count(fptr)) {
-                                if (!visited.count(fptr)) q.push_back(fptr);
-                            } else {
-                                break;
-                            }
-                        }
+            if (relocated_data_slots.count(base_addr)) {
+                uint64_t first_ptr = readU64(elf, base_addr) & 0xFFFFFFFFFFFFULL;
+                if (func_by_addr.count(first_ptr)) {
+                    for (uint64_t slot = base_addr; slot < base_addr + 0x400ULL && slot + 8 <= elf.size(); slot += 8) {
+                        if (!relocated_data_slots.count(slot)) break;
+                        uint64_t ptr = readU64(elf, slot) & 0xFFFFFFFFFFFFULL;
+                        if (!func_by_addr.count(ptr)) break;
+                        if (!visited.count(ptr) && vtable_seeded_funcs.insert(ptr).second) q.push_back(ptr);
                     }
-                } else {
-                    break;
+                    return;
+                }
+            }
+            if (base_addr >= relro_lo && base_addr < relro_hi) {
+                // Also handle struct/opcode tables in .data.rel.ro (e.g. SPIR-V opcode table)
+                for (uint64_t slot = base_addr; slot < std::min<uint64_t>(relro_hi, base_addr + 0x3000ULL) && slot + 8 <= elf.size(); slot += 8) {
+                    if (!relocated_data_slots.count(slot)) continue;
+                    uint64_t ptr = readU64(elf, slot) & 0xFFFFFFFFFFFFULL;
+                    if (func_by_addr.count(ptr) && !visited.count(ptr) && vtable_seeded_funcs.insert(ptr).second) {
+                        q.push_back(ptr);
+                    }
                 }
             }
         };
@@ -1257,8 +1263,12 @@ private:
                     uint64_t imm12 = (insn >> 10) & 0xFFF;
                     if (regs_page.count(rn)) {
                         uint64_t tgt = regs_page[rn] + imm12;
-                        if (func_by_addr.count(tgt) && !visited.count(tgt)) q.push_back(tgt);
-                        else seedVtableSlots(tgt, 0);
+                        if (func_by_addr.count(tgt) && !visited.count(tgt)) {
+                            if (vtable_seeded_funcs.count(faddr)) vtable_seeded_funcs.insert(tgt);
+                            q.push_back(tgt);
+                        } else if (!vtable_seeded_funcs.count(faddr)) {
+                            seedVtableSlots(tgt);
+                        }
                     }
                 } else if ((insn & 0xFFC00000U) == 0xF9400000U) {
                     unsigned rn = (insn >> 5) & 0x1F;
@@ -1268,7 +1278,6 @@ private:
                         if (got_addr + 8 <= elf.size()) {
                             uint64_t ptr_val = readU64(elf, got_addr) & 0xFFFFFFFFFFFFULL;
                             if (func_by_addr.count(ptr_val) && !visited.count(ptr_val)) q.push_back(ptr_val);
-                            else seedVtableSlots(ptr_val, 0);
                         }
                     }
                 }
@@ -1778,20 +1787,27 @@ public:
         emit("%flag_c = alloca i1, align 1");
         emit("%flag_v = alloca i1, align 1");
 
-        auto reloadState = [&](bool include_vec = false) {
+        // AAPCS64ABIContractPass + CpuStatePromotionPass masks:
+        //   Entry live-in  : x0..x8, x16..x30, sp, v0..v15 (skip x9..x15 scratch, v16..v31)
+        //   Call flush     : x0..x8, x16..x18, x29, x30, sp, v0..v7 (keep x19..x28, v8..v15 in SSA)
+        //   Call reload    : x0..x8, v0..v7 (callee preserves x19..x28, x29, sp, v8..v15)
+        //   Ret flush      : x0..x8, sp, v0..v7
+        auto reloadState = [&](uint32_t gpr_mask, bool include_sp, unsigned vec_count) {
             for (unsigned r = 0; r < 31; ++r) {
-                if (!((used_gpr_mask >> r) & 1U)) continue;
+                if (!((used_gpr_mask & gpr_mask) >> r & 1U)) continue;
                 std::string p = newTmp("rl_x"), v = newTmp("rv_x");
                 emit(p + " = getelementptr inbounds i8, ptr %cpu, i64 " + std::to_string(r * 8));
                 emit(v + " = load i64, ptr " + p + ", align 8");
                 emit("store i64 " + v + ", ptr %reg_x" + std::to_string(r) + ", align 8");
             }
-            std::string psp = newTmp("rl_sp"), vsp = newTmp("rv_sp");
-            emit(psp + " = getelementptr inbounds i8, ptr %cpu, i64 248");
-            emit(vsp + " = load i64, ptr " + psp + ", align 8");
-            emit("store i64 " + vsp + ", ptr %reg_sp, align 8");
-            if (include_vec) {
-                for (unsigned r = 0; r < 32; ++r) {
+            if (include_sp) {
+                std::string psp = newTmp("rl_sp"), vsp = newTmp("rv_sp");
+                emit(psp + " = getelementptr inbounds i8, ptr %cpu, i64 248");
+                emit(vsp + " = load i64, ptr " + psp + ", align 8");
+                emit("store i64 " + vsp + ", ptr %reg_sp, align 8");
+            }
+            if (uses_vec && vec_count > 0) {
+                for (unsigned r = 0; r < vec_count; ++r) {
                     std::string pv = newTmp("rl_v"), vv = newTmp("rv_v");
                     emit(pv + " = getelementptr inbounds i8, ptr %cpu, i64 " + std::to_string(272 + r * 16));
                     emit(vv + " = load i128, ptr " + pv + ", align 16");
@@ -1800,20 +1816,22 @@ public:
             }
         };
 
-        auto flushState = [&](bool include_vec = false) {
+        auto flushState = [&](uint32_t gpr_mask, bool include_sp, unsigned vec_count) {
             for (unsigned r = 0; r < 31; ++r) {
-                if (!((used_gpr_mask >> r) & 1U)) continue;
+                if (!((used_gpr_mask & gpr_mask) >> r & 1U)) continue;
                 std::string p = newTmp("fl_x"), v = newTmp("fv_x");
                 emit(v + " = load i64, ptr %reg_x" + std::to_string(r) + ", align 8");
                 emit(p + " = getelementptr inbounds i8, ptr %cpu, i64 " + std::to_string(r * 8));
                 emit("store i64 " + v + ", ptr " + p + ", align 8");
             }
-            std::string psp = newTmp("fl_sp"), vsp = newTmp("fv_sp");
-            emit(vsp + " = load i64, ptr %reg_sp, align 8");
-            emit(psp + " = getelementptr inbounds i8, ptr %cpu, i64 248");
-            emit("store i64 " + vsp + ", ptr " + psp + ", align 8");
-            if (include_vec) {
-                for (unsigned r = 0; r < 32; ++r) {
+            if (include_sp) {
+                std::string psp = newTmp("fl_sp"), vsp = newTmp("fv_sp");
+                emit(vsp + " = load i64, ptr %reg_sp, align 8");
+                emit(psp + " = getelementptr inbounds i8, ptr %cpu, i64 248");
+                emit("store i64 " + vsp + ", ptr " + psp + ", align 8");
+            }
+            if (uses_vec && vec_count > 0) {
+                for (unsigned r = 0; r < vec_count; ++r) {
                     std::string pv = newTmp("fl_v"), vv = newTmp("fv_v");
                     emit(vv + " = load i128, ptr %reg_v" + std::to_string(r) + ", align 16");
                     emit(pv + " = getelementptr inbounds i8, ptr %cpu, i64 " + std::to_string(272 + r * 16));
@@ -1822,7 +1840,7 @@ public:
             }
         };
 
-        reloadState(uses_vec);
+        reloadState(0x7FFF01FFU, true, 16);
         emit("store i1 false, ptr %flag_n, align 1");
         emit("store i1 false, ptr %flag_z, align 1");
         emit("store i1 false, ptr %flag_c, align 1");
@@ -1978,9 +1996,9 @@ public:
                             if (loader.closure_plts.count(target)) {
                                 emitCallToTarget(target);
                             } else {
-                                flushState(uses_vec);
+                                flushState(0x600701FFU, true, 8);
                                 emitCallToTarget(target);
-                                reloadState(uses_vec);
+                                reloadState(0x000001FFU, false, 8);
                             }
                         } else {
                             if (target >= faddr && target < end_addr) {
@@ -1989,9 +2007,9 @@ public:
                                 if (loader.closure_plts.count(target)) {
                                     emitCallToTarget(target);
                                 } else {
-                                    flushState(uses_vec);
+                                    flushState(0x7FFF01FFU, true, 16);
                                     emitCallToTarget(target);
-                                    reloadState(uses_vec);
+                                    reloadState(0x000001FFU, false, 8);
                                 }
                                 emit("br label %exit_ret");
                             }
@@ -2032,9 +2050,9 @@ public:
                             if (loader.closure_plts.count(target)) {
                                 emitCallToTarget(target);
                             } else {
-                                flushState(uses_vec);
+                                flushState(0x7FFF01FFU, true, 16);
                                 emitCallToTarget(target);
-                                reloadState(uses_vec);
+                                reloadState(0x000001FFU, false, 8);
                             }
                             emit("br label %exit_ret");
                         }
@@ -2053,9 +2071,9 @@ public:
                         } else if (opc == 1) {
                             std::string tgt = loadGpr(rn, true);
                             storeGpr(30, std::to_string(IMAGE_BASE + pc + 4), true);
-                            flushState(uses_vec);
+                            flushState(0x600701FFU, true, 8);
                             emit("call void @aot_indirect_dispatch(ptr %cpu, i64 " + tgt + ")");
-                            reloadState(uses_vec);
+                            reloadState(0x000001FFU, false, 8);
                             continue;
                         } else if (opc == 0) {
                             if (jtables.count(pc)) {
@@ -2073,9 +2091,9 @@ public:
                                 break;
                             } else {
                                 std::string tgt = loadGpr(rn, true);
-                                flushState(uses_vec);
+                                flushState(0x7FFF01FFU, true, 16);
                                 emit("call void @aot_indirect_dispatch(ptr %cpu, i64 " + tgt + ")");
-                                reloadState(uses_vec);
+                                reloadState(0x000001FFU, false, 8);
                                 emit("br label %exit_ret");
                                 terminated = true;
                                 break;
@@ -2437,9 +2455,9 @@ public:
                         emit(res + " = select i1 " + c_ok + ", " + ty + " " + t_val + ", " + ty + " " + f_val);
                         storeGpr(rd, res, is64);
                     } else if (op1 == 1 && op2 == 6) {
-                        unsigned S_bit = (insn >> 29) & 1;
+                        unsigned is_1src = (insn >> 30) & 1;
                         unsigned opcode2 = (insn >> 10) & 0x3F;
-                        if (S_bit == 0) {
+                        if (is_1src == 0) {
                             std::string n = loadGpr(rn, is64), m = loadGpr(rm, is64);
                             if (opcode2 == 0x02) {
                                 std::string iz = newTmp("udiv_z"), sm = newTmp("udiv_m"), q = newTmp("udiv_q"), res = newTmp("udiv_r");
@@ -3055,7 +3073,7 @@ public:
         }
 
         emitRaw("exit_ret:");
-        flushState(uses_vec);
+        flushState(0x000001FFU, true, 8);
         if (instrument_calls) {
             emit("call void @aot_so_trace_fn_exit(ptr %cpu, i64 " + std::to_string(IMAGE_BASE + faddr) + ", ptr @.aot_fn_str_" + hex8(faddr) + ")");
         }
@@ -3515,6 +3533,8 @@ public:
     template <typename ChunkCallback>
     void generateChunkedModules(size_t chunk_limit_bytes, ChunkCallback &&on_chunk) {
         size_t chunk_idx = 0;
+        size_t funcs_done = 0;
+        const size_t total_funcs = loader.closure_funcs.size();
         std::ostringstream body_ss;
         std::set<uint64_t> chunk_funcs;
 
@@ -3539,7 +3559,7 @@ public:
 
             char tag[32];
             std::snprintf(tag, sizeof(tag), "chunk_%02zu", chunk_idx++);
-            on_chunk(tag, std::move(full_ir));
+            on_chunk(tag, std::move(full_ir), funcs_done, total_funcs);
             chunk_funcs.clear();
         };
 
@@ -3557,6 +3577,7 @@ public:
             }
             body_ss << fn_ir;
             chunk_funcs.insert(faddr);
+            funcs_done++;
         }
         flush_func_chunk();
 
@@ -3578,7 +3599,7 @@ public:
         full_wrap.append(wrap_ir);
         std::string().swap(hdr);
         std::string().swap(wrap_ir);
-        on_chunk("wrappers", std::move(full_wrap));
+        on_chunk("wrappers", std::move(full_wrap), total_funcs, total_funcs);
     }
 };
 
@@ -4196,16 +4217,16 @@ static int runLoweringAndCodegenOnModule(LLVMModuleRef M, const char *outPath, b
 
     if (runO2) {
         LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
-        const char *pass_pipeline = full_o2 ? "default<O1>" : "sroa,simplifycfg,adce";
+        const char *pass_pipeline = full_o2 ? "default<O2>" : "default<O1>";
         LLVMErrorRef err = LLVMRunPasses(M, pass_pipeline, tm, opts);
         if (err) {
             char *emsg = LLVMGetErrorMessage(err);
-            fprintf(stderr, "LLVMRunPasses(default<O2>) failed: %s\n", emsg);
+            fprintf(stderr, "LLVMRunPasses(%s) failed: %s\n", pass_pipeline, emsg);
             LLVMDisposeErrorMessage(emsg);
             return 1;
         }
         LLVMDisposePassBuilderOptions(opts);
-        printf("[LLVM Passes] Offloaded SROA, mem2reg, InstCombine, GVN, SimplifyCFG, ADCE, DSE via LLVMRunPasses(default<O2>)\n");
+        printf("[LLVM Passes] Offloaded SROA, mem2reg, InstCombine, GVN, SimplifyCFG, ADCE, DSE via LLVMRunPasses(%s)\n", pass_pipeline);
     }
 
     if (optIrOut) {
@@ -4290,13 +4311,13 @@ int main(int argc, char **argv) {
                 if (parsed >= 1) jobs = parsed;
             }
         }
-        size_t chunk_mb = 100;
+        size_t chunk_mb = 40;
         if (const char *env_cmb = std::getenv("MALI_AOT_CHUNK_MB")) {
             chunk_mb = static_cast<size_t>(std::strtoull(env_cmb, nullptr, 10));
         }
         size_t chunk_limit_bytes = chunk_mb * 1024ULL * 1024ULL;
         const char *keep_ll_env = std::getenv("MALI_AOT_KEEP_LL");
-        bool keep_ll = (!keep_ll_env || std::strcmp(keep_ll_env, "0") != 0);
+        bool keep_ll = (keep_ll_env && std::strcmp(keep_ll_env, "1") == 0);
         std::string objPath = outDir + "/r54p3_lifted.o";
 
         // Remove stale monolithic/chunk artifacts before lifting
@@ -4324,14 +4345,17 @@ int main(int argc, char **argv) {
 
         {
             AArch64ToLLVMIRLiftingPass lifter(loader, instrumentCalls);
-            lifter.generateChunkedModules(chunk_limit_bytes, [&](const std::string &tag, std::string irText) {
+            size_t chunk_num = 0;
+            lifter.generateChunkedModules(chunk_limit_bytes, [&](const std::string &tag, std::string irText, size_t funcs_done, size_t total_funcs) {
                 if (rc != 0) return;
+                chunk_num++;
                 total_ir_bytes += irText.size();
                 std::string chunkUnopt = outDir + "/mali_mbs2_" + tag + "_unopt.ll";
                 std::string chunkOpt   = outDir + "/mali_mbs2_" + tag + "_opt.ll";
                 std::string chunkObj   = outDir + "/mali_mbs2_" + tag + ".o";
-                printf("  [Chunk %s] %zu bytes IR -> optimizing & emitting %s\n",
-                       tag.c_str(), irText.size(), chunkObj.c_str());
+                double pct = total_funcs ? (100.0 * static_cast<double>(funcs_done) / static_cast<double>(total_funcs)) : 100.0;
+                printf("  [Chunk %s (#%zu) | %zu/%zu funcs (%.1f%%)] %zu bytes IR -> optimizing & emitting %s\n",
+                       tag.c_str(), chunk_num, funcs_done, total_funcs, pct, irText.size(), chunkObj.c_str());
 
                 if (keep_ll) {
                     std::ofstream out(chunkUnopt);
