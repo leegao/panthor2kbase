@@ -614,6 +614,9 @@ uint64_t bionic_mali_poll_stub(uint64_t fds_addr, uint64_t nfds, uint64_t timeou
 uint64_t bionic_mali_fstat_stub(uint64_t fd, uint64_t buf_addr);
 uint64_t bionic_mali_stat_stub(uint64_t path_addr, uint64_t buf_addr);
 uint64_t bionic_mali_access_stub(uint64_t path_addr, uint64_t mode);
+uint64_t bionic_mali_create_dmabuf_heap_allocator_stub(void);
+uint64_t bionic_mali_dmabuf_heap_alloc2_stub(uint64_t alloc, uint64_t heap_name, uint64_t len,
+                                             uint64_t heap_flags, uint64_t fd_flags);
 void __mali_stack_chk_fail_diag(AOTCPUState* cpu);
 }
 struct HostVkAllocatorTable {

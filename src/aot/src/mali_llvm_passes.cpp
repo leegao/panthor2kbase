@@ -494,6 +494,7 @@ public:
     std::vector<DynSymEntry> dynsyms;
     std::map<uint64_t, std::string> plt_map;
     std::vector<uint64_t> sorted_fstarts;
+    std::set<uint64_t> relocated_data_slots;
     std::vector<uint64_t> closure_funcs;
     std::map<uint64_t, std::string> closure_plts;
     uint64_t ctx_malloc_offset = 0x78;
@@ -668,6 +669,7 @@ private:
                     if (where + 8 <= elf.size()) {
                         uint64_t val = readU64(elf, where) & 0xFFFFFFFFFFFFULL;
                         writeU64(elf, where, val);
+                        relocated_data_slots.insert(where);
                     }
                     where += 8;
                 } else {
@@ -678,6 +680,7 @@ private:
                             if (slot + 8 <= elf.size()) {
                                 uint64_t val = readU64(elf, slot) & 0xFFFFFFFFFFFFULL;
                                 writeU64(elf, slot, val);
+                                relocated_data_slots.insert(slot);
                             }
                         }
                     }
@@ -709,9 +712,11 @@ private:
                     if (static_cast<uint64_t>(cur_offset) + 8 <= elf.size()) {
                         if (r_type == 1027) {
                             writeU64(elf, cur_offset, static_cast<uint64_t>(cur_addend));
+                            relocated_data_slots.insert(static_cast<uint64_t>(cur_offset));
                         } else if (sym_idx > 0 && sym_idx < dynsyms.size()) {
                             if (dynsyms[sym_idx].shndx != 0 && dynsyms[sym_idx].value != 0) {
                                 writeU64(elf, cur_offset, dynsyms[sym_idx].value + cur_addend);
+                                relocated_data_slots.insert(static_cast<uint64_t>(cur_offset));
                             }
                         }
                     }
@@ -1176,6 +1181,33 @@ private:
             if (isExecAddr(faddr)) q.push_back(faddr);
         }
         std::set<uint64_t> visited;
+        std::set<uint64_t> scanned_vtables;
+        auto seedVtableSlots = [&](uint64_t base_addr, int depth) {
+            if (base_addr == 0 || (base_addr & 7ULL) != 0 || isExecAddr(base_addr)) return;
+            if (!scanned_vtables.insert(base_addr).second) return;
+            for (uint64_t slot = base_addr; slot < base_addr + 0x400ULL && slot + 8 <= elf.size(); slot += 8) {
+                if (!relocated_data_slots.count(slot)) break;
+                uint64_t ptr = readU64(elf, slot) & 0xFFFFFFFFFFFFULL;
+                if (func_by_addr.count(ptr)) {
+                    if (!visited.count(ptr)) q.push_back(ptr);
+                } else if (depth == 0 && !isExecAddr(ptr) && relocated_data_slots.count(ptr)) {
+                    // 1-level indirection for dispatch tables of vtable pointers (e.g. 0x2fee4d0).
+                    if (scanned_vtables.insert(ptr).second) {
+                        for (uint64_t sub = ptr; sub < ptr + 0x200ULL && sub + 8 <= elf.size(); sub += 8) {
+                            if (!relocated_data_slots.count(sub)) break;
+                            uint64_t fptr = readU64(elf, sub) & 0xFFFFFFFFFFFFULL;
+                            if (func_by_addr.count(fptr)) {
+                                if (!visited.count(fptr)) q.push_back(fptr);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+        };
         while (!q.empty()) {
             uint64_t faddr = q.front();
             q.pop_front();
@@ -1226,6 +1258,7 @@ private:
                     if (regs_page.count(rn)) {
                         uint64_t tgt = regs_page[rn] + imm12;
                         if (func_by_addr.count(tgt) && !visited.count(tgt)) q.push_back(tgt);
+                        else seedVtableSlots(tgt, 0);
                     }
                 } else if ((insn & 0xFFC00000U) == 0xF9400000U) {
                     unsigned rn = (insn >> 5) & 0x1F;
@@ -1235,6 +1268,7 @@ private:
                         if (got_addr + 8 <= elf.size()) {
                             uint64_t ptr_val = readU64(elf, got_addr) & 0xFFFFFFFFFFFFULL;
                             if (func_by_addr.count(ptr_val) && !visited.count(ptr_val)) q.push_back(ptr_val);
+                            else seedVtableSlots(ptr_val, 0);
                         }
                     }
                 }
@@ -3899,6 +3933,22 @@ void runBionicToGlibcLibcLoweringPass(LLVMModuleRef M, PassStats &stats) {
                         LLVMValueRef res = LLVMBuildCall2(B, pollTy, pollFn, args, 3, "");
                         storeReg64(cpu, 0, res);
                         stats.kbase_uapi_lowered++;
+                    } else if (sym == "CreateDmabufHeapBufferAllocator") {
+                        LLVMValueRef fn = getOrCreateFunction(M, "bionic_mali_create_dmabuf_heap_allocator_stub", i64Ty, {});
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, nullptr, 0, 0);
+                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, nullptr, 0, "");
+                        storeReg64(cpu, 0, res);
+                        stats.external_stubs_lowered++;
+                    } else if (sym == "DmabufHeapAlloc2") {
+                        LLVMValueRef args[5] = {loadReg64(cpu, 0), loadReg64(cpu, 1), loadReg64(cpu, 2),
+                                                loadReg64(cpu, 3), loadReg64(cpu, 4)};
+                        LLVMValueRef fn = getOrCreateFunction(M, "bionic_mali_dmabuf_heap_alloc2_stub",
+                                                              i64Ty, {i64Ty, i64Ty, i64Ty, i64Ty, i64Ty});
+                        LLVMTypeRef params[5] = {i64Ty, i64Ty, i64Ty, i64Ty, i64Ty};
+                        LLVMTypeRef fTy = LLVMFunctionType(i64Ty, params, 5, 0);
+                        LLVMValueRef res = LLVMBuildCall2(B, fTy, fn, args, 5, "");
+                        storeReg64(cpu, 0, res);
+                        stats.external_stubs_lowered++;
                     } else if (sym == "pthread_self" || sym == "getuid") {
                         storeReg64(cpu, 0, LLVMConstInt(i64Ty, 1000, 0));
                         stats.external_stubs_lowered++;

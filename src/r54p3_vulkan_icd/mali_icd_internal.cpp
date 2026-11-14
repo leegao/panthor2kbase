@@ -967,6 +967,24 @@ extern "C" uint64_t bionic_mali_access_stub(uint64_t path_addr, uint64_t mode) {
     int rc = mali_kbase_emu_access_direct(reinterpret_cast<const char*>(path_addr), static_cast<int>(mode));
     return (rc == 0) ? 0ULL : static_cast<uint64_t>(-1LL);
 }
+extern "C" uint64_t bionic_mali_create_dmabuf_heap_allocator_stub(void) {
+    return 0xD1A80F01ULL;
+}
+extern "C" uint64_t bionic_mali_dmabuf_heap_alloc2_stub(uint64_t alloc, uint64_t heap_name, uint64_t len,
+                                                        uint64_t heap_flags, uint64_t fd_flags) {
+    (void)alloc;
+    (void)heap_name;
+    (void)heap_flags;
+    (void)fd_flags;
+    size_t sz = len ? static_cast<size_t>(len) : 4096U;
+    int fd = memfd_create("mali_dmabuf_heap", MFD_CLOEXEC);
+    if (fd < 0) return static_cast<uint64_t>(-1LL);
+    if (ftruncate(fd, static_cast<off_t>(sz)) != 0) {
+        close(fd);
+        return static_cast<uint64_t>(-1LL);
+    }
+    return static_cast<uint64_t>(fd);
+}
 extern "C" int access(const char* pathname, int mode) noexcept {
     return mali_kbase_emu_access_direct(pathname, mode);
 }
