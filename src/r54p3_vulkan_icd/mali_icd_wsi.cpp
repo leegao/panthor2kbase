@@ -873,15 +873,20 @@ int32_t vkGetPhysicalDeviceSurfaceFormatsKHR(void* /*physicalDevice*/, uint64_t 
 __attribute__((visibility("default")))
 int32_t vkGetPhysicalDeviceSurfacePresentModesKHR(void* /*physicalDevice*/, uint64_t /*surface*/, uint32_t* pPresentModeCount, uint32_t* pPresentModes) {
     if (!pPresentModeCount) return -3;
-    static const uint32_t kModes[] = {2U /* VK_PRESENT_MODE_FIFO_KHR */, 0U /* VK_PRESENT_MODE_IMMEDIATE_KHR */};
+    static const uint32_t kModes[] = {
+        2U /* VK_PRESENT_MODE_FIFO_KHR */,
+        1U /* VK_PRESENT_MODE_MAILBOX_KHR */,
+        0U /* VK_PRESENT_MODE_IMMEDIATE_KHR */
+    };
+    constexpr uint32_t kNumModes = 3U;
     if (!pPresentModes) {
-        *pPresentModeCount = 2U;
+        *pPresentModeCount = kNumModes;
         return 0;
     }
-    uint32_t n = std::min<uint32_t>(*pPresentModeCount, 2U);
+    uint32_t n = std::min<uint32_t>(*pPresentModeCount, kNumModes);
     std::memcpy(pPresentModes, kModes, n * sizeof(uint32_t));
     *pPresentModeCount = n;
-    return (n < 2U) ? 5 : 0;
+    return (n < kNumModes) ? 5 : 0;
 }
 
 __attribute__((visibility("default")))

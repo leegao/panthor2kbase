@@ -285,6 +285,20 @@ public:
     static constexpr size_t kUboCapacityBytes = 65536ULL;
     std::string device_name;
     PFN_vkGetInstanceProcAddr gipa = nullptr;
+    VkPhysicalDeviceMemoryProperties mem_props{};
+
+    uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags requiredProps) const {
+        for (uint32_t i = 0; i < mem_props.memoryTypeCount && i < VK_MAX_MEMORY_TYPES; ++i) {
+            if ((typeBits & (1U << i)) &&
+                (mem_props.memoryTypes[i].propertyFlags & requiredProps) == requiredProps) {
+                return i;
+            }
+        }
+        for (uint32_t i = 0; i < mem_props.memoryTypeCount && i < VK_MAX_MEMORY_TYPES; ++i) {
+            if (typeBits & (1U << i)) return i;
+        }
+        return 0U;
+    }
 
     bool tryOpenBackendIcdLibrary(const char* so_path) {
         void* handle = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
@@ -330,6 +344,11 @@ public:
         if (getProps) {
             getProps(phys_dev, rawProps);
             device_name = reinterpret_cast<const char*>(rawProps + 20);
+        }
+        typedef void (*PFN_vkGetPhysicalDeviceMemoryProperties)(void*, VkPhysicalDeviceMemoryProperties*);
+        auto getMemProps = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(gipa(instance, "vkGetPhysicalDeviceMemoryProperties"));
+        if (getMemProps) {
+            getMemProps(phys_dev, &mem_props);
         }
         float qPrio = 1.0f;
         struct QCI { uint32_t sType; const void* pNext; uint32_t flags; uint32_t qfIdx; uint32_t qCount; const float* pPrio; } qci = {2, nullptr, 0, 0, 1, &qPrio};
@@ -514,7 +533,26 @@ public:
 struct MaliVertexBindingDesc;
 struct MaliVertexAttrDesc;
 
+struct MaliBoundTextureDesc {
+    uint32_t binding;
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;
+    uint32_t row_pitch;
+    uint64_t pixel_va;
+    uint64_t pixel_bytes;
+    uint32_t mag_filter;
+    uint32_t min_filter;
+    uint32_t mipmap_mode;
+    uint32_t address_mode_u;
+    uint32_t address_mode_v;
+    uint32_t address_mode_w;
+    float    max_anisotropy;
+    float    max_lod;
+};
+
 struct MaliCsfGraphicsDrawPacket {
+    static constexpr uint32_t kMaxBoundTextures = 16U;
     uint64_t mfbd_color_va;
     uint32_t width;
     uint32_t height;
@@ -545,6 +583,14 @@ struct MaliCsfGraphicsDrawPacket {
     uint32_t vertex_binding_count;
     const MaliVertexAttrDesc* vertex_attrs;
     uint32_t vertex_attr_count;
+    MaliBoundTextureDesc bound_textures[kMaxBoundTextures];
+    uint32_t bound_texture_count;
+    uint32_t cull_mode;
+    uint32_t front_face;
+    uint32_t polygon_mode;
+    uint32_t depth_test_enable;
+    uint32_t depth_write_enable;
+    uint32_t depth_compare_op;
 };
 
 extern HostSpirvExecutor        g_icd_spirv_executor;
@@ -1714,6 +1760,7 @@ struct MaliIcdPipeline {
     uint32_t                       topology       = 3; // VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
     uint32_t                       cull_mode      = 0;
     uint32_t                       front_face     = 0;
+    uint32_t                       polygon_mode   = 0;
     bool                           depth_test     = true;
     bool                           depth_write    = true;
     uint32_t                       depth_compare  = 1; // VK_COMPARE_OP_LESS
@@ -1795,7 +1842,13 @@ struct MaliIcdImageView {
 };
 
 struct MaliIcdSampler {
-    float    max_anisotropy = 16.0f;
+    uint32_t mag_filter     = 1; // VK_FILTER_LINEAR
+    uint32_t min_filter     = 1; // VK_FILTER_LINEAR
+    uint32_t mipmap_mode    = 1; // VK_SAMPLER_MIPMAP_MODE_LINEAR
+    uint32_t address_mode_u = 0; // VK_SAMPLER_ADDRESS_MODE_REPEAT
+    uint32_t address_mode_v = 0;
+    uint32_t address_mode_w = 0;
+    float    max_anisotropy = 1.0f;
     float    max_lod        = 15.0f;
     uint64_t aot_handle     = 0;
 };

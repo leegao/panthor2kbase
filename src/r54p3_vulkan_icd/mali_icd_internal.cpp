@@ -110,6 +110,62 @@ HostSpirvExecutor        g_icd_spirv_executor;
 uint32_t                 g_icd_csf_jobs_executed = 0;
 int                      g_icd_kbase_ioctl_calls = 0;
 
+static uint32_t vkFormatBytesPerPixel(VkFormat fmt) {
+    switch (fmt) {
+        case VK_FORMAT_R8_UNORM:
+        case VK_FORMAT_R8_SNORM:
+        case VK_FORMAT_R8_UINT:
+        case VK_FORMAT_R8_SINT:
+        case VK_FORMAT_R8_SRGB:
+        case VK_FORMAT_S8_UINT:
+            return 1U;
+        case VK_FORMAT_R8G8_UNORM:
+        case VK_FORMAT_R8G8_SNORM:
+        case VK_FORMAT_R8G8_UINT:
+        case VK_FORMAT_R8G8_SINT:
+        case VK_FORMAT_R8G8_SRGB:
+        case VK_FORMAT_R16_UNORM:
+        case VK_FORMAT_R16_SNORM:
+        case VK_FORMAT_R16_UINT:
+        case VK_FORMAT_R16_SINT:
+        case VK_FORMAT_R16_SFLOAT:
+        case VK_FORMAT_R5G6B5_UNORM_PACK16:
+        case VK_FORMAT_B5G6R5_UNORM_PACK16:
+        case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
+        case VK_FORMAT_B4G4R4A4_UNORM_PACK16:
+        case VK_FORMAT_R5G5B5A1_UNORM_PACK16:
+        case VK_FORMAT_B5G5R5A1_UNORM_PACK16:
+        case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
+        case VK_FORMAT_D16_UNORM:
+            return 2U;
+        case VK_FORMAT_R8G8B8_UNORM:
+        case VK_FORMAT_R8G8B8_SNORM:
+        case VK_FORMAT_R8G8B8_SRGB:
+        case VK_FORMAT_B8G8R8_UNORM:
+        case VK_FORMAT_B8G8R8_SRGB:
+            return 3U;
+        case VK_FORMAT_R16G16B16A16_UNORM:
+        case VK_FORMAT_R16G16B16A16_SNORM:
+        case VK_FORMAT_R16G16B16A16_UINT:
+        case VK_FORMAT_R16G16B16A16_SINT:
+        case VK_FORMAT_R16G16B16A16_SFLOAT:
+        case VK_FORMAT_R32G32_UINT:
+        case VK_FORMAT_R32G32_SINT:
+        case VK_FORMAT_R32G32_SFLOAT:
+            return 8U;
+        case VK_FORMAT_R32G32B32_UINT:
+        case VK_FORMAT_R32G32B32_SINT:
+        case VK_FORMAT_R32G32B32_SFLOAT:
+            return 12U;
+        case VK_FORMAT_R32G32B32A32_UINT:
+        case VK_FORMAT_R32G32B32A32_SINT:
+        case VK_FORMAT_R32G32B32A32_SFLOAT:
+            return 16U;
+        default:
+            return 4U;
+    }
+}
+
 bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraphicsDrawPacket& pkt) {
     if (!exec.init() || !pkt.mfbd_color_va || pkt.width == 0 || pkt.height == 0) return false;
     auto* gipa = exec.gipa;
@@ -215,7 +271,7 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
             (1U<<16)|56U                                   // OpFunctionEnd
         };
     };
-    std::vector<uint32_t> fs_spv = (!pkt.has_frag_const && pkt.fs_spirv_ptr && hasSpirvOpFunction(pkt.fs_spirv_ptr, pkt.fs_spirv_words))
+    std::vector<uint32_t> fs_spv = (pkt.fs_spirv_ptr && hasSpirvOpFunction(pkt.fs_spirv_ptr, pkt.fs_spirv_words))
         ? std::vector<uint32_t>(pkt.fs_spirv_ptr, pkt.fs_spirv_ptr + pkt.fs_spirv_words)
         : makeConstFsSpv();
 
@@ -251,7 +307,8 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
     }
     VkMemoryRequirements req{};
     reinterpret_cast<PFN_vkGetImageMemoryRequirements>(gipa(inst, "vkGetImageMemoryRequirements"))(dev, img, &req);
-    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, std::max<uint64_t>(req.size, img_bytes), 0};
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, std::max<uint64_t>(req.size, img_bytes),
+                             exec.findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
     reinterpret_cast<HostSpirvExecutor::PFN_vkAllocateMemory>(gipa(inst, "vkAllocateMemory"))(dev, &mai, nullptr, &img_mem);
     reinterpret_cast<PFN_vkBindImageMemory>(gipa(inst, "vkBindImageMemory"))(dev, img, img_mem, 0);
 
@@ -263,23 +320,66 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
     ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     reinterpret_cast<PFN_vkCreateImageView>(gipa(inst, "vkCreateImageView"))(dev, &ivci, nullptr, &img_view);
 
-    VkAttachmentDescription att{};
-    att.format = VK_FORMAT_B8G8R8A8_UNORM;
-    att.samples = VK_SAMPLE_COUNT_1_BIT;
-    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    att.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    VkAttachmentReference ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    bool use_depth = (pkt.depth_test_enable != 0U || pkt.depth_write_enable != 0U);
+    uint64_t depth_img = 0, depth_mem = 0, depth_view = 0;
+    if (use_depth) {
+        VkImageCreateInfo dici{};
+        dici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        dici.imageType = VK_IMAGE_TYPE_2D;
+        dici.format = VK_FORMAT_D32_SFLOAT;
+        dici.extent = {W, H, 1};
+        dici.mipLevels = 1;
+        dici.arrayLayers = 1;
+        dici.samples = VK_SAMPLE_COUNT_1_BIT;
+        dici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        dici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        if (reinterpret_cast<PFN_vkCreateImage>(gipa(inst, "vkCreateImage"))(dev, &dici, nullptr, &depth_img) == 0 && depth_img) {
+            VkMemoryRequirements dreq{};
+            reinterpret_cast<PFN_vkGetImageMemoryRequirements>(gipa(inst, "vkGetImageMemoryRequirements"))(dev, depth_img, &dreq);
+            VkMemoryAllocateInfo dmai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, std::max<uint64_t>(dreq.size, static_cast<uint64_t>(W) * H * 4ULL),
+                                      exec.findMemoryType(dreq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+            if (reinterpret_cast<HostSpirvExecutor::PFN_vkAllocateMemory>(gipa(inst, "vkAllocateMemory"))(dev, &dmai, nullptr, &depth_mem) == 0 && depth_mem &&
+                reinterpret_cast<PFN_vkBindImageMemory>(gipa(inst, "vkBindImageMemory"))(dev, depth_img, depth_mem, 0) == 0) {
+                VkImageViewCreateInfo divci{};
+                divci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+                divci.image = reinterpret_cast<VkImage>(depth_img);
+                divci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                divci.format = VK_FORMAT_D32_SFLOAT;
+                divci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+                reinterpret_cast<PFN_vkCreateImageView>(gipa(inst, "vkCreateImageView"))(dev, &divci, nullptr, &depth_view);
+            }
+        }
+        if (!depth_view) use_depth = false;
+    }
+
+    VkAttachmentDescription atts[2]{};
+    atts[0].format = VK_FORMAT_B8G8R8A8_UNORM;
+    atts[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    atts[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    atts[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    atts[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    atts[1].format = VK_FORMAT_D32_SFLOAT;
+    atts[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    atts[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    atts[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    atts[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    atts[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    atts[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference color_ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference depth_ref{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sub{};
     sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     sub.colorAttachmentCount = 1;
-    sub.pColorAttachments = &ref;
-    VkRenderPassCreateInfo rpci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, nullptr, 0, 1, &att, 1, &sub, 0, nullptr};
+    sub.pColorAttachments = &color_ref;
+    sub.pDepthStencilAttachment = use_depth ? &depth_ref : nullptr;
+    VkRenderPassCreateInfo rpci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, nullptr, 0, use_depth ? 2U : 1U, atts, 1, &sub, 0, nullptr};
     uint64_t rp = 0, fb = 0, pipe = 0;
     int32_t rprc = reinterpret_cast<PFN_vkCreateRenderPass>(gipa(inst, "vkCreateRenderPass"))(dev, &rpci, nullptr, &rp);
 
-    VkFramebufferCreateInfo fbci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, nullptr, 0, reinterpret_cast<VkRenderPass>(rp), 1, reinterpret_cast<VkImageView*>(&img_view), W, H, 1};
+    VkImageView fb_atts[2] = {reinterpret_cast<VkImageView>(img_view), reinterpret_cast<VkImageView>(depth_view)};
+    VkFramebufferCreateInfo fbci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, nullptr, 0, reinterpret_cast<VkRenderPass>(rp), use_depth ? 2U : 1U, fb_atts, W, H, 1};
     int32_t fbrc = reinterpret_cast<PFN_vkCreateFramebuffer>(gipa(inst, "vkCreateFramebuffer"))(dev, &fbci, nullptr, &fb);
 
     VkPipelineShaderStageCreateInfo stages[2] = {
@@ -316,11 +416,16 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
     VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, nullptr, 0, 1, &vp, 1, &sc};
     VkPipelineRasterizationStateCreateInfo rs{};
     rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.polygonMode = VK_POLYGON_MODE_FILL;
-    rs.cullMode = VK_CULL_MODE_NONE;
-    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.polygonMode = static_cast<VkPolygonMode>(pkt.polygon_mode <= 2U ? pkt.polygon_mode : 0U);
+    rs.cullMode = static_cast<VkCullModeFlags>(pkt.cull_mode & 0x3U);
+    rs.frontFace = static_cast<VkFrontFace>(pkt.front_face <= 1U ? pkt.front_face : 0U);
     rs.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, nullptr, 0, VK_SAMPLE_COUNT_1_BIT, VK_FALSE, 0.0f, nullptr, VK_FALSE, VK_FALSE};
+    VkPipelineDepthStencilStateCreateInfo ds_ci{};
+    ds_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds_ci.depthTestEnable = (pkt.depth_test_enable != 0U) ? VK_TRUE : VK_FALSE;
+    ds_ci.depthWriteEnable = (pkt.depth_write_enable != 0U) ? VK_TRUE : VK_FALSE;
+    ds_ci.depthCompareOp = static_cast<VkCompareOp>(pkt.depth_compare_op <= 7U ? pkt.depth_compare_op : 1U);
     VkPipelineColorBlendAttachmentState cba{};
     cba.colorWriteMask = 0xFU;
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, nullptr, 0, VK_FALSE, VK_LOGIC_OP_COPY, 1, &cba, {0,0,0,0}};
@@ -364,6 +469,18 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
     scanSpirvBindings(vs_spv);
     scanSpirvBindings(fs_spv);
 
+    struct HostTextureUpload {
+        uint64_t image = 0;
+        uint64_t mem = 0;
+        uint64_t view = 0;
+        uint64_t sampler = 0;
+        uint64_t staging_buf = 0;
+        uint64_t staging_mem = 0;
+        uint32_t width = 1;
+        uint32_t height = 1;
+    };
+    std::vector<HostTextureUpload> tex_uploads;
+
     uint64_t draw_dsl = 0, draw_pl = 0, draw_dp = 0, draw_ds = 0;
     int32_t plrc = 0;
     if (!binding_types.empty()) {
@@ -391,12 +508,131 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
                 if (reinterpret_cast<HostSpirvExecutor::PFN_vkAllocateDescriptorSets>(gipa(inst, "vkAllocateDescriptorSets"))(dev, &dsai, &draw_ds) == 0 && draw_ds) {
                     DBI ubo_dbi{exec.ubo_buf, 0, HostSpirvExecutor::kUboCapacityBytes};
                     DBI ssbo_dbi{exec.buf_in, 0, HostSpirvExecutor::kBufferCapacityBytes};
-                    DII img_dii{exec.dummy_sampler, exec.dummy_img_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                    std::vector<DII> img_diis;
+                    img_diis.reserve(binding_types.size());
                     std::vector<WDS> wds;
+                    auto findBoundTexture = [&](uint32_t binding) -> const MaliBoundTextureDesc* {
+                        for (uint32_t i = 0; i < pkt.bound_texture_count && i < MaliCsfGraphicsDrawPacket::kMaxBoundTextures; ++i) {
+                            if (pkt.bound_textures[i].binding == binding) return &pkt.bound_textures[i];
+                        }
+                        return nullptr;
+                    };
+                    auto createImgFn  = reinterpret_cast<PFN_vkCreateImage>(gipa(inst, "vkCreateImage"));
+                    auto getImgReqFn  = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(gipa(inst, "vkGetImageMemoryRequirements"));
+                    auto bindImgFn    = reinterpret_cast<PFN_vkBindImageMemory>(gipa(inst, "vkBindImageMemory"));
+                    auto createIvFn   = reinterpret_cast<PFN_vkCreateImageView>(gipa(inst, "vkCreateImageView"));
+                    typedef int32_t (*PFN_vkCreateSamplerLocal)(void*, const void*, const void*, uint64_t*);
+                    auto createSmpFn  = reinterpret_cast<PFN_vkCreateSamplerLocal>(gipa(inst, "vkCreateSampler"));
+                    auto createBufFn  = reinterpret_cast<HostSpirvExecutor::PFN_vkCreateBuffer>(gipa(inst, "vkCreateBuffer"));
+                    auto getBufReqFn  = reinterpret_cast<void (*)(void*, uint64_t, void*)>(gipa(inst, "vkGetBufferMemoryRequirements"));
+                    auto bindBufFn    = reinterpret_cast<HostSpirvExecutor::PFN_vkBindBufferMemory>(gipa(inst, "vkBindBufferMemory"));
+                    auto allocMemFn   = reinterpret_cast<HostSpirvExecutor::PFN_vkAllocateMemory>(gipa(inst, "vkAllocateMemory"));
+                    auto mapMemFn     = reinterpret_cast<HostSpirvExecutor::PFN_vkMapMemory>(gipa(inst, "vkMapMemory"));
+                    auto unmapMemFn   = reinterpret_cast<void (*)(void*, uint64_t)>(gipa(inst, "vkUnmapMemory"));
+
                     for (const auto& kv : binding_types) {
-                        if (kv.second == 6U) wds.push_back({35, nullptr, draw_ds, kv.first, 0, 1, 6U, nullptr, &ubo_dbi, nullptr});
-                        else if (kv.second == 1U && exec.dummy_sampler && exec.dummy_img_view) wds.push_back({35, nullptr, draw_ds, kv.first, 0, 1, 1U, &img_dii, nullptr, nullptr});
-                        else if (kv.second == 7U) wds.push_back({35, nullptr, draw_ds, kv.first, 0, 1, 7U, nullptr, &ssbo_dbi, nullptr});
+                        if (kv.second == 6U) {
+                            wds.push_back({35, nullptr, draw_ds, kv.first, 0, 1, 6U, nullptr, &ubo_dbi, nullptr});
+                        } else if (kv.second == 1U) {
+                            DII dii{exec.dummy_sampler, exec.dummy_img_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                            const MaliBoundTextureDesc* btd = findBoundTexture(kv.first);
+                            if (btd && btd->pixel_va && btd->width > 0 && btd->height > 0 &&
+                                createImgFn && getImgReqFn && bindImgFn && createIvFn && createSmpFn &&
+                                createBufFn && bindBufFn && allocMemFn && mapMemFn) {
+                                uint32_t tw = btd->width;
+                                uint32_t th = btd->height;
+                                VkFormat fmt = btd->format ? static_cast<VkFormat>(btd->format) : VK_FORMAT_R8G8B8A8_UNORM;
+                                uint32_t bpp = vkFormatBytesPerPixel(fmt);
+                                uint64_t tightly_bytes = static_cast<uint64_t>(tw) * th * bpp;
+                                uint64_t copy_bytes = btd->pixel_bytes ? btd->pixel_bytes : tightly_bytes;
+
+                                HostTextureUpload up{};
+                                up.width = tw;
+                                up.height = th;
+                                VkImageCreateInfo tici{};
+                                tici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+                                tici.imageType = VK_IMAGE_TYPE_2D;
+                                tici.format = fmt;
+                                tici.extent = {tw, th, 1};
+                                tici.mipLevels = 1;
+                                tici.arrayLayers = 1;
+                                tici.samples = VK_SAMPLE_COUNT_1_BIT;
+                                tici.tiling = VK_IMAGE_TILING_OPTIMAL;
+                                tici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                                if (createImgFn(dev, &tici, nullptr, &up.image) == 0 && up.image) {
+                                    VkMemoryRequirements treq{};
+                                    getImgReqFn(dev, up.image, &treq);
+                                    VkMemoryAllocateInfo tmai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, std::max<uint64_t>(treq.size, copy_bytes),
+                                                              exec.findMemoryType(treq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+                                    if (allocMemFn(dev, &tmai, nullptr, &up.mem) == 0 && up.mem &&
+                                        bindImgFn(dev, up.image, up.mem, 0) == 0) {
+                                        VkImageViewCreateInfo tivci{};
+                                        tivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+                                        tivci.image = reinterpret_cast<VkImage>(up.image);
+                                        tivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                                        tivci.format = fmt;
+                                        tivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                                        createIvFn(dev, &tivci, nullptr, &up.view);
+
+                                        VkSamplerCreateInfo tsci{};
+                                        tsci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+                                        tsci.magFilter = static_cast<VkFilter>(btd->mag_filter <= 1U ? btd->mag_filter : 1U);
+                                        tsci.minFilter = static_cast<VkFilter>(btd->min_filter <= 1U ? btd->min_filter : 1U);
+                                        tsci.mipmapMode = static_cast<VkSamplerMipmapMode>(btd->mipmap_mode <= 1U ? btd->mipmap_mode : 1U);
+                                        tsci.addressModeU = static_cast<VkSamplerAddressMode>(btd->address_mode_u <= 4U ? btd->address_mode_u : 0U);
+                                        tsci.addressModeV = static_cast<VkSamplerAddressMode>(btd->address_mode_v <= 4U ? btd->address_mode_v : 0U);
+                                        tsci.addressModeW = static_cast<VkSamplerAddressMode>(btd->address_mode_w <= 4U ? btd->address_mode_w : 0U);
+                                        tsci.anisotropyEnable = (btd->max_anisotropy > 1.0f) ? VK_TRUE : VK_FALSE;
+                                        tsci.maxAnisotropy = btd->max_anisotropy;
+                                        tsci.maxLod = btd->max_lod;
+                                        createSmpFn(dev, &tsci, nullptr, &up.sampler);
+
+                                        VkBufferCreateInfo sbci{};
+                                        sbci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+                                        sbci.size = std::max<uint64_t>(copy_bytes, 4ULL);
+                                        sbci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                                        if (createBufFn(dev, &sbci, nullptr, &up.staging_buf) == 0 && up.staging_buf) {
+                                            VkMemoryRequirements breq{};
+                                            if (getBufReqFn) getBufReqFn(dev, up.staging_buf, &breq);
+                                            uint32_t stg_mem_type = exec.findMemoryType(
+                                                breq.memoryTypeBits,
+                                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                                            VkMemoryAllocateInfo smai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, std::max<uint64_t>(breq.size, sbci.size), stg_mem_type};
+                                            if (allocMemFn(dev, &smai, nullptr, &up.staging_mem) == 0 && up.staging_mem &&
+                                                bindBufFn(dev, up.staging_buf, up.staging_mem, 0) == 0) {
+                                                void* mapped_stg = nullptr;
+                                                if (mapMemFn(dev, up.staging_mem, 0, sbci.size, 0, &mapped_stg) == 0 && mapped_stg) {
+                                                    const uint8_t* src_px = reinterpret_cast<const uint8_t*>(btd->pixel_va);
+                                                    uint32_t row_bytes = tw * bpp;
+                                                    if (btd->row_pitch > row_bytes && btd->row_pitch * static_cast<uint64_t>(th) <= copy_bytes) {
+                                                        for (uint32_t y = 0; y < th; ++y) {
+                                                            std::memcpy(static_cast<uint8_t*>(mapped_stg) + static_cast<size_t>(y) * row_bytes,
+                                                                        src_px + static_cast<size_t>(y) * btd->row_pitch, row_bytes);
+                                                        }
+                                                    } else {
+                                                        std::memcpy(mapped_stg, src_px, static_cast<size_t>(std::min<uint64_t>(copy_bytes, sbci.size)));
+                                                    }
+                                                    if (unmapMemFn) unmapMemFn(dev, up.staging_mem);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if (up.view && up.sampler && up.staging_buf && up.staging_mem) {
+                                    dii.sampler = up.sampler;
+                                    dii.imageView = up.view;
+                                    tex_uploads.push_back(up);
+                                } else {
+                                    tex_uploads.push_back(up);
+                                }
+                            }
+                            if (dii.sampler && dii.imageView) {
+                                img_diis.push_back(dii);
+                                wds.push_back({35, nullptr, draw_ds, kv.first, 0, 1, 1U, &img_diis.back(), nullptr, nullptr});
+                            }
+                        } else if (kv.second == 7U) {
+                            wds.push_back({35, nullptr, draw_ds, kv.first, 0, 1, 7U, nullptr, &ssbo_dbi, nullptr});
+                        }
                     }
                     if (!wds.empty()) {
                         reinterpret_cast<HostSpirvExecutor::PFN_vkUpdateDescriptorSets>(gipa(inst, "vkUpdateDescriptorSets"))(dev, static_cast<uint32_t>(wds.size()), wds.data(), 0, nullptr);
@@ -416,7 +652,9 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
     gpci.stageCount = 2; gpci.pStages = stages;
     gpci.pVertexInputState = &vi; gpci.pInputAssemblyState = &ia;
     gpci.pViewportState = &vps; gpci.pRasterizationState = &rs;
-    gpci.pMultisampleState = &ms; gpci.pColorBlendState = &cb;
+    gpci.pMultisampleState = &ms;
+    gpci.pDepthStencilState = use_depth ? &ds_ci : nullptr;
+    gpci.pColorBlendState = &cb;
     uint64_t active_pl = draw_pl ? draw_pl : (exec.gfx_pipeline_layout ? exec.gfx_pipeline_layout : (gfx_pl ? gfx_pl : exec.pipeline_layout));
     gpci.layout = reinterpret_cast<VkPipelineLayout>(active_pl);
     gpci.renderPass = reinterpret_cast<VkRenderPass>(rp);
@@ -446,12 +684,50 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
         reinterpret_cast<HostSpirvExecutor::PFN_vkResetCommandBuffer>(gipa(inst, "vkResetCommandBuffer"))(exec.cmd_buf, 0);
         VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, 0, nullptr};
         reinterpret_cast<HostSpirvExecutor::PFN_vkBeginCommandBuffer>(gipa(inst, "vkBeginCommandBuffer"))(exec.cmd_buf, &cbbi);
-        VkClearValue clr{};
-        clr.color.float32[0] = (pkt.clear_rgba8 & 0xFFU) / 255.0f;
-        clr.color.float32[1] = ((pkt.clear_rgba8 >> 8) & 0xFFU) / 255.0f;
-        clr.color.float32[2] = ((pkt.clear_rgba8 >> 16) & 0xFFU) / 255.0f;
-        clr.color.float32[3] = ((pkt.clear_rgba8 >> 24) & 0xFFU) / 255.0f;
-        VkRenderPassBeginInfo rpbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, nullptr, reinterpret_cast<VkRenderPass>(rp), reinterpret_cast<VkFramebuffer>(fb), {{0,0},{W,H}}, 1, &clr};
+        if (!tex_uploads.empty()) {
+            auto cmdBarrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(gipa(inst, "vkCmdPipelineBarrier"));
+            typedef void (*PFN_vkCmdCopyBufferToImage)(void*, uint64_t, uint64_t, uint32_t, uint32_t, const void*);
+            auto cmdCopyB2I = reinterpret_cast<PFN_vkCmdCopyBufferToImage>(gipa(inst, "vkCmdCopyBufferToImage"));
+            for (const auto& up : tex_uploads) {
+                if (!up.image || !up.staging_buf || !cmdBarrier || !cmdCopyB2I) continue;
+                VkImageMemoryBarrier to_dst{};
+                to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                to_dst.srcAccessMask = 0;
+                to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                to_dst.image = reinterpret_cast<VkImage>(up.image);
+                to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                cmdBarrier(exec.cmd_buf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_dst);
+
+                VkBufferImageCopy region{};
+                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                region.imageExtent = {up.width, up.height, 1};
+                cmdCopyB2I(exec.cmd_buf, up.staging_buf, up.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+                VkImageMemoryBarrier to_read{};
+                to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                to_read.image = reinterpret_cast<VkImage>(up.image);
+                to_read.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                cmdBarrier(exec.cmd_buf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_read);
+            }
+        }
+        VkClearValue clrs[2]{};
+        clrs[0].color.float32[0] = (pkt.clear_rgba8 & 0xFFU) / 255.0f;
+        clrs[0].color.float32[1] = ((pkt.clear_rgba8 >> 8) & 0xFFU) / 255.0f;
+        clrs[0].color.float32[2] = ((pkt.clear_rgba8 >> 16) & 0xFFU) / 255.0f;
+        clrs[0].color.float32[3] = ((pkt.clear_rgba8 >> 24) & 0xFFU) / 255.0f;
+        clrs[1].depthStencil.depth = 1.0f;
+        clrs[1].depthStencil.stencil = 0U;
+        VkRenderPassBeginInfo rpbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, nullptr, reinterpret_cast<VkRenderPass>(rp), reinterpret_cast<VkFramebuffer>(fb), {{0,0},{W,H}}, use_depth ? 2U : 1U, clrs};
         reinterpret_cast<PFN_vkCmdBeginRenderPass>(gipa(inst, "vkCmdBeginRenderPass"))(exec.cmd_buf, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
         reinterpret_cast<HostSpirvExecutor::PFN_vkCmdBindPipeline>(gipa(inst, "vkCmdBindPipeline"))(exec.cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         uint64_t bind_ds = draw_ds ? draw_ds : exec.gfx_desc_set;
@@ -502,8 +778,27 @@ bool executeGraphicsDrawOnHostVulkan(HostSpirvExecutor& exec, const MaliCsfGraph
         auto destroyDSL = reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(gipa(inst, "vkDestroyDescriptorSetLayout"));
         if (destroyDSL) destroyDSL(dev, draw_dsl, nullptr);
     }
+    for (const auto& up : tex_uploads) {
+        if (up.sampler) {
+            typedef void (*PFN_vkDestroySampler)(void*, uint64_t, const void*);
+            auto destroySmp = reinterpret_cast<PFN_vkDestroySampler>(gipa(inst, "vkDestroySampler"));
+            if (destroySmp) destroySmp(dev, up.sampler, nullptr);
+        }
+        if (up.view) reinterpret_cast<PFN_vkDestroyImageView>(gipa(inst, "vkDestroyImageView"))(dev, up.view, nullptr);
+        if (up.image) reinterpret_cast<PFN_vkDestroyImage>(gipa(inst, "vkDestroyImage"))(dev, up.image, nullptr);
+        if (up.mem) reinterpret_cast<PFN_vkFreeMemory>(gipa(inst, "vkFreeMemory"))(dev, up.mem, nullptr);
+        if (up.staging_buf) {
+            typedef void (*PFN_vkDestroyBuffer)(void*, uint64_t, const void*);
+            auto destroyBuf = reinterpret_cast<PFN_vkDestroyBuffer>(gipa(inst, "vkDestroyBuffer"));
+            if (destroyBuf) destroyBuf(dev, up.staging_buf, nullptr);
+        }
+        if (up.staging_mem) reinterpret_cast<PFN_vkFreeMemory>(gipa(inst, "vkFreeMemory"))(dev, up.staging_mem, nullptr);
+    }
     reinterpret_cast<PFN_vkDestroyFramebuffer>(gipa(inst, "vkDestroyFramebuffer"))(dev, fb, nullptr);
     reinterpret_cast<PFN_vkDestroyRenderPass>(gipa(inst, "vkDestroyRenderPass"))(dev, rp, nullptr);
+    if (depth_view) reinterpret_cast<PFN_vkDestroyImageView>(gipa(inst, "vkDestroyImageView"))(dev, depth_view, nullptr);
+    if (depth_img) reinterpret_cast<PFN_vkDestroyImage>(gipa(inst, "vkDestroyImage"))(dev, depth_img, nullptr);
+    if (depth_mem) reinterpret_cast<PFN_vkFreeMemory>(gipa(inst, "vkFreeMemory"))(dev, depth_mem, nullptr);
     reinterpret_cast<PFN_vkDestroyImageView>(gipa(inst, "vkDestroyImageView"))(dev, img_view, nullptr);
     reinterpret_cast<PFN_vkDestroyImage>(gipa(inst, "vkDestroyImage"))(dev, img, nullptr);
     reinterpret_cast<PFN_vkFreeMemory>(gipa(inst, "vkFreeMemory"))(dev, img_mem, nullptr);

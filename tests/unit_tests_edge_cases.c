@@ -2794,6 +2794,316 @@ static void test_v36_raw_syscall_hook_and_panvk_hw_fragment_bridge(void)
    printf("  -> PASS: Raw syscall(SYS_openat/SYS_ioctl) interception verified!\n");
 }
 
+/* ============================================================================
+ * TEST 27 (Checkpoint v37): r54p3_vulkan_icd Bound ImageView & Sampler Draw
+ * ============================================================================ */
+static void test_v37_r54p3_icd_textured_draw_sampling(void)
+{
+   printf("[TEST 27] Verifying r54p3_vulkan_icd vkQueueSubmit forwards bound ImageView + Sampler to HostSpirvExecutor...\n");
+
+   void *icd_h = dlopen("aot/libr54p3_vulkan_icd.so", RTLD_NOW | RTLD_LOCAL);
+   if (!icd_h) icd_h = dlopen("build-x86-64/aot/libr54p3_vulkan_icd.so", RTLD_NOW | RTLD_LOCAL);
+   if (!icd_h) icd_h = dlopen("build-x86-64/libr54p3_vulkan_icd.so", RTLD_NOW | RTLD_LOCAL);
+   assert(icd_h != NULL);
+
+   typedef void *(*pfn_gipa)(void *, const char *);
+   typedef void *(*pfn_gdpa)(void *, const char *);
+   pfn_gipa gipa = (pfn_gipa)dlsym(icd_h, "vk_icdGetInstanceProcAddr");
+   pfn_gdpa gdpa = (pfn_gdpa)dlsym(icd_h, "vkGetDeviceProcAddr");
+   assert(gipa != NULL && gdpa != NULL);
+
+   typedef int32_t (*pfn_create_inst)(const void *, const void *, void **);
+   typedef int32_t (*pfn_enum_pd)(void *, uint32_t *, void **);
+   typedef int32_t (*pfn_create_dev)(void *, const void *, const void *, void **);
+   typedef void (*pfn_get_queue)(void *, uint32_t, uint32_t, void **);
+   typedef void (*pfn_destroy_dev)(void *, const void *);
+   typedef void (*pfn_destroy_inst)(void *, const void *);
+   typedef int32_t (*pfn_create_obj)(void *, const void *, const void *, uint64_t *);
+   typedef void (*pfn_destroy_obj)(void *, uint64_t, const void *);
+   typedef void (*pfn_get_req)(void *, uint64_t, void *);
+   typedef int32_t (*pfn_bind_mem)(void *, uint64_t, uint64_t, uint64_t);
+   typedef int32_t (*pfn_map_mem)(void *, uint64_t, uint64_t, uint64_t, uint32_t, void **);
+   typedef void (*pfn_unmap_mem)(void *, uint64_t);
+   typedef int32_t (*pfn_alloc_sets)(void *, const void *, uint64_t *);
+   typedef void (*pfn_update_sets)(void *, uint32_t, const void *, uint32_t, const void *);
+   typedef int32_t (*pfn_create_pipes)(void *, uint64_t, uint32_t, const void *, const void *, uint64_t *);
+   typedef int32_t (*pfn_alloc_cbs)(void *, const void *, void **);
+   typedef int32_t (*pfn_begin_cb)(void *, const void *);
+   typedef int32_t (*pfn_end_cb)(void *);
+   typedef void (*pfn_cmd_copy_b2i)(void *, uint64_t, uint64_t, uint32_t, uint32_t, const void *);
+   typedef void (*pfn_cmd_begin_rp)(void *, const void *, uint32_t);
+   typedef void (*pfn_cmd_end_rp)(void *);
+   typedef void (*pfn_cmd_bind_pipe)(void *, uint32_t, uint64_t);
+   typedef void (*pfn_cmd_bind_ds)(void *, uint32_t, uint64_t, uint32_t, uint32_t, const uint64_t *, uint32_t, const uint32_t *);
+   typedef void (*pfn_cmd_draw)(void *, uint32_t, uint32_t, uint32_t, uint32_t);
+   typedef int32_t (*pfn_queue_submit)(void *, uint32_t, const void *, uint64_t);
+   typedef int32_t (*pfn_queue_wait_idle)(void *);
+
+   struct { uint32_t sType; const void *pNext; uint32_t flags; const void *pApp; uint32_t lCnt; const void *pL; uint32_t eCnt; const void *pE; } ici = { 1U, NULL, 0, NULL, 0, NULL, 0, NULL };
+   void *inst = NULL, *pdev = NULL, *dev = NULL, *queue = NULL;
+   assert(((pfn_create_inst)gipa(NULL, "vkCreateInstance"))(&ici, NULL, &inst) == 0 && inst);
+   uint32_t pd_cnt = 1;
+   assert(((pfn_enum_pd)gipa(NULL, "vkEnumeratePhysicalDevices"))(inst, &pd_cnt, &pdev) == 0 && pdev);
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t qciCnt; const void *pQci; uint32_t lCnt; const void *pL; uint32_t eCnt; const void *pE; const void *pFeat; } dci = { 3U, NULL, 0, 0, NULL, 0, NULL, 0, NULL, NULL };
+   assert(((pfn_create_dev)gipa(NULL, "vkCreateDevice"))(pdev, &dci, NULL, &dev) == 0 && dev);
+   ((pfn_get_queue)gdpa(dev, "vkGetDeviceQueue"))(dev, 0, 0, &queue);
+   assert(queue != NULL);
+
+   pfn_create_obj create_buf = (pfn_create_obj)gdpa(dev, "vkCreateBuffer");
+   pfn_destroy_obj destroy_buf = (pfn_destroy_obj)gdpa(dev, "vkDestroyBuffer");
+   pfn_get_req get_buf_req = (pfn_get_req)gdpa(dev, "vkGetBufferMemoryRequirements");
+   pfn_bind_mem bind_buf_mem = (pfn_bind_mem)gdpa(dev, "vkBindBufferMemory");
+   pfn_create_obj create_img = (pfn_create_obj)gdpa(dev, "vkCreateImage");
+   pfn_destroy_obj destroy_img = (pfn_destroy_obj)gdpa(dev, "vkDestroyImage");
+   pfn_get_req get_img_req = (pfn_get_req)gdpa(dev, "vkGetImageMemoryRequirements");
+   pfn_bind_mem bind_img_mem = (pfn_bind_mem)gdpa(dev, "vkBindImageMemory");
+   pfn_create_obj alloc_mem = (pfn_create_obj)gdpa(dev, "vkAllocateMemory");
+   pfn_destroy_obj free_mem = (pfn_destroy_obj)gdpa(dev, "vkFreeMemory");
+   pfn_map_mem map_mem = (pfn_map_mem)gdpa(dev, "vkMapMemory");
+   pfn_unmap_mem unmap_mem = (pfn_unmap_mem)gdpa(dev, "vkUnmapMemory");
+   pfn_create_obj create_iv = (pfn_create_obj)gdpa(dev, "vkCreateImageView");
+   pfn_destroy_obj destroy_iv = (pfn_destroy_obj)gdpa(dev, "vkDestroyImageView");
+   pfn_create_obj create_smp = (pfn_create_obj)gdpa(dev, "vkCreateSampler");
+   pfn_destroy_obj destroy_smp = (pfn_destroy_obj)gdpa(dev, "vkDestroySampler");
+   pfn_create_obj create_dsl = (pfn_create_obj)gdpa(dev, "vkCreateDescriptorSetLayout");
+   pfn_destroy_obj destroy_dsl = (pfn_destroy_obj)gdpa(dev, "vkDestroyDescriptorSetLayout");
+   pfn_create_obj create_pl = (pfn_create_obj)gdpa(dev, "vkCreatePipelineLayout");
+   pfn_destroy_obj destroy_pl = (pfn_destroy_obj)gdpa(dev, "vkDestroyPipelineLayout");
+   pfn_create_obj create_dp = (pfn_create_obj)gdpa(dev, "vkCreateDescriptorPool");
+   pfn_destroy_obj destroy_dp = (pfn_destroy_obj)gdpa(dev, "vkDestroyDescriptorPool");
+   pfn_alloc_sets alloc_ds = (pfn_alloc_sets)gdpa(dev, "vkAllocateDescriptorSets");
+   pfn_update_sets update_ds = (pfn_update_sets)gdpa(dev, "vkUpdateDescriptorSets");
+   pfn_create_obj create_sm = (pfn_create_obj)gdpa(dev, "vkCreateShaderModule");
+   pfn_destroy_obj destroy_sm = (pfn_destroy_obj)gdpa(dev, "vkDestroyShaderModule");
+   pfn_create_obj create_rp = (pfn_create_obj)gdpa(dev, "vkCreateRenderPass");
+   pfn_destroy_obj destroy_rp = (pfn_destroy_obj)gdpa(dev, "vkDestroyRenderPass");
+   pfn_create_obj create_fb = (pfn_create_obj)gdpa(dev, "vkCreateFramebuffer");
+   pfn_destroy_obj destroy_fb = (pfn_destroy_obj)gdpa(dev, "vkDestroyFramebuffer");
+   pfn_create_pipes create_pipes = (pfn_create_pipes)gdpa(dev, "vkCreateGraphicsPipelines");
+   pfn_destroy_obj destroy_pipe = (pfn_destroy_obj)gdpa(dev, "vkDestroyPipeline");
+   pfn_create_obj create_cp = (pfn_create_obj)gdpa(dev, "vkCreateCommandPool");
+   pfn_destroy_obj destroy_cp = (pfn_destroy_obj)gdpa(dev, "vkDestroyCommandPool");
+   pfn_alloc_cbs alloc_cbs = (pfn_alloc_cbs)gdpa(dev, "vkAllocateCommandBuffers");
+
+   /* Staging buffer (4x4 RGBA = 64 bytes) with distinct green-cyan pixel 0xFF22CC44 */
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint64_t size; uint32_t usage; uint32_t sharingMode; uint32_t qfiCnt; const uint32_t *pQfi; }
+      stg_ci = { 12U, NULL, 0U, 64ULL, 0x1U /* TRANSFER_SRC */, 0U, 0U, NULL };
+   uint64_t stg_buf = 0, stg_mem = 0;
+   assert(create_buf(dev, &stg_ci, NULL, &stg_buf) == 0 && stg_buf);
+   struct { uint64_t size; uint64_t alignment; uint32_t memTypeBits; } req = { 0 };
+   get_buf_req(dev, stg_buf, &req);
+   struct { uint32_t sType; const void *pNext; uint64_t size; uint32_t memTypeIdx; } mai = { 5U, NULL, req.size, 0U };
+   assert(alloc_mem(dev, &mai, NULL, &stg_mem) == 0 && stg_mem);
+   assert(bind_buf_mem(dev, stg_buf, stg_mem, 0ULL) == 0);
+   void *stg_ptr = NULL;
+   assert(map_mem(dev, stg_mem, 0ULL, 64ULL, 0U, &stg_ptr) == 0 && stg_ptr);
+   uint32_t *stg_px = (uint32_t *)stg_ptr;
+   for (int i = 0; i < 16; ++i) stg_px[i] = 0xFF22CC44U;
+   unmap_mem(dev, stg_mem);
+
+   /* Sampled 4x4 texture image (VK_FORMAT_R8G8B8A8_UNORM = 37) */
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t imageType; uint32_t format; uint32_t w, h, d; uint32_t mipLevels; uint32_t arrayLayers; uint32_t samples; uint32_t tiling; uint32_t usage; uint32_t sharingMode; uint32_t qfiCnt; const uint32_t *pQfi; uint32_t initialLayout; }
+      tex_ci = { 14U, NULL, 0U, 1U, 37U, 4U, 4U, 1U, 1U, 1U, 1U, 0U, 0x06U /* TRANSFER_DST|SAMPLED */, 0U, 0U, NULL, 0U };
+   uint64_t tex_img = 0, tex_mem = 0, tex_iv = 0, tex_smp = 0;
+   assert(create_img(dev, &tex_ci, NULL, &tex_img) == 0 && tex_img);
+   get_img_req(dev, tex_img, &req);
+   mai.size = req.size;
+   assert(alloc_mem(dev, &mai, NULL, &tex_mem) == 0 && tex_mem);
+   assert(bind_img_mem(dev, tex_img, tex_mem, 0ULL) == 0);
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint64_t image; uint32_t viewType; uint32_t format; uint32_t comp[4]; uint32_t aspectMask; uint32_t baseMip; uint32_t levelCnt; uint32_t baseLayer; uint32_t layerCnt; }
+      iv_ci = { 15U, NULL, 0U, tex_img, 1U, 37U, {0,0,0,0}, 1U, 0U, 1U, 0U, 1U };
+   assert(create_iv(dev, &iv_ci, NULL, &tex_iv) == 0 && tex_iv);
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t magFilter; uint32_t minFilter; uint32_t mipmapMode; uint32_t addrU; uint32_t addrV; uint32_t addrW; float mipLodBias; uint32_t anisoEn; float maxAniso; uint32_t cmpEn; uint32_t cmpOp; float minLod; float maxLod; uint32_t border; uint32_t unnorm; }
+      smp_ci = { 31U, NULL, 0U, 0U, 0U, 0U, 2U, 2U, 2U, 0.0f, 0U, 1.0f, 0U, 0U, 0.0f, 1.0f, 0U, 0U };
+   assert(create_smp(dev, &smp_ci, NULL, &tex_smp) == 0 && tex_smp);
+
+   /* 16x16 render target image + framebuffer */
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t imageType; uint32_t format; uint32_t w, h, d; uint32_t mipLevels; uint32_t arrayLayers; uint32_t samples; uint32_t tiling; uint32_t usage; uint32_t sharingMode; uint32_t qfiCnt; const uint32_t *pQfi; uint32_t initialLayout; }
+      rt_ci = { 14U, NULL, 0U, 1U, 44U /* B8G8R8A8_UNORM */, 16U, 16U, 1U, 1U, 1U, 1U, 0U, 0x11U, 0U, 0U, NULL, 0U };
+   uint64_t rt_img = 0, rt_mem = 0, rt_iv = 0, rp = 0, fb = 0;
+   assert(create_img(dev, &rt_ci, NULL, &rt_img) == 0 && rt_img);
+   get_img_req(dev, rt_img, &req);
+   mai.size = req.size;
+   assert(alloc_mem(dev, &mai, NULL, &rt_mem) == 0 && rt_mem);
+   assert(bind_img_mem(dev, rt_img, rt_mem, 0ULL) == 0);
+   iv_ci.image = rt_img; iv_ci.format = 44U;
+   assert(create_iv(dev, &iv_ci, NULL, &rt_iv) == 0 && rt_iv);
+
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t attCnt; const void *pAtt; uint32_t subCnt; const void *pSub; uint32_t depCnt; const void *pDep; }
+      rp_ci = { 38U, NULL, 0U, 0U, NULL, 0U, NULL, 0U, NULL };
+   assert(create_rp(dev, &rp_ci, NULL, &rp) == 0 && rp);
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint64_t renderPass; uint32_t attCnt; const uint64_t *pAtt; uint32_t w, h, layers; }
+      fb_ci = { 37U, NULL, 0U, rp, 1U, &rt_iv, 16U, 16U, 1U };
+   assert(create_fb(dev, &fb_ci, NULL, &fb) == 0 && fb);
+
+   /* Descriptor set with binding 1 = COMBINED_IMAGE_SAMPLER */
+   struct { uint32_t binding; uint32_t dtype; uint32_t count; uint32_t stageFlags; const void *pImm; }
+      dslb = { 1U, 1U, 1U, 0x10U /* FRAGMENT */, NULL };
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t bindingCount; const void *pBindings; }
+      dsl_ci = { 32U, NULL, 0U, 1U, &dslb };
+   uint64_t dsl = 0, pl = 0, dp = 0, ds = 0;
+   assert(create_dsl(dev, &dsl_ci, NULL, &dsl) == 0 && dsl);
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t setLayoutCount; const uint64_t *pSetLayouts; uint32_t pcCount; const void *pPC; }
+      pl_ci = { 30U, NULL, 0U, 1U, &dsl, 0U, NULL };
+   assert(create_pl(dev, &pl_ci, NULL, &pl) == 0 && pl);
+   struct { uint32_t type; uint32_t count; } dps = { 1U, 1U };
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t maxSets; uint32_t poolSizeCount; const void *pPoolSizes; }
+      dp_ci = { 33U, NULL, 0U, 1U, 1U, &dps };
+   assert(create_dp(dev, &dp_ci, NULL, &dp) == 0 && dp);
+   struct { uint32_t sType; const void *pNext; uint64_t pool; uint32_t count; const uint64_t *pLayouts; }
+      ds_ai = { 34U, NULL, dp, 1U, &dsl };
+   assert(alloc_ds(dev, &ds_ai, &ds) == 0 && ds);
+   struct { uint64_t sampler; uint64_t imageView; uint32_t imageLayout; }
+      dii = { tex_smp, tex_iv, 5U /* SHADER_READ_ONLY_OPTIMAL */ };
+   struct { uint32_t sType; const void *pNext; uint64_t dstSet; uint32_t dstBinding; uint32_t dstElem; uint32_t cnt; uint32_t dtype; const void *pImg; const void *pBuf; const void *pTex; }
+      wds = { 35U, NULL, ds, 1U, 0U, 1U, 1U, &dii, NULL, NULL };
+   update_ds(dev, 1U, &wds, 0U, NULL);
+
+   /* SPIR-V shaders: fullscreen triangle VS + texture(tex, vec2(0.5, 0.5)) FS */
+   static const uint32_t k_vs_spv[] = {
+      0x07230203U, 0x00010000U, 0x0008000bU, 0x00000028U, 0x00000000U, 0x00020011U, 0x00000001U, 0x0006000bU,
+      0x00000001U, 0x4c534c47U, 0x6474732eU, 0x3035342eU, 0x00000000U, 0x0003000eU, 0x00000000U, 0x00000001U,
+      0x0007000fU, 0x00000000U, 0x00000004U, 0x6e69616dU, 0x00000000U, 0x00000018U, 0x0000001cU, 0x00030003U,
+      0x00000002U, 0x000001c2U, 0x00040005U, 0x00000004U, 0x6e69616dU, 0x00000000U, 0x00030005U, 0x0000000cU,
+      0x00736f70U, 0x00060005U, 0x00000016U, 0x505f6c67U, 0x65567265U, 0x78657472U, 0x00000000U, 0x00060006U,
+      0x00000016U, 0x00000000U, 0x505f6c67U, 0x7469736fU, 0x006e6f69U, 0x00070006U, 0x00000016U, 0x00000001U,
+      0x505f6c67U, 0x746e696fU, 0x657a6953U, 0x00000000U, 0x00070006U, 0x00000016U, 0x00000002U, 0x435f6c67U,
+      0x4470696cU, 0x61747369U, 0x0065636eU, 0x00070006U, 0x00000016U, 0x00000003U, 0x435f6c67U, 0x446c6c75U,
+      0x61747369U, 0x0065636eU, 0x00030005U, 0x00000018U, 0x00000000U, 0x00060005U, 0x0000001cU, 0x565f6c67U,
+      0x65747265U, 0x646e4978U, 0x00007865U, 0x00030047U, 0x00000016U, 0x00000002U, 0x00050048U, 0x00000016U,
+      0x00000000U, 0x0000000bU, 0x00000000U, 0x00050048U, 0x00000016U, 0x00000001U, 0x0000000bU, 0x00000001U,
+      0x00050048U, 0x00000016U, 0x00000002U, 0x0000000bU, 0x00000003U, 0x00050048U, 0x00000016U, 0x00000003U,
+      0x0000000bU, 0x00000004U, 0x00040047U, 0x0000001cU, 0x0000000bU, 0x0000002aU, 0x00020013U, 0x00000002U,
+      0x00030021U, 0x00000003U, 0x00000002U, 0x00030016U, 0x00000006U, 0x00000020U, 0x00040017U, 0x00000007U,
+      0x00000006U, 0x00000002U, 0x00040015U, 0x00000008U, 0x00000020U, 0x00000000U, 0x0004002bU, 0x00000008U,
+      0x00000009U, 0x00000003U, 0x0004001cU, 0x0000000aU, 0x00000007U, 0x00000009U, 0x00040020U, 0x0000000bU,
+      0x00000007U, 0x0000000aU, 0x0004002bU, 0x00000006U, 0x0000000dU, 0xbf800000U, 0x0005002cU, 0x00000007U,
+      0x0000000eU, 0x0000000dU, 0x0000000dU, 0x0004002bU, 0x00000006U, 0x0000000fU, 0x40400000U, 0x0005002cU,
+      0x00000007U, 0x00000010U, 0x0000000fU, 0x0000000dU, 0x0005002cU, 0x00000007U, 0x00000011U, 0x0000000dU,
+      0x0000000fU, 0x0006002cU, 0x0000000aU, 0x00000012U, 0x0000000eU, 0x00000010U, 0x00000011U, 0x00040017U,
+      0x00000013U, 0x00000006U, 0x00000004U, 0x0004002bU, 0x00000008U, 0x00000014U, 0x00000001U, 0x0004001cU,
+      0x00000015U, 0x00000006U, 0x00000014U, 0x0006001eU, 0x00000016U, 0x00000013U, 0x00000006U, 0x00000015U,
+      0x00000015U, 0x00040020U, 0x00000017U, 0x00000003U, 0x00000016U, 0x0004003bU, 0x00000017U, 0x00000018U,
+      0x00000003U, 0x00040015U, 0x00000019U, 0x00000020U, 0x00000001U, 0x0004002bU, 0x00000019U, 0x0000001aU,
+      0x00000000U, 0x00040020U, 0x0000001bU, 0x00000001U, 0x00000019U, 0x0004003bU, 0x0000001bU, 0x0000001cU,
+      0x00000001U, 0x00040020U, 0x0000001eU, 0x00000007U, 0x00000007U, 0x0004002bU, 0x00000006U, 0x00000021U,
+      0x00000000U, 0x0004002bU, 0x00000006U, 0x00000022U, 0x3f800000U, 0x00040020U, 0x00000026U, 0x00000003U,
+      0x00000013U, 0x00050036U, 0x00000002U, 0x00000004U, 0x00000000U, 0x00000003U, 0x000200f8U, 0x00000005U,
+      0x0004003bU, 0x0000000bU, 0x0000000cU, 0x00000007U, 0x0003003eU, 0x0000000cU, 0x00000012U, 0x0004003dU,
+      0x00000019U, 0x0000001dU, 0x0000001cU, 0x00050041U, 0x0000001eU, 0x0000001fU, 0x0000000cU, 0x0000001dU,
+      0x0004003dU, 0x00000007U, 0x00000020U, 0x0000001fU, 0x00050051U, 0x00000006U, 0x00000023U, 0x00000020U,
+      0x00000000U, 0x00050051U, 0x00000006U, 0x00000024U, 0x00000020U, 0x00000001U, 0x00070050U, 0x00000013U,
+      0x00000025U, 0x00000023U, 0x00000024U, 0x00000021U, 0x00000022U, 0x00050041U, 0x00000026U, 0x00000027U,
+      0x00000018U, 0x0000001aU, 0x0003003eU, 0x00000027U, 0x00000025U, 0x000100fdU, 0x00010038U
+   };
+   static const uint32_t k_fs_spv[] = {
+      0x07230203U, 0x00010000U, 0x0008000bU, 0x00000013U, 0x00000000U, 0x00020011U, 0x00000001U, 0x0006000bU,
+      0x00000001U, 0x4c534c47U, 0x6474732eU, 0x3035342eU, 0x00000000U, 0x0003000eU, 0x00000000U, 0x00000001U,
+      0x0006000fU, 0x00000004U, 0x00000004U, 0x6e69616dU, 0x00000000U, 0x00000009U, 0x00030010U, 0x00000004U,
+      0x00000007U, 0x00030003U, 0x00000002U, 0x000001c2U, 0x00040005U, 0x00000004U, 0x6e69616dU, 0x00000000U,
+      0x00050005U, 0x00000009U, 0x4374756fU, 0x726f6c6fU, 0x00000000U, 0x00030005U, 0x0000000dU, 0x00786574U,
+      0x00040047U, 0x00000009U, 0x0000001eU, 0x00000000U, 0x00040047U, 0x0000000dU, 0x00000021U, 0x00000001U,
+      0x00040047U, 0x0000000dU, 0x00000022U, 0x00000000U, 0x00020013U, 0x00000002U, 0x00030021U, 0x00000003U,
+      0x00000002U, 0x00030016U, 0x00000006U, 0x00000020U, 0x00040017U, 0x00000007U, 0x00000006U, 0x00000004U,
+      0x00040020U, 0x00000008U, 0x00000003U, 0x00000007U, 0x0004003bU, 0x00000008U, 0x00000009U, 0x00000003U,
+      0x00090019U, 0x0000000aU, 0x00000006U, 0x00000001U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000001U,
+      0x00000000U, 0x0003001bU, 0x0000000bU, 0x0000000aU, 0x00040020U, 0x0000000cU, 0x00000000U, 0x0000000bU,
+      0x0004003bU, 0x0000000cU, 0x0000000dU, 0x00000000U, 0x00040017U, 0x0000000fU, 0x00000006U, 0x00000002U,
+      0x0004002bU, 0x00000006U, 0x00000010U, 0x3f000000U, 0x0005002cU, 0x0000000fU, 0x00000011U, 0x00000010U,
+      0x00000010U, 0x00050036U, 0x00000002U, 0x00000004U, 0x00000000U, 0x00000003U, 0x000200f8U, 0x00000005U,
+      0x0004003dU, 0x0000000bU, 0x0000000eU, 0x0000000dU, 0x00050057U, 0x00000007U, 0x00000012U, 0x0000000eU,
+      0x00000011U, 0x0003003eU, 0x00000009U, 0x00000012U, 0x000100fdU, 0x00010038U
+   };
+
+   struct { uint32_t sType; const void *pNext; uint32_t flags; size_t codeSize; const uint32_t *pCode; }
+      vs_ci = { 16U, NULL, 0U, sizeof(k_vs_spv), k_vs_spv },
+      fs_ci = { 16U, NULL, 0U, sizeof(k_fs_spv), k_fs_spv };
+   uint64_t vs_sm = 0, fs_sm = 0, pipe = 0;
+   assert(create_sm(dev, &vs_ci, NULL, &vs_sm) == 0 && vs_sm);
+   assert(create_sm(dev, &fs_ci, NULL, &fs_sm) == 0 && fs_sm);
+
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t stage; uint64_t mod; const char *pName; const void *pSpec; }
+      stages[2] = {
+         { 18U, NULL, 0U, 0x01U, vs_sm, "main", NULL },
+         { 18U, NULL, 0U, 0x10U, fs_sm, "main", NULL }
+      };
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t vbCnt; const void *pVb; uint32_t vaCnt; const void *pVa; }
+      vi_ci = { 19U, NULL, 0U, 0U, NULL, 0U, NULL };
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t topo; uint32_t primRestart; }
+      ia_ci = { 20U, NULL, 0U, 3U, 0U };
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t stageCnt; const void *pStages; const void *pVI; const void *pIA; const void *pTess; const void *pVP; const void *pRS; const void *pMS; const void *pDS; const void *pCB; const void *pDyn; uint64_t layout; uint64_t rp; uint32_t subpass; uint64_t basePipe; int32_t baseIdx; }
+      gp_ci = { 28U, NULL, 0U, 2U, stages, &vi_ci, &ia_ci, NULL, NULL, NULL, NULL, NULL, NULL, NULL, pl, rp, 0U, 0ULL, -1 };
+   assert(create_pipes(dev, 0ULL, 1U, &gp_ci, NULL, &pipe) == 0 && pipe);
+
+   uint64_t cp = 0;
+   struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t qfi; } cp_ci = { 39U, NULL, 0x02U, 0U };
+   assert(create_cp(dev, &cp_ci, NULL, &cp) == 0 && cp);
+   void *cb = NULL;
+   struct { uint32_t sType; const void *pNext; uint64_t pool; uint32_t level; uint32_t cnt; } cb_ai = { 40U, NULL, cp, 0U, 1U };
+   assert(alloc_cbs(dev, &cb_ai, &cb) == 0 && cb);
+
+   struct { uint32_t sType; const void *pNext; uint32_t flags; const void *pInh; } cbbi = { 42U, NULL, 0U, NULL };
+   assert(((pfn_begin_cb)gdpa(dev, "vkBeginCommandBuffer"))(cb, &cbbi) == 0);
+   struct { uint64_t bufOff; uint32_t rowLen; uint32_t imgH; uint32_t aspect; uint32_t mip; uint32_t baseLayer; uint32_t layerCnt; int32_t ox, oy, oz; uint32_t ew, eh, ed; }
+      b2i = { 0ULL, 0U, 0U, 1U, 0U, 0U, 1U, 0, 0, 0, 4U, 4U, 1U };
+   ((pfn_cmd_copy_b2i)gdpa(dev, "vkCmdCopyBufferToImage"))(cb, stg_buf, tex_img, 7U, 1U, &b2i);
+
+   float clear_col[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+   struct { uint32_t sType; const void *pNext; uint64_t rp; uint64_t fb; int32_t rx, ry; uint32_t rw, rh; uint32_t clrCnt; const float *pClr; }
+      rpbi = { 43U, NULL, rp, fb, 0, 0, 16U, 16U, 1U, clear_col };
+   ((pfn_cmd_begin_rp)gdpa(dev, "vkCmdBeginRenderPass"))(cb, &rpbi, 0U);
+   ((pfn_cmd_bind_pipe)gdpa(dev, "vkCmdBindPipeline"))(cb, 0U, pipe);
+   ((pfn_cmd_bind_ds)gdpa(dev, "vkCmdBindDescriptorSets"))(cb, 0U, pl, 0U, 1U, &ds, 0U, NULL);
+   ((pfn_cmd_draw)gdpa(dev, "vkCmdDraw"))(cb, 3U, 1U, 0U, 0U);
+   ((pfn_cmd_end_rp)gdpa(dev, "vkCmdEndRenderPass"))(cb);
+   assert(((pfn_end_cb)gdpa(dev, "vkEndCommandBuffer"))(cb) == 0);
+
+   struct { uint32_t sType; const void *pNext; uint32_t waitCnt; const uint64_t *pWait; const uint32_t *pStages; uint32_t cbCnt; void *const *pCBs; uint32_t sigCnt; const uint64_t *pSig; }
+      si = { 4U, NULL, 0U, NULL, NULL, 1U, &cb, 0U, NULL };
+   assert(((pfn_queue_submit)gdpa(dev, "vkQueueSubmit"))(queue, 1U, &si, 0ULL) == 0);
+   assert(((pfn_queue_wait_idle)gdpa(dev, "vkQueueWaitIdle"))(queue) == 0);
+
+   void *rt_ptr = NULL;
+   assert(map_mem(dev, rt_mem, 0ULL, 16U * 16U * 4ULL, 0U, &rt_ptr) == 0 && rt_ptr);
+   uint32_t center_px = ((const uint32_t *)rt_ptr)[8U * 16U + 8U];
+   unmap_mem(dev, rt_mem);
+
+   /* Sampled RGBA(0x44, 0xCC, 0x22, 0xFF) rendered to B8G8R8A8 target -> BGRA 0xFF44CC22 (R/B swapped) or 0xFF22CC44 */
+   printf("  -> Center pixel = 0x%08X (expected ~0xFF44CC22 BGRA from RGBA 0xFF22CC44)\n", center_px);
+   assert(center_px != 0xFFFFFFFFU && center_px != 0x00000000U);
+   uint8_t b0 = (uint8_t)(center_px & 0xFFU);
+   uint8_t b1 = (uint8_t)((center_px >> 8) & 0xFFU);
+   uint8_t b2 = (uint8_t)((center_px >> 16) & 0xFFU);
+   uint8_t b3 = (uint8_t)((center_px >> 24) & 0xFFU);
+   assert(b3 >= 250U);
+   assert(abs((int)b1 - 0xCC) <= 2);
+   assert((abs((int)b0 - 0x22) <= 2 && abs((int)b2 - 0x44) <= 2) ||
+          (abs((int)b0 - 0x44) <= 2 && abs((int)b2 - 0x22) <= 2));
+
+   destroy_cp(dev, cp, NULL);
+   destroy_pipe(dev, pipe, NULL);
+   destroy_sm(dev, fs_sm, NULL);
+   destroy_sm(dev, vs_sm, NULL);
+   destroy_dp(dev, dp, NULL);
+   destroy_pl(dev, pl, NULL);
+   destroy_dsl(dev, dsl, NULL);
+   destroy_fb(dev, fb, NULL);
+   destroy_rp(dev, rp, NULL);
+   destroy_iv(dev, rt_iv, NULL);
+   destroy_img(dev, rt_img, NULL);
+   free_mem(dev, rt_mem, NULL);
+   destroy_smp(dev, tex_smp, NULL);
+   destroy_iv(dev, tex_iv, NULL);
+   destroy_img(dev, tex_img, NULL);
+   free_mem(dev, tex_mem, NULL);
+   destroy_buf(dev, stg_buf, NULL);
+   free_mem(dev, stg_mem, NULL);
+   ((pfn_destroy_dev)gdpa(dev, "vkDestroyDevice"))(dev, NULL);
+   ((pfn_destroy_inst)gipa(NULL, "vkDestroyInstance"))(inst, NULL);
+   dlclose(icd_h);
+   printf("  -> PASS: r54p3_vulkan_icd textured draw sampled real texture pixels!\n");
+}
+
 int main(void)
 {
    printf("[Unit Tests] Running edge cases, mali_kbase.ko flag invariants, and RAII logging suite...\n");
@@ -2823,6 +3133,7 @@ int main(void)
    test_v34_async_csf_client_server_and_syncobj_fixes();
    test_v35_kbase_emu_stats_sized_abi_guard();
    test_v36_raw_syscall_hook_and_panvk_hw_fragment_bridge();
+   test_v37_r54p3_icd_textured_draw_sampling();
    printf("[Unit Tests] ALL EDGE CASES PASSED!\n");
    return 0;
 }

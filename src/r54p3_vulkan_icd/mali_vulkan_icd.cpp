@@ -971,9 +971,21 @@ void vkDestroyImageView(void* /*device*/, uint64_t view, const void* /*pAllocato
 }
 
 __attribute__((visibility("default")))
-int32_t vkCreateSampler(void* /*device*/, const void* /*pCreateInfo*/, const void* /*pAllocator*/, uint64_t* pSampler) {
+int32_t vkCreateSampler(void* /*device*/, const void* pCreateInfo, const void* /*pAllocator*/, uint64_t* pSampler) {
     if (!pSampler) return -3;
-    *pSampler = reinterpret_cast<uint64_t>(new MaliIcdSampler());
+    auto* smp = new MaliIcdSampler();
+    if (pCreateInfo) {
+        const auto* sci = static_cast<const VkSamplerCreateInfo*>(pCreateInfo);
+        smp->mag_filter     = static_cast<uint32_t>(sci->magFilter);
+        smp->min_filter     = static_cast<uint32_t>(sci->minFilter);
+        smp->mipmap_mode    = static_cast<uint32_t>(sci->mipmapMode);
+        smp->address_mode_u = static_cast<uint32_t>(sci->addressModeU);
+        smp->address_mode_v = static_cast<uint32_t>(sci->addressModeV);
+        smp->address_mode_w = static_cast<uint32_t>(sci->addressModeW);
+        smp->max_anisotropy = sci->anisotropyEnable ? std::max(1.0f, sci->maxAnisotropy) : 1.0f;
+        smp->max_lod        = sci->maxLod;
+    }
+    *pSampler = reinterpret_cast<uint64_t>(smp);
     return 0;
 }
 
@@ -1107,7 +1119,7 @@ VkResult vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCach
                     pipe->fs_exec_bo_va       = sm->exec_bo_gpu_va;
                     pipe->fs_objc_bytes       = sm->objc_words.size() * sizeof(uint64_t);
                     pipe->fs_spirv_words      = sm->spirv_words;
-                    pipe->has_frag_const      = sm->has_const_color;
+                    pipe->has_frag_const      = (sm->spirv_words.empty() && sm->has_const_color);
                     std::memcpy(pipe->frag_const_color, sm->const_color, sizeof(pipe->frag_const_color));
                     pipe->fs_has_ubo          = sm->has_ubo_load;
                     pipe->fs_has_image_sample = sm->has_image_sample;
@@ -1133,8 +1145,9 @@ VkResult vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCach
             pipe->topology = gis[i].pInputAssemblyState->topology;
         }
         if (gis[i].pRasterizationState) {
-            pipe->cull_mode  = gis[i].pRasterizationState->cullMode;
-            pipe->front_face = gis[i].pRasterizationState->frontFace;
+            pipe->polygon_mode = gis[i].pRasterizationState->polyMode;
+            pipe->cull_mode    = gis[i].pRasterizationState->cullMode;
+            pipe->front_face   = gis[i].pRasterizationState->frontFace;
         }
         if (gis[i].pDepthStencilState) {
             pipe->depth_test    = gis[i].pDepthStencilState->depthTestEnable != 0;
@@ -1797,6 +1810,7 @@ VkResult vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* 
                 } else if (cmd.type == MaliIcdRecordedCmd::CMD_COPY_BUFFER_TO_IMAGE) {
                     if (cmd.src_va && cmd.dst_image && cmd.dst_image->bound_gpu_va && cmd.copy_bytes) {
                         std::memcpy(reinterpret_cast<void*>(cmd.dst_image->bound_gpu_va), reinterpret_cast<const void*>(cmd.src_va), cmd.copy_bytes);
+                        cmd.dst_image->has_uploaded_data = true;
                     }
                 } else if (cmd.type == MaliIcdRecordedCmd::CMD_CLEAR_COLOR_IMAGE) {
                     if (cmd.dst_image && cmd.dst_image->bound_gpu_va) {
@@ -1883,6 +1897,12 @@ VkResult vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* 
                         s_gfx_pkt.instance_count = cmd.instance_count;
                         s_gfx_pkt.stride_bytes   = (cmd.pipeline && cmd.pipeline->vertex_stride >= 8U) ? cmd.pipeline->vertex_stride : 16U;
                         s_gfx_pkt.topology       = cmd.pipeline ? cmd.pipeline->topology : 3U;
+                        s_gfx_pkt.cull_mode      = cmd.pipeline ? cmd.pipeline->cull_mode : 0U;
+                        s_gfx_pkt.front_face     = cmd.pipeline ? cmd.pipeline->front_face : 0U;
+                        s_gfx_pkt.polygon_mode   = cmd.pipeline ? cmd.pipeline->polygon_mode : 0U;
+                        s_gfx_pkt.depth_test_enable  = (cmd.pipeline && cmd.pipeline->depth_test) ? 1U : 0U;
+                        s_gfx_pkt.depth_write_enable = (cmd.pipeline && cmd.pipeline->depth_write) ? 1U : 0U;
+                        s_gfx_pkt.depth_compare_op   = cmd.pipeline ? cmd.pipeline->depth_compare : 1U;
                         s_gfx_pkt.rp_draw_idx    = cmd.rp_draw_idx;
                         s_gfx_pkt.ubo_va         = cmd.desc_set ? (cmd.desc_set->bound_buffer_va[0] + cmd.dynamic_offset) : 0ULL;
                         s_gfx_pkt.ubo_range      = cmd.desc_set ? cmd.desc_set->bound_buffer_range[0] : 0ULL;
@@ -1919,6 +1939,38 @@ VkResult vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* 
                         if (cmd.pipeline && !cmd.pipeline->vertex_attrs.empty()) {
                             s_gfx_pkt.vertex_attrs      = cmd.pipeline->vertex_attrs.data();
                             s_gfx_pkt.vertex_attr_count = static_cast<uint32_t>(cmd.pipeline->vertex_attrs.size());
+                        }
+                        s_gfx_pkt.bound_texture_count = 0U;
+                        if (cmd.desc_set) {
+                            for (uint32_t b = 0; b < 64U && s_gfx_pkt.bound_texture_count < MaliCsfGraphicsDrawPacket::kMaxBoundTextures; ++b) {
+                                MaliIcdImageView* iv = cmd.desc_set->bound_image_view[b];
+                                if (!iv || !iv->image) continue;
+                                MaliIcdImage* img = iv->image;
+                                MaliIcdSampler* smp = cmd.desc_set->bound_sampler[b];
+                                uint64_t pva = img->bound_gpu_va;
+                                uint64_t pbytes = img->byte_size;
+                                if (!pva && !img->stub_texture_backing.empty()) {
+                                    pva = reinterpret_cast<uint64_t>(img->stub_texture_backing.data());
+                                    pbytes = img->stub_texture_backing.size();
+                                }
+                                if (!pva) continue;
+                                MaliBoundTextureDesc& td = s_gfx_pkt.bound_textures[s_gfx_pkt.bound_texture_count++];
+                                td.binding        = b;
+                                td.width          = std::max<uint32_t>(1U, img->width);
+                                td.height         = std::max<uint32_t>(1U, img->height);
+                                td.format         = iv->format ? iv->format : img->format;
+                                td.row_pitch      = img->row_pitch;
+                                td.pixel_va       = pva;
+                                td.pixel_bytes    = pbytes ? pbytes : (static_cast<uint64_t>(td.width) * td.height * 4ULL);
+                                td.mag_filter     = smp ? smp->mag_filter : 1U;
+                                td.min_filter     = smp ? smp->min_filter : 1U;
+                                td.mipmap_mode    = smp ? smp->mipmap_mode : 1U;
+                                td.address_mode_u = smp ? smp->address_mode_u : 0U;
+                                td.address_mode_v = smp ? smp->address_mode_v : 0U;
+                                td.address_mode_w = smp ? smp->address_mode_w : 0U;
+                                td.max_anisotropy = smp ? smp->max_anisotropy : 1.0f;
+                                td.max_lod        = smp ? smp->max_lod : 15.0f;
+                            }
                         }
                         uint64_t* srt_ptr = reinterpret_cast<uint64_t*>(dev->srt_bo_va);
                         srt_ptr[0] = reinterpret_cast<uint64_t>(&s_gfx_pkt);
