@@ -65,14 +65,12 @@ public:
         }
         if (!repr.empty() && repr[0] == '<') {
 #if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS)
+            if (auto* cv = parse_vector_literal(ty, repr, ctx())) return cv;
             return llvm::Constant::getNullValue(ty);
 #else
             // Preserve vector literal text (e.g. "<i32 31, i32 31, i32 31, i32 31>")
             // instead of falling through to std::stoull() / zeroinitializer.
-            auto lit = std::make_unique<llvm::Value>(ty, repr);
-            llvm::Value* ptr = lit.get();
-            fn_.synthetic_ssa_vals.push_back(std::move(lit));
-            return ptr;
+            return ctx().alloc_val<llvm::Value>(ty, repr);
 #endif
         }
         if (!repr.empty() && repr[0] != '%') {

@@ -77,7 +77,7 @@ fi
 if [ "$NEEDS_REBUILD" -eq 1 ]; then
     PASS_DRIVER="$OUT_DIR/horizon2llvm"
     echo "[Build] Compiling unified horizon2llvm -> $PASS_DRIVER..."
-    g++ -std=c++20 -O3 -I"$ROOT_DIR/horizon2llvm" -I"$REPO_ROOT/third_party/prebuilts/llvm-21/include" -I"$LLVM21_INC_DIR" \
+    g++ -std=c++20 -O3 -DHORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS=1 -I"$ROOT_DIR/horizon2llvm" -I"$REPO_ROOT/third_party/prebuilts/llvm-21/include" -I"$LLVM21_INC_DIR" \
         "$ROOT_DIR/horizon2llvm/main.cpp" \
         "$ROOT_DIR/horizon2llvm/mali_llvm_passes.cpp" \
         "$ROOT_DIR/horizon2llvm/ko_lifter.cpp" \

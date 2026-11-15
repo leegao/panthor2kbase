@@ -15,7 +15,7 @@ LLVM_LIB_FLAG := -lz -l:libzstd.so.1
 
 CXX ?= g++
 CC ?= gcc
-CXXFLAGS := -std=c++17 -O3 -Wall -Wextra -Wno-unused-parameter -DH2L_HAVE_LLVM_HEADERS=1 -I$(LIFTER_DIR) -I$(RUNTIME_DIR) $(LLVM_INC) $(EXTRA_CXXFLAGS) -pthread
+CXXFLAGS := -std=c++17 -O3 -Wall -Wextra -Wno-unused-parameter -DH2L_HAVE_LLVM_HEADERS=1 -DHORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS=1 -I$(LIFTER_DIR) -I$(RUNTIME_DIR) $(LLVM_INC) $(EXTRA_CXXFLAGS) -pthread
 CFLAGS := -O2 -fPIC -fno-strict-aliasing -I$(LIFTER_DIR) -I$(RUNTIME_DIR)
 LDFLAGS := $(LLVM_LIB_FLAG) -pthread -ldl
 

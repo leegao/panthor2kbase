@@ -2013,19 +2013,19 @@ public:
                             if (rcpc_info.size < 2) {
                                 val = B->cast("trunc", val, mty_t, "stlur_tr");
                             }
-                            B->CreateAtomicStore(mty_t, val, ptr_v, 1U << rcpc_info.size, ultrs::llvm_compat::AtomicOrdering::Release);
+                            B->CreateAtomicStore(mty_t, val, ptr_v, 1U << rcpc_info.size, ultrs::llvm_ir::AtomicOrdering::Release);
                         } else if (rcpc_info.opc == 1) {
-                            IRValue lv = B->CreateAtomicLoad(mty_t, ptr_v, 1U << rcpc_info.size, ultrs::llvm_compat::AtomicOrdering::Acquire);
+                            IRValue lv = B->CreateAtomicLoad(mty_t, ptr_v, 1U << rcpc_info.size, ultrs::llvm_ir::AtomicOrdering::Acquire);
                             if (rcpc_info.size < 2) {
                                 lv = B->cast("zext", lv, IRType::Int32, "ldapur_zx");
                             }
                             storeGpr(rcpc_info.rt, lv, rcpc_info.size == 3);
                         } else if (rcpc_info.opc == 2 && rcpc_info.size < 3) {
-                            IRValue lv = B->CreateAtomicLoad(mty_t, ptr_v, 1U << rcpc_info.size, ultrs::llvm_compat::AtomicOrdering::Acquire);
+                            IRValue lv = B->CreateAtomicLoad(mty_t, ptr_v, 1U << rcpc_info.size, ultrs::llvm_ir::AtomicOrdering::Acquire);
                             IRValue sx = B->cast("sext", lv, IRType::Int64, "ldapurs_sx");
                             storeGpr(rcpc_info.rt, sx, true);
                         } else if (rcpc_info.opc == 3 && rcpc_info.size < 2) {
-                            IRValue lv = B->CreateAtomicLoad(mty_t, ptr_v, 1U << rcpc_info.size, ultrs::llvm_compat::AtomicOrdering::Acquire);
+                            IRValue lv = B->CreateAtomicLoad(mty_t, ptr_v, 1U << rcpc_info.size, ultrs::llvm_ir::AtomicOrdering::Acquire);
                             IRValue sx = B->cast("sext", lv, IRType::Int32, "ldapursw_sx");
                             storeGpr(rcpc_info.rt, sx, false);
                         }
@@ -2043,7 +2043,7 @@ public:
                         IRValue ptr_v = B->CreateIntToPtr(addr_val, "at_ptr");
                         IRType mty_t = intTypeForBytes(1U << size);
                         if (L == 1) {
-                            IRValue lv = B->CreateAtomicLoad(mty_t, ptr_v, 1U << size, ultrs::llvm_compat::AtomicOrdering::Acquire);
+                            IRValue lv = B->CreateAtomicLoad(mty_t, ptr_v, 1U << size, ultrs::llvm_ir::AtomicOrdering::Acquire);
                             if (size < 2) {
                                 lv = B->cast("zext", lv, IRType::Int32, "ldar_zx");
                             }
@@ -2053,7 +2053,7 @@ public:
                             if (size < 2) {
                                 val = B->cast("trunc", val, mty_t, "stlr_tr");
                             }
-                            B->CreateAtomicStore(mty_t, val, ptr_v, 1U << size, ultrs::llvm_compat::AtomicOrdering::Release);
+                            B->CreateAtomicStore(mty_t, val, ptr_v, 1U << size, ultrs::llvm_ir::AtomicOrdering::Release);
                             if (o2 == 0) {
                                 storeGpr(rm, IRValue::imm(IRType::Int32, 0), false);
                             }
@@ -3631,7 +3631,12 @@ public:
             // llvm::Value* map and synthetic SSA/literal values are dead weight
             // once lifting finishes.
             fn->ssa_values.clear();
+#if !defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS)
+            // The compat layer's synthetic values are text-only, so they can be
+            // freed eagerly. Real LLVM instructions hold operand pointers to
+            // them, so they must outlive the module (see Module member order).
             fn->synthetic_ssa_vals.clear();
+#endif
             size_t fn_est = 0;
             for (const auto &bb : fn->blocks) fn_est += bb->insts.size() * 64;
             approx_ir_bytes += fn_est;

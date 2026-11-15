@@ -179,6 +179,7 @@ if(NOT ANDROID)
       "${LLVM21_INC_DIR}"
    )
    set_target_properties(horizon2llvm_passes PROPERTIES CXX_STANDARD 20)
+   target_compile_definitions(horizon2llvm_passes PRIVATE HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS=1)
 
    add_executable(horizon2llvm
       src/aot/horizon2llvm/main.cpp
@@ -192,6 +193,7 @@ if(NOT ANDROID)
       "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/horizon2llvm"
       "${LLVM21_INC_DIR}"
    )
+   target_compile_definitions(horizon2llvm PRIVATE HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS=1)
    set_target_properties(horizon2llvm PROPERTIES
       CXX_STANDARD 20
       RUNTIME_OUTPUT_DIRECTORY "${AOT_DIR}"

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -59,6 +60,10 @@ namespace ultrs::llvm_ir {
 #if !defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS)
 namespace llvm = ultrs::llvm_compat;
 #endif
+
+// Portable alias so callers outside this namespace can name the atomic ordering
+// enum without depending on the compat-layer namespace.
+using AtomicOrdering = llvm::AtomicOrdering;
 
 // -----------------------------------------------------------------------------
 // LLVM IR Types
@@ -249,9 +254,8 @@ struct Value {
         return Value{TypeKind::Int32, std::to_string(static_cast<int32_t>(v)), true, static_cast<uint32_t>(v), nullptr};
     }
     static Value imm_i128(uint64_t lo, uint64_t hi) {
-        if (hi == 0) {
-            return Value{TypeKind::Int128, std::to_string(lo), true, lo, nullptr};
-        }
+        // Always encode both halves in hex so resolve_llvm_value() parses the
+        // full 128-bit value via APInt instead of sign-extending the low word.
         char buf[64];
         std::snprintf(buf, sizeof(buf), "u0x%016" PRIx64 "%016" PRIx64, hi, lo);
         return Value{TypeKind::Int128, buf, true, lo, nullptr};
@@ -385,7 +389,7 @@ struct Function {
     Module* parent_mod = nullptr;
     llvm::Function* llvm_fn = nullptr;
     std::unordered_map<std::string, llvm::Value*> ssa_values;
-    std::vector<std::unique_ptr<llvm::Value>> synthetic_ssa_vals;
+    std::vector<std::unique_ptr<llvm::Argument>> synthetic_ssa_vals;
 
     BasicBlock* create_block(const std::string& label, uint64_t pc = 0);
 
@@ -418,8 +422,12 @@ struct Module {
     std::string target_triple;
     std::string data_layout;
     std::unique_ptr<llvm::LLVMContext> llvm_ctx;
-    std::unique_ptr<llvm::Module> llvm_mod;
+    // Declared before llvm_mod so functions (and their synthetic SSA values) are
+    // destroyed *after* the real llvm::Module. Real LLVM instructions hold
+    // operand pointers to those synthetic values, so the module must be torn
+    // down first to avoid use-after-free during dropAllReferences().
     std::vector<std::unique_ptr<Function>> functions;
+    std::unique_ptr<llvm::Module> llvm_mod;
     std::unordered_map<std::string, Function*> fn_map;
     std::set<std::string> external_guest_fns;
     std::set<std::string> external_hle_fns;
@@ -921,6 +929,50 @@ private:
     std::vector<std::unique_ptr<ModulePass>> passes_;
 };
 
+#if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS)
+// Parse a textual vector literal such as "<i32 32, i32 32, i32 32, i32 32>"
+// into a real llvm::ConstantVector. Returns nullptr if the literal cannot be
+// parsed (caller falls back to zeroinitializer).
+inline llvm::Constant* parse_vector_literal(llvm::Type* ty, const std::string& repr,
+                                            llvm::LLVMContext& ctx) {
+    auto* vec_ty = llvm::dyn_cast<llvm::VectorType>(ty);
+    if (!vec_ty) return nullptr;
+    llvm::Type* elem_ty = vec_ty->getElementType();
+    size_t start = repr.find('<');
+    size_t end = repr.rfind('>');
+    if (start == std::string::npos || end == std::string::npos || end <= start) return nullptr;
+    std::string body = repr.substr(start + 1, end - start - 1);
+
+    std::vector<llvm::Constant*> elems;
+    size_t pos = 0;
+    while (pos <= body.size()) {
+        size_t comma = body.find(',', pos);
+        std::string elem = body.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        size_t sp = elem.find_last_of(" \t");
+        std::string val_str = (sp == std::string::npos) ? elem : elem.substr(sp + 1);
+        if (val_str.empty()) break;
+        if (elem_ty->isIntegerTy()) {
+            bool neg = val_str[0] == '-';
+            uint64_t uv = std::strtoull(neg ? val_str.c_str() + 1 : val_str.c_str(), nullptr, 10);
+            if (neg) uv = static_cast<uint64_t>(-static_cast<int64_t>(uv));
+            elems.push_back(llvm::ConstantInt::get(elem_ty, uv, /*isSigned=*/false));
+        } else if (elem_ty->isFloatingPointTy()) {
+            elems.push_back(llvm::ConstantFP::get(elem_ty, std::stod(val_str)));
+        } else {
+            return nullptr;
+        }
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    if (elems.empty()) return nullptr;
+
+    unsigned n = llvm::cast<llvm::FixedVectorType>(vec_ty)->getNumElements();
+    while (elems.size() < n) elems.push_back(elems.back());
+    if (elems.size() > n) elems.resize(n);
+    return llvm::ConstantVector::get(elems);
+}
+#endif
+
 // -----------------------------------------------------------------------------
 // Thin IRBuilder API on top of llvm::IRBuilder<llvm::NoFolder>
 // -----------------------------------------------------------------------------
@@ -975,20 +1027,14 @@ public:
             }
             if (!v.repr.empty() && v.repr.front() == '<') {
 #if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS)
-                // Real-LLVM builds would need to materialize a ConstantVector here.
+                if (auto* cv = parse_vector_literal(ty, v.repr, ctx)) return cv;
                 return llvm::Constant::getNullValue(ty);
 #else
                 // The compat Value carries its textual form directly, so keep the
                 // literal text instead of collapsing every vector splat to
                 // zeroinitializer. Collapsing silently broke USHL/SSHL, SHL/USHR,
                 // SQXTN/UQXTN bounds, and SHA1SU1.
-                if (fn_) {
-                    auto lit = std::make_unique<llvm::Value>(ty, v.repr);
-                    llvm::Value* ptr = lit.get();
-                    fn_->synthetic_ssa_vals.push_back(std::move(lit));
-                    return ptr;
-                }
-                return llvm::Constant::getNullValue(ty);
+                return context().alloc_val<llvm::Value>(ty, v.repr);
 #endif
             }
             if (v.type == TypeKind::Pointer && !v.repr.empty() && v.repr[0] == '@') {
@@ -1012,11 +1058,14 @@ public:
             }
             return llvm::ConstantInt::get(ty, v.const_u64, false);
         }
-        if (fn_) {
+        if (fn_ && !v.repr.empty() && v.repr.front() == '%') {
             auto it = fn_->ssa_values.find(v.repr);
             if (it != fn_->ssa_values.end() && it->second->getType() == ty) {
                 return it->second;
             }
+            // Forward reference: create a named placeholder so the printed text
+            // keeps the SSA name; the definition is expected elsewhere in the
+            // function. Only SSA names (leading '%') get this treatment.
             auto arg = std::make_unique<llvm::Argument>(ty, strip_ssa_pct(v.repr));
             llvm::Value* ptr = arg.get();
             fn_->synthetic_ssa_vals.push_back(std::move(arg));
@@ -1480,7 +1529,24 @@ public:
         std::string r = fn_->next_reg("rmw");
         llvm::Value* pv = resolve_llvm_value(ptr_val);
         llvm::Value* vv = resolve_llvm_value(val);
-        auto* raw_i = builder_.CreateAtomicRMWStr(rmw_op, pv, vv, llvm::MaybeAlign(align), strip_ssa_pct(r));
+        llvm::Instruction* raw_i = nullptr;
+#if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS)
+        llvm::AtomicRMWInst::BinOp op = llvm::AtomicRMWInst::Add;
+        if (std::strcmp(rmw_op, "xchg") == 0) op = llvm::AtomicRMWInst::Xchg;
+        else if (std::strcmp(rmw_op, "add") == 0) op = llvm::AtomicRMWInst::Add;
+        else if (std::strcmp(rmw_op, "and") == 0) op = llvm::AtomicRMWInst::And;
+        else if (std::strcmp(rmw_op, "xor") == 0) op = llvm::AtomicRMWInst::Xor;
+        else if (std::strcmp(rmw_op, "or") == 0) op = llvm::AtomicRMWInst::Or;
+        else if (std::strcmp(rmw_op, "max") == 0) op = llvm::AtomicRMWInst::Max;
+        else if (std::strcmp(rmw_op, "min") == 0) op = llvm::AtomicRMWInst::Min;
+        else if (std::strcmp(rmw_op, "umax") == 0) op = llvm::AtomicRMWInst::UMax;
+        else if (std::strcmp(rmw_op, "umin") == 0) op = llvm::AtomicRMWInst::UMin;
+        raw_i = builder_.CreateAtomicRMW(op, pv, vv, llvm::MaybeAlign(align),
+                                         llvm::AtomicOrdering::SequentiallyConsistent);
+        raw_i->setName(strip_ssa_pct(r));
+#else
+        raw_i = builder_.CreateAtomicRMWStr(rmw_op, pv, vv, llvm::MaybeAlign(align), strip_ssa_pct(r));
+#endif
         fn_->register_ssa_value(r, raw_i);
 
         Instruction inst;
