@@ -76,6 +76,17 @@ enum class TypeKind {
     Vec2xI64,
     Vec4xF32,
     Vec2xF64,
+    Vec8xI8,
+    Vec4xI16,
+    Vec2xI32,
+    Vec2xF32,
+    Vec16xI1,
+    Vec8xI1,
+    Vec4xI1,
+    Vec2xI1,
+    Vec4xI8,
+    Vec2xI8,
+    Vec2xI16,
 };
 
 inline const char* type_str(TypeKind t) {
@@ -96,6 +107,17 @@ inline const char* type_str(TypeKind t) {
         case TypeKind::Vec2xI64: return "<2 x i64>";
         case TypeKind::Vec4xF32: return "<4 x float>";
         case TypeKind::Vec2xF64: return "<2 x double>";
+        case TypeKind::Vec8xI8:  return "<8 x i8>";
+        case TypeKind::Vec4xI16: return "<4 x i16>";
+        case TypeKind::Vec2xI32: return "<2 x i32>";
+        case TypeKind::Vec2xF32: return "<2 x float>";
+        case TypeKind::Vec16xI1: return "<16 x i1>";
+        case TypeKind::Vec8xI1:  return "<8 x i1>";
+        case TypeKind::Vec4xI1:  return "<4 x i1>";
+        case TypeKind::Vec2xI1:  return "<2 x i1>";
+        case TypeKind::Vec4xI8:  return "<4 x i8>";
+        case TypeKind::Vec2xI8:  return "<2 x i8>";
+        case TypeKind::Vec2xI16: return "<2 x i16>";
     }
     return "i64";
 }
@@ -118,6 +140,17 @@ inline llvm::Type* to_llvm_type(llvm::LLVMContext& ctx, TypeKind t) {
         case TypeKind::Vec2xI64: return llvm::FixedVectorType::get(llvm::Type::getInt64Ty(ctx), 2);
         case TypeKind::Vec4xF32: return llvm::FixedVectorType::get(llvm::Type::getFloatTy(ctx), 4);
         case TypeKind::Vec2xF64: return llvm::FixedVectorType::get(llvm::Type::getDoubleTy(ctx), 2);
+        case TypeKind::Vec8xI8:  return llvm::FixedVectorType::get(llvm::Type::getInt8Ty(ctx), 8);
+        case TypeKind::Vec4xI16: return llvm::FixedVectorType::get(llvm::Type::getInt16Ty(ctx), 4);
+        case TypeKind::Vec2xI32: return llvm::FixedVectorType::get(llvm::Type::getInt32Ty(ctx), 2);
+        case TypeKind::Vec2xF32: return llvm::FixedVectorType::get(llvm::Type::getFloatTy(ctx), 2);
+        case TypeKind::Vec16xI1: return llvm::FixedVectorType::get(llvm::Type::getInt1Ty(ctx), 16);
+        case TypeKind::Vec8xI1:  return llvm::FixedVectorType::get(llvm::Type::getInt1Ty(ctx), 8);
+        case TypeKind::Vec4xI1:  return llvm::FixedVectorType::get(llvm::Type::getInt1Ty(ctx), 4);
+        case TypeKind::Vec2xI1:  return llvm::FixedVectorType::get(llvm::Type::getInt1Ty(ctx), 2);
+        case TypeKind::Vec4xI8:  return llvm::FixedVectorType::get(llvm::Type::getInt8Ty(ctx), 4);
+        case TypeKind::Vec2xI8:  return llvm::FixedVectorType::get(llvm::Type::getInt8Ty(ctx), 2);
+        case TypeKind::Vec2xI16: return llvm::FixedVectorType::get(llvm::Type::getInt16Ty(ctx), 2);
     }
     return llvm::Type::getInt64Ty(ctx);
 }
@@ -129,7 +162,18 @@ inline unsigned vec_lane_count(TypeKind vt) {
         case TypeKind::Vec4xI32:
         case TypeKind::Vec4xF32: return 4;
         case TypeKind::Vec2xI64:
-        case TypeKind::Vec2xF64: return 2;
+        case TypeKind::Vec2xF64:
+        case TypeKind::Vec2xI32:
+        case TypeKind::Vec2xF32:
+        case TypeKind::Vec2xI1:
+        case TypeKind::Vec2xI8:
+        case TypeKind::Vec2xI16: return 2;
+        case TypeKind::Vec4xI8:  return 4;
+        case TypeKind::Vec4xI1:  return 4;
+        case TypeKind::Vec8xI1:  return 8;
+        case TypeKind::Vec16xI1: return 16;
+        case TypeKind::Vec4xI16: return 4;
+        case TypeKind::Vec8xI8:  return 8;
         default: return 1;
     }
 }
@@ -210,6 +254,12 @@ struct Value {
     }
     static Value zero_vec(TypeKind vt) {
         return Value{vt, "zeroinitializer", true, 0, nullptr};
+    }
+    static Value poison(TypeKind vt) {
+        return Value{vt, "poison", true, 0, nullptr};
+    }
+    static Value imm_fp(TypeKind t, const std::string& repr) {
+        return Value{t, repr, true, 0, nullptr};
     }
     static Value global_sym(std::string sym) {
         if (!sym.empty() && sym[0] == '@') {
@@ -341,7 +391,7 @@ struct Function {
     }
 
     std::string next_reg(const char* prefix = "t") {
-        return std::string("%") + prefix + std::to_string(next_ssa_id++);
+        return std::string("%") + prefix + "_" + std::to_string(next_ssa_id++);
     }
 
     void register_ssa_value(const std::string& reg_name, llvm::Value* val) {
@@ -373,9 +423,12 @@ struct Module {
     std::vector<std::string> extra_raw_functions; // e.g. @f_<pc>_nce Static NCE ABI entry points
     ChunkMetadata chunk_meta;
     bool needs_noalias_md = true;
+    bool emit_horizon_runtime_decls = true;
     bool uses_aarch64_intrinsics = false;
     bool uses_x86_pause = false;
     bool uses_x86_crc32 = false;
+    std::vector<std::string> extra_decls;
+    std::vector<std::string> extra_attrs;
 
     Module(std::string mod_name, std::string triple = "x86_64-w64-windows-gnu")
         : name(std::move(mod_name)),
@@ -500,6 +553,7 @@ struct Module {
         }
         os << "\n";
 
+        if (emit_horizon_runtime_decls) {
         // Runtime & LLVM Intrinsic Declarations
         os << "%struct.Cpu = type { [32 x i64], i64, i64, i64, i64, i64, i64, i64, ptr, i64, i64, [176 x i8], [32 x i128] }\n\n";
         os << "@g_fnprof = external dso_local global i32, align 4\n";
@@ -728,6 +782,10 @@ struct Module {
             os << "declare <8 x i16> @llvm.aarch64.neon.sqrdmulh.v8i16(<8 x i16>, <8 x i16>) nounwind readnone\n";
             os << "declare <4 x i32> @llvm.aarch64.neon.sqrdmulh.v4i32(<4 x i32>, <4 x i32>) nounwind readnone\n";
         }
+        } // end if (emit_horizon_runtime_decls)
+        for (const auto& d : extra_decls) {
+            os << d << "\n";
+        }
         os << "\n";
 
         std::unordered_set<std::string> defined_names;
@@ -768,6 +826,9 @@ struct Module {
 
         for (const auto& raw_fn : extra_raw_functions) {
             os << raw_fn << "\n\n";
+        }
+        for (const auto& attr : extra_attrs) {
+            os << attr << "\n";
         }
 
         int md_next_idx = 0;
@@ -885,6 +946,12 @@ public:
         if (v.is_const) {
             if (v.repr == "zeroinitializer") {
                 return llvm::Constant::getNullValue(ty);
+            }
+            if (v.repr == "poison" || v.repr == "undef") {
+                return llvm::UndefValue::get(ty);
+            }
+            if (!v.repr.empty() && v.repr.front() == '<') {
+                return llvm::Constant::getNullValue(ty); // vector literal handled by text or compat
             }
             if (v.type == TypeKind::Pointer && !v.repr.empty() && v.repr[0] == '@') {
                 std::string gname = v.repr.substr(1);
@@ -1174,6 +1241,20 @@ public:
         return cast("inttoptr", addr_i64, TypeKind::Pointer, prefix);
     }
 
+    Value CreateExtractElementDyn(TypeKind vt, TypeKind et, const Value& vec, const Value& idx, const char* prefix = "el") {
+        std::string r = fn_->next_reg(prefix);
+        Instruction inst;
+        inst.tag = OpTag::RawIR;
+        inst.dst_reg = r;
+        inst.dst_type = et;
+        inst.op0 = vec;
+        inst.op1 = idx;
+        inst.text = r + " = extractelement " + std::string(type_str(vt)) + " " + vec.repr + ", " +
+                    std::string(type_str(idx.type)) + " " + idx.repr;
+        bb_->insts.push_back(std::move(inst));
+        return Value::reg(et, r);
+    }
+
     Value CreateExtractElement(TypeKind vt, TypeKind et, const Value& vec, unsigned idx, const char* prefix = "el") {
         (void)vt;
         std::string r = fn_->next_reg(prefix);
@@ -1213,23 +1294,27 @@ public:
         return Value::reg(vt, r, res);
     }
 
-    Value CreateShuffleVector(TypeKind vt, const Value& a, const Value& b, const std::vector<int>& mask, const char* prefix = "shuf") {
+    Value CreateShuffleVector(TypeKind vt, const Value& a, const Value& b, const std::vector<int>& mask,
+                              const char* prefix = "shuf", TypeKind out_vt = TypeKind::Void) {
+        TypeKind res_vt = (out_vt == TypeKind::Void) ? vt : out_vt;
         std::string r = fn_->next_reg(prefix);
         llvm::Value* av = resolve_llvm_value(a);
         llvm::Value* bv = resolve_llvm_value(b);
         llvm::Value* res = builder_.CreateShuffleVector(av, bv, mask, strip_ssa_pct(r));
-        fn_->register_ssa_value(r, res);
+        if (res_vt == vt) {
+            fn_->register_ssa_value(r, res);
+        }
 
         Instruction inst;
         inst.tag = OpTag::RawIR;
         inst.dst_reg = r;
-        inst.dst_type = vt;
+        inst.dst_type = res_vt;
         inst.op0 = a;
         inst.op1 = b;
-        inst.llvm_inst = llvm::dyn_cast<llvm::Instruction>(res);
+        inst.llvm_inst = (res_vt == vt) ? llvm::dyn_cast<llvm::Instruction>(res) : nullptr;
         inst.text = format_llvm_inst(res);
         bb_->insts.push_back(std::move(inst));
-        return Value::reg(vt, r, res);
+        return Value::reg(res_vt, r, (res_vt == vt) ? res : nullptr);
     }
 
     Value CreateVolatileLoadGlobalI32(const std::string& global_name, unsigned align, const char* prefix = "prof") {
@@ -1319,6 +1404,59 @@ public:
         return Value::reg(TypeKind::Int1, ok_r, ok);
     }
 
+    Value CreateAtomicCmpXchgVal(TypeKind mt, const Value& ptr_val, const Value& exp_val,
+                                 const Value& new_val, unsigned align) {
+        std::string cx_r = fn_->next_reg("cas");
+        std::string old_r = fn_->next_reg("casold");
+        llvm::Value* pv = resolve_llvm_value(ptr_val);
+        llvm::Value* ev = resolve_llvm_value(exp_val);
+        llvm::Value* nv = resolve_llvm_value(new_val);
+        auto* cx = builder_.CreateAtomicCmpXchg(
+            pv, ev, nv, llvm::MaybeAlign(align),
+            llvm::AtomicOrdering::SequentiallyConsistent,
+            llvm::AtomicOrdering::SequentiallyConsistent);
+        cx->setName(strip_ssa_pct(cx_r));
+        auto* old_v = builder_.CreateExtractValue(cx, {0}, strip_ssa_pct(old_r));
+        fn_->register_ssa_value(cx_r, cx);
+        fn_->register_ssa_value(old_r, old_v);
+
+        Instruction inst1;
+        inst1.tag = OpTag::RawIR;
+        inst1.dst_reg = cx_r;
+        inst1.llvm_inst = cx;
+        inst1.text = format_llvm_inst(cx);
+        bb_->insts.push_back(std::move(inst1));
+
+        Instruction inst2;
+        inst2.tag = OpTag::RawIR;
+        inst2.dst_reg = old_r;
+        inst2.dst_type = mt;
+        inst2.llvm_inst = llvm::dyn_cast<llvm::Instruction>(old_v);
+        inst2.text = format_llvm_inst(old_v);
+        bb_->insts.push_back(std::move(inst2));
+        return Value::reg(mt, old_r, old_v);
+    }
+
+    Value CreateAtomicRMW(const char* rmw_op, TypeKind mt, const Value& ptr_val,
+                          const Value& val, unsigned align) {
+        std::string r = fn_->next_reg("rmw");
+        llvm::Value* pv = resolve_llvm_value(ptr_val);
+        llvm::Value* vv = resolve_llvm_value(val);
+        auto* raw_i = builder_.CreateAtomicRMWStr(rmw_op, pv, vv, llvm::MaybeAlign(align), strip_ssa_pct(r));
+        fn_->register_ssa_value(r, raw_i);
+
+        Instruction inst;
+        inst.tag = OpTag::RawIR;
+        inst.dst_reg = r;
+        inst.dst_type = mt;
+        inst.op0 = ptr_val;
+        inst.op1 = val;
+        inst.llvm_inst = raw_i;
+        inst.text = format_llvm_inst(raw_i);
+        bb_->insts.push_back(std::move(inst));
+        return Value::reg(mt, r, raw_i);
+    }
+
     Value CreateCall(TypeKind ret_t, const std::string& callee_name,
                      const std::vector<Value>& args, const char* prefix = "call",
                      OpTag tag = OpTag::RawIR) {
@@ -1349,6 +1487,208 @@ public:
         inst.text = format_llvm_inst(call);
         bb_->insts.push_back(std::move(inst));
         return Value::reg(ret_t, r, call);
+    }
+
+    Value CreateAlloca(TypeKind t, unsigned align = 0, const char* prefix = "a") {
+        std::string r = fn_->next_reg(prefix);
+        unsigned al = align ? align : ((t == TypeKind::Int128 || t == TypeKind::Vec16xI8 ||
+                                        t == TypeKind::Vec8xI16 || t == TypeKind::Vec4xI32 ||
+                                        t == TypeKind::Vec2xI64 || t == TypeKind::Vec4xF32 ||
+                                        t == TypeKind::Vec2xF64) ? 16 : (t == TypeKind::Int1 ? 1 : 8));
+        llvm::AllocaInst* ai = builder_.CreateAlloca(llvm_type(t), nullptr, strip_ssa_pct(r));
+        fn_->register_ssa_value(r, ai);
+        Instruction inst;
+        inst.tag = OpTag::RawIR;
+        inst.dst_reg = r;
+        inst.dst_type = TypeKind::Pointer;
+        inst.llvm_inst = ai;
+        inst.text = r + " = alloca " + std::string(type_str(t)) + ", align " + std::to_string(al);
+        bb_->insts.push_back(std::move(inst));
+        return Value::reg(TypeKind::Pointer, r, ai);
+    }
+
+    Value CreateNamedAlloca(TypeKind t, const std::string& exact_name, unsigned align = 0) {
+        std::string r = (!exact_name.empty() && exact_name[0] == '%') ? exact_name : ("%" + exact_name);
+        unsigned al = align ? align : ((t == TypeKind::Int128) ? 16 : (t == TypeKind::Int1 ? 1 : 8));
+        llvm::AllocaInst* ai = builder_.CreateAlloca(llvm_type(t), nullptr, strip_ssa_pct(r));
+        fn_->register_ssa_value(r, ai);
+        Instruction inst;
+        inst.tag = OpTag::RawIR;
+        inst.dst_reg = r;
+        inst.dst_type = TypeKind::Pointer;
+        inst.llvm_inst = ai;
+        inst.text = r + " = alloca " + std::string(type_str(t)) + ", align " + std::to_string(al);
+        bb_->insts.push_back(std::move(inst));
+        return Value::reg(TypeKind::Pointer, r, ai);
+    }
+
+    Value CreateLoad(TypeKind t, const Value& ptr, unsigned align = 0, OpTag tag = OpTag::RawIR,
+                     const char* prefix = "ld", const Value& guest_addr = {}, uint64_t pc = 0, int arch_reg = -1) {
+        std::string r = fn_->next_reg(prefix);
+        unsigned al = align ? align : 1;
+        llvm::LoadInst* ld = builder_.CreateAlignedLoad(llvm_type(t), resolve_llvm_value(ptr),
+                                                        llvm::Align(al), strip_ssa_pct(r));
+        fn_->register_ssa_value(r, ld);
+        Instruction inst;
+        inst.tag = tag;
+        inst.arch_reg = arch_reg;
+        inst.dst_reg = r;
+        inst.dst_type = t;
+        inst.op0 = (tag == OpTag::GuestMemLoad && !guest_addr.repr.empty()) ? guest_addr : ptr;
+        inst.guest_pc = pc;
+        inst.align_bytes = static_cast<int>(al);
+        inst.llvm_inst = ld;
+        inst.text = r + " = load " + std::string(type_str(t)) + ", ptr " + ptr.repr + ", align " + std::to_string(al);
+        bb_->insts.push_back(std::move(inst));
+        return Value::reg(t, r, ld);
+    }
+
+    void CreateStore(const Value& val, const Value& ptr, unsigned align = 0, OpTag tag = OpTag::RawIR,
+                     const Value& guest_addr = {}, uint64_t pc = 0, int arch_reg = -1) {
+        unsigned al = align ? align : 1;
+        llvm::StoreInst* st = builder_.CreateAlignedStore(resolve_llvm_value(val), resolve_llvm_value(ptr),
+                                                          llvm::Align(al));
+        Instruction inst;
+        inst.tag = tag;
+        inst.arch_reg = arch_reg;
+        inst.guest_pc = pc;
+        inst.align_bytes = static_cast<int>(al);
+        if (tag == OpTag::GuestMemStore) {
+            inst.op0 = !guest_addr.repr.empty() ? guest_addr : ptr;
+            inst.op1 = val;
+        } else {
+            inst.op0 = val;
+            inst.op1 = ptr;
+        }
+        inst.llvm_inst = st;
+        inst.text = "store " + std::string(type_str(val.type)) + " " + val.repr + ", ptr " + ptr.repr + ", align " + std::to_string(al);
+        bb_->insts.push_back(std::move(inst));
+    }
+
+    Value CreateGEP_i8(const Value& base, const Value& byte_off, const char* prefix = "gep") {
+        std::string r = fn_->next_reg(prefix);
+        llvm::Value* g = builder_.CreateInBoundsGEP(llvm::Type::getInt8Ty(context()),
+                                                    resolve_llvm_value(base),
+                                                    resolve_llvm_value(byte_off), strip_ssa_pct(r));
+        fn_->register_ssa_value(r, g);
+        Instruction inst;
+        inst.tag = OpTag::RawIR;
+        inst.dst_reg = r;
+        inst.dst_type = TypeKind::Pointer;
+        inst.op0 = base;
+        inst.op1 = byte_off;
+        inst.llvm_inst = llvm::dyn_cast<llvm::Instruction>(g);
+        inst.text = r + " = getelementptr inbounds i8, ptr " + base.repr + ", i64 " + byte_off.repr;
+        bb_->insts.push_back(std::move(inst));
+        return Value::reg(TypeKind::Pointer, r, g);
+    }
+
+    Value CreateGEP_i8(const Value& base, int64_t byte_off, const char* prefix = "gep") {
+        return CreateGEP_i8(base, Value::imm(TypeKind::Int64, static_cast<uint64_t>(byte_off)), prefix);
+    }
+
+    Value CreateGEP_ptr(const Value& base, const Value& idx, const char* prefix = "slot") {
+        std::string r = fn_->next_reg(prefix);
+        llvm::Value* g = builder_.CreateInBoundsGEP(llvm::PointerType::getUnqual(context()),
+                                                    resolve_llvm_value(base),
+                                                    resolve_llvm_value(idx), strip_ssa_pct(r));
+        fn_->register_ssa_value(r, g);
+        Instruction inst;
+        inst.tag = OpTag::RawIR;
+        inst.dst_reg = r;
+        inst.dst_type = TypeKind::Pointer;
+        inst.op0 = base;
+        inst.op1 = idx;
+        inst.llvm_inst = llvm::dyn_cast<llvm::Instruction>(g);
+        inst.text = r + " = getelementptr inbounds ptr, ptr " + base.repr + ", i64 " + idx.repr;
+        bb_->insts.push_back(std::move(inst));
+        return Value::reg(TypeKind::Pointer, r, g);
+    }
+
+    Value CreateFNeg(TypeKind t, const Value& v, const char* prefix = "fneg") {
+        std::string r = fn_->next_reg(prefix);
+        Instruction inst;
+        inst.tag = OpTag::RawIR;
+        inst.dst_reg = r;
+        inst.dst_type = t;
+        inst.op0 = v;
+        inst.text = r + " = fneg " + std::string(type_str(t)) + " " + v.repr;
+        bb_->insts.push_back(std::move(inst));
+        return Value::reg(t, r);
+    }
+
+    Value fcmp(const char* pred, TypeKind t, const Value& a, const Value& b, const char* prefix = "fcmp") {
+        std::string r = fn_->next_reg(prefix);
+        Instruction inst;
+        inst.tag = OpTag::RawIR;
+        inst.dst_reg = r;
+        inst.dst_type = TypeKind::Int1;
+        inst.op0 = a;
+        inst.op1 = b;
+        inst.text = r + " = fcmp " + std::string(pred) + " " + std::string(type_str(t)) + " " + a.repr + ", " + b.repr;
+        bb_->insts.push_back(std::move(inst));
+        return Value::reg(TypeKind::Int1, r);
+    }
+
+    Value CreatePhi(TypeKind t, const std::vector<std::pair<Value, std::string>>& incoming, const char* prefix = "phi") {
+        std::string r = fn_->next_reg(prefix);
+        std::ostringstream os;
+        os << r << " = phi " << type_str(t) << " ";
+        for (size_t i = 0; i < incoming.size(); ++i) {
+            if (i > 0) os << ", ";
+            os << "[ " << incoming[i].first.repr << ", %" << incoming[i].second << " ]";
+        }
+        Instruction inst;
+        inst.tag = OpTag::RawIR;
+        inst.dst_reg = r;
+        inst.dst_type = t;
+        inst.text = os.str();
+        bb_->insts.push_back(std::move(inst));
+        return Value::reg(t, r);
+    }
+
+    void CreateSwitch(const Value& cond, const std::string& def_label,
+                      const std::vector<std::pair<uint64_t, std::string>>& cases) {
+        std::ostringstream os;
+        os << "switch " << type_str(cond.type) << " " << cond.repr << ", label %" << def_label << " [ ";
+        for (const auto& kv : cases) {
+            os << type_str(cond.type) << " " << kv.first << ", label %" << kv.second << " ";
+        }
+        os << "]";
+        Instruction inst;
+        inst.tag = OpTag::RawIR;
+        inst.op0 = cond;
+        inst.target_label = def_label;
+        inst.text = os.str();
+        bb_->insts.push_back(std::move(inst));
+    }
+
+    Value CreateCallPtr(TypeKind ret_t, const Value& fn_ptr, const std::vector<Value>& args,
+                        OpTag tag = OpTag::IndirectCall, const char* prefix = "c") {
+        std::ostringstream os;
+        std::string r;
+        if (ret_t != TypeKind::Void) {
+            r = fn_->next_reg(prefix);
+            os << r << " = ";
+        }
+        os << "call " << type_str(ret_t) << " " << fn_ptr.repr << "(";
+        for (size_t i = 0; i < args.size(); ++i) {
+            if (i > 0) os << ", ";
+            os << type_str(args[i].type) << " " << args[i].repr;
+        }
+        os << ")";
+        Instruction inst;
+        inst.tag = tag;
+        inst.dst_reg = r;
+        inst.dst_type = ret_t;
+        inst.op0 = fn_ptr;
+        inst.text = os.str();
+        bb_->insts.push_back(std::move(inst));
+        return (ret_t == TypeKind::Void) ? Value{} : Value::reg(ret_t, r);
+    }
+
+    void CreateVoidCallPtr(const Value& fn_ptr, const std::vector<Value>& args, OpTag tag = OpTag::IndirectCall) {
+        CreateCallPtr(TypeKind::Void, fn_ptr, args, tag);
     }
 
     void CreateVoidCall(const std::string& callee_name, const std::vector<Value>& args,

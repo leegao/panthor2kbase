@@ -194,7 +194,7 @@ public:
 
             bool df_changed = true;
             int iter = 0;
-            while (df_changed && iter++ < 16) {
+                        while (df_changed && iter++ < 16) {
                 df_changed = false;
                 for (size_t bi = 0; bi < n_blocks; ++bi) {
                     std::unordered_map<int, int> merged_align;

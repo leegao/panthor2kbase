@@ -37,7 +37,11 @@ SO_R54P3 = (
     if os.path.exists(os.path.join(ROOT_DIR, "ddk/libGLES_mali.so"))
     else os.path.join(REPO_ROOT, "ddk/libGLES_mali.so")
 )
-PASS_DRIVER = os.path.join(ROOT_DIR, "bin", "mali_llvm_pass_driver")
+PASS_DRIVER = (
+    os.path.join(REPO_ROOT, "build-x86-64", "aot", "horizon2llvm")
+    if os.path.exists(os.path.join(REPO_ROOT, "build-x86-64", "aot", "horizon2llvm"))
+    else os.path.join(ROOT_DIR, "bin", "horizon2llvm")
+)
 
 
 class TestAutomatedBringUpDiagnostics(unittest.TestCase):

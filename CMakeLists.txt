@@ -156,12 +156,8 @@ endif()
 # 3. User-Space /dev/mali0 Kbase CSF & Valhall ISA Emulator (Shared & Static)
 # -----------------------------------------------------------------------------
 if(NOT ANDROID)
-   add_executable(horizon2llvm
-      src/aot/horizon2llvm/main.cpp
-      src/aot/horizon2llvm/ko_lifter.cpp
-      src/aot/horizon2llvm/llvm_backend.cpp
+   add_library(horizon2llvm_passes OBJECT
       src/aot/horizon2llvm/passes.cpp
-      src/aot/horizon2llvm/aarch64/aarch64_lifter.cpp
       src/aot/horizon2llvm/lowering/pass_aapcs64_abi_contract.cpp
       src/aot/horizon2llvm/lowering/pass_aarch64_idiom_deconstruct.cpp
       src/aot/horizon2llvm/lowering/pass_cpu_state_promotion.cpp
@@ -172,6 +168,17 @@ if(NOT ANDROID)
       src/aot/horizon2llvm/lowering/pass_nzcv_dead_flag_elim.cpp
       src/aot/horizon2llvm/lowering/pass_nzcv_predicate_fusion.cpp
       src/aot/horizon2llvm/lowering/pass_tail_call_devirt.cpp
+   )
+   target_include_directories(horizon2llvm_passes PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/horizon2llvm")
+   set_target_properties(horizon2llvm_passes PROPERTIES CXX_STANDARD 20)
+
+   add_executable(horizon2llvm
+      src/aot/horizon2llvm/main.cpp
+      src/aot/horizon2llvm/mali_llvm_passes.cpp
+      $<TARGET_OBJECTS:horizon2llvm_passes>
+      src/aot/horizon2llvm/ko_lifter.cpp
+      src/aot/horizon2llvm/llvm_backend.cpp
+      src/aot/horizon2llvm/aarch64/aarch64_lifter.cpp
    )
    target_include_directories(horizon2llvm PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/horizon2llvm")
    set_target_properties(horizon2llvm PROPERTIES
@@ -374,28 +381,19 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
    set_source_files_properties("${AOT_MBS2_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
    set_source_files_properties("${AOT_LIBCPP_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 
-   add_executable(mali_llvm_pass_driver
-      src/aot/src/mali_llvm_passes.cpp
-   )
-   target_link_libraries(mali_llvm_pass_driver PRIVATE dl ${PLATFORM_LIBS})
-   set_target_properties(mali_llvm_pass_driver PROPERTIES
-      RUNTIME_OUTPUT_DIRECTORY "${AOT_DIR}"
-   )
-
    add_custom_command(
       OUTPUT "${AOT_MBS2_OBJ}"
       COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/translate.sh" ddk/libGLES_mali.so "${CMAKE_BINARY_DIR}"
       WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-      DEPENDS mali_llvm_pass_driver
-              horizon2llvm
+      DEPENDS horizon2llvm
               "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/translate.sh"
       COMMENT "Lifting ddk/libGLES_mali.so -> r54p3_lifted.o (translate.sh)"
    )
    add_custom_command(
       OUTPUT "${AOT_LIBCPP_OBJ}"
-      COMMAND "${AOT_DIR}/mali_llvm_pass_driver" --lift-libcpp "${AOT_LIBCPP_SO}" "${CMAKE_BINARY_DIR}" -j2
+      COMMAND $<TARGET_FILE:horizon2llvm> --lift-libcpp "${AOT_LIBCPP_SO}" "${CMAKE_BINARY_DIR}" -j2
       WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-      DEPENDS mali_llvm_pass_driver
+      DEPENDS horizon2llvm
       COMMENT "Lifting NDK libc++_shared.so -> r54p3_libcpp_lifted.o"
    )
    add_custom_target(r54p3_lifted_obj DEPENDS "${AOT_MBS2_OBJ}" "${AOT_LIBCPP_OBJ}")

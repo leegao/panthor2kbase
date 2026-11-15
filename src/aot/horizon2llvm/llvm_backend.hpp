@@ -33,7 +33,10 @@ class LibLLVM {
 public:
     static LibLLVM& instance();
 
-    bool available() const { return handle_ != nullptr; }
+    bool available() const { return handle_ != nullptr || default_lookup_; }
+    void* raw_handle() const { return handle_; }
+    bool uses_default_lookup() const { return default_lookup_; }
+    const std::string& loaded_path() const { return loaded_path_; }
 
     bool process_ir(const std::string& ir_text, const std::string& module_id,
                     bool verify, const std::string& opt_pipeline = "",
@@ -57,6 +60,8 @@ private:
     LibLLVM& operator=(const LibLLVM&) = delete;
 
     void* handle_ = nullptr;
+    bool default_lookup_ = false;
+    std::string loaded_path_;
 };
 
 } // namespace ultrs::llvm_backend

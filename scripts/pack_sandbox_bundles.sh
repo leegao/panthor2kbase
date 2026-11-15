@@ -131,7 +131,7 @@ if [[ -d "mesa" ]]; then
       git -C mesa restore .
 
       echo "  [pack] Archiving clean mesa/ + host tools -> $MESA_PKG..."
-      tar -c -I 'xz -T0' -f "$MESA_PKG" \
+      tar -c -I 'xz -9 -T0' -f "$MESA_PKG" \
          --exclude='mesa/.git' --exclude='mesa/build*' \
          mesa "${EXTRA_HOST_PATHS[@]}"
 

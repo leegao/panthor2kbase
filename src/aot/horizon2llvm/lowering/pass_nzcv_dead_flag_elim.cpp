@@ -26,6 +26,7 @@ public:
             if (!fn->hle_symbol.empty() || fn->blocks.empty()) continue;
 
             const size_t n_blocks = fn->blocks.size();
+            if (n_blocks > 256) continue;
             std::unordered_map<std::string, size_t> block_idx;
             block_idx.reserve(n_blocks);
             for (size_t i = 0; i < n_blocks; ++i) {
@@ -110,7 +111,8 @@ public:
             std::vector<bool> live_in = gen;
             std::vector<bool> live_out(n_blocks, false);
             bool df_changed = true;
-            while (df_changed) {
+            int df_iter = 0;
+            while (df_changed && df_iter++ < 64) {
                 df_changed = false;
                 for (int bi = static_cast<int>(n_blocks) - 1; bi >= 0; --bi) {
                     size_t u = static_cast<size_t>(bi);
@@ -147,7 +149,7 @@ public:
                             // If this was a CCMP/CCMN FlagWrite (`cmp_kind == 0`), also mark its preceding
                             // single-use flag-packing RawIR instructions dead up to the GuestInsnMarker,
                             // preserving any SSA definitions whose values are used downstream.
-                            if (inst.cmp_kind == 0) {
+                            if (inst.cmp_kind == 0 && fn->blocks.size() <= 32 && bb.insts.size() <= 512) {
                                 std::unordered_set<std::string> live_ssa;
                                 auto add_used_tokens = [&](const std::string& txt) {
                                     std::istringstream iss(txt);

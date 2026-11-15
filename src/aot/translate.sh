@@ -53,7 +53,7 @@ if [ -n "$HOST_LIBLLVM" ]; then
     export MALI_HOST_LIBLLVM="$HOST_LIBLLVM"
     echo "[LLVM] Auto-detected host LLVM library: $MALI_HOST_LIBLLVM"
 else
-    echo "[WARN] No host libLLVM*.so* detected in standard paths; mali_llvm_pass_driver will probe via dlopen()."
+    echo "[WARN] No host libLLVM*.so* detected in standard paths; horizon2llvm will probe via dlopen()."
 fi
 
 ELF_TAG="r54p3-00eac0-6eda07"
@@ -91,16 +91,16 @@ OUT_DIR="${2:-${BUILD_DIR:-$REPO_ROOT/build-x86-64}}"
 mkdir -p "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
-if [ -x "$OUT_DIR/aot/mali_llvm_pass_driver" ]; then
-    PASS_DRIVER="$OUT_DIR/aot/mali_llvm_pass_driver"
-elif [ -x "$OUT_DIR/mali_llvm_pass_driver" ]; then
-    PASS_DRIVER="$OUT_DIR/mali_llvm_pass_driver"
+if [ -x "$OUT_DIR/aot/horizon2llvm" ]; then
+    PASS_DRIVER="$OUT_DIR/aot/horizon2llvm"
+elif [ -x "$OUT_DIR/horizon2llvm" ]; then
+    PASS_DRIVER="$OUT_DIR/horizon2llvm"
 else
-    PASS_DRIVER="$OUT_DIR/mali_llvm_pass_driver"
+    PASS_DRIVER="$OUT_DIR/horizon2llvm"
 fi
 
 NEEDS_REBUILD=0
-if [ ! -x "$PASS_DRIVER" ] || [ "$ROOT_DIR/src/mali_llvm_passes.cpp" -nt "$PASS_DRIVER" ]; then
+if [ ! -x "$PASS_DRIVER" ] || [ "$ROOT_DIR/horizon2llvm/mali_llvm_passes.cpp" -nt "$PASS_DRIVER" ]; then
     NEEDS_REBUILD=1
 elif ldd "$PASS_DRIVER" 2>/dev/null | grep -q "not found"; then
     echo "[Build] Existing $PASS_DRIVER has missing shared library dependencies on this host; rebuilding..."
@@ -108,9 +108,17 @@ elif ldd "$PASS_DRIVER" 2>/dev/null | grep -q "not found"; then
 fi
 
 if [ "$NEEDS_REBUILD" -eq 1 ]; then
-    PASS_DRIVER="$OUT_DIR/mali_llvm_pass_driver"
-    echo "[Build] Compiling 6-Pass C++ LLVM Lifter & Lowerer (src/mali_llvm_passes.cpp -> $PASS_DRIVER)..."
-    g++ -O3 "$ROOT_DIR/src/mali_llvm_passes.cpp" -ldl -o "$PASS_DRIVER"
+    PASS_DRIVER="$OUT_DIR/horizon2llvm"
+    echo "[Build] Compiling unified horizon2llvm -> $PASS_DRIVER..."
+    g++ -std=c++20 -O3 -I"$ROOT_DIR/horizon2llvm" \
+        "$ROOT_DIR/horizon2llvm/main.cpp" \
+        "$ROOT_DIR/horizon2llvm/mali_llvm_passes.cpp" \
+        "$ROOT_DIR/horizon2llvm/ko_lifter.cpp" \
+        "$ROOT_DIR/horizon2llvm/llvm_backend.cpp" \
+        "$ROOT_DIR/horizon2llvm/aarch64/aarch64_lifter.cpp" \
+        "$ROOT_DIR/horizon2llvm/passes.cpp" \
+        "$ROOT_DIR"/horizon2llvm/lowering/*.cpp \
+        -ldl -lpthread -lm -o "$PASS_DRIVER"
 fi
 
 echo "================================================================================"
@@ -124,20 +132,21 @@ echo "==========================================================================
 STAMP_FILE="$OUT_DIR/r54p3_lifted.o.stamp"
 CUR_STAMP=""
 if command -v sha256sum >/dev/null 2>&1; then
-    CUR_STAMP="$(sha256sum "$ROOT_DIR/src/mali_llvm_passes.cpp" ${SO_PATH:+"$SO_PATH"} | sha256sum | awk '{print $1}')"
+    CUR_STAMP="$(sha256sum "$ROOT_DIR/horizon2llvm/mali_llvm_passes.cpp" ${SO_PATH:+"$SO_PATH"} | sha256sum | awk '{print $1}')"
 fi
 STAMP_OK=0
 if [ -n "$CUR_STAMP" ] && [ -f "$STAMP_FILE" ] && [ "$(cat "$STAMP_FILE" 2>/dev/null || true)" = "$CUR_STAMP" ]; then
     STAMP_OK=1
 fi
 
-if [ -f "$OUT_DIR/r54p3_lifted.o" ] && [ "${MALI_AOT_FORCE_RELIFT:-0}" != "1" ] && [ "$STAMP_OK" -eq 1 ] && [ "$OUT_DIR/r54p3_lifted.o" -nt "$PASS_DRIVER" ] && [ "$OUT_DIR/r54p3_lifted.o" -nt "$ROOT_DIR/src/mali_llvm_passes.cpp" ]; then
+if [ -f "$OUT_DIR/r54p3_lifted.o" ] && [ "${MALI_AOT_FORCE_RELIFT:-0}" != "1" ] && [ "$STAMP_OK" -eq 1 ] && [ "$OUT_DIR/r54p3_lifted.o" -nt "$PASS_DRIVER" ] && [ "$OUT_DIR/r54p3_lifted.o" -nt "$ROOT_DIR/horizon2llvm/mali_llvm_passes.cpp" ]; then
     echo "[Cache] Reusing up-to-date $OUT_DIR/r54p3_lifted.o (set MALI_AOT_FORCE_RELIFT=1 to force full re-lift)"
 elif [ -n "$SO_PATH" ] && [ -f "$SO_PATH" ]; then
     export MALI_AOT_CHUNK_MB="${MALI_AOT_CHUNK_MB:-100}"
     export MALI_AOT_JOBS="${MALI_AOT_JOBS:-$(nproc 2>/dev/null || echo 2)}"
     export MALI_AOT_KEEP_LL="${MALI_AOT_KEEP_LL:-0}"
-    "$PASS_DRIVER" --lift-so "$SO_PATH" "$OUT_DIR" --hook-Vulkan-calls -j "$MALI_AOT_JOBS"
+    "$PASS_DRIVER" --lift-so "$SO_PATH" "$OUT_DIR" --hook-Vulkan-calls --emit-ll-only
+    "$PASS_DRIVER" --compile-ll-dir "$OUT_DIR/aot_ll_manifest.txt" "$OUT_DIR/r54p3_lifted.o" -j "$MALI_AOT_JOBS"
     if [ -n "$CUR_STAMP" ]; then
         echo "$CUR_STAMP" > "$STAMP_FILE"
     fi

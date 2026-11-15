@@ -126,15 +126,12 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    if (argc >= 4 && std::string(argv[1]) == "--lift-so") {
-        std::string so_path = argv[2];
-        std::string out_dir = argv[3];
-        std::string cmd = "build-x86-64/aot/mali_llvm_pass_driver --lift-so \"" + so_path + "\" \"" + out_dir + "\"";
-        for (int i = 4; i < argc; ++i) {
-            cmd += " \"" + std::string(argv[i]) + "\"";
-        }
-        int rc = std::system(cmd.c_str());
-        return (rc == 0) ? 0 : 1;
+    if ((argc >= 4 && (std::string(argv[1]) == "--lift-so" ||
+                       std::string(argv[1]) == "--lift-libcpp" ||
+                       std::string(argv[1]) == "--compile-ll-dir")) ||
+        (argc >= 3 && argv[1][0] != '-')) {
+        extern int mali_llvm_passes_main(int argc, char **argv);
+        return mali_llvm_passes_main(argc, argv);
     }
 
     if (argc >= 4 && std::string(argv[1]) == "--compile-ir") {
@@ -168,8 +165,11 @@ int main(int argc, char** argv) {
                 "  %s --lift-ko <r44_ko> <husky_ko> <out.h> <out_runtime.c> [--out-ir <out.ll>] [--out-obj-x86 <x86.o>] [--out-obj-arm64 <arm64.o>] [--full-indirect-dispatch] [--count-insns|--no-count-insns] [--instrument-calls|--no-instrument-calls]\n"
                 "  %s --lift-ko-dual <r44_ko> <husky_ko> [<out.h> <out_runtime.c>] [--out-ir <out.ll>] [--out-obj <x86.o>] [--full-indirect-dispatch] [--count-insns|--no-count-insns] [--instrument-calls|--no-instrument-calls]\n"
                 "  %s --lift-ko-single <ko_path> <label> <out.ll> [--out-obj <out.o>] [--full-indirect-dispatch] [--count-insns|--no-count-insns] [--instrument-calls|--no-instrument-calls]\n"
-                "  %s --lift-so <libGLES_mali.so> <out_dir> [--hook-Vulkan-calls] [--instrument-calls|--no-instrument-calls]\n"
-                "  %s --compile-ir <in.ll> <out.o> [-O0|-O2] [--target-triple TRIPLE]\n",
-                argv[0], argv[0], argv[0], argv[0], argv[0]);
+                "  %s --lift-so <libGLES_mali.so> <out_dir> [--hook-Vulkan-calls] [--emit-ll-only] [-j N]\n"
+                "  %s --lift-libcpp <libc++_shared.so> <out_dir> [--emit-ll-only] [-j N]\n"
+                "  %s --compile-ll-dir <manifest.txt> <out.o> [-j N]\n"
+                "  %s --compile-ir <in.ll> <out.o> [-O0|-O2] [--target-triple TRIPLE]\n"
+                "  %s <in.ll> <out.o|out.ll> [--emit-llvm] [-O0|-O2]\n",
+                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
     return 0;
 }

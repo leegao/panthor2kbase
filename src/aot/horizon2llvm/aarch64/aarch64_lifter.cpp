@@ -718,6 +718,32 @@ bool AArch64ToLLVMLifter::lift_system(IRBuilder& B, uint32_t w, uint64_t pc) {
 bool AArch64ToLLVMLifter::lift_ldst(IRBuilder& B, uint32_t w, uint64_t pc) {
     if (bits(w, 26, 1)) return lift_ldst_simd(B, w, pc);
     if (bits(w, 24, 6) == 0b001000) return lift_ldst_excl(B, w, pc);
+    RcpcUnscaledInsn rcpc;
+    if (decode_rcpc_unscaled(w, rcpc)) {
+        Value base = get_gpr(B, 1, rcpc.rn, true);
+        Value ea = rcpc.imm9 ? B.binop("add", TypeKind::Int64, base, Value::imm_u64(static_cast<uint64_t>(rcpc.imm9))) : base;
+        Value p = B.CreateIntToPtr(ea, "rcpcp");
+        unsigned nbits = 8u << rcpc.size;
+        unsigned align = 1u << rcpc.size;
+        TypeKind mt = int_type_for_bits(nbits);
+        if (rcpc.opc == 0) {
+            Value sv = (rcpc.size == 3) ? get_gpr(B, 1, rcpc.rt) : B.cast("trunc", get_gpr(B, 0, rcpc.rt), mt);
+            B.CreateAtomicStore(mt, sv, p, align, llvm::AtomicOrdering::Release, true);
+            return true;
+        }
+        if (rcpc.opc == 1) {
+            Value lv = B.CreateAtomicLoad(mt, p, align, llvm::AtomicOrdering::Acquire, "ldapur", true);
+            set_gpr(B, rcpc.size == 3 ? 1 : 0, rcpc.rt, (mt == TypeKind::Int64 || mt == TypeKind::Int32) ? lv : B.cast("zext", lv, TypeKind::Int32));
+            return true;
+        }
+        if (rcpc.opc == 2 || rcpc.opc == 3) {
+            Value lv = B.CreateAtomicLoad(mt, p, align, llvm::AtomicOrdering::Acquire, "ldapurs", true);
+            unsigned dst_sf = (rcpc.opc == 2) ? 1 : 0;
+            set_gpr(B, dst_sf, rcpc.rt, B.sext(lv, dst_sf ? TypeKind::Int64 : TypeKind::Int32));
+            return true;
+        }
+        return false;
+    }
     if (bits(w, 27, 3) == 0b011 && bits(w, 24, 2) == 0) { // Literal
         unsigned opc = bits(w, 30, 2), rt = bits(w, 0, 5);
         uint64_t addr = static_cast<uint64_t>(static_cast<int64_t>(pc) + sext(bits(w, 5, 19), 19) * 4);
@@ -734,6 +760,22 @@ bool AArch64ToLLVMLifter::lift_ldst(IRBuilder& B, uint32_t w, uint64_t pc) {
 
 bool AArch64ToLLVMLifter::lift_ldst_excl(IRBuilder& B, uint32_t w, uint64_t pc) {
     (void)pc;
+    CasInsn cas;
+    if (decode_cas(w, cas)) {
+        unsigned nbits = 8u << cas.size;
+        unsigned align = 1u << cas.size;
+        TypeKind mt = int_type_for_bits(nbits);
+        Value addr = get_gpr(B, 1, cas.rn, true);
+        Value p = B.CreateIntToPtr(addr, "casp");
+        Value exp_v = (mt == TypeKind::Int64) ? get_gpr(B, 1, cas.rs) : B.cast("trunc", get_gpr(B, 0, cas.rs), mt);
+        Value new_v = (mt == TypeKind::Int64) ? get_gpr(B, 1, cas.rt) : B.cast("trunc", get_gpr(B, 0, cas.rt), mt);
+        Value old_v = B.CreateAtomicCmpXchgVal(mt, p, exp_v, new_v, align);
+        if (cas.rs != 31) {
+            Value old64 = (mt == TypeKind::Int64) ? old_v : B.cast("zext", old_v, TypeKind::Int64);
+            set_gpr(B, 1, cas.rs, old64);
+        }
+        return true;
+    }
     unsigned size = bits(w, 30, 2), o2 = bits(w, 23, 1), L = bits(w, 22, 1), o1 = bits(w, 21, 1),
              rs = bits(w, 16, 5), rn = bits(w, 5, 5), rt = bits(w, 0, 5);
     if (o1) return false;
@@ -827,6 +869,24 @@ bool AArch64ToLLVMLifter::lift_ldst_pair(IRBuilder& B, uint32_t w, uint64_t pc) 
 }
 
 bool AArch64ToLLVMLifter::lift_ldst_reg(IRBuilder& B, uint32_t w, uint64_t pc) {
+    LseAtomicInsn lse;
+    if (decode_lse_atomic(w, lse)) {
+        unsigned nbits = 8u << lse.size;
+        unsigned align = 1u << lse.size;
+        TypeKind mt = int_type_for_bits(nbits);
+        Value addr = get_gpr(B, 1, lse.rn, true);
+        Value p = B.CreateIntToPtr(addr, "lsep");
+        Value sv = (mt == TypeKind::Int64) ? get_gpr(B, 1, lse.rs) : B.cast("trunc", get_gpr(B, 0, lse.rs), mt);
+        if (lse.invert_src) {
+            sv = B.binop("xor", mt, sv, Value::imm(mt, ones(nbits)));
+        }
+        Value old_v = B.CreateAtomicRMW(lse.llvm_rmw_op, mt, p, sv, align);
+        if (lse.rt != 31) {
+            Value old64 = (mt == TypeKind::Int64) ? old_v : B.cast("zext", old_v, TypeKind::Int64);
+            set_gpr(B, 1, lse.rt, old64);
+        }
+        return true;
+    }
     unsigned size = bits(w, 30, 2), opc = bits(w, 22, 2), rn = bits(w, 5, 5), rt = bits(w, 0, 5);
     Value base = get_gpr(B, 1, rn, true);
     Value ea = base;
@@ -1439,10 +1499,7 @@ bool AArch64ToLLVMLifter::lift_crypto_sha2(IRBuilder& B, uint32_t w) {
 }
 
 bool AArch64ToLLVMLifter::decode_imm5(unsigned imm5, unsigned& sz, unsigned& idx) {
-    if ((imm5 & 15) == 0) return false;
-    sz = __builtin_ctz(imm5);
-    idx = imm5 >> (sz + 1);
-    return sz <= 3;
+    return decode_imm5_lane(imm5, sz, idx);
 }
 
 bool AArch64ToLLVMLifter::lift_scalar_copy(IRBuilder& B, uint32_t w) {

@@ -653,9 +653,18 @@ public:
     Instruction* CreateExtractElement(Value* vec, Value* idx, const std::string& name = "") {
         std::string r = pct(name);
         Type* v_ty = (vec && vec->getType()) ? vec->getType() : getInt64Ty();
+        Type* elem_ty = getInt64Ty();
+        if (v_ty && !v_ty->ir_str.empty()) {
+            if (v_ty->ir_str.find("x i8>") != std::string::npos) elem_ty = getInt8Ty();
+            else if (v_ty->ir_str.find("x i16>") != std::string::npos) elem_ty = Type::getInt16Ty(*ctx_);
+            else if (v_ty->ir_str.find("x i32>") != std::string::npos) elem_ty = getInt32Ty();
+            else if (v_ty->ir_str.find("x i64>") != std::string::npos) elem_ty = getInt64Ty();
+            else if (v_ty->ir_str.find("x float>") != std::string::npos) elem_ty = Type::getFloatTy(*ctx_);
+            else if (v_ty->ir_str.find("x double>") != std::string::npos) elem_ty = Type::getDoubleTy(*ctx_);
+        }
         std::string txt = r + " = extractelement " + v_ty->ir_str + " " + (vec ? vec->repr_ : "zeroinitializer") +
                           ", i32 " + (idx ? idx->repr_ : "0");
-        return ctx_->alloc_val<Instruction>(getInt64Ty(), r, std::move(txt));
+        return ctx_->alloc_val<Instruction>(elem_ty, r, std::move(txt));
     }
 
     Instruction* CreateInsertElement(Value* vec, Value* elt, Value* idx, const std::string& name = "") {
@@ -683,10 +692,17 @@ public:
         return ctx_->alloc_val<Instruction>(v_ty, r, os.str());
     }
 
-    AllocaInst* CreateAlloca(Type* ty, Value*, const std::string& name = "") {
+    AllocaInst* CreateAlloca(Type* ty, Value*, const std::string& name = "", unsigned align = 8) {
         std::string r = pct(name);
-        std::string txt = r + " = alloca " + (ty ? ty->ir_str : "i64") + ", align 8";
+        std::string txt = r + " = alloca " + (ty ? ty->ir_str : "i64") + ", align " + std::to_string(align ? align : 8);
         return ctx_->alloc_val<AllocaInst>(PointerType::getUnqual(*ctx_), r, std::move(txt));
+    }
+
+    Instruction* CreateFNeg(Value* v, const std::string& name = "") {
+        std::string r = pct(name);
+        Type* ty = (v && v->getType()) ? v->getType() : Type::getFloatTy(*ctx_);
+        std::string txt = r + " = fneg " + ty->ir_str + " " + (v ? v->repr_ : "0.0");
+        return ctx_->alloc_val<Instruction>(ty, r, std::move(txt));
     }
 
     Instruction* CreateInBoundsGEP(Type* ty, Value* ptr, Value* offset, const std::string& name = "") {
@@ -736,13 +752,32 @@ public:
         return cx;
     }
 
+    Instruction* CreateAtomicRMWStr(const char* rmw_op, Value* ptr, Value* val, MaybeAlign align, const std::string& name = "") {
+        std::string r = pct(name);
+        Type* v_ty = (val && val->getType()) ? val->getType() : getInt64Ty();
+        std::ostringstream os;
+        os << r << " = atomicrmw " << rmw_op << " ptr " << (ptr ? ptr->repr_ : "%c")
+           << ", " << v_ty->ir_str << " " << (val ? val->repr_ : "0")
+           << " seq_cst, align " << align.value;
+        return ctx_->alloc_val<Instruction>(v_ty, r, os.str());
+    }
+
     Instruction* CreateExtractValue(Value* agg, std::initializer_list<unsigned> idxs, const std::string& name = "") {
         std::string r = pct(name);
         Type* a_ty = (agg && agg->getType()) ? agg->getType() : ctx_->intern_type("{ i64, i1 }");
         std::ostringstream os;
         os << r << " = extractvalue " << a_ty->ir_str << " " << (agg ? agg->repr_ : "%cx");
+        unsigned first_idx = 1;
+        for (unsigned idx : idxs) { first_idx = idx; break; }
         for (unsigned idx : idxs) os << ", " << idx;
-        return ctx_->alloc_val<Instruction>(getInt1Ty(), r, os.str());
+        Type* ret_ty = getInt1Ty();
+        if (first_idx == 0 && a_ty) {
+            if (a_ty->ir_str.find("{ i8,") == 0) ret_ty = getInt8Ty();
+            else if (a_ty->ir_str.find("{ i16,") == 0) ret_ty = Type::getInt16Ty(*ctx_);
+            else if (a_ty->ir_str.find("{ i32,") == 0) ret_ty = getInt32Ty();
+            else if (a_ty->ir_str.find("{ i64,") == 0) ret_ty = getInt64Ty();
+        }
+        return ctx_->alloc_val<Instruction>(ret_ty, r, os.str());
     }
 
     CallInst* CreateCall(FunctionCallee callee, const std::vector<Value*>& args, const std::string& name = "") {

@@ -15,60 +15,26 @@
 
 #include "llvm_ir.hpp"
 #include "abi_aapcs64.hpp"
-
-// TODO(leegao): Use LLVM's TableGen (.td) system (such as AArch64.td, AArch64InstrInfo.td,
-// and AArch64CallingConv.td) as the declarative specification for all AArch64 instruction
-// definitions, operand formats, register classes, and calling conventions, replacing manual
-// bit decoding and ad-hoc register offsets with TableGen-generated decoders and matchers.
+#include "aarch64_isa_common.hpp"
 
 namespace ultrs::lifter {
 
 using namespace ultrs::llvm_ir;
-
-inline uint32_t bits(uint32_t w, unsigned lo, unsigned n) {
-    return (w >> lo) & ((1u << n) - 1u);
-}
-
-inline int64_t sext(uint64_t v, unsigned n) {
-    uint64_t sign_bit = 1ULL << (n - 1);
-    return (v & sign_bit) ? static_cast<int64_t>(v - (1ULL << n)) : static_cast<int64_t>(v);
-}
-
-inline uint64_t ones(unsigned n) {
-    return n >= 64 ? ~0ULL : ((1ULL << n) - 1ULL);
-}
-
-inline uint64_t ror_val(uint64_t v, unsigned r, unsigned size) {
-    r %= size;
-    if (!r) return v & ones(size);
-    return ((v >> r) | (v << (size - r))) & ones(size);
-}
-
-inline uint64_t replicate_val(uint64_t v, unsigned esize, unsigned size) {
-    uint64_t out = 0;
-    for (unsigned i = 0; i < size; i += esize) out |= (v << i);
-    return out;
-}
-
-inline bool decode_bit_masks(unsigned N, unsigned imms, unsigned immr, unsigned size, bool immediate,
-                             uint64_t& wmask, uint64_t& tmask) {
-    unsigned x = (N << 6) | (~imms & 0x3Fu);
-    if (x == 0) return false;
-    unsigned length = 31u - __builtin_clz(x);
-    if (length < 1) return false;
-    unsigned levels = (1u << length) - 1u;
-    if (immediate && (imms & levels) == levels) return false;
-    unsigned S = imms & levels;
-    unsigned R = immr & levels;
-    unsigned diff = (S - R) & 0x3Fu;
-    unsigned esize = 1u << length;
-    unsigned d = diff & levels;
-    uint64_t welem = ones(S + 1);
-    uint64_t telem = ones(d + 1);
-    wmask = replicate_val(ror_val(welem, R, esize), esize, size);
-    tmask = replicate_val(telem, esize, size);
-    return true;
-}
+using ultrs::aarch64_isa::bits;
+using ultrs::aarch64_isa::sext;
+using ultrs::aarch64_isa::ones;
+using ultrs::aarch64_isa::ror_val;
+using ultrs::aarch64_isa::replicate_val;
+using ultrs::aarch64_isa::decode_bit_masks;
+using ultrs::aarch64_isa::vfp_expand_imm;
+using ultrs::aarch64_isa::simd_expand_imm;
+using ultrs::aarch64_isa::decode_imm5_lane;
+using ultrs::aarch64_isa::CasInsn;
+using ultrs::aarch64_isa::decode_cas;
+using ultrs::aarch64_isa::LseAtomicInsn;
+using ultrs::aarch64_isa::decode_lse_atomic;
+using ultrs::aarch64_isa::RcpcUnscaledInsn;
+using ultrs::aarch64_isa::decode_rcpc_unscaled;
 
 // Lane-op enum values matching src/runtime/simd.h
 enum LaneOp : int {
@@ -103,55 +69,7 @@ inline std::string fn_symbol(uint64_t pc) {
     return buf;
 }
 
-inline uint64_t vfp_expand_imm(uint32_t imm8, unsigned N) {
-    unsigned E = (N == 32) ? 8 : 11;
-    unsigned F = N - E - 1;
-    uint64_t sign = (imm8 >> 7) & 1;
-    uint64_t b6 = (imm8 >> 6) & 1;
-    uint64_t exp = ((b6 ^ 1) << (E - 1)) | ((b6 ? ((1ULL << (E - 3)) - 1ULL) : 0ULL) << 2) | ((imm8 >> 4) & 3);
-    uint64_t frac = static_cast<uint64_t>(imm8 & 15) << (F - 4);
-    return (sign << (N - 1)) | (exp << F) | frac;
-}
 
-inline uint64_t simd_expand_imm(unsigned op, unsigned cmode, uint32_t imm8) {
-    unsigned c = cmode >> 1;
-    uint64_t u8 = imm8;
-    if (c == 0) return (u8 << 32) | u8;
-    if (c == 1) return ((u8 << 8) << 32) | (u8 << 8);
-    if (c == 2) return ((u8 << 16) << 32) | (u8 << 16);
-    if (c == 3) return ((u8 << 24) << 32) | (u8 << 24);
-    if (c == 4) {
-        uint64_t r = 0;
-        for (unsigned s = 0; s < 64; s += 16) r |= (u8 << s);
-        return r;
-    }
-    if (c == 5) {
-        uint64_t r = 0;
-        for (unsigned s = 0; s < 64; s += 16) r |= ((u8 << 8) << s);
-        return r;
-    }
-    if (c == 6) {
-        uint64_t v = !(cmode & 1) ? ((u8 << 8) | 0xFFULL) : ((u8 << 16) | 0xFFFFULL);
-        return (v << 32) | v;
-    }
-    if (!(cmode & 1) && !op) {
-        uint64_t r = 0;
-        for (unsigned s = 0; s < 64; s += 8) r |= (u8 << s);
-        return r;
-    }
-    if (!(cmode & 1) && op) {
-        uint64_t r = 0;
-        for (unsigned i = 0; i < 8; ++i) {
-            if ((u8 >> i) & 1) r |= (0xFFULL << (8 * i));
-        }
-        return r;
-    }
-    if ((cmode & 1) && !op) {
-        uint64_t v = vfp_expand_imm(imm8, 32);
-        return (v << 32) | v;
-    }
-    return vfp_expand_imm(imm8, 64);
-}
 
 class AArch64ToLLVMLifter {
 public:
