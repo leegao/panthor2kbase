@@ -2849,10 +2849,32 @@ int ioctl(int fd, unsigned long request, ...)
          errno = EINVAL;
          return -1;
       }
-      case 41: /* KBASE_IOCTL_CS_QUEUE_TERMINATE */
-      case 43: /* KBASE_IOCTL_CS_QUEUE_GROUP_TERMINATE */
+      case 41: { /* KBASE_IOCTL_CS_QUEUE_TERMINATE */
+         if (arg) {
+            uint64_t q_addr = *(const uint64_t *)arg;
+            for (size_t i = 0; i < 32; i++) {
+               if (g_kfile.queues[i].buffer_gpu_addr == q_addr ||
+                   (g_kfile.queues[i].buffer_gpu_addr & ~0xFFFULL) == (q_addr & ~0xFFFULL)) {
+                  g_kfile.queues[i].bound = false;
+                  g_kfile.queues[i].registered = false;
+               }
+            }
+         }
          pthread_mutex_unlock(&g_emu_lock);
          return 0;
+      }
+      case 43: { /* KBASE_IOCTL_CS_QUEUE_GROUP_TERMINATE */
+         if (arg) {
+            uint8_t gh = *(const uint8_t *)arg;
+            for (size_t i = 0; i < 32; i++) {
+               if (g_kfile.queues[i].group_handle == gh) {
+                  g_kfile.queues[i].bound = false;
+               }
+            }
+         }
+         pthread_mutex_unlock(&g_emu_lock);
+         return 0;
+      }
       case 42: /* KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6 */
       case 58: { /* KBASE_IOCTL_CS_QUEUE_GROUP_CREATE */
          union kbase_ioctl_cs_queue_group_create_1_6 *cg =
@@ -3433,20 +3455,50 @@ int mali_kbase_emu_poll_direct(void *fds, unsigned long nfds, int timeout)
 {
    if (fds && nfds > 0) {
       struct pollfd *p = (struct pollfd *)fds;
+      bool is_mali[16];
       bool any_mali = false;
+      bool any_host = false;
+      unsigned long n = (nfds <= 16) ? nfds : 16;
       pthread_mutex_lock(&g_emu_lock);
-      for (unsigned long i = 0; i < nfds; ++i) {
-         if (find_kfile_by_fd_locked(p[i].fd) != NULL) {
+      for (unsigned long i = 0; i < n; ++i) {
+         is_mali[i] = (find_kfile_by_fd_locked(p[i].fd) != NULL);
+         if (is_mali[i])
             any_mali = true;
-            break;
-         }
+         else if (p[i].fd >= 0)
+            any_host = true;
       }
       pthread_mutex_unlock(&g_emu_lock);
       if (any_mali) {
-         for (unsigned long i = 0; i < nfds; ++i) {
-            p[i].revents = POLLIN;
+         if (any_host) {
+            struct pollfd host_fds[16];
+            for (unsigned long i = 0; i < n; ++i) {
+               host_fds[i] = p[i];
+               host_fds[i].revents = 0;
+               if (is_mali[i])
+                  host_fds[i].fd = -1;
+            }
+            /* Poll non-mali eventfds first so wake/remove/terminate events are never starved */
+            int hrc = poll(host_fds, (nfds_t)n, 0);
+            if (hrc <= 0 && timeout != 0) {
+               hrc = poll(host_fds, (nfds_t)n, 1);
+            }
+            if (hrc > 0) {
+               for (unsigned long i = 0; i < n; ++i) {
+                  p[i].revents = is_mali[i] ? 0 : host_fds[i].revents;
+               }
+               return hrc;
+            }
          }
-         return (int)nfds;
+         int ready = 0;
+         for (unsigned long i = 0; i < nfds; ++i) {
+            if (i < n && is_mali[i]) {
+               p[i].revents = POLLIN;
+               ready++;
+            } else {
+               p[i].revents = 0;
+            }
+         }
+         return ready;
       }
       return poll(p, (nfds_t)nfds, timeout);
    }

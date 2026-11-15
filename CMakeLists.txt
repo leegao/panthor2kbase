@@ -393,7 +393,7 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
    )
    add_custom_command(
       OUTPUT "${AOT_LIBCPP_OBJ}"
-      COMMAND "${AOT_DIR}/mali_llvm_pass_driver" --lift-libcpp "${AOT_LIBCPP_SO}" "${CMAKE_BINARY_DIR}" -j8
+      COMMAND "${AOT_DIR}/mali_llvm_pass_driver" --lift-libcpp "${AOT_LIBCPP_SO}" "${CMAKE_BINARY_DIR}" -j2
       WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
       DEPENDS mali_llvm_pass_driver
       COMMENT "Lifting NDK libc++_shared.so -> r54p3_libcpp_lifted.o"
@@ -422,7 +422,7 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
       "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator"
    )
    target_link_options(r54p3_vulkan_icd PRIVATE -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -Wl,--no-as-needed)
-   target_link_libraries(r54p3_vulkan_icd PRIVATE mali_kbase_emu z ${PLATFORM_LIBS})
+   target_link_libraries(r54p3_vulkan_icd PRIVATE mali_kbase_emu z atomic ${PLATFORM_LIBS})
    set_target_properties(r54p3_vulkan_icd PROPERTIES
       LIBRARY_OUTPUT_DIRECTORY "${AOT_DIR}"
    )
