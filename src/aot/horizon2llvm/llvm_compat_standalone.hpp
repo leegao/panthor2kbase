@@ -22,7 +22,7 @@
 #include <utility>
 #include <vector>
 
-namespace llvm {
+namespace ultrs::llvm_compat {
 
 class raw_string_ostream {
 public:
@@ -840,4 +840,4 @@ private:
     }
 };
 
-} // namespace llvm
+} // namespace ultrs::llvm_compat

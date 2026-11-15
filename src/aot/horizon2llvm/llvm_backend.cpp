@@ -1,20 +1,45 @@
-// Unified Horizon2LLVM Dynamic LLVM Backend Bridge Implementation (src/aot/horizon2llvm/llvm_backend.cpp)
+// Unified Horizon2LLVM Static LLVM-21 Backend Bridge Implementation (src/aot/horizon2llvm/llvm_backend.cpp)
 //
-// Dynamically loads host `libLLVM*.so` via `dlopen` / `dlsym` without requiring
-// external `llvm-c/*` or `llvm/IR/*` headers at compile time.
+// Directly calls LLVM-21 C APIs (statically linked from third_party/prebuilts/llvm-21).
 
 #include "llvm_backend.hpp"
+
+#include <llvm-c/Analysis.h>
+#include <llvm-c/BitWriter.h>
+#include <llvm-c/Core.h>
+#include <llvm-c/Disassembler.h>
+#include <llvm-c/Error.h>
+#include <llvm-c/IRReader.h>
+#include <llvm-c/Target.h>
+#include <llvm-c/TargetMachine.h>
+#include <llvm-c/Transforms/PassBuilder.h>
 
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
-#include <glob.h>
 #include <fstream>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+
+
+#if defined(__GLIBC__) && (__GLIBC__ == 2 && __GLIBC_MINOR__ < 38)
+extern "C" {
+__attribute__((weak)) long __isoc23_strtol(const char* nptr, char** endptr, int base) {
+    return std::strtol(nptr, endptr, base);
+}
+__attribute__((weak)) long long __isoc23_strtoll(const char* nptr, char** endptr, int base) {
+    return std::strtoll(nptr, endptr, base);
+}
+__attribute__((weak)) unsigned long __isoc23_strtoul(const char* nptr, char** endptr, int base) {
+    return std::strtoul(nptr, endptr, base);
+}
+__attribute__((weak)) unsigned long long __isoc23_strtoull(const char* nptr, char** endptr, int base) {
+    return std::strtoull(nptr, endptr, base);
+}
+}
+#endif
 
 namespace ultrs::llvm_backend {
 
@@ -32,86 +57,19 @@ LibLLVM& LibLLVM::instance() {
 }
 
 LibLLVM::LibLLVM() {
-    auto try_open = [&](const char* p) -> bool {
-        if (!p || !p[0]) return false;
-        void* h = dlopen(p, RTLD_LAZY | RTLD_GLOBAL);
-        if (!h) return false;
-        if (!dlsym(h, "LLVMContextCreate") || !dlsym(h, "LLVMRunPasses")) {
-            dlclose(h);
-            return false;
-        }
-        handle_ = h;
-        loaded_path_ = p;
-        return true;
-    };
-    if (!try_open(std::getenv("MALI_HOST_LIBLLVM"))) {
-        if (dlsym(RTLD_DEFAULT, "LLVMContextCreate") && dlsym(RTLD_DEFAULT, "LLVMRunPasses")) {
-            default_lookup_ = true;
-            loaded_path_ = "RTLD_DEFAULT";
-        }
-    }
-    if (!handle_ && !default_lookup_) {
-        const char* cands[] = {
-            "libLLVM.so",
-            "libLLVM-22.so", "libLLVM-21.so", "libLLVM-20.so", "libLLVM-19.so",
-            "libLLVM-18.so", "libLLVM-17.so", "libLLVM-16.so", "libLLVM-15.so",
-            "/usr/lib/x86_64-linux-gnu/libLLVM.so.22.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM-21.so.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM.so.21.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM-20.so.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM.so.20.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM-19.so.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM-18.so.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM-17.so.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM-16.so.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM-15.so.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM-14.so.1",
-            "libLLVM-18.so.1", "libLLVM-17.so.1", "libLLVM-16.so.1",
-            "libLLVM-15.so.1", "libLLVM-14.so.1",
-        };
-        for (const char* c : cands) {
-            if (try_open(c)) break;
-        }
-    }
-    if (!handle_ && !default_lookup_) {
-        const char* globs[] = {
-            "/usr/lib/libLLVM*.so*",
-            "/usr/lib64/libLLVM*.so*",
-            "/usr/lib/x86_64-linux-gnu/libLLVM*.so*",
-            "/usr/lib/llvm-*/lib/libLLVM*.so*",
-        };
-        for (const char* pat : globs) {
-            glob_t g{};
-            if (glob(pat, 0, nullptr, &g) == 0) {
-                for (size_t i = g.gl_pathc; i > 0; --i) {
-                    if (try_open(g.gl_pathv[i - 1])) break;
-                }
-                globfree(&g);
-            }
-            if (handle_) break;
-        }
-    }
-    if (!handle_ && !default_lookup_) return;
+    LLVMInitializeX86TargetInfo();
+    LLVMInitializeX86Target();
+    LLVMInitializeX86TargetMC();
+    LLVMInitializeX86AsmPrinter();
+    LLVMInitializeX86AsmParser();
+    LLVMInitializeX86Disassembler();
 
-    using InitFn = void (*)();
-    const char* init_syms[] = {
-        "LLVMInitializeX86TargetInfo",
-        "LLVMInitializeX86Target",
-        "LLVMInitializeX86TargetMC",
-        "LLVMInitializeX86AsmPrinter",
-        "LLVMInitializeX86AsmParser",
-        "LLVMInitializeX86Disassembler",
-        "LLVMInitializeAArch64TargetInfo",
-        "LLVMInitializeAArch64Target",
-        "LLVMInitializeAArch64TargetMC",
-        "LLVMInitializeAArch64AsmPrinter",
-        "LLVMInitializeAArch64AsmParser",
-        "LLVMInitializeAArch64Disassembler",
-    };
-    for (const char* s : init_syms) {
-        auto fn = reinterpret_cast<InitFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, s));
-        if (fn) fn();
-    }
+    LLVMInitializeAArch64TargetInfo();
+    LLVMInitializeAArch64Target();
+    LLVMInitializeAArch64TargetMC();
+    LLVMInitializeAArch64AsmPrinter();
+    LLVMInitializeAArch64AsmParser();
+    LLVMInitializeAArch64Disassembler();
 }
 
 bool LibLLVM::process_ir(const std::string& ir_text, const std::string& module_id,
@@ -121,54 +79,10 @@ bool LibLLVM::process_ir(const std::string& ir_text, const std::string& module_i
                          const std::string& out_obj_path,
                          const std::string& target_triple,
                          const std::string& cpu_arch) const {
-    // `default_lookup_` means libLLVM symbols are already resolvable via RTLD_DEFAULT
-    // (e.g. another component dlopen'd libLLVM with RTLD_GLOBAL first), so `handle_`
-    // may legitimately be null while every dlsym below still succeeds.
-    if (!handle_ && !default_lookup_) {
-        throw std::runtime_error("libLLVM shared library not loaded");
-    }
-
-    using ContextCreateFn = void* (*)();
-    using ContextDisposeFn = void (*)(void*);
-    using CreateMemBufFn = void* (*)(const char*, size_t, const char*);
-    using ParseIRFn = int (*)(void*, void*, void**, char**);
-    using DisposeModuleFn = void (*)(void*);
-    using VerifyModuleFn = int (*)(void*, int, char**);
-    using DisposeMsgFn = void (*)(char*);
-    using GetTargetFn = int (*)(const char*, void**, char**);
-    using CreateTMFn = void* (*)(void*, const char*, const char*, const char*, int, int, int);
-    using DisposeTMFn = void (*)(void*);
-    using CreatePBOptsFn = void* (*)();
-    using DisposePBOptsFn = void (*)(void*);
-    using RunPassesFn = void* (*)(void*, const char*, void*, void*);
-    using GetErrMsgFn = char* (*)(void*);
-    using DisposeErrMsgFn = void (*)(char*);
-    using PrintModToStrFn = char* (*)(void*);
-    using WriteBCFn = int (*)(void*, const char*);
-    using EmitToFileFn = int (*)(void*, void*, char*, int, char**);
-
-    auto LLVMContextCreate = reinterpret_cast<ContextCreateFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMContextCreate"));
-    auto LLVMContextDispose = reinterpret_cast<ContextDisposeFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMContextDispose"));
-    auto LLVMCreateMemoryBufferWithMemoryRangeCopy = reinterpret_cast<CreateMemBufFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMCreateMemoryBufferWithMemoryRangeCopy"));
-    auto LLVMParseIRInContext = reinterpret_cast<ParseIRFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMParseIRInContext"));
-    auto LLVMDisposeModule = reinterpret_cast<DisposeModuleFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMDisposeModule"));
-    auto LLVMVerifyModule = reinterpret_cast<VerifyModuleFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMVerifyModule"));
-    auto LLVMDisposeMessage = reinterpret_cast<DisposeMsgFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMDisposeMessage"));
-    auto LLVMGetTargetFromTriple = reinterpret_cast<GetTargetFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMGetTargetFromTriple"));
-    auto LLVMCreateTargetMachine = reinterpret_cast<CreateTMFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMCreateTargetMachine"));
-    auto LLVMDisposeTargetMachine = reinterpret_cast<DisposeTMFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMDisposeTargetMachine"));
-    auto LLVMCreatePassBuilderOptions = reinterpret_cast<CreatePBOptsFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMCreatePassBuilderOptions"));
-    auto LLVMDisposePassBuilderOptions = reinterpret_cast<DisposePBOptsFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMDisposePassBuilderOptions"));
-    auto LLVMRunPasses = reinterpret_cast<RunPassesFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMRunPasses"));
-    auto LLVMGetErrorMessage = reinterpret_cast<GetErrMsgFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMGetErrorMessage"));
-    auto LLVMDisposeErrorMessage = reinterpret_cast<DisposeErrMsgFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMDisposeErrorMessage"));
-    auto LLVMPrintModuleToString = reinterpret_cast<PrintModToStrFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMPrintModuleToString"));
-    auto LLVMWriteBitcodeToFile = reinterpret_cast<WriteBCFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMWriteBitcodeToFile"));
-    auto LLVMTargetMachineEmitToFile = reinterpret_cast<EmitToFileFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMTargetMachineEmitToFile"));
-
-    void* ctx = LLVMContextCreate();
-    void* mem_buf = LLVMCreateMemoryBufferWithMemoryRangeCopy(ir_text.data(), ir_text.size(), module_id.c_str());
-    void* mod = nullptr;
+    LLVMContextRef ctx = LLVMContextCreate();
+    LLVMMemoryBufferRef mem_buf = LLVMCreateMemoryBufferWithMemoryRangeCopy(
+        ir_text.data(), ir_text.size(), module_id.c_str());
+    LLVMModuleRef mod = nullptr;
     char* err_msg = nullptr;
 
     if (LLVMParseIRInContext(ctx, mem_buf, &mod, &err_msg) != 0) {
@@ -178,9 +92,9 @@ bool LibLLVM::process_ir(const std::string& ir_text, const std::string& module_i
         throw std::runtime_error("LLVMParseIRInContext failed for " + module_id + ":\n" + err);
     }
 
-    if (verify && LLVMVerifyModule) {
+    if (verify) {
         char* v_err = nullptr;
-        if (LLVMVerifyModule(mod, 2 /* LLVMReturnStatusAction */, &v_err) != 0) {
+        if (LLVMVerifyModule(mod, LLVMReturnStatusAction, &v_err) != 0) {
             std::string err = v_err ? v_err : "verifyModule failed";
             if (v_err) LLVMDisposeMessage(v_err);
             LLVMDisposeModule(mod);
@@ -190,9 +104,9 @@ bool LibLLVM::process_ir(const std::string& ir_text, const std::string& module_i
         if (v_err) LLVMDisposeMessage(v_err);
     }
 
-    void* tm = nullptr;
+    LLVMTargetMachineRef tm = nullptr;
     if (!opt_pipeline.empty() || !out_obj_path.empty()) {
-        void* target = nullptr;
+        LLVMTargetRef target = nullptr;
         char* targ_err = nullptr;
         if (LLVMGetTargetFromTriple(target_triple.c_str(), &target, &targ_err) != 0) {
             if (targ_err) LLVMDisposeMessage(targ_err);
@@ -204,13 +118,13 @@ bool LibLLVM::process_ir(const std::string& ir_text, const std::string& module_i
             }
             tm = LLVMCreateTargetMachine(
                 target, target_triple.c_str(), arch.c_str(), "",
-                2 /* LLVMCodeGenLevelDefault */, 2 /* LLVMRelocPIC */, 0 /* LLVMCodeModelDefault */);
+                LLVMCodeGenLevelDefault, LLVMRelocPIC, LLVMCodeModelDefault);
         }
     }
 
-    if (!opt_pipeline.empty() && LLVMRunPasses) {
-        void* opts = LLVMCreatePassBuilderOptions();
-        void* pass_err = LLVMRunPasses(mod, opt_pipeline.c_str(), tm, opts);
+    if (!opt_pipeline.empty()) {
+        LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
+        LLVMErrorRef pass_err = LLVMRunPasses(mod, opt_pipeline.c_str(), tm, opts);
         LLVMDisposePassBuilderOptions(opts);
         if (pass_err) {
             char* msg = LLVMGetErrorMessage(pass_err);
@@ -223,7 +137,7 @@ bool LibLLVM::process_ir(const std::string& ir_text, const std::string& module_i
         }
     }
 
-    if (out_optimized_ll && LLVMPrintModuleToString) {
+    if (out_optimized_ll) {
         char* s = LLVMPrintModuleToString(mod);
         if (s) {
             *out_optimized_ll = s;
@@ -231,7 +145,7 @@ bool LibLLVM::process_ir(const std::string& ir_text, const std::string& module_i
         }
     }
 
-    if (!out_bc_path.empty() && LLVMWriteBitcodeToFile) {
+    if (!out_bc_path.empty()) {
         if (LLVMWriteBitcodeToFile(mod, out_bc_path.c_str()) != 0) {
             if (tm) LLVMDisposeTargetMachine(tm);
             LLVMDisposeModule(mod);
@@ -240,10 +154,10 @@ bool LibLLVM::process_ir(const std::string& ir_text, const std::string& module_i
         }
     }
 
-    if (!out_obj_path.empty() && tm && LLVMTargetMachineEmitToFile) {
+    if (!out_obj_path.empty() && tm) {
         char* emit_err = nullptr;
         if (LLVMTargetMachineEmitToFile(tm, mod, const_cast<char*>(out_obj_path.c_str()),
-                                        1 /* LLVMObjectFile */, &emit_err) != 0) {
+                                        LLVMObjectFile, &emit_err) != 0) {
             std::string err = emit_err ? emit_err : "unknown codegen error";
             if (emit_err) LLVMDisposeMessage(emit_err);
             LLVMDisposeTargetMachine(tm);
@@ -288,19 +202,11 @@ BackendResult process_module(
 }
 
 std::string LibLLVM::disassemble_aarch64_inst(uint64_t pc, uint32_t word) const {
-    if (!handle_ && !default_lookup_) {
-        char fallback[32];
-        std::snprintf(fallback, sizeof(fallback), ".word 0x%08x", word);
-        return fallback;
-    }
-    using CreateDisasmFn = void* (*)(const char*, void*, int, void*, void*);
-    using DisasmInstFn = size_t (*)(void*, uint8_t*, uint64_t, uint64_t, char*, size_t);
     static std::mutex mtx;
     std::lock_guard<std::mutex> lk(mtx);
-    static auto create_fn = reinterpret_cast<CreateDisasmFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMCreateDisasm"));
-    static auto disasm_fn = reinterpret_cast<DisasmInstFn>(dlsym(handle_ ? handle_ : RTLD_DEFAULT, "LLVMDisasmInstruction"));
-    static void* dcr = create_fn ? create_fn("aarch64-unknown-linux-gnu", nullptr, 0, nullptr, nullptr) : nullptr;
-    if (!dcr || !disasm_fn) {
+    static LLVMDisasmContextRef dcr = LLVMCreateDisasm(
+        "aarch64-unknown-linux-gnu", nullptr, 0, nullptr, nullptr);
+    if (!dcr) {
         char fallback[32];
         std::snprintf(fallback, sizeof(fallback), ".word 0x%08x", word);
         return fallback;
@@ -312,7 +218,7 @@ std::string LibLLVM::disassemble_aarch64_inst(uint64_t pc, uint32_t word) const 
         static_cast<uint8_t>((word >> 16) & 0xFFu),
         static_cast<uint8_t>((word >> 24) & 0xFFu),
     };
-    size_t sz = disasm_fn(dcr, bytes, 4, pc, buf, sizeof(buf));
+    size_t sz = LLVMDisasmInstruction(dcr, bytes, 4, pc, buf, sizeof(buf));
     if (sz == 0) {
         std::snprintf(buf, sizeof(buf), "\t.word\t0x%08x", word);
     }

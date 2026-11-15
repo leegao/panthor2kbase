@@ -31,7 +31,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
+#include <llvm-c/Disassembler.h>
+#include <llvm-c/Target.h>
 #include <fstream>
 #include <iomanip>
 #include <map>
@@ -74,67 +75,13 @@ static int64_t read_s64_le(const uint8_t* p) {
 }
 
 struct LLVMDisasmDynamic {
-    void* handle = nullptr;
-    using CreateFn = void* (*)(const char*, void*, int, void*, void*);
-    using DisasmFn = size_t (*)(void*, uint8_t*, uint64_t, uint64_t, char*, size_t);
-    using DisposeFn = void (*)(void*);
-    using InitFn = void (*)();
-
-    CreateFn create_disasm = nullptr;
-    DisasmFn disasm_inst = nullptr;
-    DisposeFn dispose_disasm = nullptr;
-    void* ctx = nullptr;
+    LLVMDisasmContextRef ctx = nullptr;
 
     bool init(std::string& err) {
-        const char* cands[] = {
-            std::getenv("MALI_HOST_LIBLLVM"),
-            "/usr/lib/x86_64-linux-gnu/libLLVM.so.22.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM-21.so.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM.so.21.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM-20.so.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM.so.20.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM-19.so.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM-18.so.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM-17.so.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM-16.so.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM-15.so.1",
-            "/usr/lib/x86_64-linux-gnu/libLLVM-14.so.1",
-            "libLLVM-21.so.1",
-            "libLLVM-20.so.1",
-            "libLLVM-19.so.1",
-            "libLLVM-18.so.1",
-            "libLLVM-17.so.1",
-            "libLLVM-16.so.1",
-            "libLLVM-15.so.1",
-            "libLLVM-14.so.1",
-            "libLLVM.so",
-        };
-        for (const char* c : cands) {
-            if (!c || !c[0]) continue;
-            handle = dlopen(c, RTLD_LAZY | RTLD_GLOBAL);
-            if (handle) break;
-        }
-        if (!handle) {
-            err = "Failed to dlopen libLLVM shared library for AArch64 MC disassembler";
-            return false;
-        }
-        const char* init_syms[] = {
-            "LLVMInitializeAArch64TargetInfo",
-            "LLVMInitializeAArch64TargetMC",
-            "LLVMInitializeAArch64Disassembler",
-        };
-        for (const char* s : init_syms) {
-            auto fn = reinterpret_cast<InitFn>(dlsym(handle, s));
-            if (fn) fn();
-        }
-        create_disasm = reinterpret_cast<CreateFn>(dlsym(handle, "LLVMCreateDisasm"));
-        disasm_inst = reinterpret_cast<DisasmFn>(dlsym(handle, "LLVMDisasmInstruction"));
-        dispose_disasm = reinterpret_cast<DisposeFn>(dlsym(handle, "LLVMDisasmDispose"));
-        if (!create_disasm || !disasm_inst || !dispose_disasm) {
-            err = "Missing LLVMCreateDisasm/LLVMDisasmInstruction in libLLVM";
-            return false;
-        }
-        ctx = create_disasm("aarch64-linux-gnu", nullptr, 0, nullptr, nullptr);
+        LLVMInitializeAArch64TargetInfo();
+        LLVMInitializeAArch64TargetMC();
+        LLVMInitializeAArch64Disassembler();
+        ctx = LLVMCreateDisasm("aarch64-linux-gnu", nullptr, 0, nullptr, nullptr);
         if (!ctx) {
             err = "LLVMCreateDisasm(\"aarch64-linux-gnu\") returned NULL";
             return false;
@@ -143,7 +90,7 @@ struct LLVMDisasmDynamic {
     }
 
     ~LLVMDisasmDynamic() {
-        if (ctx && dispose_disasm) dispose_disasm(ctx);
+        if (ctx) LLVMDisasmDispose(ctx);
     }
 
     std::vector<DisasmInsn> disasm_range(const std::vector<uint8_t>& text, uint64_t start, uint64_t end) {
@@ -153,7 +100,7 @@ struct LLVMDisasmDynamic {
             uint8_t raw[4] = {text[pc], text[pc + 1], text[pc + 2], text[pc + 3]};
             uint32_t word = read_u32_le(raw);
             std::memset(buf, 0, sizeof(buf));
-            size_t sz = disasm_inst(ctx, raw, 4, pc, buf, sizeof(buf) - 1);
+            size_t sz = LLVMDisasmInstruction(ctx, raw, 4, pc, buf, sizeof(buf) - 1);
             DisasmInsn d;
             d.addr = pc;
             d.word = word;

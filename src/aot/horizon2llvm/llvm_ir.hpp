@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <iomanip>
 #include <map>
@@ -55,6 +56,9 @@
 #endif
 
 namespace ultrs::llvm_ir {
+#if !defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS)
+namespace llvm = ultrs::llvm_compat;
+#endif
 
 // -----------------------------------------------------------------------------
 // LLVM IR Types
@@ -381,7 +385,7 @@ struct Function {
     Module* parent_mod = nullptr;
     llvm::Function* llvm_fn = nullptr;
     std::unordered_map<std::string, llvm::Value*> ssa_values;
-    std::vector<std::unique_ptr<llvm::Argument>> synthetic_ssa_vals;
+    std::vector<std::unique_ptr<llvm::Value>> synthetic_ssa_vals;
 
     BasicBlock* create_block(const std::string& label, uint64_t pc = 0);
 
@@ -541,8 +545,7 @@ struct Module {
         return ptr;
     }
 
-    std::string serialize() const {
-        std::ostringstream os;
+    void serialize_to(std::ostream& os) const {
         os << "; ModuleID = '" << name << "'\n";
         os << "source_filename = \"" << name << "\"\n";
         if (!data_layout.empty()) {
@@ -850,7 +853,24 @@ struct Module {
             os << "!" << chunk_node_idx << " = !{!\"" << chunk_meta.chunk_id << "\", i64 " << chunk_meta.num_functions
                << ", i64 " << chunk_meta.pc_lo << ", i64 " << chunk_meta.pc_hi << "}\n";
         }
+    }
+
+    std::string serialize() const {
+        std::ostringstream os;
+        serialize_to(os);
         return os.str();
+    }
+
+    // Stream the module IR straight to disk, avoiding the extra full-text copy
+    // that serialize() would otherwise hold in memory. Returns bytes written.
+    size_t serialize_to_file(const std::string& path) const {
+        std::ofstream out(path, std::ios::binary);
+        if (!out) return 0;
+        serialize_to(out);
+        std::streampos pos = out.tellp();
+        out.close();
+        if (!out || pos <= 0) return 0;
+        return static_cast<size_t>(pos);
     }
 };
 
@@ -947,11 +967,29 @@ public:
             if (v.repr == "zeroinitializer") {
                 return llvm::Constant::getNullValue(ty);
             }
-            if (v.repr == "poison" || v.repr == "undef") {
+            if (v.repr == "poison") {
+                return llvm::PoisonValue::get(ty);
+            }
+            if (v.repr == "undef") {
                 return llvm::UndefValue::get(ty);
             }
             if (!v.repr.empty() && v.repr.front() == '<') {
-                return llvm::Constant::getNullValue(ty); // vector literal handled by text or compat
+#if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS)
+                // Real-LLVM builds would need to materialize a ConstantVector here.
+                return llvm::Constant::getNullValue(ty);
+#else
+                // The compat Value carries its textual form directly, so keep the
+                // literal text instead of collapsing every vector splat to
+                // zeroinitializer. Collapsing silently broke USHL/SSHL, SHL/USHR,
+                // SQXTN/UQXTN bounds, and SHA1SU1.
+                if (fn_) {
+                    auto lit = std::make_unique<llvm::Value>(ty, v.repr);
+                    llvm::Value* ptr = lit.get();
+                    fn_->synthetic_ssa_vals.push_back(std::move(lit));
+                    return ptr;
+                }
+                return llvm::Constant::getNullValue(ty);
+#endif
             }
             if (v.type == TypeKind::Pointer && !v.repr.empty() && v.repr[0] == '@') {
                 std::string gname = v.repr.substr(1);

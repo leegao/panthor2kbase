@@ -169,7 +169,15 @@ if(NOT ANDROID)
       src/aot/horizon2llvm/lowering/pass_nzcv_predicate_fusion.cpp
       src/aot/horizon2llvm/lowering/pass_tail_call_devirt.cpp
    )
-   target_include_directories(horizon2llvm_passes PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/horizon2llvm")
+   set(LLVM21_INC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/prebuilts/llvm-21/include" "${CMAKE_CURRENT_SOURCE_DIR}/third_party/prebuilts/llvm-21/include")
+   set(LLVM21_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/prebuilts/llvm-21/lib")
+   file(GLOB LLVM21_STATIC_LIBS "${LLVM21_LIB_DIR}/*.a")
+   list(SORT LLVM21_STATIC_LIBS)
+
+   target_include_directories(horizon2llvm_passes PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/horizon2llvm"
+      "${LLVM21_INC_DIR}"
+   )
    set_target_properties(horizon2llvm_passes PROPERTIES CXX_STANDARD 20)
 
    add_executable(horizon2llvm
@@ -180,20 +188,28 @@ if(NOT ANDROID)
       src/aot/horizon2llvm/llvm_backend.cpp
       src/aot/horizon2llvm/aarch64/aarch64_lifter.cpp
    )
-   target_include_directories(horizon2llvm PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/horizon2llvm")
+   target_include_directories(horizon2llvm PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/horizon2llvm"
+      "${LLVM21_INC_DIR}"
+   )
    set_target_properties(horizon2llvm PROPERTIES
       CXX_STANDARD 20
       RUNTIME_OUTPUT_DIRECTORY "${AOT_DIR}"
    )
-   option(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS "Compile horizon2llvm against system C++ LLVM headers instead of self-contained llvm_compat_standalone.hpp" OFF)
-   if(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS)
-      target_compile_definitions(horizon2llvm PRIVATE HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS=1)
-      find_library(SYSTEM_LLVM_SHARED_LIB NAMES LLVM LLVM-18 LLVM-17 LLVM-16 LLVM-15)
-      if(SYSTEM_LLVM_SHARED_LIB)
-         target_link_libraries(horizon2llvm PRIVATE "${SYSTEM_LLVM_SHARED_LIB}")
-      endif()
+   find_library(ZLIB_LIB NAMES z libz.so.1 HINTS /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib /usr/lib64)
+   find_library(ZSTD_LIB NAMES zstd libzstd.so.1 HINTS /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib /usr/lib64)
+   set(LLVM21_EXT_LIBS "")
+   if(ZLIB_LIB)
+      list(APPEND LLVM21_EXT_LIBS "${ZLIB_LIB}")
    endif()
-   target_link_libraries(horizon2llvm PRIVATE dl ${PLATFORM_LIBS})
+   if(ZSTD_LIB)
+      list(APPEND LLVM21_EXT_LIBS "${ZSTD_LIB}")
+   endif()
+   target_link_libraries(horizon2llvm PRIVATE
+      -Wl,--start-group ${LLVM21_STATIC_LIBS} -Wl,--end-group
+      ${LLVM21_EXT_LIBS}
+      dl ${PLATFORM_LIBS}
+   )
 
    add_custom_command(
       OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/lifted_kbase_ko.ll"

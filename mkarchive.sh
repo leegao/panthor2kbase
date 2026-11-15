@@ -54,6 +54,7 @@ elif command -v zip >/dev/null 2>&1; then
         "llvm.zip" "include.zip" "AGENTS.md" "CLAUDE.md" "External/*"
         "kittytoy/*" "screenshots/*" "mesa/*" "archive.zip" "*.zip" "*.so" "*.o" "*.whl" "*.ko"
         "sandbox_bundles/*" "predownloaded/*" "src/aot/bin/*" "src/aot/horizon2llvm/horizon2llvm"
+        ".git/*" "third_party/prebuilts/llvm-21/lib/*" "third_party/prebuilts/llvm-21/include/*"
     )
     if $SLIM; then
         FLAGS+=(-x "*.ko")
@@ -61,9 +62,11 @@ elif command -v zip >/dev/null 2>&1; then
         FLAGS+=(-x "*.pyc")
         FLAGS+=(-x "*.zip")
         FLAGS+=(-x ".git/*")
+    else
+        zip -9 -y -r "$TARGET_FILE" third_party/prebuilts/ \
+            -x "third_party/prebuilts/llvm-21/lib/*" "third_party/prebuilts/llvm-21/include/*"
     fi
     zip "${FLAGS[@]}"
-    zip -9 -y -r "$TARGET_FILE" third_party/prebuilts/
 elif $SLIM; then
     python3 "$SCRIPT_DIR/tools/mkarchive.py" --slim "$TARGET_FILE"
 else

@@ -55,307 +55,19 @@
 #include <tuple>
 #include <vector>
 
-#include <dlfcn.h>
+#include <llvm-c/Analysis.h>
+#include <llvm-c/Core.h>
+#include <llvm-c/Error.h>
+#include <llvm-c/IRReader.h>
+#include <llvm-c/Target.h>
+#include <llvm-c/TargetMachine.h>
+#include <llvm-c/Transforms/PassBuilder.h>
 #include "../horizon2llvm/aarch64/aarch64_isa_common.hpp"
 #include "../horizon2llvm/llvm_backend.hpp"
 #include "../horizon2llvm/llvm_ir.hpp"
 #include "../horizon2llvm/passes.hpp"
-#include <glob.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
-// Dynamic runtime loader for ANY host libLLVM (LLVM 14..22+ on Arch, Ubuntu, Debian, Fedora)
-// Eliminates hardcoded DT_NEEDED on libLLVM-15.so.1 so prebuilt binaries work across distros.
-extern "C" {
-typedef struct LLVMOpaqueContext *LLVMContextRef;
-typedef struct LLVMOpaqueModule *LLVMModuleRef;
-typedef struct LLVMOpaqueType *LLVMTypeRef;
-typedef struct LLVMOpaqueValue *LLVMValueRef;
-typedef struct LLVMOpaqueBasicBlock *LLVMBasicBlockRef;
-typedef struct LLVMOpaqueBuilder *LLVMBuilderRef;
-typedef struct LLVMOpaqueMemoryBuffer *LLVMMemoryBufferRef;
-typedef struct LLVMOpaqueTarget *LLVMTargetRef;
-typedef struct LLVMOpaqueTargetMachine *LLVMTargetMachineRef;
-typedef struct LLVMOpaquePassBuilderOptions *LLVMPassBuilderOptionsRef;
-typedef struct LLVMOpaqueError *LLVMErrorRef;
-typedef int LLVMBool;
-
-typedef enum {
-    LLVMVerifierFailureActionAbortProcess = 0,
-    LLVMVerifierFailureActionPrintMessage = 1,
-    LLVMVerifierFailureActionReturnStatus = 2
-} LLVMVerifierFailureAction;
-}
-
-#define MALI_LLVM_API_LIST(X) \
-    X(void, LLVMInitializeX86TargetInfo, (void), ()) \
-    X(void, LLVMInitializeX86Target, (void), ()) \
-    X(void, LLVMInitializeX86TargetMC, (void), ()) \
-    X(void, LLVMInitializeX86AsmPrinter, (void), ()) \
-    X(void, LLVMInitializeX86AsmParser, (void), ()) \
-    X(LLVMContextRef, LLVMContextCreate, (void), ()) \
-    X(void, LLVMContextDispose, (LLVMContextRef C), (C)) \
-    X(LLVMBool, LLVMCreateMemoryBufferWithContentsOfFile, (const char *Path, LLVMMemoryBufferRef *OutMemBuf, char **OutMessage), (Path, OutMemBuf, OutMessage)) \
-    X(LLVMMemoryBufferRef, LLVMCreateMemoryBufferWithMemoryRangeCopy, (const char *InputData, size_t InputDataLength, const char *BufferName), (InputData, InputDataLength, BufferName)) \
-    X(LLVMBool, LLVMParseIRInContext, (LLVMContextRef ContextRef, LLVMMemoryBufferRef MemBuf, LLVMModuleRef *OutM, char **OutMessage), (ContextRef, MemBuf, OutM, OutMessage)) \
-    X(LLVMBool, LLVMVerifyModule, (LLVMModuleRef M, LLVMVerifierFailureAction Action, char **OutMessage), (M, Action, OutMessage)) \
-    X(LLVMBool, LLVMPrintModuleToFile, (LLVMModuleRef M, const char *Filename, char **ErrorMessage), (M, Filename, ErrorMessage)) \
-    X(void, LLVMDisposeMessage, (char *Message), (Message)) \
-    X(void, LLVMDisposeModule, (LLVMModuleRef M), (M)) \
-    X(LLVMContextRef, LLVMGetModuleContext, (LLVMModuleRef M), (M)) \
-    X(LLVMTypeRef, LLVMVoidTypeInContext, (LLVMContextRef C), (C)) \
-    X(LLVMTypeRef, LLVMInt1TypeInContext, (LLVMContextRef C), (C)) \
-    X(LLVMTypeRef, LLVMInt8TypeInContext, (LLVMContextRef C), (C)) \
-    X(LLVMTypeRef, LLVMInt32TypeInContext, (LLVMContextRef C), (C)) \
-    X(LLVMTypeRef, LLVMInt64TypeInContext, (LLVMContextRef C), (C)) \
-    X(LLVMTypeRef, LLVMPointerType, (LLVMTypeRef ElementType, unsigned AddressSpace), (ElementType, AddressSpace)) \
-    X(LLVMTypeRef, LLVMFunctionType, (LLVMTypeRef ReturnType, LLVMTypeRef *ParamTypes, unsigned ParamCount, LLVMBool IsVarArg), (ReturnType, ParamTypes, ParamCount, IsVarArg)) \
-    X(LLVMValueRef, LLVMConstInt, (LLVMTypeRef IntTy, unsigned long long N, LLVMBool SignExtend), (IntTy, N, SignExtend)) \
-    X(unsigned long long, LLVMConstIntGetZExtValue, (LLVMValueRef ConstantVal), (ConstantVal)) \
-    X(LLVMValueRef, LLVMGetNamedFunction, (LLVMModuleRef M, const char *Name), (M, Name)) \
-    X(LLVMValueRef, LLVMAddFunction, (LLVMModuleRef M, const char *Name, LLVMTypeRef FunctionTy), (M, Name, FunctionTy)) \
-    X(LLVMValueRef, LLVMGetFirstFunction, (LLVMModuleRef M), (M)) \
-    X(LLVMValueRef, LLVMGetNextFunction, (LLVMValueRef Fn), (Fn)) \
-    X(LLVMBasicBlockRef, LLVMGetFirstBasicBlock, (LLVMValueRef Fn), (Fn)) \
-    X(LLVMBasicBlockRef, LLVMGetNextBasicBlock, (LLVMBasicBlockRef BB), (BB)) \
-    X(LLVMValueRef, LLVMGetFirstInstruction, (LLVMBasicBlockRef BB), (BB)) \
-    X(LLVMValueRef, LLVMGetNextInstruction, (LLVMValueRef Inst), (Inst)) \
-    X(LLVMValueRef, LLVMIsACallInst, (LLVMValueRef Val), (Val)) \
-    X(unsigned, LLVMGetNumArgOperands, (LLVMValueRef Instr), (Instr)) \
-    X(LLVMValueRef, LLVMGetArgOperand, (LLVMValueRef Inst, unsigned i), (Inst, i)) \
-    X(LLVMValueRef, LLVMGetCalledValue, (LLVMValueRef Instr), (Instr)) \
-    X(const char *, LLVMGetValueName2, (LLVMValueRef Val, size_t *Length), (Val, Length)) \
-    X(void, LLVMReplaceAllUsesWith, (LLVMValueRef OldVal, LLVMValueRef NewVal), (OldVal, NewVal)) \
-    X(void, LLVMInstructionEraseFromParent, (LLVMValueRef Inst), (Inst)) \
-    X(LLVMBuilderRef, LLVMCreateBuilderInContext, (LLVMContextRef C), (C)) \
-    X(void, LLVMPositionBuilderBefore, (LLVMBuilderRef Builder, LLVMValueRef Instr), (Builder, Instr)) \
-    X(void, LLVMDisposeBuilder, (LLVMBuilderRef Builder), (Builder)) \
-    X(LLVMValueRef, LLVMBuildAdd, (LLVMBuilderRef B, LLVMValueRef LHS, LLVMValueRef RHS, const char *Name), (B, LHS, RHS, Name)) \
-    X(LLVMValueRef, LLVMBuildAnd, (LLVMBuilderRef B, LLVMValueRef LHS, LLVMValueRef RHS, const char *Name), (B, LHS, RHS, Name)) \
-    X(LLVMValueRef, LLVMBuildZExt, (LLVMBuilderRef B, LLVMValueRef Val, LLVMTypeRef DestTy, const char *Name), (B, Val, DestTy, Name)) \
-    X(LLVMValueRef, LLVMBuildTrunc, (LLVMBuilderRef B, LLVMValueRef Val, LLVMTypeRef DestTy, const char *Name), (B, Val, DestTy, Name)) \
-    X(LLVMValueRef, LLVMBuildIntToPtr, (LLVMBuilderRef B, LLVMValueRef Val, LLVMTypeRef DestTy, const char *Name), (B, Val, DestTy, Name)) \
-    X(LLVMValueRef, LLVMBuildPtrToInt, (LLVMBuilderRef B, LLVMValueRef Val, LLVMTypeRef DestTy, const char *Name), (B, Val, DestTy, Name)) \
-    X(LLVMValueRef, LLVMBuildGEP2, (LLVMBuilderRef B, LLVMTypeRef Ty, LLVMValueRef Pointer, LLVMValueRef *Indices, unsigned NumIndices, const char *Name), (B, Ty, Pointer, Indices, NumIndices, Name)) \
-    X(LLVMValueRef, LLVMBuildLoad2, (LLVMBuilderRef B, LLVMTypeRef Ty, LLVMValueRef PointerVal, const char *Name), (B, Ty, PointerVal, Name)) \
-    X(LLVMValueRef, LLVMBuildStore, (LLVMBuilderRef B, LLVMValueRef Val, LLVMValueRef Ptr), (B, Val, Ptr)) \
-    X(LLVMValueRef, LLVMBuildCall2, (LLVMBuilderRef B, LLVMTypeRef Ty, LLVMValueRef Fn, LLVMValueRef *Args, unsigned NumArgs, const char *Name), (B, Ty, Fn, Args, NumArgs, Name)) \
-    X(LLVMBool, LLVMGetTargetFromTriple, (const char *Triple, LLVMTargetRef *T, char **ErrorMessage), (Triple, T, ErrorMessage)) \
-    X(LLVMTargetMachineRef, LLVMCreateTargetMachine, (LLVMTargetRef T, const char *Triple, const char *CPU, const char *Features, int Level, int Reloc, int CodeModel), (T, Triple, CPU, Features, Level, Reloc, CodeModel)) \
-    X(void, LLVMDisposeTargetMachine, (LLVMTargetMachineRef T), (T)) \
-    X(LLVMPassBuilderOptionsRef, LLVMCreatePassBuilderOptions, (void), ()) \
-    X(void, LLVMDisposePassBuilderOptions, (LLVMPassBuilderOptionsRef Options), (Options)) \
-    X(LLVMErrorRef, LLVMRunPasses, (LLVMModuleRef M, const char *Passes, LLVMTargetMachineRef TM, LLVMPassBuilderOptionsRef Options), (M, Passes, TM, Options)) \
-    X(char *, LLVMGetErrorMessage, (LLVMErrorRef Err), (Err)) \
-    X(void, LLVMDisposeErrorMessage, (char *ErrMsg), (ErrMsg)) \
-    X(LLVMBool, LLVMTargetMachineEmitToFile, (LLVMTargetMachineRef T, LLVMModuleRef M, char *Filename, int codegen, char **ErrorMessage), (T, M, Filename, codegen, ErrorMessage))
-
-namespace {
-struct DynamicLlvmTable {
-    void *handle = nullptr;
-    std::string loaded_path;
-    LLVMTypeRef (*p_LLVMPointerTypeInContext)(LLVMContextRef, unsigned) = nullptr;
-    void (*p_LLVMContextSetOpaquePointers)(LLVMContextRef, LLVMBool) = nullptr;
-    void (*p_cxx_setOpaquePointers)(LLVMContextRef, bool) = nullptr;
-    void (*p_cxx_enableOpaquePointers)(LLVMContextRef) = nullptr;
-    void (*p_LLVMParseCommandLineOptions)(int, const char *const *, const char *) = nullptr;
-#define DECL_PTR(ret, name, params, args) ret (*p_##name) params = nullptr;
-    MALI_LLVM_API_LIST(DECL_PTR)
-#undef DECL_PTR
-
-    bool tryOpen(const char *path) {
-        if (!path || !path[0]) return false;
-        void *h = dlopen(path, RTLD_LAZY | RTLD_GLOBAL);
-        if (!h) return false;
-        if (!tryOpenHandle(h, path)) {
-            dlclose(h);
-            return false;
-        }
-        return true;
-    }
-
-    bool tryOpenHandle(void *h, const char *path) {
-        void *lookup_h = h ? h : RTLD_DEFAULT;
-        if (!dlsym(lookup_h, "LLVMContextCreate") || !dlsym(lookup_h, "LLVMRunPasses")) {
-            return false;
-        }
-        handle = lookup_h;
-        loaded_path = path ? path : "RTLD_DEFAULT";
-        p_LLVMPointerTypeInContext = reinterpret_cast<LLVMTypeRef (*)(LLVMContextRef, unsigned)>(
-            dlsym(lookup_h, "LLVMPointerTypeInContext"));
-        p_LLVMContextSetOpaquePointers = reinterpret_cast<void (*)(LLVMContextRef, LLVMBool)>(
-            dlsym(lookup_h, "LLVMContextSetOpaquePointers"));
-        p_cxx_setOpaquePointers = reinterpret_cast<void (*)(LLVMContextRef, bool)>(
-            dlsym(lookup_h, "_ZNK4llvm11LLVMContext17setOpaquePointersEb"));
-        if (!p_cxx_setOpaquePointers) {
-            p_cxx_setOpaquePointers = reinterpret_cast<void (*)(LLVMContextRef, bool)>(
-                dlsym(lookup_h, "_ZN4llvm11LLVMContext17setOpaquePointersEb"));
-        }
-        p_cxx_enableOpaquePointers = reinterpret_cast<void (*)(LLVMContextRef)>(
-            dlsym(lookup_h, "_ZN4llvm11LLVMContext20enableOpaquePointersEv"));
-        if (!p_cxx_enableOpaquePointers) {
-            p_cxx_enableOpaquePointers = reinterpret_cast<void (*)(LLVMContextRef)>(
-                dlsym(lookup_h, "_ZNK4llvm11LLVMContext20enableOpaquePointersEv"));
-        }
-        p_LLVMParseCommandLineOptions = reinterpret_cast<void (*)(int, const char *const *, const char *)>(
-            dlsym(lookup_h, "LLVMParseCommandLineOptions"));
-#define LOAD_SYM(ret, name, params, args) \
-        p_##name = reinterpret_cast<ret (*) params>(dlsym(lookup_h, #name)); \
-        if (!p_##name) { std::fprintf(stderr, "[LLVM_LOADER] Missing symbol %s in %s\n", #name, path); return false; }
-        MALI_LLVM_API_LIST(LOAD_SYM)
-#undef LOAD_SYM
-        return true;
-    }
-
-    void ensureLoaded() {
-        if (handle) return;
-        auto& shared_llvm = ultrs::llvm_backend::LibLLVM::instance();
-        if (shared_llvm.available()) {
-            void* sh = shared_llvm.raw_handle();
-            if (tryOpenHandle(sh, shared_llvm.loaded_path().c_str())) return;
-        }
-        const char *env_lib = getenv("MALI_HOST_LIBLLVM");
-        if (env_lib && tryOpen(env_lib)) return;
-
-        // First check if already linked into process
-        if (dlsym(RTLD_DEFAULT, "LLVMContextCreate") && tryOpen(nullptr)) return;
-
-        static const char *const kDirectCandidates[] = {
-            "libLLVM.so",
-            "libLLVM-22.so", "libLLVM-21.so", "libLLVM-20.so", "libLLVM-19.so",
-            "libLLVM-18.so", "libLLVM-17.so", "libLLVM-16.so", "libLLVM-15.so",
-            "libLLVM-21.so.1", "libLLVM-20.so.1", "libLLVM-19.so.1", "libLLVM-18.so.1",
-            "libLLVM-17.so.1", "libLLVM-16.so.1", "libLLVM-15.so.1", "libLLVM-14.so.1",
-        };
-        for (const char *c : kDirectCandidates) {
-            if (tryOpen(c)) return;
-        }
-
-        static const char *const kGlobPatterns[] = {
-            "/usr/lib/libLLVM*.so*",
-            "/usr/lib64/libLLVM*.so*",
-            "/usr/lib/x86_64-linux-gnu/libLLVM*.so*",
-            "/usr/lib/llvm-*/lib/libLLVM*.so*",
-            "/usr/local/lib/libLLVM*.so*",
-        };
-        for (const char *pat : kGlobPatterns) {
-            glob_t g{};
-            if (glob(pat, 0, nullptr, &g) == 0) {
-                // Prefer highest version (reverse order)
-                for (size_t i = g.gl_pathc; i > 0; --i) {
-                    if (tryOpen(g.gl_pathv[i - 1])) {
-                        globfree(&g);
-                        return;
-                    }
-                }
-                globfree(&g);
-            }
-        }
-        std::fprintf(stderr, "[ERROR] Could not dynamically load any host libLLVM shared library (checked LLVM 14..22 in /usr/lib, /usr/lib/x86_64-linux-gnu, /usr/lib/llvm-*/lib). Set MALI_HOST_LIBLLVM=/path/to/libLLVM.so\n");
-        std::exit(1);
-    }
-};
-
-static DynamicLlvmTable g_llvm;
-} // namespace
-
-#define DEF_WRAPPER(ret, name, params, args) \
-    static inline ret raw_##name params { g_llvm.ensureLoaded(); return g_llvm.p_##name args; }
-MALI_LLVM_API_LIST(DEF_WRAPPER)
-#undef DEF_WRAPPER
-
-#define LLVMInitializeX86TargetInfo raw_LLVMInitializeX86TargetInfo
-#define LLVMInitializeX86Target raw_LLVMInitializeX86Target
-#define LLVMInitializeX86TargetMC raw_LLVMInitializeX86TargetMC
-#define LLVMInitializeX86AsmPrinter raw_LLVMInitializeX86AsmPrinter
-#define LLVMInitializeX86AsmParser raw_LLVMInitializeX86AsmParser
-#define LLVMContextDispose raw_LLVMContextDispose
-#define LLVMCreateMemoryBufferWithContentsOfFile raw_LLVMCreateMemoryBufferWithContentsOfFile
-#define LLVMCreateMemoryBufferWithMemoryRangeCopy raw_LLVMCreateMemoryBufferWithMemoryRangeCopy
-#define LLVMParseIRInContext raw_LLVMParseIRInContext
-#define LLVMVerifyModule raw_LLVMVerifyModule
-#define LLVMPrintModuleToFile raw_LLVMPrintModuleToFile
-#define LLVMDisposeMessage raw_LLVMDisposeMessage
-#define LLVMDisposeModule raw_LLVMDisposeModule
-#define LLVMGetModuleContext raw_LLVMGetModuleContext
-#define LLVMVoidTypeInContext raw_LLVMVoidTypeInContext
-#define LLVMInt1TypeInContext raw_LLVMInt1TypeInContext
-#define LLVMInt8TypeInContext raw_LLVMInt8TypeInContext
-#define LLVMInt32TypeInContext raw_LLVMInt32TypeInContext
-#define LLVMInt64TypeInContext raw_LLVMInt64TypeInContext
-#define LLVMPointerType raw_LLVMPointerType
-#define LLVMFunctionType raw_LLVMFunctionType
-#define LLVMConstInt raw_LLVMConstInt
-#define LLVMConstIntGetZExtValue raw_LLVMConstIntGetZExtValue
-#define LLVMGetNamedFunction raw_LLVMGetNamedFunction
-#define LLVMAddFunction raw_LLVMAddFunction
-#define LLVMGetFirstFunction raw_LLVMGetFirstFunction
-#define LLVMGetNextFunction raw_LLVMGetNextFunction
-#define LLVMGetFirstBasicBlock raw_LLVMGetFirstBasicBlock
-#define LLVMGetNextBasicBlock raw_LLVMGetNextBasicBlock
-#define LLVMGetFirstInstruction raw_LLVMGetFirstInstruction
-#define LLVMGetNextInstruction raw_LLVMGetNextInstruction
-#define LLVMIsACallInst raw_LLVMIsACallInst
-#define LLVMGetNumArgOperands raw_LLVMGetNumArgOperands
-#define LLVMGetArgOperand raw_LLVMGetArgOperand
-#define LLVMGetCalledValue raw_LLVMGetCalledValue
-#define LLVMGetValueName2 raw_LLVMGetValueName2
-#define LLVMReplaceAllUsesWith raw_LLVMReplaceAllUsesWith
-#define LLVMInstructionEraseFromParent raw_LLVMInstructionEraseFromParent
-#define LLVMCreateBuilderInContext raw_LLVMCreateBuilderInContext
-#define LLVMPositionBuilderBefore raw_LLVMPositionBuilderBefore
-#define LLVMDisposeBuilder raw_LLVMDisposeBuilder
-#define LLVMBuildAdd raw_LLVMBuildAdd
-#define LLVMBuildAnd raw_LLVMBuildAnd
-#define LLVMBuildZExt raw_LLVMBuildZExt
-#define LLVMBuildTrunc raw_LLVMBuildTrunc
-#define LLVMBuildIntToPtr raw_LLVMBuildIntToPtr
-#define LLVMBuildPtrToInt raw_LLVMBuildPtrToInt
-#define LLVMBuildGEP2 raw_LLVMBuildGEP2
-#define LLVMBuildLoad2 raw_LLVMBuildLoad2
-#define LLVMBuildStore raw_LLVMBuildStore
-#define LLVMBuildCall2 raw_LLVMBuildCall2
-#define LLVMGetTargetFromTriple raw_LLVMGetTargetFromTriple
-#define LLVMCreateTargetMachine raw_LLVMCreateTargetMachine
-#define LLVMDisposeTargetMachine raw_LLVMDisposeTargetMachine
-#define LLVMCreatePassBuilderOptions raw_LLVMCreatePassBuilderOptions
-#define LLVMDisposePassBuilderOptions raw_LLVMDisposePassBuilderOptions
-#define LLVMRunPasses raw_LLVMRunPasses
-#define LLVMGetErrorMessage raw_LLVMGetErrorMessage
-#define LLVMDisposeErrorMessage raw_LLVMDisposeErrorMessage
-#define LLVMTargetMachineEmitToFile raw_LLVMTargetMachineEmitToFile
-
-static inline LLVMContextRef LLVMContextCreate(void) {
-    g_llvm.ensureLoaded();
-    static bool s_cl_parsed = false;
-    if (!s_cl_parsed) {
-        s_cl_parsed = true;
-        if (g_llvm.p_LLVMParseCommandLineOptions &&
-            (g_llvm.loaded_path.find("14") != std::string::npos ||
-             g_llvm.loaded_path.find("15") != std::string::npos)) {
-            const char *argv[] = {"horizon2llvm", "-opaque-pointers"};
-            g_llvm.p_LLVMParseCommandLineOptions(2, argv, "");
-        }
-    }
-    LLVMContextRef C = g_llvm.p_LLVMContextCreate();
-    if (C) {
-        if (g_llvm.p_LLVMContextSetOpaquePointers) {
-            g_llvm.p_LLVMContextSetOpaquePointers(C, 1);
-        } else if (g_llvm.p_cxx_setOpaquePointers) {
-            g_llvm.p_cxx_setOpaquePointers(C, true);
-        } else if (g_llvm.p_cxx_enableOpaquePointers) {
-            g_llvm.p_cxx_enableOpaquePointers(C);
-        }
-    }
-    return C;
-}
-
-static inline LLVMTypeRef LLVMPointerTypeInContext(LLVMContextRef C, unsigned AddressSpace) {
-    g_llvm.ensureLoaded();
-    if (g_llvm.p_LLVMPointerTypeInContext)
-        return g_llvm.p_LLVMPointerTypeInContext(C, AddressSpace);
-    return g_llvm.p_LLVMPointerType(g_llvm.p_LLVMInt8TypeInContext(C), AddressSpace);
-}
 
 struct LifterConfig {
     bool is_libcpp = false;
@@ -2301,19 +2013,19 @@ public:
                             if (rcpc_info.size < 2) {
                                 val = B->cast("trunc", val, mty_t, "stlur_tr");
                             }
-                            B->CreateAtomicStore(mty_t, val, ptr_v, 1U << rcpc_info.size, llvm::AtomicOrdering::Release);
+                            B->CreateAtomicStore(mty_t, val, ptr_v, 1U << rcpc_info.size, ultrs::llvm_compat::AtomicOrdering::Release);
                         } else if (rcpc_info.opc == 1) {
-                            IRValue lv = B->CreateAtomicLoad(mty_t, ptr_v, 1U << rcpc_info.size, llvm::AtomicOrdering::Acquire);
+                            IRValue lv = B->CreateAtomicLoad(mty_t, ptr_v, 1U << rcpc_info.size, ultrs::llvm_compat::AtomicOrdering::Acquire);
                             if (rcpc_info.size < 2) {
                                 lv = B->cast("zext", lv, IRType::Int32, "ldapur_zx");
                             }
                             storeGpr(rcpc_info.rt, lv, rcpc_info.size == 3);
                         } else if (rcpc_info.opc == 2 && rcpc_info.size < 3) {
-                            IRValue lv = B->CreateAtomicLoad(mty_t, ptr_v, 1U << rcpc_info.size, llvm::AtomicOrdering::Acquire);
+                            IRValue lv = B->CreateAtomicLoad(mty_t, ptr_v, 1U << rcpc_info.size, ultrs::llvm_compat::AtomicOrdering::Acquire);
                             IRValue sx = B->cast("sext", lv, IRType::Int64, "ldapurs_sx");
                             storeGpr(rcpc_info.rt, sx, true);
                         } else if (rcpc_info.opc == 3 && rcpc_info.size < 2) {
-                            IRValue lv = B->CreateAtomicLoad(mty_t, ptr_v, 1U << rcpc_info.size, llvm::AtomicOrdering::Acquire);
+                            IRValue lv = B->CreateAtomicLoad(mty_t, ptr_v, 1U << rcpc_info.size, ultrs::llvm_compat::AtomicOrdering::Acquire);
                             IRValue sx = B->cast("sext", lv, IRType::Int32, "ldapursw_sx");
                             storeGpr(rcpc_info.rt, sx, false);
                         }
@@ -2331,7 +2043,7 @@ public:
                         IRValue ptr_v = B->CreateIntToPtr(addr_val, "at_ptr");
                         IRType mty_t = intTypeForBytes(1U << size);
                         if (L == 1) {
-                            IRValue lv = B->CreateAtomicLoad(mty_t, ptr_v, 1U << size, llvm::AtomicOrdering::Acquire);
+                            IRValue lv = B->CreateAtomicLoad(mty_t, ptr_v, 1U << size, ultrs::llvm_compat::AtomicOrdering::Acquire);
                             if (size < 2) {
                                 lv = B->cast("zext", lv, IRType::Int32, "ldar_zx");
                             }
@@ -2341,7 +2053,7 @@ public:
                             if (size < 2) {
                                 val = B->cast("trunc", val, mty_t, "stlr_tr");
                             }
-                            B->CreateAtomicStore(mty_t, val, ptr_v, 1U << size, llvm::AtomicOrdering::Release);
+                            B->CreateAtomicStore(mty_t, val, ptr_v, 1U << size, ultrs::llvm_compat::AtomicOrdering::Release);
                             if (o2 == 0) {
                                 storeGpr(rm, IRValue::imm(IRType::Int32, 0), false);
                             }
@@ -3721,7 +3433,48 @@ public:
         }
 
         // @<prefix>_indirect_dispatch(ptr %c, i64 %target_va)
+        //
+        // The dispatch covers every closure function. Emitting it as a single
+        // switch with ~65k cases produces one enormous function that LLVM
+        // optimizes/codegens very slowly, so split it into bounded-size part
+        // functions and have the top-level dispatcher range-check into them.
         {
+            static constexpr size_t kDispatchPartSize = 1024;
+            std::vector<uint64_t> sorted_funcs(loader.closure_funcs.begin(), loader.closure_funcs.end());
+            std::sort(sorted_funcs.begin(), sorted_funcs.end());
+
+            struct DispatchPart {
+                size_t begin;
+                size_t end;
+                uint64_t lo;
+                uint64_t hi;
+            };
+            std::vector<DispatchPart> parts;
+            for (size_t i = 0; i < sorted_funcs.size(); i += kDispatchPartSize) {
+                size_t j = std::min(i + kDispatchPartSize, sorted_funcs.size());
+                parts.push_back({i, j, cfg.image_base + sorted_funcs[i], cfg.image_base + sorted_funcs[j - 1]});
+            }
+
+            // Emit one bounded-size switch function per part. `noinline` keeps
+            // the parts from being merged back into the top-level dispatcher.
+            for (size_t p = 0; p < parts.size(); ++p) {
+                std::ostringstream fn_ss;
+                fn_ss << "define void @" << cfg.prefix << "_indirect_dispatch_part_" << p
+                      << "(ptr %c, i64 %target_va) noinline nounwind {\nentry:\n"
+                      << "  switch i64 %target_va, label %fallback [ ";
+                for (size_t i = parts[p].begin; i < parts[p].end; ++i) {
+                    uint64_t faddr = sorted_funcs[i];
+                    fn_ss << "i64 " << (cfg.image_base + faddr) << ", label %call_" << hex8(faddr) << " ";
+                }
+                fn_ss << "]\n";
+                for (size_t i = parts[p].begin; i < parts[p].end; ++i) {
+                    uint64_t faddr = sorted_funcs[i];
+                    fn_ss << "call_" << hex8(faddr) << ":\n  call void @" << cfg.prefix << "_sub_" << hex8(faddr) << "(ptr %c)\n  ret void\n";
+                }
+                fn_ss << "fallback:\n  call void @aot_unhandled_plt(ptr %c, i64 %target_va)\n  ret void\n}";
+                M.extra_raw_functions.push_back(fn_ss.str());
+            }
+
             std::ostringstream fn_ss;
             fn_ss << "define void @" << cfg.prefix << "_indirect_dispatch(ptr %c, i64 %target_va) nounwind {\n"
                   << "entry:\n"
@@ -3762,13 +3515,22 @@ public:
                   << "  %desc_addr = load i64, ptr %x0_ptr, align 8\n"
                   << "  %tls_off = call i64 @llvm.mali.bionic.tlsdesc(i64 %desc_addr)\n"
                   << "  store i64 %tls_off, ptr %x0_ptr, align 8\n  ret void\n"
-                  << "dispatch_switch:\n  switch i64 %target_va, label %fallback [ ";
-            for (uint64_t faddr : loader.closure_funcs) {
-                fn_ss << "i64 " << (cfg.image_base + faddr) << ", label %call_" << hex8(faddr) << " ";
+                  << "dispatch_switch:\n";
+            for (size_t p = 0; p < parts.size(); ++p) {
+                if (p != 0) fn_ss << "check_" << p << ":\n";
+                fn_ss << "  %ge_" << p << " = icmp uge i64 %target_va, " << parts[p].lo << "\n"
+                      << "  %le_" << p << " = icmp ule i64 %target_va, " << parts[p].hi << "\n"
+                      << "  %in_" << p << " = and i1 %ge_" << p << ", %le_" << p << "\n"
+                      << "  br i1 %in_" << p << ", label %call_part_" << p << ", label %check_" << (p + 1) << "\n";
             }
-            fn_ss << "]\n";
-            for (uint64_t faddr : loader.closure_funcs) {
-                fn_ss << "call_" << hex8(faddr) << ":\n  call void @" << cfg.prefix << "_sub_" << hex8(faddr) << "(ptr %c)\n  ret void\n";
+            if (parts.empty()) {
+                fn_ss << "  br label %fallback\n";
+            } else {
+                fn_ss << "check_" << parts.size() << ":\n  br label %fallback\n";
+            }
+            for (size_t p = 0; p < parts.size(); ++p) {
+                fn_ss << "call_part_" << p << ":\n  call void @" << cfg.prefix << "_indirect_dispatch_part_" << p
+                      << "(ptr %c, i64 %target_va)\n  ret void\n";
             }
             fn_ss << "fallback:\n  call void @aot_unhandled_plt(ptr %c, i64 %target_va)\n  ret void\n}";
             M.extra_raw_functions.push_back(fn_ss.str());
@@ -3827,12 +3589,20 @@ public:
         mpm.addPass(std::make_unique<ultrs::passes::AArch64SysBarrierLoweringPass>(
             ultrs::passes::LoweringMode::UserspaceBionicSo));
         mpm.addPass(std::make_unique<ultrs::passes::GuestStackAndAlignmentPass>(true));
-        mpm.addPass(std::make_unique<ultrs::passes::NZCVDeadFlagElimPass>(true));
+        // mpm.addPass(std::make_unique<ultrs::passes::NZCVDeadFlagElimPass>(true));
         mpm.run(M);
     }
 
+    // Lift `funcs` into size-bounded chunks and hand each serialized module to
+    // `on_chunk`. `tag_prefix` namespaces the chunk tags so that several
+    // workers can emit into the same output directory concurrently, and only
+    // the worker that owns the runtime/wrapper chunk passes emit_wrappers=true.
     template <typename ChunkCallback>
-    void generateChunkedModules(size_t chunk_limit_bytes, ChunkCallback &&on_chunk) {
+    void generateChunkedModulesRange(const std::vector<uint64_t> &funcs,
+                                     size_t chunk_limit_bytes,
+                                     const std::string &tag_prefix,
+                                     bool emit_wrappers,
+                                     ChunkCallback &&on_chunk) {
         size_t chunk_idx = 0;
         size_t funcs_done = 0;
         const size_t total_funcs = loader.closure_funcs.size();
@@ -3844,19 +3614,24 @@ public:
             if (chunk_funcs.empty()) return;
             populateModuleHeader(*cur_mod, chunk_funcs, false);
             runHorizonLoweringPasses(*cur_mod);
-            std::string full_ir = cur_mod->serialize();
-            char tag[32];
-            std::snprintf(tag, sizeof(tag), "chunk_%02zu", chunk_idx++);
-            on_chunk(tag, std::move(full_ir), funcs_done, total_funcs);
+            char tag[64];
+            std::snprintf(tag, sizeof(tag), "%schunk_%02zu", tag_prefix.c_str(), chunk_idx++);
+            on_chunk(tag, *cur_mod, funcs_done, total_funcs);
             chunk_funcs.clear();
             called_guest_fns.clear();
             approx_ir_bytes = 0;
             cur_mod = std::make_unique<IRModule>(cfg.prefix + "_chunk", "x86_64-pc-linux-gnu");
         };
 
-        for (uint64_t faddr : loader.closure_funcs) {
+        for (uint64_t faddr : funcs) {
             IRFunction *fn = cur_mod->create_function(cfg.prefix + "_sub_" + hex8(faddr), faddr, faddr + 4);
             liftFunction(faddr, *cur_mod, fn);
+            // The lowering passes and serialize() only read the textual
+            // Instruction/Value representation, so the per-function SSA name ->
+            // llvm::Value* map and synthetic SSA/literal values are dead weight
+            // once lifting finishes.
+            fn->ssa_values.clear();
+            fn->synthetic_ssa_vals.clear();
             size_t fn_est = 0;
             for (const auto &bb : fn->blocks) fn_est += bb->insts.size() * 64;
             approx_ir_bytes += fn_est;
@@ -3868,13 +3643,21 @@ public:
         }
         flush_func_chunk();
 
-        // Emit runtime/wrapper chunk
-        std::set<uint64_t> empty_defs;
-        IRModule wrap_mod(cfg.prefix + "_wrappers", "x86_64-pc-linux-gnu");
-        populateModuleHeader(wrap_mod, empty_defs, true);
-        buildWrappersAndRuntime(wrap_mod);
-        runHorizonLoweringPasses(wrap_mod);
-        on_chunk("wrappers", wrap_mod.serialize(), total_funcs, total_funcs);
+        if (emit_wrappers) {
+            // Emit runtime/wrapper chunk
+            std::set<uint64_t> empty_defs;
+            IRModule wrap_mod(cfg.prefix + "_wrappers", "x86_64-pc-linux-gnu");
+            populateModuleHeader(wrap_mod, empty_defs, true);
+            buildWrappersAndRuntime(wrap_mod);
+            runHorizonLoweringPasses(wrap_mod);
+            on_chunk("wrappers", wrap_mod, total_funcs, total_funcs);
+        }
+    }
+
+    template <typename ChunkCallback>
+    void generateChunkedModules(size_t chunk_limit_bytes, ChunkCallback &&on_chunk) {
+        generateChunkedModulesRange(loader.closure_funcs, chunk_limit_bytes, "", true,
+                                    std::forward<ChunkCallback>(on_chunk));
     }
 };
 
@@ -4146,7 +3929,7 @@ static int runLoweringAndCodegenOnModule(LLVMModuleRef M, const char *outPath, b
     printf("  Bionic PLT64 calls     : %d (External/Vendor stubs: %d, /dev/mali0 kbase UAPI: %d)\n",
            stats.bionic_plt_lowered, stats.external_stubs_lowered, stats.kbase_uapi_lowered);
 
-    if (LLVMVerifyModule(M, LLVMVerifierFailureActionReturnStatus, &errMsg) != 0) {
+    if (LLVMVerifyModule(M, LLVMReturnStatusAction, &errMsg) != 0) {
         fprintf(stderr, "Module Verification Failed after lowering passes:\n%s\n", errMsg ? errMsg : "");
         return 1;
     }
@@ -4160,7 +3943,7 @@ static int runLoweringAndCodegenOnModule(LLVMModuleRef M, const char *outPath, b
     }
     const char *env_o2 = std::getenv("MALI_AOT_FULL_O2");
     bool full_o2 = (env_o2 && std::strcmp(env_o2, "1") == 0);
-    LLVMTargetMachineRef tm = LLVMCreateTargetMachine(target, triple, "x86-64-v3", "", full_o2 ? 3 : 1, 2, 0);
+    LLVMTargetMachineRef tm = LLVMCreateTargetMachine(target, triple, "x86-64-v3", "", full_o2 ? LLVMCodeGenLevelAggressive : LLVMCodeGenLevelLess, LLVMRelocPIC, LLVMCodeModelDefault);
 
     if (runO2) {
         LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
@@ -4191,7 +3974,7 @@ static int runLoweringAndCodegenOnModule(LLVMModuleRef M, const char *outPath, b
         }
         printf("[LLVM Passes] Emitted lowered LLVM IR to %s\n", outPath);
     } else {
-        if (LLVMTargetMachineEmitToFile(tm, M, const_cast<char *>(outPath), 1, &errMsg) != 0) {
+        if (LLVMTargetMachineEmitToFile(tm, M, const_cast<char *>(outPath), LLVMObjectFile, &errMsg) != 0) {
             fprintf(stderr, "EmitToFile error: %s\n", errMsg ? errMsg : "");
             return 1;
         }
@@ -4453,108 +4236,181 @@ int mali_llvm_passes_main(int argc, char **argv) {
                instrumentCalls ? 1 : 0, chunk_mb, jobs);
 
         std::vector<std::string> chunk_objs;
-        std::vector<pid_t> active_pids;
         size_t total_ir_bytes = 0;
         int rc = 0;
-
-        auto reap_one = [&]() {
-            int status = 0;
-            pid_t done = waitpid(-1, &status, 0);
-            if (done > 0) {
-                active_pids.erase(std::remove(active_pids.begin(), active_pids.end(), done), active_pids.end());
-                if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-                    rc = 1;
-                }
-            }
-        };
+        int stat_total_instructions = 0;
+        int stat_jump_tables = 0;
+        int stat_simd_ops = 0;
+        int stat_crypto_sha1 = 0;
+        int stat_atomics = 0;
 
         std::vector<std::string> emitted_ll_files;
         {
-            AArch64ToLLVMIRLiftingPass lifter(loader, cfg, plt_index_map, instrumentCalls);
-            size_t chunk_num = 0;
-            lifter.generateChunkedModules(chunk_limit_bytes, [&](const std::string &tag, std::string irText, size_t funcs_done, size_t total_funcs) {
-                if (rc != 0) return;
-                chunk_num++;
-                total_ir_bytes += irText.size();
-                std::string chunkUnopt = outDir + "/" + cfg.prefix + "_" + tag + "_unopt.ll";
-                std::string chunkOpt   = outDir + "/" + cfg.prefix + "_" + tag + "_opt.ll";
-                std::string chunkObj   = outDir + "/" + cfg.prefix + "_" + tag + ".o";
-                double pct = total_funcs ? (100.0 * static_cast<double>(funcs_done) / static_cast<double>(total_funcs)) : 100.0;
-                printf("  [Chunk %s (#%zu) | %zu/%zu funcs (%.1f%%)] %zu bytes IR -> %s\n",
-                       tag.c_str(), chunk_num, funcs_done, total_funcs, pct, irText.size(),
-                       emitLlOnly ? chunkUnopt.c_str() : chunkObj.c_str());
-                std::fflush(stdout);
+            // Split the closure into per-worker slices so that lifting,
+            // serialization and .ll emission run in parallel across processes.
+            // Each worker owns a disjoint set of functions and emits its own
+            // namespaced chunks (w<id>_chunk_NN), so no output file collides.
+            const size_t nworkers = jobs > 1 ? jobs : 1;
+            std::vector<std::vector<uint64_t>> slices(nworkers);
+            for (size_t i = 0; i < loader.closure_funcs.size(); ++i) {
+                slices[i % nworkers].push_back(loader.closure_funcs[i]);
+            }
 
-                if (emitLlOnly || keep_ll) {
-                    std::ofstream out(chunkUnopt);
-                    out.write(irText.data(), static_cast<std::streamsize>(irText.size()));
-                    std::string().swap(irText);
-                    if (emitLlOnly) {
-                        emitted_ll_files.push_back(chunkUnopt);
-                        return;
-                    }
+            auto chunk_paths = [&](const std::string &tag, std::string &unopt, std::string &opt, std::string &obj) {
+                unopt = outDir + "/" + cfg.prefix + "_" + tag + "_unopt.ll";
+                opt   = outDir + "/" + cfg.prefix + "_" + tag + "_opt.ll";
+                obj   = outDir + "/" + cfg.prefix + "_" + tag + ".o";
+            };
+
+            auto compile_chunk = [&](const std::string &tag, const std::string &chunkUnopt,
+                                     const std::string &chunkOpt, const std::string &chunkObj) -> int {
+                LLVMMemoryBufferRef memBuf = nullptr;
+                char *errMsg = nullptr;
+                if (LLVMCreateMemoryBufferWithContentsOfFile(chunkUnopt.c_str(), &memBuf, &errMsg) != 0) {
+                    fprintf(stderr, "Error reading %s: %s\n", chunkUnopt.c_str(), errMsg ? errMsg : "unknown");
+                    return 1;
                 }
 
-                auto compile_chunk = [&]() -> int {
-                    LLVMMemoryBufferRef memBuf = nullptr;
-                    char *errMsg = nullptr;
-                    if (keep_ll) {
-                        if (LLVMCreateMemoryBufferWithContentsOfFile(chunkUnopt.c_str(), &memBuf, &errMsg) != 0) {
-                            fprintf(stderr, "Error reading %s: %s\n", chunkUnopt.c_str(), errMsg ? errMsg : "unknown");
-                            return 1;
-                        }
-                    } else {
-                        memBuf = LLVMCreateMemoryBufferWithMemoryRangeCopy(irText.data(), irText.size(), chunkUnopt.c_str());
-                        std::string().swap(irText);
-                    }
-
-                    LLVMContextRef C = LLVMContextCreate();
-                    LLVMModuleRef M = nullptr;
-                    if (LLVMParseIRInContext(C, memBuf, &M, &errMsg) != 0) {
-                        fprintf(stderr, "LLVM IR Parse Error (%s): %s\n", tag.c_str(), errMsg ? errMsg : "unknown");
-                        LLVMContextDispose(C);
-                        return 1;
-                    }
-                    int crc = runLoweringAndCodegenOnModule(M, chunkObj.c_str(), false, true, keep_ll ? chunkOpt.c_str() : nullptr);
-                    LLVMDisposeModule(M);
+                LLVMContextRef C = LLVMContextCreate();
+                LLVMModuleRef M = nullptr;
+                if (LLVMParseIRInContext(C, memBuf, &M, &errMsg) != 0) {
+                    fprintf(stderr, "LLVM IR Parse Error (%s): %s\n", tag.c_str(), errMsg ? errMsg : "unknown");
                     LLVMContextDispose(C);
-                    return crc;
-                };
+                    return 1;
+                }
+                int crc = runLoweringAndCodegenOnModule(M, chunkObj.c_str(), false, true, keep_ll ? chunkOpt.c_str() : nullptr);
+                LLVMDisposeModule(M);
+                LLVMContextDispose(C);
+                return crc;
+            };
 
-                if (jobs <= 1) {
-                    int crc = compile_chunk();
-                    if (crc != 0) rc = crc;
-                    else chunk_objs.push_back(chunkObj);
-                } else {
-                    while (active_pids.size() >= jobs && rc == 0) {
-                        reap_one();
-                    }
-                    if (rc != 0) return;
+            // Lift one slice of the closure and emit its chunks. Returns 0 on
+            // success; produced .ll/.o paths are appended to ll_out/obj_out and
+            // a compact stats line is written to stats_line.
+            auto run_worker = [&](size_t wid, const std::vector<uint64_t> &slice,
+                                  std::vector<std::string> &ll_out,
+                                  std::vector<std::string> &obj_out,
+                                  std::string &stats_line) -> int {
+                AArch64ToLLVMIRLiftingPass lifter(loader, cfg, plt_index_map, instrumentCalls);
+                const std::string tag_prefix = (nworkers > 1) ? ("w" + std::to_string(wid) + "_") : "";
+                int wrc = 0;
+                size_t worker_ir_bytes = 0;
+                lifter.generateChunkedModulesRange(slice, chunk_limit_bytes, tag_prefix, wid == 0,
+                    [&](const std::string &tag, const ultrs::llvm_ir::Module &mod, size_t funcs_done, size_t total_funcs) {
+                        if (wrc != 0) return;
+                        std::string chunkUnopt, chunkOpt, chunkObj;
+                        chunk_paths(tag, chunkUnopt, chunkOpt, chunkObj);
+                        // Stream the IR straight to disk instead of materializing
+                        // a full std::string copy of the chunk in memory.
+                        size_t irBytes = mod.serialize_to_file(chunkUnopt);
+                        if (irBytes == 0) {
+                            fprintf(stderr, "Error writing %s\n", chunkUnopt.c_str());
+                            wrc = 1;
+                            return;
+                        }
+                        worker_ir_bytes += irBytes;
+                        double pct = total_funcs ? (100.0 * static_cast<double>(funcs_done) / static_cast<double>(total_funcs)) : 100.0;
+                        printf("  [Chunk %s | %zu/%zu funcs (%.1f%%)] %zu bytes IR -> %s\n",
+                               tag.c_str(), funcs_done, total_funcs, pct, irBytes,
+                               emitLlOnly ? chunkUnopt.c_str() : chunkObj.c_str());
+                        std::fflush(stdout);
+
+                        if (emitLlOnly) {
+                            ll_out.push_back(chunkUnopt);
+                            return;
+                        }
+
+                        int crc = compile_chunk(tag, chunkUnopt, chunkOpt, chunkObj);
+                        if (crc != 0) {
+                            wrc = crc;
+                        } else {
+                            obj_out.push_back(chunkObj);
+                            if (!keep_ll) std::remove(chunkUnopt.c_str());
+                        }
+                    });
+
+                char sbuf[256];
+                std::snprintf(sbuf, sizeof(sbuf), "%d %d %d %d %d %zu",
+                              lifter.stats.total_instructions, lifter.stats.jump_tables_lowered,
+                              lifter.stats.simd_ops_lifted, lifter.stats.crypto_sha1_lifted,
+                              lifter.stats.atomic_ops_lifted, worker_ir_bytes);
+                stats_line = sbuf;
+                return wrc;
+            };
+
+            auto accumulate_stats = [&](const std::string &stats_line) {
+                int ti = 0, jt = 0, so = 0, cs = 0, ao = 0;
+                size_t tib = 0;
+                if (std::sscanf(stats_line.c_str(), "%d %d %d %d %d %zu", &ti, &jt, &so, &cs, &ao, &tib) == 6) {
+                    stat_total_instructions += ti;
+                    stat_jump_tables += jt;
+                    stat_simd_ops += so;
+                    stat_crypto_sha1 += cs;
+                    stat_atomics += ao;
+                    total_ir_bytes += tib;
+                }
+            };
+
+            if (nworkers == 1) {
+                std::string stats_line;
+                int wrc = run_worker(0, slices[0], emitted_ll_files, chunk_objs, stats_line);
+                accumulate_stats(stats_line);
+                if (wrc != 0) rc = wrc;
+            } else {
+                std::vector<pid_t> pids;
+                for (size_t w = 0; w < nworkers; ++w) {
                     std::fflush(stdout);
                     std::fflush(stderr);
                     pid_t pid = fork();
                     if (pid < 0) {
                         perror("fork");
                         rc = 1;
-                        return;
+                        break;
                     }
                     if (pid == 0) {
-                        int crc = compile_chunk();
+                        std::vector<std::string> ll_out, obj_out;
+                        std::string stats_line;
+                        int wrc = run_worker(w, slices[w], ll_out, obj_out, stats_line);
+                        std::string mfPath = outDir + "/" + cfg.prefix + "_worker_" + std::to_string(w) + ".manifest";
+                        std::ofstream mf(mfPath);
+                        mf << "#stats " << stats_line << "\n";
+                        for (const auto &p : ll_out) mf << p << "\n";
+                        for (const auto &p : obj_out) mf << p << "\n";
+                        mf.close();
                         std::fflush(stdout);
                         std::fflush(stderr);
-                        _exit(crc);
+                        _exit(wrc);
                     }
-                    std::string().swap(irText);
-                    active_pids.push_back(pid);
-                    chunk_objs.push_back(chunkObj);
+                    pids.push_back(pid);
                 }
-            });
-            while (!active_pids.empty()) {
-                reap_one();
+                for (pid_t pid : pids) {
+                    int status = 0;
+                    if (waitpid(pid, &status, 0) > 0) {
+                        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) rc = 1;
+                    }
+                }
+                for (size_t w = 0; w < nworkers; ++w) {
+                    std::string mfPath = outDir + "/" + cfg.prefix + "_worker_" + std::to_string(w) + ".manifest";
+                    std::ifstream mf(mfPath);
+                    std::string line;
+                    while (std::getline(mf, line)) {
+                        if (line.empty()) continue;
+                        if (line.rfind("#stats ", 0) == 0) {
+                            accumulate_stats(line.substr(7));
+                        } else if (emitLlOnly) {
+                            emitted_ll_files.push_back(line);
+                        } else {
+                            chunk_objs.push_back(line);
+                        }
+                    }
+                    std::remove(mfPath.c_str());
+                }
             }
+
             printf("  Lifted instructions : %d (%d PIC jump tables, %d SIMD ops, %d Crypto SHA-1 ops, %d Atomics, total_ir=%zu bytes across %zu chunks)\n",
-                   lifter.stats.total_instructions, lifter.stats.jump_tables_lowered, lifter.stats.simd_ops_lifted,
-                   lifter.stats.crypto_sha1_lifted, lifter.stats.atomic_ops_lifted, total_ir_bytes, chunk_objs.size());
+                   stat_total_instructions, stat_jump_tables, stat_simd_ops,
+                   stat_crypto_sha1, stat_atomics, total_ir_bytes,
+                   emitLlOnly ? emitted_ll_files.size() : chunk_objs.size());
         }
         if (rc != 0) return rc;
 
@@ -4615,4 +4471,3 @@ int mali_llvm_passes_main(int argc, char **argv) {
     LLVMContextDispose(C);
     return rc;
 }
-

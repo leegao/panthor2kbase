@@ -1,9 +1,8 @@
-// Unified Horizon2LLVM Dynamic LLVM Backend Bridge (src/aot/horizon2llvm/llvm_backend.hpp)
+// Unified Horizon2LLVM Static LLVM-21 Backend Bridge (src/aot/horizon2llvm/llvm_backend.hpp)
 //
-// Dynamically loads host `libLLVM*.so` via `dlopen` / `dlsym` (requiring zero external
-// llvm-dev C/C++ headers at build time) to invoke LLVM's in-process IR Parser, Verifier,
-// New Pass Manager optimizer (`LLVMRunPasses`), Bitcode Writer, native TargetMachine
-// Object File emitter, and AArch64 MCDisassembler.
+// Directly links against pinned LLVM-21 static libraries to invoke LLVM's in-process
+// IR Parser, Verifier, New Pass Manager optimizer (`LLVMRunPasses`), Bitcode Writer,
+// native TargetMachine Object File emitter, and AArch64 MCDisassembler.
 #pragma once
 
 #include <cstdint>
@@ -33,9 +32,9 @@ class LibLLVM {
 public:
     static LibLLVM& instance();
 
-    bool available() const { return handle_ != nullptr || default_lookup_; }
-    void* raw_handle() const { return handle_; }
-    bool uses_default_lookup() const { return default_lookup_; }
+    bool available() const { return true; }
+    void* raw_handle() const { return nullptr; }
+    bool uses_default_lookup() const { return true; }
     const std::string& loaded_path() const { return loaded_path_; }
 
     bool process_ir(const std::string& ir_text, const std::string& module_id,
@@ -59,9 +58,7 @@ private:
     LibLLVM(const LibLLVM&) = delete;
     LibLLVM& operator=(const LibLLVM&) = delete;
 
-    void* handle_ = nullptr;
-    bool default_lookup_ = false;
-    std::string loaded_path_;
+    std::string loaded_path_ = "static-llvm-21";
 };
 
 } // namespace ultrs::llvm_backend

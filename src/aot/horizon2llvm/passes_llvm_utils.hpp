@@ -63,6 +63,18 @@ public:
                                                 llvm::GlobalValue::ExternalLinkage, nullptr, gname);
             }
         }
+        if (!repr.empty() && repr[0] == '<') {
+#if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS)
+            return llvm::Constant::getNullValue(ty);
+#else
+            // Preserve vector literal text (e.g. "<i32 31, i32 31, i32 31, i32 31>")
+            // instead of falling through to std::stoull() / zeroinitializer.
+            auto lit = std::make_unique<llvm::Value>(ty, repr);
+            llvm::Value* ptr = lit.get();
+            fn_.synthetic_ssa_vals.push_back(std::move(lit));
+            return ptr;
+#endif
+        }
         if (!repr.empty() && repr[0] != '%') {
             if (tk == TypeKind::Float || tk == TypeKind::Double) {
                 return llvm::ConstantFP::get(ty, std::stod(repr));

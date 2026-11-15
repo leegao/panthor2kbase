@@ -19,42 +19,9 @@ elif [ -f "$REPO_ROOT/$SO_ARG" ]; then
     SO_PATH="$(realpath "$REPO_ROOT/$SO_ARG")"
 fi
 
-# Auto-detect installed host libLLVM shared library across Arch, Ubuntu, Debian, Fedora (LLVM 14..22+)
-detect_host_libllvm() {
-    if [ -n "${MALI_HOST_LIBLLVM:-}" ] && [ -f "${MALI_HOST_LIBLLVM}" ]; then
-        echo "${MALI_HOST_LIBLLVM}"
-        return 0
-    fi
-    for cfg in llvm-config llvm-config-22 llvm-config-21 llvm-config-20 llvm-config-19 llvm-config-18 llvm-config-17 llvm-config-16 llvm-config-15 llvm-config-14; do
-        if command -v "$cfg" >/dev/null 2>&1; then
-            local libdir
-            libdir="$("$cfg" --libdir 2>/dev/null || true)"
-            if [ -n "$libdir" ] && [ -d "$libdir" ]; then
-                local found
-                found="$(ls -1 "$libdir"/libLLVM*.so* 2>/dev/null | head -n 1 || true)"
-                if [ -n "$found" ]; then
-                    echo "$found"
-                    return 0
-                fi
-            fi
-        fi
-    done
-    local cand
-    cand="$(ls -1 /usr/lib/libLLVM*.so* /usr/lib64/libLLVM*.so* /usr/lib/x86_64-linux-gnu/libLLVM*.so* /usr/lib/llvm-*/lib/libLLVM*.so* 2>/dev/null | sort -V | tail -n 1 || true)"
-    if [ -n "$cand" ]; then
-        echo "$cand"
-        return 0
-    fi
-    return 1
-}
-
-HOST_LIBLLVM="$(detect_host_libllvm || true)"
-if [ -n "$HOST_LIBLLVM" ]; then
-    export MALI_HOST_LIBLLVM="$HOST_LIBLLVM"
-    echo "[LLVM] Auto-detected host LLVM library: $MALI_HOST_LIBLLVM"
-else
-    echo "[WARN] No host libLLVM*.so* detected in standard paths; horizon2llvm will probe via dlopen()."
-fi
+# Pinned static LLVM-21 headers & libraries in third_party/
+LLVM21_INC_DIR="$REPO_ROOT/third_party/prebuilts/llvm-21/includes"
+LLVM21_LIB_DIR="$REPO_ROOT/third_party/prebuilts/llvm-21/lib"
 
 ELF_TAG="r54p3-00eac0-6eda07"
 if [ -n "$SO_PATH" ] && [ -f "$SO_PATH" ]; then
@@ -110,7 +77,7 @@ fi
 if [ "$NEEDS_REBUILD" -eq 1 ]; then
     PASS_DRIVER="$OUT_DIR/horizon2llvm"
     echo "[Build] Compiling unified horizon2llvm -> $PASS_DRIVER..."
-    g++ -std=c++20 -O3 -I"$ROOT_DIR/horizon2llvm" \
+    g++ -std=c++20 -O3 -I"$ROOT_DIR/horizon2llvm" -I"$REPO_ROOT/third_party/prebuilts/llvm-21/include" -I"$LLVM21_INC_DIR" \
         "$ROOT_DIR/horizon2llvm/main.cpp" \
         "$ROOT_DIR/horizon2llvm/mali_llvm_passes.cpp" \
         "$ROOT_DIR/horizon2llvm/ko_lifter.cpp" \
@@ -118,14 +85,15 @@ if [ "$NEEDS_REBUILD" -eq 1 ]; then
         "$ROOT_DIR/horizon2llvm/aarch64/aarch64_lifter.cpp" \
         "$ROOT_DIR/horizon2llvm/passes.cpp" \
         "$ROOT_DIR"/horizon2llvm/lowering/*.cpp \
-        -ldl -lpthread -lm -o "$PASS_DRIVER"
+        -Wl,--start-group "$LLVM21_LIB_DIR"/*.a -Wl,--end-group \
+        -lz -l:libzstd.so.1 -ldl -lpthread -lm -o "$PASS_DRIVER"
 fi
 
 echo "================================================================================"
 echo " Mali 64-Bit AArch64 -> x86-64 Linux C++ LLVM 6-Pass AOT Translation Pipeline"
 echo " Input Binary   : ${SO_PATH:-(prebuilt $OUT_DIR/r54p3_lifted.o)}"
 echo " Driver Build   : $ELF_TAG (64-bit ELF64 EM_AARCH64)"
-echo " Host libLLVM   : ${MALI_HOST_LIBLLVM:-dynamic dlopen}"
+echo " LLVM Backend   : Static LLVM-21 (third_party/prebuilts/llvm-21)"
 echo " Output Dir     : $OUT_DIR"
 echo "================================================================================"
 
@@ -142,10 +110,10 @@ fi
 if [ -f "$OUT_DIR/r54p3_lifted.o" ] && [ "${MALI_AOT_FORCE_RELIFT:-0}" != "1" ] && [ "$STAMP_OK" -eq 1 ] && [ "$OUT_DIR/r54p3_lifted.o" -nt "$PASS_DRIVER" ] && [ "$OUT_DIR/r54p3_lifted.o" -nt "$ROOT_DIR/horizon2llvm/mali_llvm_passes.cpp" ]; then
     echo "[Cache] Reusing up-to-date $OUT_DIR/r54p3_lifted.o (set MALI_AOT_FORCE_RELIFT=1 to force full re-lift)"
 elif [ -n "$SO_PATH" ] && [ -f "$SO_PATH" ]; then
-    export MALI_AOT_CHUNK_MB="${MALI_AOT_CHUNK_MB:-100}"
-    export MALI_AOT_JOBS="${MALI_AOT_JOBS:-$(nproc 2>/dev/null || echo 2)}"
+    export MALI_AOT_CHUNK_MB="${MALI_AOT_CHUNK_MB:-50}"
     export MALI_AOT_KEEP_LL="${MALI_AOT_KEEP_LL:-0}"
-    "$PASS_DRIVER" --lift-so "$SO_PATH" "$OUT_DIR" --hook-Vulkan-calls --emit-ll-only
+    MALI_AOT_JOBS=4 "$PASS_DRIVER" --lift-so "$SO_PATH" "$OUT_DIR" --hook-Vulkan-calls --emit-ll-only
+    export MALI_AOT_JOBS="20"
     "$PASS_DRIVER" --compile-ll-dir "$OUT_DIR/aot_ll_manifest.txt" "$OUT_DIR/r54p3_lifted.o" -j "$MALI_AOT_JOBS"
     if [ -n "$CUR_STAMP" ]; then
         echo "$CUR_STAMP" > "$STAMP_FILE"
@@ -156,7 +124,15 @@ elif [ ! -f "$OUT_DIR/r54p3_lifted.o" ]; then
 fi
 
 if [ "${MALI_AOT_KEEP_LL:-0}" = "0" ]; then
-    rm -f "$OUT_DIR/mali_mbs2_unopt.ll" "$OUT_DIR/mali_mbs2_opt.ll" "$OUT_DIR"/mali_mbs2_chunk_*.ll "$OUT_DIR"/mali_mbs2_wrappers_*.ll
+    # Chunk IR is named aot_chunk_NN_unopt.ll (jobs=1) or aot_w<id>_chunk_NN_unopt.ll
+    # (jobs>1); the backend may also leave <chunk>.ll.opt.ll / <chunk>.ll.o behind.
+    rm -f "$OUT_DIR"/aot_*_unopt.ll \
+          "$OUT_DIR"/aot_*_opt.ll \
+          "$OUT_DIR"/aot_*.ll.opt.ll \
+          "$OUT_DIR"/aot_worker_*.manifest \
+          "$OUT_DIR/aot_ll_manifest.txt" \
+          "$OUT_DIR/mali_mbs2_unopt.ll" "$OUT_DIR/mali_mbs2_opt.ll" \
+          "$OUT_DIR"/mali_mbs2_chunk_*.ll "$OUT_DIR"/mali_mbs2_wrappers_*.ll
 fi
 
 echo "================================================================================"

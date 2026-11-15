@@ -7,22 +7,11 @@ BUILD_DIR := $(THIS_DIR)/build
 OBJ_DIR := $(BUILD_DIR)/lifter_obj
 RUNTIME_DIR := $(LIFTER_DIR)/runtime
 
-ifneq ($(wildcard $(LIFTER_DIR)/third-party/llvm/llvm/include),)
-LLVM_DIR := $(LIFTER_DIR)/third-party/llvm/llvm
-else
-LLVM_DIR := $(LIFTER_DIR)/third-party/llvm
-endif
-LLVM_INC := -I$(LLVM_DIR)/include -I$(LLVM_DIR)/include/llvm -I$(LIFTER_DIR)/third-party/llvm/include -I$(LIFTER_DIR)/third-party/llvm/include/llvm
-LLVM_LIB_DIR := $(LLVM_DIR)/prebuilts/x86-64
-LLVM_LIB := $(LLVM_LIB_DIR)/libLLVM.so
-
-ifneq ($(shell which llvm-config 2>/dev/null),)
-LLVM_INC := $(shell llvm-config --cxxflags)
-LLVM_LIB := $(shell llvm-config --libs core engine scalaropts passes bitwriter native)
-LLVM_LIB_FLAG := $(shell llvm-config --ldflags)
-else
-LLVM_LIB_FLAG := -Wl,-rpath,$(LLVM_LIB_DIR)
-endif
+REPO_ROOT_3P := $(abspath $(LIFTER_DIR)/../../..)
+LLVM_INC := -I$(REPO_ROOT_3P)/third_party/prebuilts/llvm-21/include
+LLVM_LIB_DIR := $(REPO_ROOT_3P)/third_party/prebuilts/llvm-21/lib
+LLVM_LIB := -Wl,--start-group $(wildcard $(LLVM_LIB_DIR)/*.a) -Wl,--end-group
+LLVM_LIB_FLAG := -lz -l:libzstd.so.1
 
 CXX ?= g++
 CC ?= gcc
