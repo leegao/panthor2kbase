@@ -70,6 +70,7 @@
 #include <dlfcn.h>
 #include <mutex>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -4287,6 +4288,40 @@ int mali_jit_init_session(const char *so_path, const char *cache_dir) {
     sess.cache_dir = (cache_dir && cache_dir[0]) ? cache_dir : "build-x86-64/jit_cache";
     ::mkdir(sess.cache_dir.c_str(), 0755);
 
+    // Validate persistent JIT cache against current r54p3_lifted.o.stamp
+    {
+        std::string cur_stamp;
+        std::ifstream st_in("build-x86-64/r54p3_lifted.o.stamp");
+        if (st_in) {
+            std::getline(st_in, cur_stamp);
+        } else {
+            struct stat st_buf {};
+            if (::stat(sess.so_path.c_str(), &st_buf) == 0) {
+                cur_stamp = std::to_string(st_buf.st_size) + ":" + std::to_string(st_buf.st_mtime);
+            }
+        }
+        std::string stamp_file = sess.cache_dir + "/.aot_stamp";
+        std::string prev_stamp;
+        {
+            std::ifstream sp_in(stamp_file);
+            if (sp_in) std::getline(sp_in, prev_stamp);
+        }
+        if (!cur_stamp.empty() && cur_stamp != prev_stamp) {
+            if (DIR *dp = ::opendir(sess.cache_dir.c_str())) {
+                while (struct dirent *de = ::readdir(dp)) {
+                    if (std::strncmp(de->d_name, "jit_rva_", 8) == 0 ||
+                        std::strncmp(de->d_name, "jit_batch_", 10) == 0) {
+                        std::string full = sess.cache_dir + "/" + de->d_name;
+                        std::remove(full.c_str());
+                    }
+                }
+                ::closedir(dp);
+            }
+            std::ofstream sp_out(stamp_file);
+            if (sp_out) sp_out << cur_stamp << "\n";
+        }
+    }
+
     if (!sess.loader.loadAndPrepareOnly(sess.so_path, 0x400000000ULL, false)) {
         fprintf(stderr, "[MALI_JIT] Failed to load ELF64 image from %s\n", sess.so_path.c_str());
         return -1;
@@ -4348,6 +4383,41 @@ int mali_jit_compile_subgraph(
     auto t0 = std::chrono::steady_clock::now();
     if (max_batch_funcs < 1) max_batch_funcs = 1;
     if (max_depth < 0) max_depth = 0;
+
+    // Fast path: reuse persistent cached .so for this root_rva if valid
+    const char *no_cache_env = std::getenv("MALI_AOT_JIT_NO_CACHE");
+    if (!no_cache_env || std::strcmp(no_cache_env, "1") != 0) {
+        std::string rva_hex = AArch64ToLLVMIRLiftingPass::hex8(root_rva);
+        std::string cached_so = sess.cache_dir + "/jit_rva_" + rva_hex + ".so";
+        std::string cached_fn = sess.cache_dir + "/jit_rva_" + rva_hex + ".funcs";
+        std::ifstream fn_in(cached_fn);
+        if (fn_in && ::access(cached_so.c_str(), R_OK) == 0) {
+            void *dlh = dlopen(cached_so.c_str(), RTLD_NOW | RTLD_LOCAL);
+            if (dlh) {
+                sess.loaded_batch_handles.push_back(dlh);
+                int reg = 0;
+                std::string line;
+                while (std::getline(fn_in, line)) {
+                    if (line.empty()) continue;
+                    uint64_t faddr = std::strtoull(line.c_str(), nullptr, 16);
+                    if (faddr == 0) continue;
+                    if (query_rva_status && query_rva_status(faddr, user) != 0) continue;
+                    std::string sym = "aot_sub_" + AArch64ToLLVMIRLiftingPass::hex8(faddr);
+                    void *fn_ptr = dlsym(dlh, sym.c_str());
+                    if (fn_ptr && on_compiled) {
+                        const char *fname = nullptr;
+                        uint32_t fsz = 0;
+                        mali_jit_get_func_info(faddr, &fname, &fsz);
+                        on_compiled(faddr, fn_ptr, fname ? fname : sym.c_str(), fsz, user);
+                        reg++;
+                    }
+                }
+                if (reg > 0) {
+                    return reg;
+                }
+            }
+        }
+    }
 
     std::vector<uint64_t> batch_funcs;
     std::set<uint64_t> batch_set;
@@ -4494,8 +4564,9 @@ int mali_jit_compile_subgraph(
 
     uint32_t bid = ++sess.batch_counter;
     char base_name[128];
-    std::snprintf(base_name, sizeof(base_name), "jit_batch_%04u_%08" PRIx64, bid, root_rva);
+    std::snprintf(base_name, sizeof(base_name), "jit_rva_%08" PRIx64, root_rva);
     std::string so_path = sess.cache_dir + "/" + base_name + ".so";
+    std::string funcs_path = sess.cache_dir + "/" + base_name + ".funcs";
 
     LifterConfig cfg;
     cfg.is_libcpp = false;
@@ -4517,9 +4588,9 @@ int mali_jit_compile_subgraph(
 
     // Partition batch_funcs across up to 8 parallel codegen slices for multi-core JIT speed
     size_t n_slices = 1;
-    if (batch_funcs.size() >= 192) n_slices = 8;
-    else if (batch_funcs.size() >= 64) n_slices = 4;
-    else if (batch_funcs.size() >= 16) n_slices = 2;
+    if (batch_funcs.size() >= 64) n_slices = 8;
+    else if (batch_funcs.size() >= 16) n_slices = 4;
+    else if (batch_funcs.size() >= 4) n_slices = 2;
 
     std::vector<std::string> slice_irs(n_slices);
     std::vector<std::string> slice_objs(n_slices);
@@ -4630,6 +4701,7 @@ int mali_jit_compile_subgraph(
     sess.loaded_batch_handles.push_back(dlh);
 
     int registered = 0;
+    std::ofstream fn_out(funcs_path);
     for (uint64_t faddr : batch_funcs) {
         std::string sym = cfg.prefix + "_sub_" + AArch64ToLLVMIRLiftingPass::hex8(faddr);
         void *fn_ptr = dlsym(dlh, sym.c_str());
@@ -4638,6 +4710,7 @@ int mali_jit_compile_subgraph(
             uint32_t fsz = 0;
             mali_jit_get_func_info(faddr, &fname, &fsz);
             on_compiled(faddr, fn_ptr, fname ? fname : sym.c_str(), fsz, user);
+            if (fn_out) fn_out << AArch64ToLLVMIRLiftingPass::hex8(faddr) << "\n";
             registered++;
         }
     }

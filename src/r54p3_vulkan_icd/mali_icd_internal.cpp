@@ -1238,13 +1238,13 @@ static MaliJitFn mali_jit_get_or_compile(AOTCPUState* cpu, uint64_t target_va) {
         return nullptr;
     }
 
-    int batch_max = 32;
+    int batch_max = 128;
     if (const char* bm = std::getenv("MALI_AOT_JIT_BATCH_MAX")) {
         if (bm[0]) batch_max = std::max(1, std::atoi(bm));
     } else if (const char* single_env = std::getenv("MALI_AOT_JIT_SINGLE")) {
         if (single_env[0] && std::strcmp(single_env, "0") != 0) batch_max = 1;
     }
-    int batch_depth = (batch_max == 1) ? 0 : 2;
+    int batch_depth = (batch_max == 1) ? 0 : 3;
     if (const char* bd = std::getenv("MALI_AOT_JIT_DEPTH")) {
         if (bd[0]) batch_depth = std::max(0, std::atoi(bd));
     }
@@ -1317,41 +1317,10 @@ static void write_merged_seed_file(const char* seed_path, const std::vector<cons
 
 } // namespace
 
-extern "C" void mali_jit_on_enter(AOTCPUState* cpu, uint64_t rva) {
-    if (rva >= IMAGE_BASE) rva -= IMAGE_BASE;
-    MaliJitProfileEntry* ent = mali_jit_get_or_create_profile_entry(rva);
-    uint64_t h = ent->hits.fetch_add(1, std::memory_order_relaxed) + 1;
-    g_jit_total_calls_executed.fetch_add(1, std::memory_order_relaxed);
-    if (h == 1) {
-        g_jit_unique_funcs_executed.fetch_add(1, std::memory_order_relaxed);
-        uint64_t raw_lr = cpu ? cpu->x[30] : 0ULL;
-        uint64_t lr_rva = (raw_lr >= IMAGE_BASE && raw_lr < IMAGE_BASE + 0x04000000ULL)
-                              ? (raw_lr - IMAGE_BASE)
-                              : raw_lr;
-        uint64_t caller_rva = 0ULL;
-        uint32_t depth = aot_so_get_stack_depth();
-        if (depth > 0) {
-            const AotSoStackFrame* fr = aot_so_get_stack_frame(depth - 1);
-            if (fr && fr->fn_va >= IMAGE_BASE && fr->fn_va < IMAGE_BASE + 0x04000000ULL) {
-                caller_rva = fr->fn_va - IMAGE_BASE;
-            }
-        }
-        if (caller_rva == 0ULL && lr_rva < 0x04000000ULL) {
-            caller_rva = g_pfn_jit_find_start ? g_pfn_jit_find_start(lr_rva) : lr_rva;
-        }
-        ent->first_lr.store(lr_rva, std::memory_order_relaxed);
-        ent->caller_rva.store(caller_rva, std::memory_order_relaxed);
-        mali_jit_dump_profile();
+static void mali_jit_dump_profile_impl(bool print_summary) {
+    static std::mutex s_dump_mtx;
+    std::lock_guard<std::mutex> dump_lk(s_dump_mtx);
 
-        const char* jit_log = std::getenv("MALI_AOT_JIT_LOG");
-        if (jit_log && jit_log[0] && std::strcmp(jit_log, "0") != 0) {
-            std::fprintf(stderr, "[MALI_JIT_HIT] rva=0x%08" PRIx64 " name=%s first_lr=0x%08" PRIx64 " caller_rva=0x%08" PRIx64 "\n",
-                         rva, ent->name.c_str(), lr_rva, caller_rva);
-        }
-    }
-}
-
-extern "C" void mali_jit_dump_profile() {
     std::vector<const MaliJitProfileEntry*> executed;
     {
         std::lock_guard<std::mutex> lk(g_jit_prof_mtx);
@@ -1385,20 +1354,33 @@ extern "C" void mali_jit_dump_profile() {
             while (std::getline(in, line)) {
                 if (line.empty() || line[0] == '#') continue;
                 std::istringstream iss(line);
-                std::string rva_s, name_s, lr_s, caller_s;
-                uint64_t hits_v = 0;
-                if (iss >> rva_s >> name_s >> hits_v >> lr_s >> caller_s) {
-                    uint64_t r = std::strtoull(rva_s.c_str(), nullptr, 0);
+                std::vector<std::string> toks;
+                std::string tok;
+                while (iss >> tok) toks.push_back(std::move(tok));
+                if (toks.size() >= 5) {
+                    uint64_t r = std::strtoull(toks[0].c_str(), nullptr, 0);
                     if (r >= IMAGE_BASE) r -= IMAGE_BASE;
-                    if (r != 0) {
-                        rows[r] = {name_s, hits_v, std::strtoull(lr_s.c_str(), nullptr, 0), std::strtoull(caller_s.c_str(), nullptr, 0)};
+                    if (r != 0 && r < 0x04000000ULL) {
+                        uint64_t hits_v = std::strtoull(toks[toks.size() - 3].c_str(), nullptr, 10);
+                        uint64_t lr_v = std::strtoull(toks[toks.size() - 2].c_str(), nullptr, 0);
+                        uint64_t caller_v = std::strtoull(toks[toks.size() - 1].c_str(), nullptr, 0);
+                        std::string name_s = toks[1];
+                        for (size_t ti = 2; ti + 3 < toks.size(); ++ti) {
+                            name_s += " ";
+                            name_s += toks[ti];
+                        }
+                        rows[r] = {std::move(name_s), hits_v, lr_v, caller_v};
                     }
                 }
             }
         }
         for (const auto* e : executed) {
+            std::string clean_name = e->name;
+            for (char& ch : clean_name) {
+                if (ch == '\n' || ch == '\r') ch = ' ';
+            }
             rows[e->rva] = {
-                e->name,
+                std::move(clean_name),
                 e->hits.load(std::memory_order_relaxed),
                 e->first_lr.load(std::memory_order_relaxed),
                 e->caller_rva.load(std::memory_order_relaxed)
@@ -1408,10 +1390,16 @@ extern "C" void mali_jit_dump_profile() {
         if (!out) return;
         out << "# <rva> <name> <hits> <first_lr> <caller_rva>\n";
         for (const auto& kv : rows) {
-            char buf[512];
-            std::snprintf(buf, sizeof(buf), "0x%08" PRIx64 " %-40s %-8" PRIu64 " 0x%08" PRIx64 " 0x%08" PRIx64 "\n",
-                          kv.first, kv.second.name.c_str(), kv.second.hits, kv.second.first_lr, kv.second.caller_rva);
-            out << buf;
+            char hdr[32];
+            std::snprintf(hdr, sizeof(hdr), "0x%08" PRIx64, kv.first);
+            char tail[128];
+            std::snprintf(tail, sizeof(tail), " %-8" PRIu64 " 0x%08" PRIx64 " 0x%08" PRIx64 "\n",
+                          kv.second.hits, kv.second.first_lr, kv.second.caller_rva);
+            out << hdr << ' ' << kv.second.name;
+            if (kv.second.name.size() < 40) {
+                out << std::string(40 - kv.second.name.size(), ' ');
+            }
+            out << tail;
         }
     };
 
@@ -1425,7 +1413,7 @@ extern "C" void mali_jit_dump_profile() {
         write_merged_seed_file("src/r54p3_vulkan_icd/aot_seeds.txt", executed);
     }
 
-    if (mali_icd_log_enabled() || std::getenv("MALI_AOT_JIT_LOG")) {
+    if (print_summary && (mali_icd_log_enabled() || std::getenv("MALI_AOT_JIT_LOG"))) {
         std::fprintf(stderr,
                      "================================================================================\n"
                      " [MALI_JIT] Runtime JIT & Incremental Seed Profile Summary:\n"
@@ -1441,6 +1429,46 @@ extern "C" void mali_jit_dump_profile() {
                      g_jit_total_calls_executed.load(),
                      prof_path);
     }
+}
+
+extern "C" void mali_jit_on_enter(AOTCPUState* cpu, uint64_t rva) {
+    if (rva >= IMAGE_BASE) rva -= IMAGE_BASE;
+    MaliJitProfileEntry* ent = mali_jit_get_or_create_profile_entry(rva);
+    uint64_t h = ent->hits.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_jit_total_calls_executed.fetch_add(1, std::memory_order_relaxed);
+    if (h == 1) {
+        uint64_t uniq = g_jit_unique_funcs_executed.fetch_add(1, std::memory_order_relaxed) + 1;
+        uint64_t raw_lr = cpu ? cpu->x[30] : 0ULL;
+        uint64_t lr_rva = (raw_lr >= IMAGE_BASE && raw_lr < IMAGE_BASE + 0x04000000ULL)
+                              ? (raw_lr - IMAGE_BASE)
+                              : raw_lr;
+        uint64_t caller_rva = 0ULL;
+        uint32_t depth = aot_so_get_stack_depth();
+        if (depth > 0) {
+            const AotSoStackFrame* fr = aot_so_get_stack_frame(depth - 1);
+            if (fr && fr->fn_va >= IMAGE_BASE && fr->fn_va < IMAGE_BASE + 0x04000000ULL) {
+                caller_rva = fr->fn_va - IMAGE_BASE;
+            }
+        }
+        if (caller_rva == 0ULL && lr_rva < 0x04000000ULL) {
+            caller_rva = g_pfn_jit_find_start ? g_pfn_jit_find_start(lr_rva) : lr_rva;
+        }
+        ent->first_lr.store(lr_rva, std::memory_order_relaxed);
+        ent->caller_rva.store(caller_rva, std::memory_order_relaxed);
+        if ((uniq % 256) == 0) {
+            mali_jit_dump_profile_impl(false);
+        }
+
+        const char* jit_log = std::getenv("MALI_AOT_JIT_LOG");
+        if (jit_log && jit_log[0] && std::strcmp(jit_log, "0") != 0) {
+            std::fprintf(stderr, "[MALI_JIT_HIT] rva=0x%08" PRIx64 " name=%s first_lr=0x%08" PRIx64 " caller_rva=0x%08" PRIx64 "\n",
+                         rva, ent->name.c_str(), lr_rva, caller_rva);
+        }
+    }
+}
+
+extern "C" void mali_jit_dump_profile() {
+    mali_jit_dump_profile_impl(true);
 }
 
 __attribute__((destructor))
