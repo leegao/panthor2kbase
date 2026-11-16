@@ -537,57 +537,42 @@ static bool ensure_host_vk_initialized_locked() {
     return true;
 }
 
-static void ensure_guest_texture_uploaded_locked(const PendingIDVSJob& job) {
-    if (g_vvr.tex_uploaded) return;
+static bool ensure_guest_texture_uploaded_locked(const PendingIDVSJob& job) {
+    if (g_vvr.tex_uploaded) return true;
 
-    uint32_t W = (job.tex_width > 0) ? job.tex_width : 512;
-    uint32_t H = (job.tex_height > 0) ? job.tex_height : 512;
+    if (job.tex_va == 0 || job.tex_width == 0 || job.tex_height == 0) {
+        std::fprintf(stderr,
+                     "[valhall_vk_renderer] ERROR: unresolved guest texture "
+                     "(tex_va=0x%llx %ux%u stride=%u)\n",
+                     static_cast<unsigned long long>(job.tex_va),
+                     job.tex_width, job.tex_height, job.tex_stride);
+        return false;
+    }
+
+    uint32_t W = job.tex_width;
+    uint32_t H = job.tex_height;
     g_vvr.tex_w = W;
     g_vvr.tex_h = H;
 
-    std::vector<uint8_t> rgba(W * H * 4, 0);
-    bool found_guest_tex = false;
-
-    if (job.tex_va != 0) {
-        uint8_t* p = resolve_guest_va_ptr(job.tex_va, W * H * 4);
-        if (p) {
-            uint32_t non_zero = 0;
-            const uint32_t* p32 = reinterpret_cast<const uint32_t*>(p);
-            for (uint32_t i = 0; i < W * H; ++i) {
-                if ((p32[i] & 0x00FFFFFFU) != 0) non_zero++;
-            }
-            if (non_zero > (W * H) / 16) {
-                std::memcpy(rgba.data(), p, W * H * 4);
-                found_guest_tex = true;
-            }
-        }
+    std::vector<uint8_t> rgba(static_cast<size_t>(W) * H * 4, 0);
+    uint8_t* p = resolve_guest_va_ptr(job.tex_va, static_cast<size_t>(W) * H * 4);
+    if (!p) {
+        std::fprintf(stderr,
+                     "[valhall_vk_renderer] ERROR: guest texture VA 0x%llx (%ux%u) not mapped\n",
+                     static_cast<unsigned long long>(job.tex_va), W, H);
+        return false;
     }
-
-    if (!found_guest_tex) {
-        for (uint32_t y = 0; y < H; ++y) {
-            for (uint32_t x = 0; x < W; ++x) {
-                float u = static_cast<float>(x) / static_cast<float>(W);
-                float v = static_cast<float>(y) / static_cast<float>(H);
-                uint32_t chk = ((x / 32) ^ (y / 32)) & 1u;
-                float dx = u - 0.5f;
-                float dy = v - 0.5f;
-                float r2 = dx * dx + dy * dy;
-                uint8_t R, G, B;
-                if (r2 < 0.12f && r2 > 0.03f) {
-                    R = 235; G = 95; B = 40;
-                } else if (chk) {
-                    R = 225; G = 232; B = 240;
-                } else {
-                    R = 45;  G = 95;  B = 165;
-                }
-                size_t idx = (static_cast<size_t>(y) * W + x) * 4;
-                rgba[idx + 0] = R;
-                rgba[idx + 1] = G;
-                rgba[idx + 2] = B;
-                rgba[idx + 3] = 255;
-            }
-        }
+    uint32_t non_zero = 0;
+    const uint32_t* p32 = reinterpret_cast<const uint32_t*>(p);
+    for (uint32_t i = 0; i < W * H; ++i) {
+        if ((p32[i] & 0x00FFFFFFU) != 0) non_zero++;
     }
+    if (non_zero == 0) {
+        std::fprintf(stderr,
+                     "[valhall_vk_renderer] WARNING: guest texture 0x%llx (%ux%u) is entirely black\n",
+                     static_cast<unsigned long long>(job.tex_va), W, H);
+    }
+    std::memcpy(rgba.data(), p, static_cast<size_t>(W) * H * 4);
 
     VkImageCreateInfo ici{};
     ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -689,6 +674,7 @@ static void ensure_guest_texture_uploaded_locked(const PendingIDVSJob& job) {
     g_vvr.fp_vkCreateSampler(g_vvr.device, &sci, nullptr, &g_vvr.tex_sampler);
 
     g_vvr.tex_uploaded = true;
+    return true;
 }
 
 static bool ensure_gfx_pipeline_locked(const PendingIDVSJob& job) {
@@ -1113,7 +1099,7 @@ static void handle_csf_run_fragment(uint64_t /*insn*/, const uint64_t* cs_regs) 
     if (!job.valid) return;
 
     if (!ensure_host_vk_initialized_locked()) return;
-    ensure_guest_texture_uploaded_locked(job);
+    if (!ensure_guest_texture_uploaded_locked(job)) return;
     if (!ensure_gfx_pipeline_locked(job)) return;
 
     /* Copy live guest uniform/vertex buffer from job.primary_buf_va into host UBO */
