@@ -702,7 +702,7 @@ std::vector<uint32_t> ValhallISAToSpirvTranslator::translateObjcToSpirv(
         int comp_writes = 0;
 
         for (const auto& ins : decoded) {
-            if (ins.opcode == 96) {
+            if (ins.opcode == 96 || ins.opcode == 100 || (ins.opcode >= 72 && ins.opcode <= 79)) {
                 uint32_t ptr_id = next_id++;
                 pushOp(body, 65, {10, ptr_id, 11, 15});
                 uint32_t val_id = next_id++;
@@ -783,7 +783,7 @@ std::vector<uint32_t> ValhallISAToSpirvTranslator::translateObjcToSpirv(
                 uint32_t val_id = next_id++;
                 pushOp(body, 61, {7, val_id, ptr_id});
                 pushOp(body, 62, {vreg_var[ins.dest_reg & 15], val_id});
-            } else if (ins.opcode == 97 || ins.opcode == 113 || ins.opcode == 127) {
+            } else if (ins.opcode == 97 || ins.opcode == 101 || ins.opcode == 113 || ins.opcode == 127) {
                 uint32_t out_val = 0;
                 if (ins.opcode == 113 && has_component_imm) {
                     out_val = next_id++;
