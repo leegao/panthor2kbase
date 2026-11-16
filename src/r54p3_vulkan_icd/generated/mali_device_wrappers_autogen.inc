@@ -727,6 +727,34 @@ static inline void aot_forward_vkCmdBindIndexBuffer(VkCommandBuffer commandBuffe
     g_aot_rt.lifted_vk_calls_executed++;
 }
 
+static inline void aot_forward_vkCmdSetViewport(VkCommandBuffer commandBuffer, uint32_t firstViewport, uint32_t viewportCount, const VkViewport* pViewports) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkCmdSetViewport) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdSetViewport,
+        reinterpret_cast<VkCommandBuffer>(resolveAotHandle(commandBuffer)), firstViewport, viewportCount, pViewports);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
+static inline void aot_forward_vkCmdSetScissor(VkCommandBuffer commandBuffer, uint32_t firstScissor, uint32_t scissorCount, const VkRect2D* pScissors) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkCmdSetScissor) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdSetScissor,
+        reinterpret_cast<VkCommandBuffer>(resolveAotHandle(commandBuffer)), firstScissor, scissorCount, pScissors);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
 static inline void aot_forward_vkCmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance) {
     g_aot_rt.ensureInitialized();
     if (!aot_vkCmdDraw) {
@@ -1861,5 +1889,33 @@ static inline void aot_forward_vkCmdSetStencilWriteMask(VkCommandBuffer commandB
     mali_aapcs64::invokeLiftedAapcs64<void>(
         tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdSetStencilWriteMask,
         reinterpret_cast<VkCommandBuffer>(resolveAotHandle(commandBuffer)), faceMask, writeMask);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
+static inline void aot_forward_vkCmdBeginConditionalRenderingEXT(VkCommandBuffer commandBuffer, const VkConditionalRenderingBeginInfoEXT* pConditionalRenderingBegin) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkCmdBeginConditionalRenderingEXT) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdBeginConditionalRenderingEXT,
+        reinterpret_cast<VkCommandBuffer>(resolveAotHandle(commandBuffer)), pConditionalRenderingBegin);
+    g_aot_rt.lifted_vk_calls_executed++;
+}
+
+static inline void aot_forward_vkCmdEndConditionalRenderingEXT(VkCommandBuffer commandBuffer) {
+    g_aot_rt.ensureInitialized();
+    if (!aot_vkCmdEndConditionalRenderingEXT) {
+        return;
+    }
+    auto& tctx = maliGetThreadGuestContext();
+    GuestStackFrameGuard frame(tctx);
+    const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+    mali_aapcs64::invokeLiftedAapcs64<void>(
+        tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdEndConditionalRenderingEXT,
+        reinterpret_cast<VkCommandBuffer>(resolveAotHandle(commandBuffer)));
     g_aot_rt.lifted_vk_calls_executed++;
 }

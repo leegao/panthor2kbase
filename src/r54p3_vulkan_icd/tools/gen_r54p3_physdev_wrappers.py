@@ -107,6 +107,8 @@ DEVICE_COMMANDS = [
     "vkCmdBindDescriptorSets",
     "vkCmdBindVertexBuffers",
     "vkCmdBindIndexBuffer",
+    "vkCmdSetViewport",
+    "vkCmdSetScissor",
     "vkCmdDraw",
     "vkCmdDrawIndexed",
     "vkCmdDrawIndirect",
@@ -186,6 +188,8 @@ DEVICE_COMMANDS = [
     "vkCmdSetStencilCompareMask",
     "vkCmdSetStencilReference",
     "vkCmdSetStencilWriteMask",
+    "vkCmdBeginConditionalRenderingEXT",
+    "vkCmdEndConditionalRenderingEXT",
 ]
 
 

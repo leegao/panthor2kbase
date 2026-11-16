@@ -780,8 +780,17 @@ void vkDestroyPipelineLayout(void* device, uint64_t pipelineLayout, const void* 
 
 __attribute__((visibility("default")))
 int32_t vkCreateComputePipelines(void* device, uint64_t pipelineCache, uint32_t createInfoCount,
-                                 const void* pCreateInfos, const void* /*pAllocator*/, uint64_t* pPipelines) {
+                                 const void* pCreateInfos, const void* pAllocator, uint64_t* pPipelines) {
     if (!pCreateInfos || !pPipelines) return -3;
+    if (useNativeAotFor("vkCreateComputePipelines")) {
+        return aot_forward_vkCreateComputePipelines(
+            reinterpret_cast<VkDevice>(device),
+            reinterpret_cast<VkPipelineCache>(pipelineCache),
+            createInfoCount,
+            static_cast<const VkComputePipelineCreateInfo*>(pCreateInfos),
+            static_cast<const VkAllocationCallbacks*>(pAllocator),
+            reinterpret_cast<VkPipeline*>(pPipelines));
+    }
     auto* dev = reinterpret_cast<MaliIcdDevice*>(device);
     const auto* cis = static_cast<const VkComputePipelineCreateInfo*>(pCreateInfos);
     for (uint32_t i = 0; i < createInfoCount; ++i) {
@@ -1769,22 +1778,62 @@ void vkCmdBindIndexBuffer(void* commandBuffer, uint64_t buffer, uint64_t offset,
 }
 
 __attribute__((visibility("default")))
-void vkCmdPushConstants(void* commandBuffer, uint64_t /*layout*/, uint32_t /*stageFlags*/, uint32_t offset, uint32_t size, const void* pValues) {
-    if (!commandBuffer || !pValues || offset >= 256U) return;
+void vkCmdPushConstants(void* commandBuffer, uint64_t layout, uint32_t stageFlags, uint32_t offset, uint32_t size, const void* pValues) {
+    if (!commandBuffer || !pValues) return;
+    if (useNativeAotFor("vkCmdPushConstants")) {
+        aot_forward_vkCmdPushConstants(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer),
+            reinterpret_cast<VkPipelineLayout>(layout),
+            static_cast<VkShaderStageFlags>(stageFlags),
+            offset, size, pValues);
+        return;
+    }
+    if (offset >= 256U) return;
     uint32_t copy_sz = std::min<uint32_t>(size, 256U - offset);
     std::memcpy(static_cast<MaliIcdCommandBuffer*>(commandBuffer)->push_constants + offset, pValues, copy_sz);
 }
 
 __attribute__((visibility("default")))
-void vkCmdSetViewport(void* /*cb*/, uint32_t /*f*/, uint32_t /*c*/, const void* /*p*/) {}
+void vkCmdSetViewport(void* cb, uint32_t firstViewport, uint32_t viewportCount, const void* pViewports) {
+    if (!cb) return;
+    if (useNativeAotFor("vkCmdSetViewport") && aot_vkCmdSetViewport) {
+        g_aot_rt.ensureInitialized();
+        auto& tctx = maliGetThreadGuestContext();
+        GuestStackFrameGuard frame(tctx);
+        const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdSetViewport,
+            reinterpret_cast<VkCommandBuffer>(resolveAotHandle(cb)),
+            firstViewport, viewportCount, static_cast<const VkViewport*>(pViewports));
+        g_aot_rt.lifted_vk_calls_executed++;
+    }
+}
 __attribute__((visibility("default")))
-void vkCmdSetScissor(void* /*cb*/, uint32_t /*f*/, uint32_t /*c*/, const void* /*p*/) {}
+void vkCmdSetScissor(void* cb, uint32_t firstScissor, uint32_t scissorCount, const void* pScissors) {
+    if (!cb) return;
+    if (useNativeAotFor("vkCmdSetScissor") && aot_vkCmdSetScissor) {
+        g_aot_rt.ensureInitialized();
+        auto& tctx = maliGetThreadGuestContext();
+        GuestStackFrameGuard frame(tctx);
+        const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+        mali_aapcs64::invokeLiftedAapcs64<void>(
+            tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdSetScissor,
+            reinterpret_cast<VkCommandBuffer>(resolveAotHandle(cb)),
+            firstScissor, scissorCount, static_cast<const VkRect2D*>(pScissors));
+        g_aot_rt.lifted_vk_calls_executed++;
+    }
+}
 __attribute__((visibility("default")))
 void vkCmdSetColorWriteEnableEXT(void* /*cb*/, uint32_t /*c*/, const uint32_t* /*p*/) {}
 
 __attribute__((visibility("default")))
 void vkCmdSetBlendConstants(void* commandBuffer, const float blendConstants[4]) {
     if (!commandBuffer || !blendConstants) return;
+    if (useNativeAotFor("vkCmdSetBlendConstants")) {
+        aot_forward_vkCmdSetBlendConstants(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer), blendConstants);
+        return;
+    }
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     std::memcpy(cb->blend_constants, blendConstants, 16);
     if (aot_vkCmdSetBlendConstants && cb->aot_cmdbuf_mem.size() >= 256 && *reinterpret_cast<const uint64_t*>(cb->aot_cmdbuf_mem.data() + 0x68) != 0) {
@@ -1799,6 +1848,12 @@ void vkCmdSetBlendConstants(void* commandBuffer, const float blendConstants[4]) 
 __attribute__((visibility("default")))
 void vkCmdSetDepthBias(void* commandBuffer, float depthBiasConstantFactor, float depthBiasClamp, float depthBiasSlopeFactor) {
     if (!commandBuffer) return;
+    if (useNativeAotFor("vkCmdSetDepthBias")) {
+        aot_forward_vkCmdSetDepthBias(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer),
+            depthBiasConstantFactor, depthBiasClamp, depthBiasSlopeFactor);
+        return;
+    }
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     cb->depth_bias_const = depthBiasConstantFactor;
     cb->depth_bias_clamp = depthBiasClamp;
@@ -1817,6 +1872,11 @@ void vkCmdSetDepthBias(void* commandBuffer, float depthBiasConstantFactor, float
 __attribute__((visibility("default")))
 void vkCmdSetDepthBounds(void* commandBuffer, float minDepthBounds, float maxDepthBounds) {
     if (!commandBuffer) return;
+    if (useNativeAotFor("vkCmdSetDepthBounds")) {
+        aot_forward_vkCmdSetDepthBounds(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer), minDepthBounds, maxDepthBounds);
+        return;
+    }
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     cb->min_depth_bounds = minDepthBounds;
     cb->max_depth_bounds = maxDepthBounds;
@@ -1833,6 +1893,11 @@ void vkCmdSetDepthBounds(void* commandBuffer, float minDepthBounds, float maxDep
 __attribute__((visibility("default")))
 void vkCmdSetLineWidth(void* commandBuffer, float lineWidth) {
     if (!commandBuffer) return;
+    if (useNativeAotFor("vkCmdSetLineWidth")) {
+        aot_forward_vkCmdSetLineWidth(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer), lineWidth);
+        return;
+    }
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     cb->line_width = lineWidth;
     if (aot_vkCmdSetLineWidth && cb->aot_cmdbuf_mem.size() >= 256 && *reinterpret_cast<const uint64_t*>(cb->aot_cmdbuf_mem.data() + 0x68) != 0) {
@@ -1847,6 +1912,12 @@ void vkCmdSetLineWidth(void* commandBuffer, float lineWidth) {
 __attribute__((visibility("default")))
 void vkCmdSetStencilCompareMask(void* commandBuffer, uint32_t faceMask, uint32_t compareMask) {
     if (!commandBuffer) return;
+    if (useNativeAotFor("vkCmdSetStencilCompareMask")) {
+        aot_forward_vkCmdSetStencilCompareMask(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer),
+            static_cast<VkStencilFaceFlags>(faceMask), compareMask);
+        return;
+    }
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     cb->stencil_comp_mask = compareMask;
     if (aot_vkCmdSetStencilCompareMask && cb->aot_cmdbuf_mem.size() >= 256 && *reinterpret_cast<const uint64_t*>(cb->aot_cmdbuf_mem.data() + 0x68) != 0) {
@@ -1862,6 +1933,12 @@ void vkCmdSetStencilCompareMask(void* commandBuffer, uint32_t faceMask, uint32_t
 __attribute__((visibility("default")))
 void vkCmdSetStencilReference(void* commandBuffer, uint32_t faceMask, uint32_t reference) {
     if (!commandBuffer) return;
+    if (useNativeAotFor("vkCmdSetStencilReference")) {
+        aot_forward_vkCmdSetStencilReference(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer),
+            static_cast<VkStencilFaceFlags>(faceMask), reference);
+        return;
+    }
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     cb->stencil_ref = reference;
     if (aot_vkCmdSetStencilReference && cb->aot_cmdbuf_mem.size() >= 256 && *reinterpret_cast<const uint64_t*>(cb->aot_cmdbuf_mem.data() + 0x68) != 0) {
@@ -1877,6 +1954,12 @@ void vkCmdSetStencilReference(void* commandBuffer, uint32_t faceMask, uint32_t r
 __attribute__((visibility("default")))
 void vkCmdSetStencilWriteMask(void* commandBuffer, uint32_t faceMask, uint32_t writeMask) {
     if (!commandBuffer) return;
+    if (useNativeAotFor("vkCmdSetStencilWriteMask")) {
+        aot_forward_vkCmdSetStencilWriteMask(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer),
+            static_cast<VkStencilFaceFlags>(faceMask), writeMask);
+        return;
+    }
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     cb->stencil_write_mask = writeMask;
     if (aot_vkCmdSetStencilWriteMask && cb->aot_cmdbuf_mem.size() >= 256 && *reinterpret_cast<const uint64_t*>(cb->aot_cmdbuf_mem.data() + 0x68) != 0) {
@@ -1892,6 +1975,19 @@ void vkCmdSetStencilWriteMask(void* commandBuffer, uint32_t faceMask, uint32_t w
 __attribute__((visibility("default")))
 void vkCmdBeginConditionalRenderingEXT(void* commandBuffer, const void* pCondBegin) {
     if (!commandBuffer || !pCondBegin) return;
+    if (useNativeAotFor("vkCmdBeginConditionalRenderingEXT")) {
+        if (aot_vkCmdBeginConditionalRenderingEXT) {
+            g_aot_rt.ensureInitialized();
+            auto& tctx = maliGetThreadGuestContext();
+            GuestStackFrameGuard frame(tctx);
+            const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+            mali_aapcs64::invokeLiftedAapcs64<void>(
+                tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdBeginConditionalRenderingEXT,
+                reinterpret_cast<VkCommandBuffer>(resolveAotHandle(commandBuffer)), pCondBegin);
+            g_aot_rt.lifted_vk_calls_executed++;
+        }
+        return;
+    }
     struct CondInfo { uint32_t sType; const void* pNext; uint64_t buffer; uint64_t offset; uint32_t flags; };
     const auto* ci = static_cast<const CondInfo*>(pCondBegin);
     auto* buf = reinterpret_cast<MaliIcdBuffer*>(ci->buffer);
@@ -1903,12 +1999,32 @@ void vkCmdBeginConditionalRenderingEXT(void* commandBuffer, const void* pCondBeg
 
 __attribute__((visibility("default")))
 void vkCmdEndConditionalRenderingEXT(void* commandBuffer) {
-    if (commandBuffer) static_cast<MaliIcdCommandBuffer*>(commandBuffer)->conditional_active = true;
+    if (!commandBuffer) return;
+    if (useNativeAotFor("vkCmdEndConditionalRenderingEXT")) {
+        if (aot_vkCmdEndConditionalRenderingEXT) {
+            g_aot_rt.ensureInitialized();
+            auto& tctx = maliGetThreadGuestContext();
+            GuestStackFrameGuard frame(tctx);
+            const size_t frame_stack_sz = static_cast<size_t>(tctx.cpu.sp - reinterpret_cast<uintptr_t>(tctx.stack_mem));
+            mali_aapcs64::invokeLiftedAapcs64<void>(
+                tctx.cpu, tctx.stack_mem, frame_stack_sz, aot_vkCmdEndConditionalRenderingEXT,
+                reinterpret_cast<VkCommandBuffer>(resolveAotHandle(commandBuffer)));
+            g_aot_rt.lifted_vk_calls_executed++;
+        }
+        return;
+    }
+    static_cast<MaliIcdCommandBuffer*>(commandBuffer)->conditional_active = true;
 }
 
 __attribute__((visibility("default")))
 void vkCmdDispatch(void* commandBuffer, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ) {
     if (!commandBuffer) return;
+    if (useNativeAotFor("vkCmdDispatch")) {
+        aot_forward_vkCmdDispatch(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer),
+            groupCountX, groupCountY, groupCountZ);
+        return;
+    }
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     if (!cb->conditional_active) return;
     MaliIcdRecordedCmd cmd{};
@@ -1988,6 +2104,15 @@ void vkCmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t ins
 __attribute__((visibility("default")))
 void vkCmdCopyBuffer(void* commandBuffer, uint64_t srcBuffer, uint64_t dstBuffer, uint32_t regionCount, const void* pRegions) {
     if (!commandBuffer || !srcBuffer || !dstBuffer || !pRegions) return;
+    if (useNativeAotFor("vkCmdCopyBuffer")) {
+        aot_forward_vkCmdCopyBuffer(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer),
+            reinterpret_cast<VkBuffer>(srcBuffer),
+            reinterpret_cast<VkBuffer>(dstBuffer),
+            regionCount,
+            static_cast<const VkBufferCopy*>(pRegions));
+        return;
+    }
     auto* cb  = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     auto* src = reinterpret_cast<MaliIcdBuffer*>(srcBuffer);
     auto* dst = reinterpret_cast<MaliIcdBuffer*>(dstBuffer);
@@ -2034,9 +2159,17 @@ void vkCmdCopyBufferToImage(void* commandBuffer, uint64_t srcBuffer, uint64_t ds
 }
 
 __attribute__((visibility("default")))
-void vkCmdBlitImage(void* commandBuffer, uint64_t srcImg, uint32_t /*srcL*/,
-                    uint64_t dstImg, uint32_t /*dstL*/, uint32_t /*c*/, const void* /*pR*/, uint32_t /*flt*/) {
+void vkCmdBlitImage(void* commandBuffer, uint64_t srcImg, uint32_t srcL,
+                    uint64_t dstImg, uint32_t dstL, uint32_t c, const void* pR, uint32_t flt) {
     if (!commandBuffer || !dstImg) return;
+    if (useNativeAotFor("vkCmdBlitImage")) {
+        aot_forward_vkCmdBlitImage(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer),
+            reinterpret_cast<VkImage>(srcImg), static_cast<VkImageLayout>(srcL),
+            reinterpret_cast<VkImage>(dstImg), static_cast<VkImageLayout>(dstL),
+            c, static_cast<const VkImageBlit*>(pR), static_cast<VkFilter>(flt));
+        return;
+    }
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     MaliIcdRecordedCmd cmd{};
     cmd.type      = MaliIcdRecordedCmd::CMD_BLIT_IMAGE;
@@ -2046,8 +2179,16 @@ void vkCmdBlitImage(void* commandBuffer, uint64_t srcImg, uint32_t /*srcL*/,
 }
 
 __attribute__((visibility("default")))
-void vkCmdWriteTimestamp(void* commandBuffer, uint32_t /*stage*/, uint64_t queryPool, uint32_t query) {
+void vkCmdWriteTimestamp(void* commandBuffer, uint32_t stage, uint64_t queryPool, uint32_t query) {
     if (!commandBuffer || !queryPool) return;
+    if (useNativeAotFor("vkCmdWriteTimestamp")) {
+        aot_forward_vkCmdWriteTimestamp(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer),
+            static_cast<VkPipelineStageFlagBits>(stage),
+            reinterpret_cast<VkQueryPool>(queryPool),
+            query);
+        return;
+    }
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     MaliIcdRecordedCmd cmd{};
     cmd.type        = MaliIcdRecordedCmd::CMD_WRITE_TIMESTAMP;
@@ -2899,6 +3040,12 @@ int32_t vkQueueSubmit2(void* queue, uint32_t submitCount, const void* pSubmits, 
 __attribute__((visibility("default")))
 void vkCmdPipelineBarrier2(void* commandBuffer, const void* pDependencyInfo) {
     if (!commandBuffer) return;
+    if (useNativeAotFor("vkCmdPipelineBarrier2")) {
+        aot_forward_vkCmdPipelineBarrier2(
+            reinterpret_cast<VkCommandBuffer>(commandBuffer),
+            static_cast<const VkDependencyInfo*>(pDependencyInfo));
+        return;
+    }
     auto* cb = static_cast<MaliIcdCommandBuffer*>(commandBuffer);
     MaliIcdRecordedCmd cmd{};
     cmd.type = MaliIcdRecordedCmd::CMD_PIPELINE_BARRIER;
