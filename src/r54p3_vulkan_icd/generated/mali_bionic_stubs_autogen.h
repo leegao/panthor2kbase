@@ -75,6 +75,11 @@ struct BionicHybrisMutexSlot {
 };
 static inline pthread_mutex_t* mali_hybris_resolve_mutex(uint64_t mtx_va) {
     if (!mtx_va) return nullptr;
+    // Guest pointers must live in the emulated image (0x400000000..0x404000000)
+    // or on the emulated thread stack. Anything below 0x10000 is a small integer
+    // (typically a struct field offset such as 0x10) that the guest passed where
+    // a real bionic_mutex_t* was expected -- dereferencing it faults.
+    if (mtx_va < 0x10000ULL) return nullptr;
     auto* slot = reinterpret_cast<BionicHybrisMutexSlot*>(mtx_va);
     if (slot->magic != BIONIC_HYBRIS_MUTEX_MAGIC || !slot->host_mtx) {
         slot->host_mtx = static_cast<pthread_mutex_t*>(std::calloc(1, sizeof(pthread_mutex_t)));
