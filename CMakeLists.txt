@@ -325,10 +325,26 @@ else()
 endif()
 set_source_files_properties(${LIFTED_KBASE_KO_LL_OBJ} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 
+# Regenerate the CSF genxml decode header from the pinned Panfrost v11 XML.
+set(CSFFW_GENXML_XML "${CMAKE_CURRENT_SOURCE_DIR}/specs/panfrost/v11.xml")
+set(CSFFW_GENXML_HDR "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/generated/csffw_genxml_decode.h")
+if(EXISTS "${CSFFW_GENXML_XML}")
+   add_custom_command(
+      OUTPUT "${CSFFW_GENXML_HDR}"
+      COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/tools/gen_csffw_genxml.py"
+              --xml "${CSFFW_GENXML_XML}" --out "${CSFFW_GENXML_HDR}"
+      DEPENDS "${CSFFW_GENXML_XML}" "${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/tools/gen_csffw_genxml.py"
+      COMMENT "Regenerating csffw_genxml_decode.h from Panfrost v11 genxml"
+      VERBATIM
+   )
+   set_source_files_properties("${CSFFW_GENXML_HDR}" PROPERTIES GENERATED TRUE)
+endif()
+
 add_library(mali_kbase_emu SHARED
    src/emulator/mali_kbase_emu.c
    src/emulator/lifted_kbase_ko.c
    src/emulator/lifted_csffw.c
+   ${CSFFW_GENXML_HDR}
    ${LIFTED_KBASE_KO_LL_OBJ}
    src/emulator/panfrost_valhall_disasm_gen.c
     src/emulator/valhall_vulkan_renderer.cpp
@@ -348,6 +364,7 @@ add_library(mali_kbase_emu_static STATIC
    src/emulator/mali_kbase_emu.c
    src/emulator/lifted_kbase_ko.c
    src/emulator/lifted_csffw.c
+   ${CSFFW_GENXML_HDR}
    ${LIFTED_KBASE_KO_LL_OBJ}
    src/emulator/panfrost_valhall_disasm_gen.c
     src/emulator/valhall_vulkan_renderer.cpp

@@ -249,8 +249,20 @@ def verify_source_coverage(repo_root: str, firmware_opcodes: list[int]) -> dict:
     assert "#define CSFFW_MAX_CALL_STACK_DEPTH   8U" in lifted_h
     assert "call_depth < 8U" in emu_c or "MALI_CSF_MAX_CALL_STACK_DEPTH" in emu_c
 
-    # Extract case labels from lifted_csffw_dispatch_opcode
+    # Extract case labels from lifted_csffw_dispatch_opcode. Labels may be
+    # literal `case 0xNN:` or generated `case CS_OPCODE_<NAME>:` (see
+    # csffw_genxml_decode.h, produced by tools/gen_csffw_genxml.py).
+    genxml_h_path = os.path.join(repo_root, "src", "emulator", "generated", "csffw_genxml_decode.h")
+    opcode_macros = {}
+    if os.path.exists(genxml_h_path):
+        with open(genxml_h_path) as f:
+            for m in re.finditer(r"#define\s+CS_OPCODE_(\w+)\s+(\d+)", f.read()):
+                opcode_macros[m.group(1)] = int(m.group(2))
+
     lifted_cases = {int(m, 16) for m in re.findall(r"case\s+0x([0-9A-Fa-f]+)\s*:", lifted_c)}
+    for m in re.findall(r"case\s+CS_OPCODE_(\w+)\s*:", lifted_c):
+        if m in opcode_macros:
+            lifted_cases.add(opcode_macros[m])
     missing_in_lifted = [op for op in firmware_opcodes + CSHWIF_OPCODES if op not in lifted_cases]
     assert not missing_in_lifted, f"Missing opcodes in lifted_csffw.c: {[hex(x) for x in missing_in_lifted]}"
 

@@ -714,7 +714,7 @@ vkQueueSubmit(VkQueue queue, uint32_t submitCount,
    cs[5] = (18ULL << 56) | (71ULL << 48) | (70ULL << 40) | (1ULL << 32);              /* COMPARE_SELECT32 */
    cs[6] = (CSF_OP_HEAP_OPERATION << 56) | (1ULL << 48);
    cs[7] = (CSF_OP_RUN_IDVS << 56) | (1ULL << 32);
-   cs[8] = (CSF_OP_FINISH_TILING << 56);
+   cs[8] = (HW_CSF_OP_FINISH_TILING << 56);
    cs[9] = (CSF_OP_SYNC_ADD64 << 56) | (CSF_SYNC_SCOPE_CSG << 28) | (48ULL << 16) | 1ULL;
    cs[10] = (CSF_OP_RUN_COMPUTE << 56) | (1ULL << 32);
 

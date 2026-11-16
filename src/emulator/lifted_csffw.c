@@ -12,6 +12,7 @@
  */
 
 #include "lifted_csffw.h"
+#include "generated/csffw_genxml_decode.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,7 +32,6 @@ static uint32_t read_u32_le(const uint8_t *p)
     memcpy(&v, p, sizeof(v));
     return v;
 }
-
 
 bool csffw_parse_binary_file(const char *path, struct csffw_parsed_image *out_img)
 {
@@ -215,64 +215,74 @@ enum csffw_opcode_ret lifted_csffw_dispatch_opcode(
     if (!st)
         return CSFFW_OP_RET_FAULT;
 
-    uint32_t opcode = (cmd_hi >> 24) & 0xFFU;
+    /* Field layouts below are generated from mesa/src/panfrost/genxml/v11.xml
+     * by tools/gen_csffw_genxml.py (see csffw_genxml_decode.h). The opcode
+     * *names* follow the Mesa v11 CS Opcode enum; the *semantics* follow the
+     * firmware handlers in mali_csffw.bin (validated by
+     * src/verifier/csffw_formal_semantics_verifier.py). */
+    const uint64_t insn = ((uint64_t)cmd_hi << 32) | (uint64_t)cmd_lo;
+    const uint32_t opcode = (uint32_t)cs_base_opcode(insn);
     if (opcode > 128U)
         return csffw_raise_invalid_insn_fault(st);
 
     switch (opcode) {
-    /* --- CSHWIF Hardware Frontend Instructions (0x00..0x07) --- */
-    case 0x00: /* NOP */
-    case 0x80: /* NOP_TRAP @ 0x00806b3c: movs r0, #0; bx lr */
+    /* --- CSHWIF hardware frontend instructions --- */
+    case CS_OPCODE_NOP:
+    case 0x80: /* NOP_TRAP @ 0x00806b3c (not in the v11 CS Opcode enum) */
         return CSFFW_OP_RET_COMPLETED;
 
-    case 0x01: /* MOVE48: dst = bits[23:16] of cmd_hi, imm48 = ((cmd_hi & 0xFFFF) << 32) | cmd_lo */ {
-        uint32_t dst = (cmd_hi >> 16) & 0xFFU;
+    case CS_OPCODE_MOVE48: {
+        uint32_t dst = (uint32_t)cs_move48_destination(insn);
         if (dst >= (uint32_t)(st->max_regs - 1U))
             return csffw_raise_invalid_insn_fault(st);
-        st->cshwif_regs[dst] = cmd_lo;
-        st->cshwif_regs[dst + 1] = cmd_hi & 0xFFFFU;
+        uint64_t imm48 = cs_move48_immediate(insn);
+        st->cshwif_regs[dst] = (uint32_t)(imm48 & 0xFFFFFFFFULL);
+        st->cshwif_regs[dst + 1] = (uint32_t)(imm48 >> 32);
         return CSFFW_OP_RET_COMPLETED;
     }
 
-    case 0x02: /* MOV32 / MOVE32: dst = bits[23:16] of cmd_hi, imm32 = cmd_lo */ {
-        uint32_t dst = (cmd_hi >> 16) & 0xFFU;
+    case CS_OPCODE_MOVE32: {
+        uint32_t dst = (uint32_t)cs_move32_destination(insn);
         if (dst >= st->max_regs)
             return csffw_raise_invalid_insn_fault(st);
-        st->cshwif_regs[dst] = cmd_lo;
+        st->cshwif_regs[dst] = (uint32_t)cs_move32_immediate(insn);
         return CSFFW_OP_RET_COMPLETED;
     }
 
-    case 0x03: /* WAIT: scoreboard mask in cmd_lo[15:0] */
+    case CS_OPCODE_WAIT:
         return CSFFW_OP_RET_COMPLETED;
 
-    case 0x04: /* RUN_COMPUTE: CSHWIF compute iterator dispatch */
-        st->iter_states[1] = CSFFW_ITER_ENABLED;
+    case CS_OPCODE_RUN_COMPUTE:
+        st->iter_states[CSFFW_TL_ITER_TYPE_COMPUTE] = CSFFW_ITER_ENABLED;
         st->csi_state = CSFFW_CSI_RUNNABLE;
         return CSFFW_OP_RET_COMPLETED;
 
-    case 0x05: /* RUN_TILING: CSHWIF tiler iterator dispatch */
-    case 0x06: /* RUN_IDVS: CSHWIF IDVS vertex+tiler iterator dispatch */
-        st->iter_states[0] = CSFFW_ITER_ENABLED;
+    case 0x05: /* RUN_TILING (v10; absent from the v11 CS Opcode enum) */
+    case CS_OPCODE_RUN_IDVS:
+        st->iter_states[CSFFW_TL_ITER_TYPE_TILER] = CSFFW_ITER_ENABLED;
         st->csi_state = CSFFW_CSI_RUNNABLE;
         return CSFFW_OP_RET_COMPLETED;
 
-    case 0x07: /* RUN_FRAGMENT: CSHWIF fragment iterator dispatch */
-        st->iter_states[2] = CSFFW_ITER_ENABLED;
+    case CS_OPCODE_RUN_FRAGMENT:
+        st->iter_states[CSFFW_TL_ITER_TYPE_FRAGMENT] = CSFFW_ITER_ENABLED;
         st->csi_state = CSFFW_CSI_RUNNABLE;
         return CSFFW_OP_RET_COMPLETED;
 
-    /* --- Firmware-Trapped CSF Opcodes in g_csffw_opcode_table (VA 0x004100BC) --- */
-    case 0x0B: /* Handler @ 0x0080796c: SHARED_SB_DEC / SB_INC */ {
-        uint32_t src0 = (cmd_hi >> 8) & 0xFFU;
-        uint32_t src1 = cmd_hi & 0xFFU;
+    /* --- Firmware-trapped CSF opcodes in g_csffw_opcode_table --- */
+    case CS_OPCODE_FINISH_FRAGMENT: {
+        /* Handler @ 0x0080796c. Firmware models this as a shared scoreboard
+         * decrement; validate the two register operands. */
+        uint32_t src0 = (uint32_t)cs_finish_fragment_first_heap_chunk(insn);
+        uint32_t src1 = (uint32_t)cs_finish_fragment_last_heap_chunk(insn);
         if (src0 >= (uint32_t)(st->max_regs - 1U) || src1 >= (uint32_t)(st->max_regs - 1U))
             return csffw_raise_invalid_insn_fault(st);
         return CSFFW_OP_RET_COMPLETED;
     }
 
-    case 0x18: /* Handler @ 0x00812668: DEFERRED_SYNC / PROT_REGION */ {
-        uint32_t src = (cmd_hi >> 8) & 0xFFU;
-        uint32_t slot = cmd_lo & 0x1FU;
+    case CS_OPCODE_PROGRESS_WAIT: {
+        /* Handler @ 0x00812668: deferred progress wait. */
+        uint32_t src = (uint32_t)cs_progress_wait_source(insn);
+        uint32_t slot = (uint32_t)cs_progress_wait_queue(insn);
         if (src >= (uint32_t)(st->max_regs - 1U) || slot >= 8U)
             return csffw_raise_invalid_insn_fault(st);
         st->csi_deferred_opcode = 24U;
@@ -283,17 +293,18 @@ enum csffw_opcode_ret lifted_csffw_dispatch_opcode(
         return CSFFW_OP_RET_BLOCKED_DEFERRED;
     }
 
-    case 0x19: /* Handler @ 0x00806dc8: TILER_HEAP_SET */ {
-        uint32_t src0 = (cmd_hi >> 8) & 0xFFU;
-        uint32_t src1 = cmd_hi & 0xFFU;
+    case CS_OPCODE_SET_EXCEPTION_HANDLER: {
+        /* Handler @ 0x00806dc8. */
+        uint32_t src0 = (uint32_t)cs_set_exception_handler_address(insn);
+        uint32_t src1 = (uint32_t)cs_set_exception_handler_length(insn);
         if (src0 >= (uint32_t)(st->max_regs - 1U) || src1 >= st->max_regs)
             return csffw_raise_invalid_insn_fault(st);
         return CSFFW_OP_RET_COMPLETED;
     }
 
-    case 0x20: /* Handler @ 0x00811714: CALL (subroutine call via CSHWIF_REG[src0:src0+1], len CSHWIF_REG[src1]) */ {
-        uint32_t src0 = (cmd_hi >> 8) & 0xFFU;
-        uint32_t src1 = cmd_hi & 0xFFU;
+    case CS_OPCODE_CALL: {
+        uint32_t src0 = (uint32_t)cs_call_address(insn);
+        uint32_t src1 = (uint32_t)cs_call_length(insn);
         if (src0 >= (uint32_t)(st->max_regs - 1U) || src1 >= st->max_regs)
             return csffw_raise_invalid_insn_fault(st);
         if (st->csi_call_depth >= CSFFW_MAX_CALL_STACK_DEPTH)
@@ -310,9 +321,9 @@ enum csffw_opcode_ret lifted_csffw_dispatch_opcode(
         return CSFFW_OP_RET_BRANCHED;
     }
 
-    case 0x21: /* Handler @ 0x0081182e: JUMP (tail branch inside subroutine or ringbuffer) */ {
-        uint32_t src0 = (cmd_hi >> 8) & 0xFFU;
-        uint32_t src1 = cmd_hi & 0xFFU;
+    case CS_OPCODE_JUMP: {
+        uint32_t src0 = (uint32_t)cs_jump_address(insn);
+        uint32_t src1 = (uint32_t)cs_jump_length(insn);
         if (src0 >= (uint32_t)(st->max_regs - 1U) || src1 >= st->max_regs)
             return csffw_raise_invalid_insn_fault(st);
         uint64_t target_va = csffw_read_reg64(st, src0) & ~7ULL;
@@ -325,8 +336,12 @@ enum csffw_opcode_ret lifted_csffw_dispatch_opcode(
     }
 
     case 0x16: /* Synthetic alias for REQ_RESOURCE */
-    case 0x22: /* Handler @ 0x00806cec: REQ_RESOURCE (acquires/releases TILER/COMPUTE/FRAGMENT/NEURAL iterators) */ {
-        uint8_t req_mask = (uint8_t)(cmd_lo & 0x0FU);
+    case CS_OPCODE_REQ_RESOURCE: {
+        uint8_t req_mask = 0;
+        if (cs_req_resource_compute(insn))  req_mask |= 1U << 0;
+        if (cs_req_resource_fragment(insn)) req_mask |= 1U << 1;
+        if (cs_req_resource_tiler(insn))    req_mask |= 1U << 2;
+        if (cs_req_resource_idvs(insn))     req_mask |= 1U << 3;
         st->csi_req_res_mask = req_mask;
         st->csi_granted_res_mask = req_mask;
         for (int it = 0; it < 4; ++it) {
@@ -338,54 +353,55 @@ enum csffw_opcode_ret lifted_csffw_dispatch_opcode(
                    : CSFFW_OP_RET_BLOCKED_RESOURCE;
     }
 
-    case 0x24: /* Handler @ 0x008014b0: FLUSH_CACHE */ {
-        uint32_t sb = (cmd_hi >> 16) & 0x0FU;
-        uint32_t reg = (cmd_hi >> 8) & 0xFFU;
+    case CS_OPCODE_FLUSH_CACHE2: {
+        uint32_t sb = (uint32_t)cs_flush_cache2_signal_slot(insn);
+        uint32_t reg = (uint32_t)cs_flush_cache2_latest_flush_id(insn);
         if (sb >= st->max_scoreboards || reg >= st->max_regs)
             return csffw_raise_invalid_insn_fault(st);
         return CSFFW_OP_RET_COMPLETED;
     }
 
-    case 0x25: /* Handler @ 0x00801650: SYNC_ADD32 */
-    case 0x26: /* Handler @ 0x00801650: SYNC_SET32 */
-    case 0x33: /* Handler @ 0x00801650: SYNC_ADD64 */
-    case 0x34: /* Handler @ 0x00801650: SYNC_SET64 */ {
-        bool is_64 = (opcode >= 0x33U);
-        uint32_t addr_reg = (cmd_hi >> 8) & 0xFFU;
-        uint32_t val_reg = cmd_hi & 0xFFU;
-        uint32_t sb = (cmd_hi >> 16) & 0x0FU;
+    case CS_OPCODE_SYNC_ADD32:
+    case CS_OPCODE_SYNC_SET32:
+    case CS_OPCODE_SYNC_ADD64:
+    case CS_OPCODE_SYNC_SET64: {
+        bool is_64 = (opcode == CS_OPCODE_SYNC_ADD64 || opcode == CS_OPCODE_SYNC_SET64);
+        bool is_add = (opcode == CS_OPCODE_SYNC_ADD32 || opcode == CS_OPCODE_SYNC_ADD64);
+        uint32_t addr_reg = (uint32_t)(is_64 ? cs_sync_add64_address(insn)
+                                             : cs_sync_add32_address(insn));
+        uint32_t val_reg = (uint32_t)(is_64 ? cs_sync_add64_data(insn)
+                                            : cs_sync_add32_data(insn));
+        uint32_t sb = (uint32_t)(is_64 ? cs_sync_add64_signal_slot(insn)
+                                       : cs_sync_add32_signal_slot(insn));
         if (addr_reg >= (uint32_t)(st->max_regs - 1U) || sb >= st->max_scoreboards)
             return csffw_raise_invalid_insn_fault(st);
         if (is_64 ? (val_reg >= (uint32_t)(st->max_regs - 1U)) : (val_reg >= st->max_regs))
             return csffw_raise_invalid_insn_fault(st);
         uint64_t sync_va = csffw_read_reg64(st, addr_reg);
-        /* 0x008016ac / 0x008016d4: 8-byte alignment check for 32-bit, 16-byte or 8-byte for 64-bit */
-        if ((sync_va & 0x7ULL) != 0ULL || sync_va < 0x10000ULL || !csffw_is_mapped_va(sync_va, is_64 ? 8U : 4U))
+        if ((sync_va & 0x7ULL) != 0ULL || sync_va < 0x10000ULL ||
+            !csffw_is_mapped_va(sync_va, is_64 ? 8U : 4U))
             return csffw_raise_invalid_insn_fault(st);
         if (is_64) {
-            uint64_t v64 = csffw_read_reg64(st, val_reg);
-            uint64_t *p64 = (uint64_t *)(uintptr_t)sync_va;
-            if (opcode == 0x33U)
-                *p64 += v64;
-            else
-                *p64 = v64;
+            uint64_t v = csffw_read_reg64(st, val_reg);
+            uint64_t *p = (uint64_t *)(uintptr_t)sync_va;
+            if (is_add) *p += v; else *p = v;
         } else {
-            uint32_t v32 = st->cshwif_regs[val_reg];
-            uint32_t *p32 = (uint32_t *)(uintptr_t)sync_va;
-            if (opcode == 0x25U)
-                *p32 += v32;
-            else
-                *p32 = v32;
+            uint32_t v = st->cshwif_regs[val_reg];
+            uint32_t *p = (uint32_t *)(uintptr_t)sync_va;
+            if (is_add) *p += v; else *p = v;
         }
         return CSFFW_OP_RET_COMPLETED;
     }
 
-    case 0x27: /* Handler @ 0x0080195c: SYNC_WAIT32 */
-    case 0x35: /* Handler @ 0x0080195c: SYNC_WAIT64 */ {
-        bool is_64 = (opcode >= 0x33U);
-        uint32_t addr_reg = (cmd_hi >> 8) & 0xFFU;
-        uint32_t val_reg = cmd_hi & 0xFFU;
-        uint32_t cond = ((cmd_lo >> 28) | ((cmd_hi & 0xFFU) << 4)) & 0x0FU;
+    case CS_OPCODE_SYNC_WAIT32:
+    case CS_OPCODE_SYNC_WAIT64: {
+        bool is_64 = (opcode == CS_OPCODE_SYNC_WAIT64);
+        uint32_t addr_reg = (uint32_t)(is_64 ? cs_sync_wait64_address(insn)
+                                             : cs_sync_wait32_address(insn));
+        uint32_t val_reg = (uint32_t)(is_64 ? cs_sync_wait64_data(insn)
+                                            : cs_sync_wait32_data(insn));
+        uint32_t cond = (uint32_t)(is_64 ? cs_sync_wait64_condition(insn)
+                                         : cs_sync_wait32_condition(insn));
         if (addr_reg >= (uint32_t)(st->max_regs - 1U))
             return csffw_raise_invalid_insn_fault(st);
         if (is_64 ? (val_reg >= (uint32_t)(st->max_regs - 1U)) : (val_reg >= st->max_regs))
@@ -394,9 +410,10 @@ enum csffw_opcode_ret lifted_csffw_dispatch_opcode(
         if (cond > 5U || (((1U << cond) & 0x23U) == 0U))
             return csffw_raise_invalid_insn_fault(st);
         uint64_t sync_va = csffw_read_reg64(st, addr_reg);
-        if ((sync_va & 0x7ULL) != 0ULL || sync_va < 0x10000ULL || !csffw_is_mapped_va(sync_va, is_64 ? 8U : 4U))
+        if ((sync_va & 0x7ULL) != 0ULL || sync_va < 0x10000ULL ||
+            !csffw_is_mapped_va(sync_va, is_64 ? 8U : 4U))
             return csffw_raise_invalid_insn_fault(st);
-        bool satisfied = false;
+        bool satisfied;
         if (is_64) {
             uint64_t cur = *(const uint64_t *)(uintptr_t)sync_va;
             uint64_t ref = csffw_read_reg64(st, val_reg);
@@ -414,12 +431,13 @@ enum csffw_opcode_ret lifted_csffw_dispatch_opcode(
         return CSFFW_OP_RET_COMPLETED;
     }
 
-    case 0x28: /* Handler @ 0x00806f52: POINTER_OFFSET (adds sxth(cmd_lo & 0xFFF8) to 64-bit reg pair) */ {
-        uint32_t sb = (cmd_hi >> 16) & 0x0FU;
-        uint32_t reg = (cmd_hi >> 8) & 0xFFU;
+    case CS_OPCODE_STORE_STATE: {
+        /* Handler @ 0x00806f52: signed 16-bit pointer offset on a register pair. */
+        uint32_t sb = (uint32_t)cs_store_state_signal_slot(insn);
+        uint32_t reg = (uint32_t)cs_store_state_address(insn);
         if (reg >= (uint32_t)(st->max_regs - 1U) || sb >= st->max_scoreboards)
             return csffw_raise_invalid_insn_fault(st);
-        int16_t delta = (int16_t)(cmd_lo & 0xFFF8U);
+        int16_t delta = (int16_t)(uint16_t)(cs_store_state_offset(insn) & 0xFFF8U);
         uint64_t ptr = csffw_read_reg64(st, reg);
         ptr = (uint64_t)((int64_t)ptr + (int64_t)delta);
         if ((ptr & 0x7ULL) != 0ULL)
@@ -428,8 +446,9 @@ enum csffw_opcode_ret lifted_csffw_dispatch_opcode(
         return CSFFW_OP_RET_COMPLETED;
     }
 
-    case 0x29: /* Handler @ 0x00806b40: SKIP */ {
-        uint32_t skip_bytes = (cmd_lo << 3) & 0x0007FFF8U;
+    case CS_OPCODE_PROT_REGION: {
+        /* Handler @ 0x00806b40: skip (cmd_lo << 3) bytes. */
+        uint32_t skip_bytes = (uint32_t)cs_prot_region_size(insn);
         if (skip_bytes == 0)
             return CSFFW_OP_RET_COMPLETED;
         if (st->cshwif_pc + 8ULL + skip_bytes > st->cshwif_end_pc)
@@ -438,35 +457,37 @@ enum csffw_opcode_ret lifted_csffw_dispatch_opcode(
         return CSFFW_OP_RET_COMPLETED;
     }
 
-    case 0x2A: /* Handler @ 0x008125f0: LOAD_ITER_STATE (CSHWIF_REG[src:src+1] -> CSHWIF+0x90..0x94) */ {
-        uint32_t src = (cmd_hi >> 8) & 0xFFU;
+    case CS_OPCODE_PROGRESS_STORE: {
+        uint32_t src = (uint32_t)cs_progress_store_source(insn);
         if (src >= (uint32_t)(st->max_regs - 1U))
             return csffw_raise_invalid_insn_fault(st);
         st->cshwif_iter_state64 = csffw_read_reg64(st, src);
         return CSFFW_OP_RET_COMPLETED;
     }
 
-    case 0x2B: /* Handler @ 0x00812578: STORE_ITER_STATE (CSHWIF+0x90..0x94 -> CSHWIF_REG[dst:dst+1]) */ {
-        uint32_t dst = (cmd_hi >> 16) & 0xFFU;
+    case CS_OPCODE_PROGRESS_LOAD: {
+        uint32_t dst = (uint32_t)cs_progress_load_destination(insn);
         if (dst >= st->max_regs)
             return csffw_raise_invalid_insn_fault(st);
         csffw_write_reg64(st, dst, st->cshwif_iter_state64);
         return CSFFW_OP_RET_COMPLETED;
     }
 
-    case 0x2C: /* Handler @ 0x0081284a: FINISH_FRAGMENT / ITER_INC */ {
-        if (st->csi_iter_active && (cmd_hi & 1U))
+    case CS_OPCODE_RUN_COMPUTE_INDIRECT: {
+        if (st->csi_iter_active && cs_run_compute_indirect_progress_increment(insn))
             st->cshwif_iter_state64 += 1ULL;
         return CSFFW_OP_RET_COMPLETED;
     }
 
-    case 0x2F: /* Handler @ 0x00806a5c: PROTM_EXIT */ {
+    case CS_OPCODE_ERROR_BARRIER: {
+        /* Handler @ 0x00806a5c: protected-mode exit. */
         st->csi_iter_active = 0;
         return CSFFW_OP_RET_COMPLETED;
     }
 
-    case 0x30: /* Handler @ 0x00807672: HEAP_OPERATION */ {
-        uint32_t src = (cmd_hi >> 8) & 0xFFU;
+    case CS_OPCODE_HEAP_SET: {
+        /* Handler @ 0x00807672. */
+        uint32_t src = (uint32_t)cs_heap_set_address(insn);
         if (src >= (uint32_t)(st->max_regs - 1U))
             return csffw_raise_invalid_insn_fault(st);
         uint64_t heap_va = csffw_read_reg64(st, src);
@@ -475,18 +496,20 @@ enum csffw_opcode_ret lifted_csffw_dispatch_opcode(
         return CSFFW_OP_RET_COMPLETED;
     }
 
-    case 0x31: /* Handler @ 0x008078c4: ITER_PROGRESS_INC */ {
-        uint32_t mode = cmd_hi & 0x7U;
-        uint32_t sb = (cmd_hi >> 16) & 0x0FU;
+    case CS_OPCODE_HEAP_OPERATION: {
+        /* Handler @ 0x008078c4. */
+        uint32_t mode = (uint32_t)cs_heap_operation_operation(insn);
+        uint32_t sb = (uint32_t)cs_heap_operation_signal_slot(insn);
         if (mode > 3U || sb >= st->max_scoreboards)
             return csffw_raise_invalid_insn_fault(st);
         return CSFFW_OP_RET_COMPLETED;
     }
 
-    case 0x32: /* Handler @ 0x00812cb6: LOAD_MULTIPLE */ {
-        uint32_t count = (cmd_hi >> 8) & 0xFFU;
-        uint32_t sb = (cmd_hi >> 16) & 0x0FU;
-        uint32_t base_reg = cmd_hi & 0xFFU;
+    case CS_OPCODE_TRACE_POINT: {
+        /* Handler @ 0x00812cb6. */
+        uint32_t count = (uint32_t)cs_trace_point_register_count(insn);
+        uint32_t sb = (uint32_t)cs_trace_point_signal_slot(insn);
+        uint32_t base_reg = (uint32_t)cs_trace_point_base_register(insn);
         if (count > 16U || sb >= st->max_scoreboards || base_reg + count > st->max_regs)
             return csffw_raise_invalid_insn_fault(st);
         return CSFFW_OP_RET_COMPLETED;

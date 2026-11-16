@@ -36,6 +36,12 @@ extern "C" {
 #define CSF_OP_CALL             MALI_CSF_OP_CALL
 #define CSF_OP_JUMP             MALI_CSF_OP_JUMP
 #define CSF_OP_REQ_RESOURCE     MALI_CSF_OP_REQ_RESOURCE
+/* TODO(leegao): Legacy synthetic opcode space (emulator test harness only).
+ * NOTE: these values do NOT match the hardware/Mesa v11 CS opcode space
+ * (MALI_CSF_OP_*). In particular CSF_OP_FINISH_TILING == 0x2c collides with
+ * the real RUN_COMPUTE_INDIRECT (0x2c); the real FINISH_TILING is 0x09
+ * (HW_CSF_OP_FINISH_TILING). Do not emit these into a stream that is also
+ * interpreted as hardware CS. See docs/r54p3_reverse_engineering.md §7.5. */
 #define CSF_OP_SYNC_SET32       0x24ULL
 #define CSF_OP_SYNC_ADD32       0x25ULL
 #define CSF_OP_SYNC_WAIT32      0x26ULL
