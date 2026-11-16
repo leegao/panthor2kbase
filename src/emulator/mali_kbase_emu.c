@@ -48,6 +48,7 @@
 #include "panthor_csf_instr.h"
 #include "valhall_disasm_lift.h"
 #include "panthor_kbase_adapter.h"
+#include "valhall_vulkan_renderer.h"
 
 static int (*orig_open)(const char *, int, ...) = NULL;
 static int (*orig_close)(int) = NULL;
@@ -268,7 +269,7 @@ static int g_default_direct_fd = -1;
 static int g_emu_profile_override = -1;
 static LiftedKbaseCPU g_lifted_cpu;
 static struct csffw_emu_state g_csffw_state;
-static mali_kbase_emu_csf_job_hook_fn g_csf_job_hook = NULL;
+static mali_kbase_emu_csf_job_hook_fn g_csf_job_hook = valhall_vk_csf_job_hook;
 static void *g_csf_job_hook_user_data = NULL;
 
 __attribute__((visibility("default")))
@@ -1772,8 +1773,11 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
          break;
       }
 
+      case 5: /* HW_CSF_OP_RUN_TILING (0x05) */
       case 6: /* HW_CSF_OP_RUN_IDVS (0x06) */
       case 7: /* HW_CSF_OP_RUN_FRAGMENT (0x07) */
+      case 8: /* HW_CSF_OP_RUN_FULLSCREEN (0x08) */
+      case 44: /* HW_CSF_OP_RUN_COMPUTE_INDIRECT (0x2c) */
       case CSF_OP_RUN_IDVS:
       case CSF_OP_RUN_FRAGMENT:
       handle_run_compute: {
@@ -1784,13 +1788,84 @@ static void execute_csf_stream_depth(const uint64_t *stream, uint32_t size_bytes
          else
             g_stats.fragment_jobs_run++;
 
-         if (g_csf_job_hook) {
+         if (getenv("KBASE_EMU_DUMP_CSF_JOB")) {
+            static int s_dump_job = 0;
+            if (s_dump_job < 4) {
+               s_dump_job++;
+               fprintf(stderr, "\n================ [KBASE_EMU_DUMP_CSF_JOB #%d] opcode=0x%02x insn=0x%016llx ================\n",
+                       s_dump_job, (unsigned)opcode, (unsigned long long)insn);
+               for (int ri = 0; ri < 96; ri += 2) {
+                  uint64_t lo = cs_regs[ri] & 0xffffffffULL;
+                  uint64_t hi = cs_regs[ri + 1] & 0xffffffffULL;
+                  uint64_t pair = (hi << 32) | lo;
+                  if (pair != 0) {
+                     fprintf(stderr, "  r%02d:r%02d = 0x%016llx (r%02d=0x%08llx, r%02d=0x%08llx)\n",
+                             ri, ri + 1, (unsigned long long)pair, ri, (unsigned long long)lo, ri + 1, (unsigned long long)hi);
+                  }
+               }
+               if (s_dump_job == 1) {
+                  fprintf(stderr, "\n--- Active Kbase Memory Regions ---\n");
+                  for (size_t r = 0; r < 2048; r++) {
+                     if (g_kfile.regions[r].active && g_kfile.regions[r].cpu_ptr) {
+                        fprintf(stderr, "  Region[%zu]: gpu_va=0x%012llx size=0x%zx flags=0x%llx\n",
+                                r, (unsigned long long)g_kfile.regions[r].gpu_va,
+                                g_kfile.regions[r].size, (unsigned long long)g_kfile.regions[r].flags);
+                        if (g_kfile.regions[r].flags & BASE_MEM_PROT_GPU_EX) {
+                           const uint64_t *words = (const uint64_t *)g_kfile.regions[r].cpu_ptr;
+                           size_t nw = g_kfile.regions[r].size / 8;
+                           for (size_t w = 0; w < nw; w++) {
+                              if (words[w] != 0) {
+                                 fprintf(stderr, "    [EXEC_VA 0x%llx + 0x%zx (0x%llx)]:\n",
+                                         (unsigned long long)g_kfile.regions[r].gpu_va, w * 8,
+                                         (unsigned long long)(g_kfile.regions[r].gpu_va + w * 8));
+                                 size_t end_w = w;
+                                 while (end_w < nw && words[end_w] != 0) {
+                                    fprintf(stderr, "      0x%012llx: 0x%016llx  ",
+                                            (unsigned long long)(g_kfile.regions[r].gpu_va + end_w * 8),
+                                            (unsigned long long)words[end_w]);
+                                    va_disasm_instr(stderr, words[end_w]);
+                                    fprintf(stderr, "\n");
+                                    end_w++;
+                                 }
+                                 w = end_w;
+                              }
+                           }
+                        }
+                     }
+                  }
+               }
+               int dump_regs[] = {0, 4, 8, 16, 18, 20, 24, 40, 50, 52};
+               for (size_t di = 0; di < sizeof(dump_regs)/sizeof(dump_regs[0]); di++) {
+                  int rbase = dump_regs[di];
+                  uint64_t raw_ptr = ((cs_regs[rbase + 1] & 0xffffULL) << 32) | (cs_regs[rbase] & 0xffffffffULL);
+                  uint64_t va = raw_ptr & ~0x3fULL;
+                  if (rbase == 0 || rbase == 4) va = (raw_ptr >= 0x100) ? ((raw_ptr - 0xc8) & ~0x7ULL) : raw_ptr;
+                  if (va >= 0x10000ULL && emu_is_valid_host_range(va, 512)) {
+                     fprintf(stderr, "\n--- Dump around r%02d:r%02d (raw=0x%llx, base=0x%llx) ---\n",
+                             rbase, rbase + 1, (unsigned long long)raw_ptr, (unsigned long long)va);
+                     const uint64_t *q = (const uint64_t *)(uintptr_t)va;
+                     for (size_t qi = 0; qi < 64; qi += 2) {
+                        if (q[qi] == 0 && q[qi+1] == 0) continue;
+                        fprintf(stderr, "  0x%012llx (+0x%03zx): 0x%016llx  0x%016llx  (u32: %08x %08x | %08x %08x)\n",
+                                (unsigned long long)(va + qi * 8), qi * 8,
+                                (unsigned long long)q[qi], (unsigned long long)q[qi+1],
+                                (uint32_t)q[qi], (uint32_t)(q[qi] >> 32),
+                                (uint32_t)q[qi+1], (uint32_t)(q[qi+1] >> 32));
+                     }
+                  }
+               }
+            }
+         }
+         {
             mali_kbase_emu_csf_job_hook_fn hook_fn = g_csf_job_hook;
             void *hook_ud = g_csf_job_hook_user_data;
             uint64_t cs_regs_snap[128];
             memcpy(cs_regs_snap, cs_regs, sizeof(cs_regs_snap));
             pthread_mutex_unlock(&g_emu_lock);
-            hook_fn((uint8_t)opcode, insn, cs_regs_snap, hook_ud);
+            valhall_vk_csf_job_hook((uint8_t)opcode, insn, cs_regs_snap, NULL);
+            if (hook_fn && hook_fn != valhall_vk_csf_job_hook) {
+               hook_fn((uint8_t)opcode, insn, cs_regs_snap, hook_ud);
+            }
             pthread_mutex_lock(&g_emu_lock);
          }
 
