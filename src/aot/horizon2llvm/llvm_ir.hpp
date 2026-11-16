@@ -27,7 +27,8 @@
 #include <utility>
 #include <vector>
 
-#if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS) && __has_include("llvm/IR/IRBuilder.h")
+#if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS) && HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS && HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS && __has_include("llvm/IR/IRBuilder.h")
+#include "llvm/IR/ModuleSlotTracker.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -57,7 +58,7 @@
 #endif
 
 namespace ultrs::llvm_ir {
-#if !defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS)
+#if !defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS) || !HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS
 namespace llvm = ultrs::llvm_compat;
 #endif
 
@@ -212,7 +213,12 @@ inline TypeKind vec_int_type(unsigned sz) {
 inline std::string format_llvm_inst(const llvm::Value* v) {
     std::string s;
     llvm::raw_string_ostream os(s);
+#if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS) && HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS
+    static thread_local llvm::ModuleSlotTracker null_mst(nullptr, false);
+    v->print(os, null_mst);
+#else
     v->print(os);
+#endif
     os.flush();
     while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) {
         s.erase(s.begin());
@@ -929,7 +935,7 @@ private:
     std::vector<std::unique_ptr<ModulePass>> passes_;
 };
 
-#if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS)
+#if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS) && HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS
 // Parse a textual vector literal such as "<i32 32, i32 32, i32 32, i32 32>"
 // into a real llvm::ConstantVector. Returns nullptr if the literal cannot be
 // parsed (caller falls back to zeroinitializer).
@@ -1026,7 +1032,7 @@ public:
                 return llvm::UndefValue::get(ty);
             }
             if (!v.repr.empty() && v.repr.front() == '<') {
-#if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS)
+#if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS) && HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS
                 if (auto* cv = parse_vector_literal(ty, v.repr, ctx)) return cv;
                 return llvm::Constant::getNullValue(ty);
 #else
@@ -1056,7 +1062,7 @@ public:
             if (v.type == TypeKind::Float || v.type == TypeKind::Double) {
                 return llvm::ConstantFP::get(ty, std::stod(v.repr));
             }
-            return llvm::ConstantInt::get(ty, v.const_u64, false);
+            return llvm::ConstantInt::get(ty, v.const_u64, !v.repr.empty() && v.repr[0] == '-');
         }
         if (fn_ && !v.repr.empty() && v.repr.front() == '%') {
             auto it = fn_->ssa_values.find(v.repr);
@@ -1530,7 +1536,7 @@ public:
         llvm::Value* pv = resolve_llvm_value(ptr_val);
         llvm::Value* vv = resolve_llvm_value(val);
         llvm::Instruction* raw_i = nullptr;
-#if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS)
+#if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS) && HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS
         llvm::AtomicRMWInst::BinOp op = llvm::AtomicRMWInst::Add;
         if (std::strcmp(rmw_op, "xchg") == 0) op = llvm::AtomicRMWInst::Xchg;
         else if (std::strcmp(rmw_op, "add") == 0) op = llvm::AtomicRMWInst::Add;

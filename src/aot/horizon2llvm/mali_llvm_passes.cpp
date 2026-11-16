@@ -3631,10 +3631,14 @@ public:
             // llvm::Value* map and synthetic SSA/literal values are dead weight
             // once lifting finishes.
             fn->ssa_values.clear();
-#if !defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS)
-            // The compat layer's synthetic values are text-only, so they can be
-            // freed eagerly. Real LLVM instructions hold operand pointers to
-            // them, so they must outlive the module (see Module member order).
+#if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS) && HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS
+            for (auto &bb : fn->blocks) {
+                bb->llvm_bb = nullptr;
+                for (auto &inst : bb->insts) inst.llvm_inst = nullptr;
+            }
+            if (fn->llvm_fn) fn->llvm_fn->deleteBody();
+            fn->synthetic_ssa_vals.clear();
+#else
             fn->synthetic_ssa_vals.clear();
 #endif
             size_t fn_est = 0;

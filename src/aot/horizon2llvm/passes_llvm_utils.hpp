@@ -64,7 +64,7 @@ public:
             }
         }
         if (!repr.empty() && repr[0] == '<') {
-#if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS)
+#if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS) && HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS
             if (auto* cv = parse_vector_literal(ty, repr, ctx())) return cv;
             return llvm::Constant::getNullValue(ty);
 #else
