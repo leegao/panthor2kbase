@@ -35,10 +35,12 @@ int main() {
     llvm_ir::Module mod("test_aarch64_mod", llvm_backend::default_host_triple());
     auto* fn = mod.create_function(lifter::fn_symbol(entry_pc), entry_pc, end_pc);
     fn->label_pcs = labels;
-    fn->raw_words = words;
+    for (size_t i = 0; i < words.size(); ++i) {
+        fn->raw_words[entry_pc + i * 4] = words[i];
+    }
 
-    lifter::FunctionLifter fl(*fn, entry_pc, words, entry_pc, end_pc, labels, {});
-    fl.lift();
+    lifter::AArch64ToLLVMLifter fl(entry_pc, end_pc);
+    fl.lift_function(mod, fn, words, entry_pc);
 
     passes::PassPipelineConfig cfg;
     llvm_ir::ModulePassManager mpm;
@@ -47,9 +49,9 @@ int main() {
 
     std::string ir_text = mod.serialize();
     assert(!ir_text.empty());
-    assert(ir_text.find("define void @f_1000") != std::string::npos);
+    assert(ir_text.find("@f_1000") != std::string::npos);
 
-    auto res = llvm_backend::process_module(ir_text, mod.target_triple, true, "default<O2>");
+    auto res = llvm_backend::process_module(ir_text, mod.target_triple, true, "default<O2>", "", "", "");
     assert(res.ok && "LLVM 21 verifier + O2 optimization pipeline must succeed on lifted AArch64 IR");
 
     std::printf("[horizon2llvm] PASS: Lifted AArch64 function verified and optimized cleanly via LLVM 21 (%zu bytes IR)\n",

@@ -157,6 +157,9 @@ endif()
 # -----------------------------------------------------------------------------
 if(NOT ANDROID)
    add_library(horizon2llvm_passes OBJECT
+      src/aot/horizon2llvm/mali_llvm_passes.cpp
+      src/aot/horizon2llvm/llvm_backend.cpp
+      src/aot/horizon2llvm/aarch64/aarch64_lifter.cpp
       src/aot/horizon2llvm/passes.cpp
       src/aot/horizon2llvm/lowering/pass_aapcs64_abi_contract.cpp
       src/aot/horizon2llvm/lowering/pass_aarch64_idiom_deconstruct.cpp
@@ -169,29 +172,26 @@ if(NOT ANDROID)
       src/aot/horizon2llvm/lowering/pass_nzcv_predicate_fusion.cpp
       src/aot/horizon2llvm/lowering/pass_tail_call_devirt.cpp
    )
-   set(LLVM21_INC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/prebuilts/llvm-21/include" "${CMAKE_CURRENT_SOURCE_DIR}/third_party/prebuilts/llvm-21/include")
+   set(LLVM21_INC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/prebuilts/llvm-21/include")
    set(LLVM21_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/prebuilts/llvm-21/lib")
    file(GLOB LLVM21_STATIC_LIBS "${LLVM21_LIB_DIR}/*.a")
    list(SORT LLVM21_STATIC_LIBS)
 
    target_include_directories(horizon2llvm_passes PRIVATE
       "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/horizon2llvm"
-      "${LLVM21_INC_DIR}"
+      ${LLVM21_INC_DIR}
    )
    set_target_properties(horizon2llvm_passes PROPERTIES CXX_STANDARD 20)
    target_compile_definitions(horizon2llvm_passes PRIVATE HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS=1)
 
    add_executable(horizon2llvm
       src/aot/horizon2llvm/main.cpp
-      src/aot/horizon2llvm/mali_llvm_passes.cpp
-      $<TARGET_OBJECTS:horizon2llvm_passes>
       src/aot/horizon2llvm/ko_lifter.cpp
-      src/aot/horizon2llvm/llvm_backend.cpp
-      src/aot/horizon2llvm/aarch64/aarch64_lifter.cpp
+      $<TARGET_OBJECTS:horizon2llvm_passes>
    )
    target_include_directories(horizon2llvm PRIVATE
       "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/horizon2llvm"
-      "${LLVM21_INC_DIR}"
+      ${LLVM21_INC_DIR}
    )
    target_compile_definitions(horizon2llvm PRIVATE HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS=1)
    set_target_properties(horizon2llvm PROPERTIES
@@ -211,6 +211,23 @@ if(NOT ANDROID)
       -Wl,--start-group ${LLVM21_STATIC_LIBS} -Wl,--end-group
       ${LLVM21_EXT_LIBS}
       dl ${PLATFORM_LIBS}
+   )
+
+   add_library(mali_jit SHARED
+      $<TARGET_OBJECTS:horizon2llvm_passes>
+   )
+   set_target_properties(mali_jit PROPERTIES
+      CXX_STANDARD 20
+      LIBRARY_OUTPUT_DIRECTORY "${AOT_DIR}"
+   )
+   target_link_options(mali_jit PRIVATE -Wl,-Bsymbolic -Wl,-Bsymbolic-functions)
+   target_link_libraries(mali_jit PRIVATE
+      -Wl,--start-group ${LLVM21_STATIC_LIBS} -Wl,--end-group
+      ${LLVM21_EXT_LIBS}
+      dl ${PLATFORM_LIBS}
+   )
+   add_custom_command(TARGET mali_jit POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:mali_jit> "${CMAKE_BINARY_DIR}/libmali_jit.so"
    )
 
    add_custom_command(
@@ -399,12 +416,19 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
    set_source_files_properties("${AOT_MBS2_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
    set_source_files_properties("${AOT_LIBCPP_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 
+   set(AOT_SEEDS_FILE "${CMAKE_CURRENT_SOURCE_DIR}/src/r54p3_vulkan_icd/aot_seeds.txt")
+   set(AOT_LIFT_EXTRA_DEPENDS)
+   if(EXISTS "${AOT_SEEDS_FILE}")
+      list(APPEND AOT_LIFT_EXTRA_DEPENDS "${AOT_SEEDS_FILE}")
+   endif()
+
    add_custom_command(
       OUTPUT "${AOT_MBS2_OBJ}"
       COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/translate.sh" ddk/libGLES_mali.so "${CMAKE_BINARY_DIR}"
       WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
       DEPENDS horizon2llvm
               "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/translate.sh"
+              ${AOT_LIFT_EXTRA_DEPENDS}
       COMMENT "Lifting ddk/libGLES_mali.so -> r54p3_lifted.o (translate.sh)"
    )
    add_custom_command(
@@ -429,7 +453,7 @@ if(PANTHOR_KBASE_BUILD_AOT AND NOT ANDROID)
       "${AOT_MBS2_OBJ}"
       "${AOT_LIBCPP_OBJ}"
    )
-   add_dependencies(r54p3_vulkan_icd r54p3_lifted_obj)
+   add_dependencies(r54p3_vulkan_icd r54p3_lifted_obj mali_jit)
    target_include_directories(r54p3_vulkan_icd PRIVATE
       "${CMAKE_BINARY_DIR}"
       "${CMAKE_CURRENT_SOURCE_DIR}/include"

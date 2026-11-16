@@ -9,6 +9,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <atomic>
+#include <cinttypes>
 #include <unordered_set>
 
 bool mali_icd_log_enabled() {
@@ -995,8 +997,471 @@ extern "C" void __mali_stack_chk_fail_diag(AOTCPUState* cpu) {
 }
 
 HostVkAllocatorTable g_host_vk_allocators;
+volatile sig_atomic_t g_mali_ia_sigsegv_guard = 0;
 
 extern "C" bool mali_dispatch_synth_plt_va(AOTCPUState* cpu, uint64_t target_va);
+
+// ============================================================================
+// Runtime On-Demand JIT Dispatcher & Incremental Seed Profile Recorder
+// ============================================================================
+namespace {
+
+typedef void (*MaliJitFn)(AOTCPUState*);
+typedef int (*PFN_mali_jit_init_session)(const char* so_path, const char* cache_dir);
+typedef uint64_t (*PFN_mali_jit_find_func_start)(uint64_t rva);
+typedef int (*PFN_mali_jit_get_func_info)(uint64_t rva, const char** out_name, uint32_t* out_size);
+typedef int (*PFN_mali_jit_compile_subgraph)(
+    uint64_t root_rva,
+    int max_batch_funcs,
+    int max_depth,
+    int (*query_rva_status)(uint64_t rva, void* user),
+    void (*on_compiled)(uint64_t rva, void* fn_ptr, const char* fn_name, uint32_t fn_size, void* user),
+    void* user);
+
+struct MaliJitFastSlot {
+    std::atomic<uint64_t>  va{0};
+    std::atomic<MaliJitFn> fn{nullptr};
+};
+
+// 131,072-slot (2 MiB) lock-free open-addressed hash table for O(1) JIT dispatch
+static constexpr size_t kMaliJitFastCacheSize = 1ULL << 17;
+static MaliJitFastSlot g_jit_fast_cache[kMaliJitFastCacheSize];
+
+struct MaliJitProfileEntry {
+    uint64_t              rva = 0;
+    std::string           name;
+    uint32_t              fn_size = 0;
+    std::atomic<uint64_t> hits{0};
+    std::atomic<uint64_t> first_lr{0};
+    std::atomic<uint64_t> caller_rva{0};
+};
+
+static std::mutex g_jit_mtx;
+static std::mutex g_jit_prof_mtx;
+static std::unordered_map<uint64_t, std::unique_ptr<MaliJitProfileEntry>> g_jit_profile_map;
+static std::unordered_set<uint64_t> g_jit_compiled_rvas;
+static std::unordered_set<uint64_t> g_jit_failed_rvas;
+static void* g_icd_self_handle = nullptr;
+static void* g_jit_lib_handle = nullptr;
+static bool  g_jit_lib_tried = false;
+static PFN_mali_jit_init_session     g_pfn_jit_init = nullptr;
+static PFN_mali_jit_find_func_start  g_pfn_jit_find_start = nullptr;
+static PFN_mali_jit_get_func_info    g_pfn_jit_get_info = nullptr;
+static PFN_mali_jit_compile_subgraph g_pfn_jit_compile_subgraph = nullptr;
+static std::atomic<uint32_t> g_jit_batches_compiled{0};
+static std::atomic<uint32_t> g_jit_funcs_compiled{0};
+static std::atomic<uint32_t> g_jit_unique_funcs_executed{0};
+static std::atomic<uint64_t> g_jit_total_calls_executed{0};
+
+static inline MaliJitFn mali_jit_lookup_fast(uint64_t target_va) {
+    uint32_t h = static_cast<uint32_t>(((target_va - IMAGE_BASE) >> 2) * 0x9E3779B1U) & (kMaliJitFastCacheSize - 1);
+    for (size_t probe = 0; probe < 16; ++probe) {
+        uint32_t slot = (h + probe) & (kMaliJitFastCacheSize - 1);
+        uint64_t cur_va = g_jit_fast_cache[slot].va.load(std::memory_order_acquire);
+        if (cur_va == target_va) {
+            return g_jit_fast_cache[slot].fn.load(std::memory_order_acquire);
+        }
+        if (cur_va == 0ULL) {
+            return nullptr;
+        }
+    }
+    return nullptr;
+}
+
+static inline void mali_jit_insert_fast(uint64_t target_va, MaliJitFn fn) {
+    if (!fn || target_va == 0) return;
+    uint32_t h = static_cast<uint32_t>(((target_va - IMAGE_BASE) >> 2) * 0x9E3779B1U) & (kMaliJitFastCacheSize - 1);
+    for (size_t probe = 0; probe < kMaliJitFastCacheSize; ++probe) {
+        uint32_t slot = (h + probe) & (kMaliJitFastCacheSize - 1);
+        uint64_t cur_va = g_jit_fast_cache[slot].va.load(std::memory_order_relaxed);
+        if (cur_va == target_va || cur_va == 0ULL) {
+            g_jit_fast_cache[slot].fn.store(fn, std::memory_order_release);
+            g_jit_fast_cache[slot].va.store(target_va, std::memory_order_release);
+            return;
+        }
+    }
+}
+
+static void mali_jit_ensure_self_global_locked() {
+    if (g_icd_self_handle) return;
+    Dl_info dli{};
+    if (dladdr(reinterpret_cast<void*>(&mali_jit_dispatch), &dli) && dli.dli_fname) {
+        g_icd_self_handle = dlopen(dli.dli_fname, RTLD_NOW | RTLD_NOLOAD | RTLD_GLOBAL);
+    }
+    if (!g_icd_self_handle) {
+        g_icd_self_handle = RTLD_DEFAULT;
+    }
+}
+
+static MaliJitFn mali_jit_lookup_aot_symbol_locked(uint64_t rva) {
+    mali_jit_ensure_self_global_locked();
+    char sym[32];
+    std::snprintf(sym, sizeof(sym), "aot_sub_%08" PRIx64, rva);
+    void* p = dlsym(g_icd_self_handle, sym);
+    return reinterpret_cast<MaliJitFn>(p);
+}
+
+static bool mali_jit_ensure_loaded_locked() {
+    if (g_pfn_jit_compile_subgraph) return true;
+    if (g_jit_lib_tried) return false;
+    g_jit_lib_tried = true;
+
+    const char* dis_env = std::getenv("MALI_AOT_DISABLE_JIT");
+    if (dis_env && dis_env[0] && std::strcmp(dis_env, "0") != 0) {
+        return false;
+    }
+
+    mali_jit_ensure_self_global_locked();
+
+    std::string icd_dir;
+    Dl_info dli{};
+    if (dladdr(reinterpret_cast<void*>(&mali_jit_dispatch), &dli) && dli.dli_fname) {
+        std::string p(dli.dli_fname);
+        size_t sl = p.find_last_of('/');
+        if (sl != std::string::npos) icd_dir = p.substr(0, sl);
+    }
+
+    std::vector<std::string> cands;
+    if (const char* env_lib = std::getenv("MALI_AOT_JIT_LIB")) {
+        if (env_lib[0]) cands.push_back(env_lib);
+    }
+    if (!icd_dir.empty()) {
+        cands.push_back(icd_dir + "/libmali_jit.so");
+        cands.push_back(icd_dir + "/aot/libmali_jit.so");
+        cands.push_back(icd_dir + "/../aot/libmali_jit.so");
+        cands.push_back(icd_dir + "/../libmali_jit.so");
+    }
+    cands.push_back("build-x86-64/aot/libmali_jit.so");
+    cands.push_back("build-x86-64/libmali_jit.so");
+    cands.push_back("./libmali_jit.so");
+
+    for (const auto& c : cands) {
+        g_jit_lib_handle = dlopen(c.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (g_jit_lib_handle) break;
+    }
+    if (!g_jit_lib_handle) {
+        std::fprintf(stderr, "[MALI_JIT] Warning: Could not dlopen libmali_jit.so (%s)\n", dlerror());
+        return false;
+    }
+
+    g_pfn_jit_init = reinterpret_cast<PFN_mali_jit_init_session>(dlsym(g_jit_lib_handle, "mali_jit_init_session"));
+    g_pfn_jit_find_start = reinterpret_cast<PFN_mali_jit_find_func_start>(dlsym(g_jit_lib_handle, "mali_jit_find_func_start"));
+    g_pfn_jit_get_info = reinterpret_cast<PFN_mali_jit_get_func_info>(dlsym(g_jit_lib_handle, "mali_jit_get_func_info"));
+    g_pfn_jit_compile_subgraph = reinterpret_cast<PFN_mali_jit_compile_subgraph>(dlsym(g_jit_lib_handle, "mali_jit_compile_subgraph"));
+
+    if (!g_pfn_jit_init || !g_pfn_jit_compile_subgraph) {
+        std::fprintf(stderr, "[MALI_JIT] Warning: libmali_jit.so missing entrypoints\n");
+        g_pfn_jit_compile_subgraph = nullptr;
+        return false;
+    }
+
+    const char* so_path = !g_aot_rt.mapper.so_path_loaded.empty()
+                              ? g_aot_rt.mapper.so_path_loaded.c_str()
+                              : "ddk/libGLES_mali.so";
+    const char* cache_dir = std::getenv("MALI_AOT_JIT_CACHE");
+    if (!cache_dir || !cache_dir[0]) cache_dir = "build-x86-64/jit_cache";
+
+    if (g_pfn_jit_init(so_path, cache_dir) != 0) {
+        g_pfn_jit_compile_subgraph = nullptr;
+        return false;
+    }
+    return true;
+}
+
+static MaliJitProfileEntry* mali_jit_get_or_create_profile_entry(uint64_t rva, const char* fn_name = nullptr, uint32_t fn_size = 0) {
+    std::lock_guard<std::mutex> lk(g_jit_prof_mtx);
+    auto it = g_jit_profile_map.find(rva);
+    if (it != g_jit_profile_map.end()) return it->second.get();
+
+    auto ent = std::make_unique<MaliJitProfileEntry>();
+    ent->rva = rva;
+    ent->fn_size = fn_size;
+    const char* dbg = r54p3_lookup_debug_symbol_by_va(IMAGE_BASE + rva);
+    if (dbg && dbg[0] && std::strncmp(dbg, "sub_", 4) != 0) {
+        ent->name = dbg;
+    } else if (fn_name && fn_name[0]) {
+        ent->name = fn_name;
+    } else if (dbg && dbg[0]) {
+        ent->name = dbg;
+    } else {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "sub_%08" PRIx64, rva);
+        ent->name = buf;
+    }
+    MaliJitProfileEntry* raw = ent.get();
+    g_jit_profile_map[rva] = std::move(ent);
+    return raw;
+}
+
+static int jit_query_rva_status_cb(uint64_t rva, void* /*user*/) {
+    if (g_jit_compiled_rvas.count(rva)) return 1;
+    if (mali_jit_lookup_aot_symbol_locked(rva) != nullptr) return 2;
+    return 0;
+}
+
+static void jit_on_compiled_cb(uint64_t rva, void* fn_ptr, const char* fn_name, uint32_t fn_size, void* /*user*/) {
+    MaliJitFn fn = reinterpret_cast<MaliJitFn>(fn_ptr);
+    g_jit_compiled_rvas.insert(rva);
+    mali_jit_get_or_create_profile_entry(rva, fn_name, fn_size);
+    mali_jit_insert_fast(IMAGE_BASE + rva, fn);
+    g_jit_funcs_compiled.fetch_add(1, std::memory_order_relaxed);
+}
+
+static MaliJitFn mali_jit_get_or_compile(AOTCPUState* cpu, uint64_t target_va) {
+    if (target_va < IMAGE_BASE || target_va >= IMAGE_BASE + 0x04000000ULL) return nullptr;
+    uint64_t rva = target_va - IMAGE_BASE;
+
+    std::lock_guard<std::mutex> lk(g_jit_mtx);
+    if (MaliJitFn cached = mali_jit_lookup_fast(target_va)) {
+        return cached;
+    }
+    if (g_jit_failed_rvas.count(rva)) {
+        return nullptr;
+    }
+
+    // Check if symbol is already compiled in r54p3_lifted.o
+    if (MaliJitFn aot_fn = mali_jit_lookup_aot_symbol_locked(rva)) {
+        mali_jit_insert_fast(target_va, aot_fn);
+        return aot_fn;
+    }
+
+    // Save/pause DT_INIT_ARRAY SIGSEGV guard during JIT compilation
+    sig_atomic_t saved_ia_guard = g_mali_ia_sigsegv_guard;
+    g_mali_ia_sigsegv_guard = 0;
+
+    if (!mali_jit_ensure_loaded_locked()) {
+        g_mali_ia_sigsegv_guard = saved_ia_guard;
+        // Phase 0 fallback: still record the missing function in unhandled_jit.txt
+        mali_jit_get_or_create_profile_entry(rva);
+        mali_jit_on_enter(cpu, rva);
+        g_jit_failed_rvas.insert(rva);
+        return nullptr;
+    }
+
+    int batch_max = 32;
+    if (const char* bm = std::getenv("MALI_AOT_JIT_BATCH_MAX")) {
+        if (bm[0]) batch_max = std::max(1, std::atoi(bm));
+    } else if (const char* single_env = std::getenv("MALI_AOT_JIT_SINGLE")) {
+        if (single_env[0] && std::strcmp(single_env, "0") != 0) batch_max = 1;
+    }
+    int batch_depth = (batch_max == 1) ? 0 : 2;
+    if (const char* bd = std::getenv("MALI_AOT_JIT_DEPTH")) {
+        if (bd[0]) batch_depth = std::max(0, std::atoi(bd));
+    }
+
+    int count = g_pfn_jit_compile_subgraph(rva, batch_max, batch_depth, &jit_query_rva_status_cb, &jit_on_compiled_cb, nullptr);
+    g_mali_ia_sigsegv_guard = saved_ia_guard;
+
+    if (count > 0) {
+        g_jit_batches_compiled.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (MaliJitFn fn = mali_jit_lookup_fast(target_va)) {
+        return fn;
+    }
+    if (g_pfn_jit_find_start) {
+        uint64_t fst = g_pfn_jit_find_start(rva);
+        if (fst != 0 && fst != rva) {
+            if (MaliJitFn fn = mali_jit_lookup_fast(IMAGE_BASE + fst)) {
+                mali_jit_insert_fast(target_va, fn);
+                return fn;
+            }
+        }
+    }
+
+    g_jit_failed_rvas.insert(rva);
+    return nullptr;
+}
+
+static void write_merged_seed_file(const char* seed_path, const std::vector<const MaliJitProfileEntry*>& executed) {
+    if (!seed_path || !seed_path[0]) return;
+    std::map<uint64_t, std::string> seeds;
+    bool file_exists = false;
+    {
+        std::ifstream in(seed_path);
+        file_exists = static_cast<bool>(in);
+        std::string line;
+        while (std::getline(in, line)) {
+            size_t p = 0;
+            while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) p++;
+            if (p >= line.size() || line[p] == '#') continue;
+            char* endp = nullptr;
+            uint64_t v = std::strtoull(line.c_str() + p, &endp, 0);
+            if (endp != line.c_str() + p && v != 0) {
+                if (v >= IMAGE_BASE) v -= IMAGE_BASE;
+                std::string comment;
+                size_t cpos = line.find('#');
+                if (cpos != std::string::npos) comment = line.substr(cpos + 1);
+                seeds[v] = comment;
+            }
+        }
+    }
+    bool set_changed = !file_exists;
+    for (const auto* e : executed) {
+        if (!seeds.count(e->rva)) {
+            seeds[e->rva] = " " + e->name + " (hits=" + std::to_string(e->hits.load(std::memory_order_relaxed)) + ")";
+            set_changed = true;
+        }
+    }
+    if (!set_changed) return;
+    std::ofstream out(seed_path);
+    if (!out) return;
+    out << "# Incremental AOT Seed Profile for libGLES_mali.so (" << seeds.size() << " functions)\n";
+    out << "# <rva> # <name> (hits)\n";
+    for (const auto& kv : seeds) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "0x%08" PRIx64, kv.first);
+        out << buf << " #" << (kv.second.empty() ? " seed" : kv.second) << "\n";
+    }
+}
+
+} // namespace
+
+extern "C" void mali_jit_on_enter(AOTCPUState* cpu, uint64_t rva) {
+    if (rva >= IMAGE_BASE) rva -= IMAGE_BASE;
+    MaliJitProfileEntry* ent = mali_jit_get_or_create_profile_entry(rva);
+    uint64_t h = ent->hits.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_jit_total_calls_executed.fetch_add(1, std::memory_order_relaxed);
+    if (h == 1) {
+        g_jit_unique_funcs_executed.fetch_add(1, std::memory_order_relaxed);
+        uint64_t raw_lr = cpu ? cpu->x[30] : 0ULL;
+        uint64_t lr_rva = (raw_lr >= IMAGE_BASE && raw_lr < IMAGE_BASE + 0x04000000ULL)
+                              ? (raw_lr - IMAGE_BASE)
+                              : raw_lr;
+        uint64_t caller_rva = 0ULL;
+        uint32_t depth = aot_so_get_stack_depth();
+        if (depth > 0) {
+            const AotSoStackFrame* fr = aot_so_get_stack_frame(depth - 1);
+            if (fr && fr->fn_va >= IMAGE_BASE && fr->fn_va < IMAGE_BASE + 0x04000000ULL) {
+                caller_rva = fr->fn_va - IMAGE_BASE;
+            }
+        }
+        if (caller_rva == 0ULL && lr_rva < 0x04000000ULL) {
+            caller_rva = g_pfn_jit_find_start ? g_pfn_jit_find_start(lr_rva) : lr_rva;
+        }
+        ent->first_lr.store(lr_rva, std::memory_order_relaxed);
+        ent->caller_rva.store(caller_rva, std::memory_order_relaxed);
+        mali_jit_dump_profile();
+
+        const char* jit_log = std::getenv("MALI_AOT_JIT_LOG");
+        if (jit_log && jit_log[0] && std::strcmp(jit_log, "0") != 0) {
+            std::fprintf(stderr, "[MALI_JIT_HIT] rva=0x%08" PRIx64 " name=%s first_lr=0x%08" PRIx64 " caller_rva=0x%08" PRIx64 "\n",
+                         rva, ent->name.c_str(), lr_rva, caller_rva);
+        }
+    }
+}
+
+extern "C" void mali_jit_dump_profile() {
+    std::vector<const MaliJitProfileEntry*> executed;
+    {
+        std::lock_guard<std::mutex> lk(g_jit_prof_mtx);
+        for (const auto& kv : g_jit_profile_map) {
+            if (kv.second->hits.load(std::memory_order_relaxed) > 0) {
+                executed.push_back(kv.second.get());
+            }
+        }
+    }
+    if (executed.empty()) return;
+
+    std::sort(executed.begin(), executed.end(), [](const MaliJitProfileEntry* a, const MaliJitProfileEntry* b) {
+        return a->rva < b->rva;
+    });
+
+    const char* prof_env = std::getenv("MALI_AOT_JIT_PROFILE");
+    const char* prof_path = (prof_env && prof_env[0]) ? prof_env : "unhandled_jit.txt";
+
+    auto write_profile_file = [&](const char* path) {
+        // Merge with any existing entries on disk so unhandled_jit.txt is idempotent & cumulative
+        struct DiskRow {
+            std::string name;
+            uint64_t hits = 0;
+            uint64_t first_lr = 0;
+            uint64_t caller_rva = 0;
+        };
+        std::map<uint64_t, DiskRow> rows;
+        {
+            std::ifstream in(path);
+            std::string line;
+            while (std::getline(in, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                std::istringstream iss(line);
+                std::string rva_s, name_s, lr_s, caller_s;
+                uint64_t hits_v = 0;
+                if (iss >> rva_s >> name_s >> hits_v >> lr_s >> caller_s) {
+                    uint64_t r = std::strtoull(rva_s.c_str(), nullptr, 0);
+                    if (r >= IMAGE_BASE) r -= IMAGE_BASE;
+                    if (r != 0) {
+                        rows[r] = {name_s, hits_v, std::strtoull(lr_s.c_str(), nullptr, 0), std::strtoull(caller_s.c_str(), nullptr, 0)};
+                    }
+                }
+            }
+        }
+        for (const auto* e : executed) {
+            rows[e->rva] = {
+                e->name,
+                e->hits.load(std::memory_order_relaxed),
+                e->first_lr.load(std::memory_order_relaxed),
+                e->caller_rva.load(std::memory_order_relaxed)
+            };
+        }
+        std::ofstream out(path);
+        if (!out) return;
+        out << "# <rva> <name> <hits> <first_lr> <caller_rva>\n";
+        for (const auto& kv : rows) {
+            char buf[512];
+            std::snprintf(buf, sizeof(buf), "0x%08" PRIx64 " %-40s %-8" PRIu64 " 0x%08" PRIx64 " 0x%08" PRIx64 "\n",
+                          kv.first, kv.second.name.c_str(), kv.second.hits, kv.second.first_lr, kv.second.caller_rva);
+            out << buf;
+        }
+    };
+
+    write_profile_file(prof_path);
+    if (std::strcmp(prof_path, "build-x86-64/unhandled_jit.txt") != 0) {
+        write_profile_file("build-x86-64/unhandled_jit.txt");
+    }
+
+    const char* auto_seed = std::getenv("MALI_AOT_AUTO_UPDATE_SEEDS");
+    if (!auto_seed || std::strcmp(auto_seed, "0") != 0) {
+        write_merged_seed_file("src/r54p3_vulkan_icd/aot_seeds.txt", executed);
+    }
+
+    if (mali_icd_log_enabled() || std::getenv("MALI_AOT_JIT_LOG")) {
+        std::fprintf(stderr,
+                     "================================================================================\n"
+                     " [MALI_JIT] Runtime JIT & Incremental Seed Profile Summary:\n"
+                     "   JIT Batches Compiled       : %u\n"
+                     "   JIT Functions Compiled     : %u\n"
+                     "   Unique JIT Funcs Executed  : %zu\n"
+                     "   Total JIT Function Calls   : %" PRIu64 "\n"
+                     "   Profile Output             : %s (and src/r54p3_vulkan_icd/aot_seeds.txt)\n"
+                     "================================================================================\n",
+                     g_jit_batches_compiled.load(),
+                     g_jit_funcs_compiled.load(),
+                     executed.size(),
+                     g_jit_total_calls_executed.load(),
+                     prof_path);
+    }
+}
+
+__attribute__((destructor))
+static void mali_jit_auto_dump_on_exit() {
+    mali_jit_dump_profile();
+}
+
+extern "C" void mali_jit_dispatch(AOTCPUState* cpu, uint64_t target_va) {
+    if (target_va >= IMAGE_BASE && target_va < IMAGE_BASE + 0x04000000ULL) {
+        if (MaliJitFn fn = mali_jit_lookup_fast(target_va)) {
+            fn(cpu);
+            return;
+        }
+        if (MaliJitFn fn = mali_jit_get_or_compile(cpu, target_va)) {
+            fn(cpu);
+            return;
+        }
+    }
+    aot_unhandled_plt(cpu, target_va);
+}
+
 
 extern "C" void aot_unhandled_plt(AOTCPUState* cpu, uint64_t target_va) {
     if (target_va >= LIBCPP_IMAGE_BASE && target_va < LIBCPP_IMAGE_BASE + 0x00400000ULL) {

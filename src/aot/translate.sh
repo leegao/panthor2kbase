@@ -55,7 +55,7 @@ print(f"{ver}{bid}")
 fi
 
 OUT_DIR="${2:-${BUILD_DIR:-$REPO_ROOT/build-x86-64}}"
-mkdir -p "$OUT_DIR"
+mkdir -p "$OUT_DIR" "$OUT_DIR/aot" "$OUT_DIR/jit_cache"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
 if [ -x "$OUT_DIR/aot/horizon2llvm" ]; then
@@ -63,7 +63,7 @@ if [ -x "$OUT_DIR/aot/horizon2llvm" ]; then
 elif [ -x "$OUT_DIR/horizon2llvm" ]; then
     PASS_DRIVER="$OUT_DIR/horizon2llvm"
 else
-    PASS_DRIVER="$OUT_DIR/horizon2llvm"
+    PASS_DRIVER="$OUT_DIR/aot/horizon2llvm"
 fi
 
 NEEDS_REBUILD=0
@@ -75,9 +75,9 @@ elif ldd "$PASS_DRIVER" 2>/dev/null | grep -q "not found"; then
 fi
 
 if [ "$NEEDS_REBUILD" -eq 1 ]; then
-    PASS_DRIVER="$OUT_DIR/horizon2llvm"
     echo "[Build] Compiling unified horizon2llvm -> $PASS_DRIVER..."
-    g++ -std=c++20 -O3 -DHORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS=1 -I"$ROOT_DIR/horizon2llvm" -I"$REPO_ROOT/third_party/prebuilts/llvm-21/include" -I"$LLVM21_INC_DIR" \
+    g++ -std=c++20 -O2 -fPIC -DHORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS=1 \
+        -I"$ROOT_DIR/horizon2llvm" -I"$REPO_ROOT/third_party/prebuilts/llvm-21/include" -I"$LLVM21_INC_DIR" \
         "$ROOT_DIR/horizon2llvm/main.cpp" \
         "$ROOT_DIR/horizon2llvm/mali_llvm_passes.cpp" \
         "$ROOT_DIR/horizon2llvm/ko_lifter.cpp" \
@@ -89,10 +89,28 @@ if [ "$NEEDS_REBUILD" -eq 1 ]; then
         -lz -l:libzstd.so.1 -ldl -lpthread -lm -o "$PASS_DRIVER"
 fi
 
+export MALI_AOT_CLOSURE_MODE="${MALI_AOT_CLOSURE_MODE:-minimal}"
+export MALI_AOT_CLOSURE_DEPTH="${MALI_AOT_CLOSURE_DEPTH:-2}"
+
+# Resolve incremental seed file (unhandled_jit.txt / aot_seeds.txt) unless MALI_AOT_RESET_SEEDS=1
+ACTIVE_SEED_FILE="${MALI_AOT_SEED_FILE:-}"
+if [ "${MALI_AOT_RESET_SEEDS:-0}" = "1" ]; then
+    ACTIVE_SEED_FILE=""
+elif [ -z "$ACTIVE_SEED_FILE" ]; then
+    if [ -f "$REPO_ROOT/src/r54p3_vulkan_icd/aot_seeds.txt" ]; then
+        ACTIVE_SEED_FILE="$REPO_ROOT/src/r54p3_vulkan_icd/aot_seeds.txt"
+    elif [ -f "$REPO_ROOT/src/aot/aot_seeds.txt" ]; then
+        ACTIVE_SEED_FILE="$REPO_ROOT/src/aot/aot_seeds.txt"
+    elif [ -f "$REPO_ROOT/aot_seeds.txt" ]; then
+        ACTIVE_SEED_FILE="$REPO_ROOT/aot_seeds.txt"
+    fi
+fi
+
 echo "================================================================================"
 echo " Mali 64-Bit AArch64 -> x86-64 Linux C++ LLVM 6-Pass AOT Translation Pipeline"
 echo " Input Binary   : ${SO_PATH:-(prebuilt $OUT_DIR/r54p3_lifted.o)}"
 echo " Driver Build   : $ELF_TAG (64-bit ELF64 EM_AARCH64)"
+echo " Closure Mode   : $MALI_AOT_CLOSURE_MODE (depth=$MALI_AOT_CLOSURE_DEPTH, seed_file=${ACTIVE_SEED_FILE:-(core seeds only)})"
 echo " LLVM Backend   : Static LLVM-21 (third_party/prebuilts/llvm-21)"
 echo " Output Dir     : $OUT_DIR"
 echo "================================================================================"
@@ -100,7 +118,11 @@ echo "==========================================================================
 STAMP_FILE="$OUT_DIR/r54p3_lifted.o.stamp"
 CUR_STAMP=""
 if command -v sha256sum >/dev/null 2>&1; then
-    CUR_STAMP="$(sha256sum "$ROOT_DIR/horizon2llvm/mali_llvm_passes.cpp" ${SO_PATH:+"$SO_PATH"} | sha256sum | awk '{print $1}')"
+    SEED_HASH=""
+    if [ -n "$ACTIVE_SEED_FILE" ] && [ -f "$ACTIVE_SEED_FILE" ]; then
+        SEED_HASH="$(grep -v '^[[:space:]]*#' "$ACTIVE_SEED_FILE" | awk 'NF {print $1}' | sort -u | sha256sum | awk '{print $1}')"
+    fi
+    CUR_STAMP="$( { sha256sum "$ROOT_DIR/horizon2llvm/mali_llvm_passes.cpp" ${SO_PATH:+"$SO_PATH"}; echo "mode=$MALI_AOT_CLOSURE_MODE depth=$MALI_AOT_CLOSURE_DEPTH seeds=$SEED_HASH"; } | sha256sum | awk '{print $1}')"
 fi
 STAMP_OK=0
 if [ -n "$CUR_STAMP" ] && [ -f "$STAMP_FILE" ] && [ "$(cat "$STAMP_FILE" 2>/dev/null || true)" = "$CUR_STAMP" ]; then
@@ -108,11 +130,19 @@ if [ -n "$CUR_STAMP" ] && [ -f "$STAMP_FILE" ] && [ "$(cat "$STAMP_FILE" 2>/dev/
 fi
 
 if [ -f "$OUT_DIR/r54p3_lifted.o" ] && [ "${MALI_AOT_FORCE_RELIFT:-0}" != "1" ] && [ "$STAMP_OK" -eq 1 ] && [ "$OUT_DIR/r54p3_lifted.o" -nt "$PASS_DRIVER" ] && [ "$OUT_DIR/r54p3_lifted.o" -nt "$ROOT_DIR/horizon2llvm/mali_llvm_passes.cpp" ]; then
-    echo "[Cache] Reusing up-to-date $OUT_DIR/r54p3_lifted.o (set MALI_AOT_FORCE_RELIFT=1 to force full re-lift)"
+    echo "[Cache] Reusing up-to-date $OUT_DIR/r54p3_lifted.o (set MALI_AOT_FORCE_RELIFT=1 to force re-lift)"
 elif [ -n "$SO_PATH" ] && [ -f "$SO_PATH" ]; then
     export MALI_AOT_CHUNK_MB="${MALI_AOT_CHUNK_MB:-50}"
     export MALI_AOT_KEEP_LL="${MALI_AOT_KEEP_LL:-0}"
-    MALI_AOT_JOBS=4 "$PASS_DRIVER" --lift-so "$SO_PATH" "$OUT_DIR" --hook-Vulkan-calls --emit-ll-only
+    SEED_ARGS=()
+    if [ -n "$ACTIVE_SEED_FILE" ] && [ -f "$ACTIVE_SEED_FILE" ]; then
+        SEED_ARGS=(--seed-file "$ACTIVE_SEED_FILE")
+    fi
+    MALI_AOT_JOBS=4 "$PASS_DRIVER" --lift-so "$SO_PATH" "$OUT_DIR" \
+        --closure-mode "$MALI_AOT_CLOSURE_MODE" \
+        --closure-depth "$MALI_AOT_CLOSURE_DEPTH" \
+        "${SEED_ARGS[@]}" \
+        --hook-Vulkan-calls --emit-ll-only
     export MALI_AOT_JOBS="20"
     "$PASS_DRIVER" --compile-ll-dir "$OUT_DIR/aot_ll_manifest.txt" "$OUT_DIR/r54p3_lifted.o" -j "$MALI_AOT_JOBS"
     if [ -n "$CUR_STAMP" ]; then
@@ -124,8 +154,6 @@ elif [ ! -f "$OUT_DIR/r54p3_lifted.o" ]; then
 fi
 
 if [ "${MALI_AOT_KEEP_LL:-0}" = "0" ]; then
-    # Chunk IR is named aot_chunk_NN_unopt.ll (jobs=1) or aot_w<id>_chunk_NN_unopt.ll
-    # (jobs>1); the backend may also leave <chunk>.ll.opt.ll / <chunk>.ll.o behind.
     rm -f "$OUT_DIR"/aot_*_unopt.ll \
           "$OUT_DIR"/aot_*_opt.ll \
           "$OUT_DIR"/aot_*.ll.opt.ll \

@@ -101,4 +101,5 @@ src/emulator/lifted_kbase_ko.ll
 mali_uapi_trace.jsonl
 !third_party/prebuilts/**/*.so
 !build-host
-third_party/prebuilts/llvm-21
+third_party/prebuilts/llvm-21/lib
+!aot_seeds.txt

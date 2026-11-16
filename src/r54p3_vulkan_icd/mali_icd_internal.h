@@ -678,7 +678,11 @@ static constexpr uint64_t LIBCPP_IMAGE_BASE = 0x500000000ULL;
 static constexpr uint64_t SYNTH_PLT_VA_BASE = 0x600000000ULL;
 
 extern HostVkAllocatorTable g_host_vk_allocators;
+extern volatile sig_atomic_t g_mali_ia_sigsegv_guard;
 extern "C" void aot_unhandled_plt(AOTCPUState* cpu, uint64_t target_va);
+extern "C" void mali_jit_dispatch(AOTCPUState* cpu, uint64_t target_va);
+extern "C" void mali_jit_on_enter(AOTCPUState* cpu, uint64_t rva);
+extern "C" void mali_jit_dump_profile();
 extern "C" void aot_host_hle_dispatch(AOTCPUState* cpu, uint64_t target_va);
 extern "C" void libcpp_indirect_dispatch(AOTCPUState* cpu, uint64_t target_va);
 extern "C" void libcpp_run_dt_init_array(AOTCPUState* cpu);
@@ -1287,10 +1291,10 @@ struct MaliAotGlobalRuntime {
         }
         if (mapped_ok && (!skip_ia || skip_ia[0] == '0')) {
             static sigjmp_buf s_ia_jmp;
-            static volatile sig_atomic_t s_ia_guard = 0;
+            g_mali_ia_sigsegv_guard = 0;
             struct sigaction sa_new{}, sa_old{};
             sa_new.sa_handler = [](int) {
-                if (s_ia_guard) siglongjmp(s_ia_jmp, 1);
+                if (g_mali_ia_sigsegv_guard) siglongjmp(s_ia_jmp, 1);
             };
             sigemptyset(&sa_new.sa_mask);
             sigaction(SIGSEGV, &sa_new, &sa_old);
@@ -1306,13 +1310,13 @@ struct MaliAotGlobalRuntime {
             for (volatile uint64_t i = 0; i < ia_count; ++i) {
                 resetGuestStackLocked();
                 volatile uint32_t saved_so_depth = aot_so_get_stack_depth();
-                s_ia_guard = 1;
+                g_mali_ia_sigsegv_guard = 1;
                 if (sigsetjmp(s_ia_jmp, 1) == 0) {
                     aot_run_dt_init_array_entry(&cpu, i);
-                    s_ia_guard = 0;
+                    g_mali_ia_sigsegv_guard = 0;
                     ia_ok++;
                 } else {
-                    s_ia_guard = 0;
+                    g_mali_ia_sigsegv_guard = 0;
                     aot_so_unwind_to_depth(saved_so_depth);
                     ia_skipped++;
                     if (trace_ia) {

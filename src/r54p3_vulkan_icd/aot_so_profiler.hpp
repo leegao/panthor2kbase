@@ -19,7 +19,7 @@
 #define AOT_SO_DEBUG_TRACE_CALLS        (1U << 1)
 #define AOT_SO_DEBUG_PROFILE_CALLS      (1U << 2)
 #define AOT_SO_MAX_CALL_FRAMES          128U
-#define AOT_SO_MAX_PROFILE_FUNCS        1024U
+#define AOT_SO_MAX_PROFILE_FUNCS        16384U
 
 extern "C" {
 

@@ -128,7 +128,8 @@ int main(int argc, char** argv) {
 
     if ((argc >= 4 && (std::string(argv[1]) == "--lift-so" ||
                        std::string(argv[1]) == "--lift-libcpp" ||
-                       std::string(argv[1]) == "--compile-ll-dir")) ||
+                       std::string(argv[1]) == "--compile-ll-dir" ||
+                       std::string(argv[1]) == "--jit-fn")) ||
         (argc >= 3 && argv[1][0] != '-')) {
         extern int mali_llvm_passes_main(int argc, char **argv);
         return mali_llvm_passes_main(argc, argv);

@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
 VK_LAYER_PATH="$ROOT_DIR/third_party/prebuilts/bcn_layer/x86-64:$ROOT_DIR/third_party/prebuilts/compat_layer/x86-64:$ROOT_DIR/third_party/prebuilts/vulkan_wsi_layer/x86-64" \

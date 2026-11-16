@@ -65,7 +65,11 @@
 #include "../horizon2llvm/aarch64/aarch64_isa_common.hpp"
 #include "../horizon2llvm/llvm_backend.hpp"
 #include "../horizon2llvm/llvm_ir.hpp"
-#include "../horizon2llvm/passes.hpp"
+#include "passes.hpp"
+#include <chrono>
+#include <dlfcn.h>
+#include <mutex>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -75,6 +79,11 @@ struct LifterConfig {
     std::string plt_table_name = "g_aot_plt_table";
     uint64_t image_base = 0x400000000ULL;
     bool seed_all_dynsyms = false;
+    std::string closure_mode = "minimal";
+    int closure_depth = 2;
+    std::string seed_file = "";
+    bool is_jit_module = false;
+    std::set<uint64_t> aot_known_funcs;
 };
 
 static inline bool isHotInlinePltSym(const std::string &sym) {
@@ -205,8 +214,13 @@ public:
     std::vector<std::pair<std::string, uint64_t>> exported_data;
     uint64_t image_base = 0x400000000ULL;
     bool seed_all_dynsyms = false;
+    std::string closure_mode = "minimal";
+    int closure_depth = 2;
+    std::string seed_file = "";
+    size_t seed_file_loaded_count = 0;
+    size_t core_seed_count = 0;
 
-    bool run(const std::string &so_path, uint64_t img_base = 0x400000000ULL, bool seed_all = false) {
+    bool loadAndPrepareOnly(const std::string &so_path, uint64_t img_base = 0x400000000ULL, bool seed_all = false) {
         image_base = img_base;
         seed_all_dynsyms = seed_all;
         std::ifstream in(so_path, std::ios::binary);
@@ -218,7 +232,6 @@ public:
         uint16_t machine = *reinterpret_cast<const uint16_t *>(&raw[18]);
         if (machine != 183) return false;
 
-        // Detect version string
         for (size_t i = 0; i + 16 < raw.size(); ++i) {
             if (raw[i] == 'r' && raw[i + 1] >= '0' && raw[i + 1] <= '9') {
                 size_t j = i + 1;
@@ -231,7 +244,6 @@ public:
             }
         }
 
-        // Map PT_LOAD segments by p_vaddr
         uint64_t e_phoff = readU64(raw, 32);
         uint16_t e_phentsize = *reinterpret_cast<const uint16_t *>(&raw[54]);
         uint16_t e_phnum = *reinterpret_cast<const uint16_t *>(&raw[56]);
@@ -260,7 +272,6 @@ public:
             if (ld.flags & 1) text_ranges.push_back({ld.vaddr, ld.vaddr + ld.filesz});
         }
 
-        // Parse ELF64 Section Headers
         uint64_t e_shoff = readU64(raw, 40);
         uint16_t e_shentsize = *reinterpret_cast<const uint16_t *>(&raw[58]);
         uint16_t e_shnum = *reinterpret_cast<const uint16_t *>(&raw[60]);
@@ -291,11 +302,17 @@ public:
         parseDynsym();
         applyRelocations();
         parsePlt();
+        closure_plts = plt_map;
         for (const auto &kv : func_by_addr) sorted_fstarts.push_back(kv.first);
 
         discoverVulkanAndKbaseEntries();
-        computeClosure();
         detectCtxMallocOffset();
+        return true;
+    }
+
+    bool run(const std::string &so_path, uint64_t img_base = 0x400000000ULL, bool seed_all = false) {
+        if (!loadAndPrepareOnly(so_path, img_base, seed_all)) return false;
+        computeClosure();
         return true;
     }
 
@@ -480,6 +497,10 @@ private:
     }
 
 public:
+    bool isExecutableRva(uint64_t addr) const {
+        return isExecAddr(addr);
+    }
+
     uint64_t findFuncStart(uint64_t addr) const {
         if (func_by_addr.count(addr)) return addr;
         auto it = std::upper_bound(sorted_fstarts.begin(), sorted_fstarts.end(), addr);
@@ -490,6 +511,24 @@ public:
             if (addr >= st && addr < st + sz) return st;
         }
         return 0;
+    }
+
+    uint64_t getFuncExtent(uint64_t faddr) const {
+        if (func_by_addr.count(faddr) && func_by_addr.at(faddr).second > 0) {
+            return func_by_addr.at(faddr).second;
+        }
+        uint64_t fst = findFuncStart(faddr);
+        if (fst != 0 && func_by_addr.count(fst)) {
+            uint64_t sz = func_by_addr.at(fst).second;
+            if (faddr >= fst && faddr < fst + sz) {
+                return (fst + sz) - faddr;
+            }
+        }
+        auto it = std::upper_bound(sorted_fstarts.begin(), sorted_fstarts.end(), faddr);
+        if (it != sorted_fstarts.end() && *it > faddr) {
+            return std::min<uint64_t>(*it - faddr, 0x1000ULL);
+        }
+        return 0x1000ULL;
     }
 
 private:
@@ -797,89 +836,92 @@ private:
     }
 
     void computeClosure() {
+        // Always include all PLT entries in closure_plts so g_aot_plt_table
+        // has a deterministic 398-slot layout across minimal, full, and JIT modes.
+        closure_plts = plt_map;
         std::deque<uint64_t> q;
         for (const char *sym : {
-                 "cmpbe_v2_deserialize_MBS2_to_C",
-                 "cmpbe_v2_init_options",
-                 "cmpbe_v2_set_option_value",
-                 "cmpbe_v2_free_compilation_result",
-                 "cmpbe_v2_compile_multiple_shaders",
-                 "cmpbe_v2_compile_single_shader",
-                 "cmpbe_blend_shadergen_generate_shader",
-                 "cmpbep_v2_get_variant_info",
-                 "cmpbe_has_robustness",
-                 "cmpbep_shutdown_llvm",
-                 "vk_hal_open",
-                 "vkGetInstanceProcAddr",
-                 "vkGetDeviceProcAddr",
-                 "vkEnumerateInstanceVersion",
-                 "vkEnumerateInstanceLayerProperties",
-                 "vkEnumerateInstanceExtensionProperties",
-                 "vkEnumeratePhysicalDevices",
-                 "vkEnumeratePhysicalDeviceGroups",
-                 "vkGetPhysicalDeviceProperties",
-                 "vkGetPhysicalDeviceFeatures",
-                 "vkGetPhysicalDeviceFeatures2",
-                 "vkGetPhysicalDeviceMemoryProperties",
-                 "vkGetPhysicalDeviceMemoryProperties2",
-                 "vkGetPhysicalDeviceQueueFamilyProperties",
-                 "vkGetPhysicalDeviceQueueFamilyProperties2",
-                 "vkEnumerateDeviceExtensionProperties",
-                 "vkEnumerateDeviceLayerProperties",
-                 "vkGetDeviceQueue",
-                 "vkGetDeviceQueue2",
-                 "vkGetBufferMemoryRequirements",
-                 "vkGetBufferMemoryRequirements2",
-                 "vkGetBufferDeviceAddress",
-                 "vkGetImageMemoryRequirements",
-                 "vkGetImageMemoryRequirements2",
-                 "vkMapMemory",
-                 "vkUnmapMemory",
-                 "vkResetFences",
-                 "vkDestroyFence",
-                 "vkDestroyDescriptorSetLayout",
-                 "vkDestroyPipelineLayout",
-                 "vkCreateShaderModule",
-                 "vkDestroyShaderModule",
-                 "vkCmdSetBlendConstants",
+                "cmpbe_v2_deserialize_MBS2_to_C",
+                "cmpbe_v2_init_options",
+                "cmpbe_v2_set_option_value",
+                "cmpbe_v2_free_compilation_result",
+                "cmpbe_v2_compile_multiple_shaders",
+                "cmpbe_v2_compile_single_shader",
+                "cmpbe_blend_shadergen_generate_shader",
+                "cmpbep_v2_get_variant_info",
+                "cmpbe_has_robustness",
+                "cmpbep_shutdown_llvm",
+                "vk_hal_open",
+                "vkGetInstanceProcAddr",
+                "vkGetDeviceProcAddr",
+                "vkEnumerateInstanceVersion",
+                "vkEnumerateInstanceLayerProperties",
+                "vkEnumerateInstanceExtensionProperties",
+                "vkEnumeratePhysicalDevices",
+                "vkEnumeratePhysicalDeviceGroups",
+                "vkGetPhysicalDeviceProperties",
+                "vkGetPhysicalDeviceFeatures",
+                "vkGetPhysicalDeviceFeatures2",
+                "vkGetPhysicalDeviceMemoryProperties",
+                "vkGetPhysicalDeviceMemoryProperties2",
+                "vkGetPhysicalDeviceQueueFamilyProperties",
+                "vkGetPhysicalDeviceQueueFamilyProperties2",
+                "vkEnumerateDeviceExtensionProperties",
+                "vkEnumerateDeviceLayerProperties",
+                "vkGetDeviceQueue",
+                "vkGetDeviceQueue2",
+                "vkGetBufferMemoryRequirements",
+                "vkGetBufferMemoryRequirements2",
+                "vkGetBufferDeviceAddress",
+                "vkGetImageMemoryRequirements",
+                "vkGetImageMemoryRequirements2",
+                "vkMapMemory",
+                "vkUnmapMemory",
+                "vkResetFences",
+                "vkDestroyFence",
+                "vkDestroyDescriptorSetLayout",
+                "vkDestroyPipelineLayout",
+                "vkCreateShaderModule",
+                "vkDestroyShaderModule",
+                "vkCmdSetBlendConstants",
                 "vkCmdSetDepthBias",
                 "vkCmdSetDepthBounds",
                 "vkCmdSetLineWidth",
                 "vkCmdSetStencilCompareMask",
                 "vkCmdSetStencilReference",
                 "vkCmdSetStencilWriteMask",
-                 "mali_gpu_props_get",
-                 "kbase_version_check_csf",
-                 "kbase_version_check_jm",
-                 "kbase_version_check_reserved",
-                 "kbase_set_flags",
-                 "kbase_job_submit",
-                 "kbase_post_term",
-                 "kbase_soft_event_update",
-                 "kbase_mem_jit_init",
-                 "kbase_mem_exec_init",
-                 "kbase_mem_alloc",
-                 "kbase_mem_free",
-                 "kbase_mem_query",
-                 "kbase_mem_commit",
-                 "kbase_mem_alias",
-                 "kbase_mem_import",
-                 "kbase_mem_flags_change",
-                 "kbase_mem_sync",
-                 "kbase_cs_get_glb_iface",
-                 "kbase_cs_event_signal",
-                 "kbase_cs_queue_register",
-                 "kbase_cs_queue_register_ex",
-                 "kbase_cs_queue_terminate",
-                 "kbase_cs_queue_bind",
-                 "kbase_cs_queue_kick",
-                 "kbase_cs_queue_group_create",
-                 "kbase_cs_queue_group_terminate",
-                 "kbase_cs_tiler_heap_init",
-                 "kbase_cs_tiler_heap_term",
-                 "kbase_kcpu_queue_create",
-                 "kbase_kcpu_queue_delete",
-                 "kbase_kcpu_queue_enqueue",
+                "mali_gpu_props_get",
+                "kbase_version_check_csf",
+                "kbase_version_check_jm",
+                "kbase_version_check_reserved",
+                "kbase_set_flags",
+                "kbase_job_submit",
+                "kbase_post_term",
+                "kbase_soft_event_update",
+                "kbase_mem_jit_init",
+                "kbase_mem_exec_init",
+                "kbase_mem_alloc",
+                "kbase_mem_free",
+                "kbase_mem_query",
+                "kbase_mem_commit",
+                "kbase_mem_alias",
+                "kbase_mem_import",
+                "kbase_mem_flags_change",
+                "kbase_mem_sync",
+                "kbase_cs_get_glb_iface",
+                "kbase_cs_event_signal",
+                "kbase_cs_queue_register",
+                "kbase_cs_queue_register_ex",
+                "kbase_cs_queue_terminate",
+                "kbase_cs_queue_bind",
+                "kbase_cs_queue_kick",
+                "kbase_cs_queue_group_create",
+                "kbase_cs_queue_group_terminate",
+                "kbase_cs_tiler_heap_init",
+                "kbase_cs_tiler_heap_term",
+                "kbase_kcpu_queue_create",
+                "kbase_kcpu_queue_delete",
+                "kbase_kcpu_queue_enqueue",
              }) {
             if (addr_by_name.count(sym)) {
                 uint64_t st = findFuncStart(addr_by_name[sym]);
@@ -915,6 +957,146 @@ private:
             if (faddr == 0) faddr = vk_ent.second;
             if (isExecAddr(faddr)) q.push_back(faddr);
         }
+
+        // Check environment overrides for closure_mode, closure_depth, and seed_file
+        if (!seed_all_dynsyms) {
+            if (const char *env_cm = std::getenv("MALI_AOT_CLOSURE_MODE")) {
+                if (env_cm[0] != '\0') closure_mode = env_cm;
+            } else if (const char *env_fc = std::getenv("MALI_AOT_FULL_CLOSURE")) {
+                if (std::strcmp(env_fc, "1") == 0) closure_mode = "full";
+                else if (std::strcmp(env_fc, "0") == 0) closure_mode = "minimal";
+            }
+            if (const char *env_cd = std::getenv("MALI_AOT_CLOSURE_DEPTH")) {
+                if (env_cd[0] != '\0') closure_depth = std::atoi(env_cd);
+            }
+            if (seed_file.empty()) {
+                if (const char *env_sf = std::getenv("MALI_AOT_SEED_FILE")) {
+                    if (env_sf[0] != '\0') seed_file = env_sf;
+                }
+            }
+        } else {
+            closure_mode = "full";
+        }
+
+        if (!seed_all_dynsyms && closure_mode == "minimal") {
+            std::set<uint64_t> visited;
+            std::deque<std::pair<uint64_t, int>> dq;
+
+            // 1. Walk full direct BL/B closure of .init_array constructors (~150 functions)
+            //    so DT_INIT_ARRAY completes natively before main Vulkan dispatch.
+            std::deque<uint64_t> ia_q(init_array_funcs.begin(), init_array_funcs.end());
+            while (!ia_q.empty()) {
+                uint64_t faddr = ia_q.front();
+                ia_q.pop_front();
+                if (plt_map.count(faddr)) continue;
+                uint64_t fstart = findFuncStart(faddr);
+                if (fstart != 0) faddr = fstart;
+                if (!isExecAddr(faddr) || !visited.insert(faddr).second) continue;
+                uint64_t fsize = getFuncExtent(faddr);
+                for (uint64_t off = 0; off < fsize; off += 4) {
+                    uint64_t pc = faddr + off;
+                    uint32_t insn = readU32(elf, pc);
+                    unsigned top6 = (insn >> 26) & 0x3F;
+                    if (top6 == 0x25 || top6 == 0x05) {
+                        int64_t imm26 = sext64(insn & 0x3FFFFFFU, 26);
+                        uint64_t target = static_cast<uint64_t>(static_cast<int64_t>(pc) + (imm26 << 2));
+                        if (!plt_map.count(target) && (top6 == 0x25 || !(target >= faddr && target < faddr + fsize))) {
+                            uint64_t tst = findFuncStart(target);
+                            uint64_t cand = tst ? tst : target;
+                            if (!visited.count(cand)) ia_q.push_back(cand);
+                        }
+                    }
+                }
+            }
+
+            // 2. Seed core vk*, kbase_*, and cmpbe_* entrypoints up to closure_depth
+            for (uint64_t seed_rva : q) {
+                uint64_t fstart = findFuncStart(seed_rva);
+                uint64_t cand = fstart ? fstart : seed_rva;
+                if (isExecAddr(cand)) {
+                    dq.push_back({cand, 0});
+                }
+            }
+            core_seed_count = visited.size() + dq.size();
+
+            // 3. Load incremental seed profile (unhandled_jit.txt / aot_seeds.txt) if provided
+            int seed_extra_depth = 0;
+            if (const char *env_sd = std::getenv("MALI_AOT_SEED_DEPTH")) {
+                if (env_sd[0] != '\0') seed_extra_depth = std::atoi(env_sd);
+            }
+            if (!seed_file.empty()) {
+                std::ifstream sf(seed_file);
+                std::string line;
+                while (std::getline(sf, line)) {
+                    size_t p = 0;
+                    while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) p++;
+                    if (p >= line.size() || line[p] == '#') continue;
+                    char *endp = nullptr;
+                    uint64_t val = std::strtoull(line.c_str() + p, &endp, 0);
+                    if (endp == line.c_str() + p || val == 0) continue;
+                    if (val >= image_base) val -= image_base;
+                    if (!isExecAddr(val)) continue;
+                    seed_file_loaded_count++;
+                    int start_d = (closure_depth >= 0) ? std::max(0, closure_depth - seed_extra_depth) : 0;
+                    dq.push_back({val, start_d});
+                    uint64_t fst = findFuncStart(val);
+                    if (fst != 0 && fst != val) {
+                        dq.push_back({fst, start_d});
+                    }
+                }
+            }
+
+            while (!dq.empty()) {
+                auto [faddr, depth] = dq.front();
+                dq.pop_front();
+                if (plt_map.count(faddr)) continue;
+                if (!isExecAddr(faddr)) continue;
+                bool is_new = visited.insert(faddr).second;
+                uint64_t fstart = findFuncStart(faddr);
+                if (fstart != 0 && fstart != faddr) {
+                    visited.insert(fstart);
+                }
+                if (!is_new && depth > 0) continue;
+                if (closure_depth >= 0 && depth >= closure_depth) continue;
+
+                uint64_t fsize = getFuncExtent(faddr);
+                for (uint64_t off = 0; off < fsize; off += 4) {
+                    uint64_t pc = faddr + off;
+                    uint32_t insn = readU32(elf, pc);
+                    unsigned top6 = (insn >> 26) & 0x3F;
+                    if (top6 == 0x25 || top6 == 0x05) {
+                        int64_t imm26 = sext64(insn & 0x3FFFFFFU, 26);
+                        uint64_t target = static_cast<uint64_t>(static_cast<int64_t>(pc) + (imm26 << 2));
+                        if (!plt_map.count(target) && (top6 == 0x25 || !(target >= faddr && target < faddr + fsize))) {
+                            uint64_t tst = findFuncStart(target);
+                            uint64_t cand = tst ? tst : target;
+                            if (!visited.count(cand)) {
+                                dq.push_back({cand, depth + 1});
+                            }
+                        }
+                    } else {
+                        uint64_t cond_target = 0;
+                        if ((insn & 0xFF000010U) == 0x54000000U || (insn & 0x7E000000U) == 0x34000000U) {
+                            int64_t imm19 = sext64((insn >> 5) & 0x7FFFFU, 19);
+                            cond_target = static_cast<uint64_t>(static_cast<int64_t>(pc) + (imm19 << 2));
+                        } else if ((insn & 0x7E000000U) == 0x36000000U) {
+                            int64_t imm14 = sext64((insn >> 5) & 0x3FFFU, 14);
+                            cond_target = static_cast<uint64_t>(static_cast<int64_t>(pc) + (imm14 << 2));
+                        }
+                        if (cond_target != 0 && !(cond_target >= faddr && cond_target < faddr + fsize) && !plt_map.count(cond_target)) {
+                            uint64_t tst = findFuncStart(cond_target);
+                            uint64_t cand = tst ? tst : cond_target;
+                            if (!visited.count(cand)) {
+                                dq.push_back({cand, depth + 1});
+                            }
+                        }
+                    }
+                }
+            }
+            closure_funcs.assign(visited.begin(), visited.end());
+            return;
+        }
+
         for (uint64_t slot : relocated_data_slots) {
             if (slot + 8 <= elf.size()) {
                 uint64_t ptr = readU64(elf, slot) & 0xFFFFFFFFFFFFULL;
@@ -1444,14 +1626,19 @@ public:
     void emitCallToTarget(uint64_t target_rva, uint64_t pc = 0) {
         if (loader.closure_plts.count(target_rva)) {
             emitBionicPltCall(loader.closure_plts.at(target_rva));
-        } else if (func_set.count(target_rva)) {
+        } else if (func_set.count(target_rva) || (cfg.is_jit_module && cfg.aot_known_funcs.count(target_rva))) {
             called_guest_fns.insert(target_rva);
             B->CreateDirectCall(cfg.prefix + "_sub_" + hex8(target_rva), pc, target_rva);
         } else {
             uint64_t fst = loader.findFuncStart(target_rva);
-            if (fst != 0 && fst == target_rva && func_set.count(fst)) {
+            if (fst != 0 && fst == target_rva &&
+                (func_set.count(fst) || (cfg.is_jit_module && cfg.aot_known_funcs.count(fst)))) {
                 called_guest_fns.insert(fst);
                 B->CreateDirectCall(cfg.prefix + "_sub_" + hex8(fst), pc, fst);
+            } else if (!cfg.is_libcpp) {
+                B->CreateVoidCall("mali_jit_dispatch",
+                                  {IRValue::cpu_ptr(), IRValue::imm_u64(cfg.image_base + target_rva)},
+                                  IROpTag::IndirectCall);
             } else {
                 B->CreateVoidCall(cfg.prefix + "_indirect_dispatch",
                                   {IRValue::cpu_ptr(), IRValue::imm_u64(cfg.image_base + target_rva)},
@@ -1556,8 +1743,8 @@ public:
     }
 
     void liftFunction(uint64_t faddr, IRModule &M, IRFunction *fn) {
-        auto fname_sz = loader.func_by_addr.count(faddr) ? loader.func_by_addr.at(faddr) : std::make_pair("sub_" + hex8(faddr), uint64_t(4));
-        uint64_t fsize = fname_sz.second ? fname_sz.second : 4;
+        uint64_t fsize = loader.getFuncExtent(faddr);
+        if (fsize == 0) fsize = 4;
         uint64_t end_addr = faddr + fsize;
 
         // Pass 2: Discover Basic Blocks & PIC Jump Tables
@@ -1684,6 +1871,10 @@ public:
         B->CreateStore(IRValue::imm(IRType::Int1, 0), flag_z_alloca, 1, IROpTag::FlagWrite, {}, 0, 32);
         B->CreateStore(IRValue::imm(IRType::Int1, 0), flag_c_alloca, 1, IROpTag::FlagWrite, {}, 0, 32);
         B->CreateStore(IRValue::imm(IRType::Int1, 0), flag_v_alloca, 1, IROpTag::FlagWrite, {}, 0, 32);
+        if (cfg.is_jit_module) {
+            B->CreateVoidCall("mali_jit_on_enter",
+                              {cpu, IRValue::imm_u64(faddr)});
+        }
         if (instrument_calls) {
             B->CreateVoidCall("aot_so_trace_fn_enter",
                               {cpu, IRValue::imm_u64(cfg.image_base + faddr),
@@ -3220,6 +3411,8 @@ public:
             "declare i64 @bionic_mali_fstat_stub(i64, i64)",
             "declare i64 @bionic_mali_access_stub(i64, i64)",
             "declare void @aot_unhandled_plt(ptr, i64)",
+            "declare void @mali_jit_dispatch(ptr, i64)",
+            "declare void @mali_jit_on_enter(ptr, i64)",
             "declare void @aot_so_trace_fn_enter(ptr, i64, ptr)",
             "declare void @aot_so_trace_fn_exit(ptr, i64, ptr)",
             "declare i32 @llvm.fshr.i32(i32, i32, i32)",
@@ -3381,13 +3574,19 @@ public:
                 IRFunction *fn = M.create_function("aot_" + wname, rva, rva + 4);
                 IRBasicBlock *bb = fn->create_block("entry", rva);
                 IRBuilder wb(fn, bb);
-                wb.CreateDirectCall("aot_sub_" + hex8(rva), rva, rva);
+                if (func_set.count(rva)) {
+                    wb.CreateDirectCall("aot_sub_" + hex8(rva), rva, rva);
+                } else {
+                    wb.CreateVoidCall("mali_jit_dispatch",
+                                      {IRValue::cpu_ptr(), IRValue::imm_u64(cfg.image_base + rva)},
+                                      IROpTag::IndirectCall);
+                }
                 wb.CreateRetVoid(rva);
             };
             for (const auto &vk_ent : loader.vk_dispatch_entries) {
                 uint64_t rva = loader.findFuncStart(vk_ent.second);
                 if (rva == 0) rva = vk_ent.second;
-                if (func_set.count(rva) && emitted_aot_wrappers.insert(vk_ent.first).second) {
+                if (emitted_aot_wrappers.insert(vk_ent.first).second) {
                     emit_wrapper(vk_ent.first, rva);
                 }
             }
@@ -3425,7 +3624,8 @@ public:
                  }) {
                 if (loader.addr_by_name.count(sym) && !emitted_aot_wrappers.count(sym)) {
                     uint64_t rva = loader.findFuncStart(loader.addr_by_name.at(sym));
-                    if (func_set.count(rva) && emitted_aot_wrappers.insert(sym).second) {
+                    if (rva == 0) rva = loader.addr_by_name.at(sym);
+                    if (emitted_aot_wrappers.insert(sym).second) {
                         emit_wrapper(sym, rva);
                     }
                 }
@@ -3471,7 +3671,7 @@ public:
                     uint64_t faddr = sorted_funcs[i];
                     fn_ss << "call_" << hex8(faddr) << ":\n  call void @" << cfg.prefix << "_sub_" << hex8(faddr) << "(ptr %c)\n  ret void\n";
                 }
-                fn_ss << "fallback:\n  call void @aot_unhandled_plt(ptr %c, i64 %target_va)\n  ret void\n}";
+                fn_ss << "fallback:\n  call void @" << (cfg.is_libcpp ? "aot_unhandled_plt" : "mali_jit_dispatch") << "(ptr %c, i64 %target_va)\n  ret void\n}";
                 M.extra_raw_functions.push_back(fn_ss.str());
             }
 
@@ -3532,7 +3732,7 @@ public:
                 fn_ss << "call_part_" << p << ":\n  call void @" << cfg.prefix << "_indirect_dispatch_part_" << p
                       << "(ptr %c, i64 %target_va)\n  ret void\n";
             }
-            fn_ss << "fallback:\n  call void @aot_unhandled_plt(ptr %c, i64 %target_va)\n  ret void\n}";
+            fn_ss << "fallback:\n  call void @" << (cfg.is_libcpp ? "aot_unhandled_plt" : "mali_jit_dispatch") << "(ptr %c, i64 %target_va)\n  ret void\n}";
             M.extra_raw_functions.push_back(fn_ss.str());
         }
 
@@ -3922,21 +4122,23 @@ void runBionicToGlibcLibcLoweringPass(LLVMModuleRef M, PassStats &stats) {
 // ============================================================================
 // Pass 6: LLVMO2OptimizationAndX86CodegenPass
 // ============================================================================
-static int runLoweringAndCodegenOnModule(LLVMModuleRef M, const char *outPath, bool emitLlvm, bool runO2, const char *optIrOut = nullptr) {
+static int runLoweringAndCodegenOnModule(LLVMModuleRef M, const char *outPath, bool emitLlvm, bool runO2, const char *optIrOut = nullptr, bool quiet = false, bool fastJitMode = false) {
     char *errMsg = nullptr;
     PassStats stats{};
     runArm64BionicIdiosyncrasyLoweringPass(M, stats);
     runBionicToGlibcLibcLoweringPass(M, stats);
 
-    printf("[LLVM Passes] Arm64BionicIdiosyncrasyLoweringPass:\n");
-    printf("  PAC/BTI hints stripped : %d\n", stats.pac_bti_stripped);
-    printf("  RETAA lowered          : %d\n", stats.retaa_lowered);
-    printf("  MRS sysregs lowered    : %d\n", stats.sysreg_lowered);
-    printf("  DC ZVA lowered         : %d\n", stats.dc_zva_lowered);
-    printf("  TLSDESC lowered        : %d\n", stats.tlsdesc_lowered);
-    printf("[LLVM Passes] BionicToGlibcLibcLoweringPass:\n");
-    printf("  Bionic PLT64 calls     : %d (External/Vendor stubs: %d, /dev/mali0 kbase UAPI: %d)\n",
-           stats.bionic_plt_lowered, stats.external_stubs_lowered, stats.kbase_uapi_lowered);
+    if (!quiet) {
+        printf("[LLVM Passes] Arm64BionicIdiosyncrasyLoweringPass:\n");
+        printf("  PAC/BTI hints stripped : %d\n", stats.pac_bti_stripped);
+        printf("  RETAA lowered          : %d\n", stats.retaa_lowered);
+        printf("  MRS sysregs lowered    : %d\n", stats.sysreg_lowered);
+        printf("  DC ZVA lowered         : %d\n", stats.dc_zva_lowered);
+        printf("  TLSDESC lowered        : %d\n", stats.tlsdesc_lowered);
+        printf("[LLVM Passes] BionicToGlibcLibcLoweringPass:\n");
+        printf("  Bionic PLT64 calls     : %d (External/Vendor stubs: %d, /dev/mali0 kbase UAPI: %d)\n",
+               stats.bionic_plt_lowered, stats.external_stubs_lowered, stats.kbase_uapi_lowered);
+    }
 
     if (LLVMVerifyModule(M, LLVMReturnStatusAction, &errMsg) != 0) {
         fprintf(stderr, "Module Verification Failed after lowering passes:\n%s\n", errMsg ? errMsg : "");
@@ -3952,11 +4154,18 @@ static int runLoweringAndCodegenOnModule(LLVMModuleRef M, const char *outPath, b
     }
     const char *env_o2 = std::getenv("MALI_AOT_FULL_O2");
     bool full_o2 = (env_o2 && std::strcmp(env_o2, "1") == 0);
-    LLVMTargetMachineRef tm = LLVMCreateTargetMachine(target, triple, "x86-64-v3", "", full_o2 ? LLVMCodeGenLevelAggressive : LLVMCodeGenLevelLess, LLVMRelocPIC, LLVMCodeModelDefault);
+    const char *env_jit_o1 = std::getenv("MALI_AOT_JIT_O1");
+    bool jit_o1 = (env_jit_o1 && std::strcmp(env_jit_o1, "1") == 0);
+    LLVMCodeGenOptLevel cg_lvl = (fastJitMode && !jit_o1)
+                                     ? LLVMCodeGenLevelNone
+                                     : (full_o2 ? LLVMCodeGenLevelAggressive : LLVMCodeGenLevelLess);
+    LLVMTargetMachineRef tm = LLVMCreateTargetMachine(target, triple, "x86-64-v3", "", cg_lvl, LLVMRelocPIC, LLVMCodeModelDefault);
 
     if (runO2) {
         LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
-        const char *pass_pipeline = full_o2 ? "default<O2>" : "default<O1>";
+        const char *pass_pipeline = (fastJitMode && !jit_o1)
+                                        ? "sroa,dce"
+                                        : (full_o2 ? "default<O2>" : "default<O1>");
         LLVMErrorRef err = LLVMRunPasses(M, pass_pipeline, tm, opts);
         if (err) {
             char *emsg = LLVMGetErrorMessage(err);
@@ -3965,7 +4174,9 @@ static int runLoweringAndCodegenOnModule(LLVMModuleRef M, const char *outPath, b
             return 1;
         }
         LLVMDisposePassBuilderOptions(opts);
-        printf("[LLVM Passes] Offloaded SROA, mem2reg, InstCombine, GVN, SimplifyCFG, ADCE, DSE via LLVMRunPasses(%s)\n", pass_pipeline);
+        if (!quiet) {
+            printf("[LLVM Passes] Offloaded SROA, mem2reg, InstCombine, GVN, SimplifyCFG, ADCE, DSE via LLVMRunPasses(%s)\n", pass_pipeline);
+        }
     }
 
     if (optIrOut) {
@@ -3973,7 +4184,7 @@ static int runLoweringAndCodegenOnModule(LLVMModuleRef M, const char *outPath, b
             fprintf(stderr, "PrintModule error: %s\n", errMsg ? errMsg : "");
             return 1;
         }
-        printf("[LLVM Passes] Emitted optimized LLVM IR to %s\n", optIrOut);
+        if (!quiet) printf("[LLVM Passes] Emitted optimized LLVM IR to %s\n", optIrOut);
     }
 
     if (emitLlvm) {
@@ -3981,18 +4192,468 @@ static int runLoweringAndCodegenOnModule(LLVMModuleRef M, const char *outPath, b
             fprintf(stderr, "PrintModule error: %s\n", errMsg ? errMsg : "");
             return 1;
         }
-        printf("[LLVM Passes] Emitted lowered LLVM IR to %s\n", outPath);
+        if (!quiet) printf("[LLVM Passes] Emitted lowered LLVM IR to %s\n", outPath);
     } else {
         if (LLVMTargetMachineEmitToFile(tm, M, const_cast<char *>(outPath), LLVMObjectFile, &errMsg) != 0) {
             fprintf(stderr, "EmitToFile error: %s\n", errMsg ? errMsg : "");
             return 1;
         }
-        printf("[LLVM Passes] Emitted native x86-64 object file to %s\n", outPath);
+        if (!quiet) printf("[LLVM Passes] Emitted native x86-64 object file to %s\n", outPath);
     }
 
     LLVMDisposeTargetMachine(tm);
     return 0;
 }
+
+
+// ============================================================================
+// Runtime On-Demand JIT API (libmali_jit.so & single/subgraph JIT compilation)
+// ============================================================================
+struct JitLiftResult {
+    std::string ir;
+    std::string fn_symbol;
+    bool ok = false;
+};
+
+JitLiftResult liftOneFunction(const ELF64LoaderAndCallGraphPass &loader,
+                              const LifterConfig &base_cfg,
+                              const std::map<std::string, size_t> &plt_index_map,
+                              uint64_t faddr,
+                              bool instrument_calls) {
+    JitLiftResult res;
+    if (!loader.isExecutableRva(faddr)) return res;
+    LifterConfig cfg = base_cfg;
+    cfg.is_jit_module = true;
+    AArch64ToLLVMIRLiftingPass lifter(loader, cfg, plt_index_map, instrument_calls);
+    lifter.func_set.clear();
+    lifter.func_set.insert(faddr);
+
+    ultrs::llvm_ir::Module M(cfg.prefix + "_jit_" + AArch64ToLLVMIRLiftingPass::hex8(faddr), "x86_64-pc-linux-gnu");
+    res.fn_symbol = cfg.prefix + "_sub_" + AArch64ToLLVMIRLiftingPass::hex8(faddr);
+    auto *fn = M.create_function(res.fn_symbol, faddr, faddr + 4);
+    lifter.liftFunction(faddr, M, fn);
+    fn->ssa_values.clear();
+#if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS) && HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS
+    for (auto &bb : fn->blocks) {
+        bb->llvm_bb = nullptr;
+        for (auto &inst : bb->insts) inst.llvm_inst = nullptr;
+    }
+    if (fn->llvm_fn) fn->llvm_fn->deleteBody();
+    fn->synthetic_ssa_vals.clear();
+#else
+    fn->synthetic_ssa_vals.clear();
+#endif
+    std::set<uint64_t> def_set = {faddr};
+    lifter.populateModuleHeader(M, def_set, false);
+    AArch64ToLLVMIRLiftingPass::runHorizonLoweringPasses(M);
+    res.ir = M.serialize();
+    res.ok = !res.ir.empty();
+    return res;
+}
+
+namespace {
+struct MaliJitSessionState {
+    std::mutex mtx;
+    bool initialized = false;
+    std::string so_path;
+    std::string cache_dir;
+    ELF64LoaderAndCallGraphPass loader;
+    std::map<std::string, size_t> plt_index_map;
+    std::vector<void*> loaded_batch_handles;
+    uint32_t batch_counter = 0;
+};
+
+static MaliJitSessionState &getJitSession() {
+    static MaliJitSessionState s;
+    return s;
+}
+} // namespace
+
+extern "C" {
+
+__attribute__((visibility("default")))
+int mali_jit_init_session(const char *so_path, const char *cache_dir) {
+    auto &sess = getJitSession();
+    std::lock_guard<std::mutex> lk(sess.mtx);
+    if (sess.initialized) return 0;
+
+    LLVMInitializeX86TargetInfo();
+    LLVMInitializeX86Target();
+    LLVMInitializeX86TargetMC();
+    LLVMInitializeX86AsmPrinter();
+    LLVMInitializeX86AsmParser();
+
+    sess.so_path = (so_path && so_path[0]) ? so_path : "ddk/libGLES_mali.so";
+    sess.cache_dir = (cache_dir && cache_dir[0]) ? cache_dir : "build-x86-64/jit_cache";
+    ::mkdir(sess.cache_dir.c_str(), 0755);
+
+    if (!sess.loader.loadAndPrepareOnly(sess.so_path, 0x400000000ULL, false)) {
+        fprintf(stderr, "[MALI_JIT] Failed to load ELF64 image from %s\n", sess.so_path.c_str());
+        return -1;
+    }
+
+    std::set<std::string> non_hot_syms;
+    for (const auto &kv : sess.loader.closure_plts) {
+        if (!isHotInlinePltSym(kv.second)) non_hot_syms.insert(kv.second);
+    }
+    size_t idx = 0;
+    for (const auto &sym : non_hot_syms) {
+        sess.plt_index_map[sym] = idx++;
+    }
+    sess.initialized = true;
+    return 0;
+}
+
+__attribute__((visibility("default")))
+uint64_t mali_jit_find_func_start(uint64_t rva) {
+    auto &sess = getJitSession();
+    if (!sess.initialized) return rva;
+    uint64_t fst = sess.loader.findFuncStart(rva);
+    return fst ? fst : rva;
+}
+
+__attribute__((visibility("default")))
+int mali_jit_get_func_info(uint64_t rva, const char **out_name, uint32_t *out_size) {
+    auto &sess = getJitSession();
+    if (!sess.initialized) return -1;
+    uint64_t fst = sess.loader.findFuncStart(rva);
+    uint64_t key = (fst != 0 && sess.loader.func_by_addr.count(fst)) ? fst : rva;
+    if (sess.loader.func_by_addr.count(key)) {
+        const auto &p = sess.loader.func_by_addr.at(key);
+        if (out_name) *out_name = p.first.c_str();
+        if (out_size) *out_size = static_cast<uint32_t>(p.second);
+        return 0;
+    }
+    if (out_name) *out_name = nullptr;
+    if (out_size) *out_size = static_cast<uint32_t>(sess.loader.getFuncExtent(rva));
+    return 0;
+}
+
+// query_rva_status(rva, user) returns:
+//   0 = not compiled yet (neither AOT nor JIT)
+//   1 = already JIT-compiled in a previous batch
+//   2 = already AOT-compiled in r54p3_lifted.o
+__attribute__((visibility("default")))
+int mali_jit_compile_subgraph(
+    uint64_t root_rva,
+    int max_batch_funcs,
+    int max_depth,
+    int (*query_rva_status)(uint64_t rva, void *user),
+    void (*on_compiled)(uint64_t rva, void *fn_ptr, const char *fn_name, uint32_t fn_size, void *user),
+    void *user) {
+    auto &sess = getJitSession();
+    std::lock_guard<std::mutex> lk(sess.mtx);
+    if (!sess.initialized) return -1;
+
+    auto t0 = std::chrono::steady_clock::now();
+    if (max_batch_funcs < 1) max_batch_funcs = 1;
+    if (max_depth < 0) max_depth = 0;
+
+    std::vector<uint64_t> batch_funcs;
+    std::set<uint64_t> batch_set;
+    std::set<uint64_t> aot_known;
+    std::set<uint64_t> scanned_vtables;
+    std::deque<std::pair<uint64_t, int>> q;
+
+    uint64_t relro_lo = 0, relro_hi = 0;
+    if (sess.loader.sections.count(".data.rel.ro")) {
+        relro_lo = sess.loader.sections[".data.rel.ro"].offset;
+        relro_hi = relro_lo + sess.loader.sections[".data.rel.ro"].size;
+    }
+
+    auto try_enqueue = [&](uint64_t cand, int d) {
+        if (!sess.loader.isExecutableRva(cand) || sess.loader.plt_map.count(cand)) return;
+        if (batch_set.count(cand)) return;
+        if (query_rva_status) {
+            int st = query_rva_status(cand, user);
+            if (st == 2) {
+                aot_known.insert(cand);
+                return;
+            }
+            if (st == 1) {
+                return;
+            }
+        }
+        if (static_cast<int>(batch_funcs.size()) >= max_batch_funcs) return;
+        batch_set.insert(cand);
+        batch_funcs.push_back(cand);
+        q.push_back({cand, d});
+    };
+
+    auto seed_vtable_slots = [&](uint64_t base_addr, int d) {
+        if (base_addr == 0 || (base_addr & 7ULL) != 0 || sess.loader.isExecutableRva(base_addr)) return;
+        if (!scanned_vtables.insert(base_addr).second) return;
+        if (sess.loader.relocated_data_slots.count(base_addr)) {
+            uint64_t first_ptr = readU64(sess.loader.elf, base_addr) & 0xFFFFFFFFFFFFULL;
+            if (sess.loader.func_by_addr.count(first_ptr)) {
+                for (uint64_t slot = base_addr; slot < base_addr + 0x400ULL && slot + 8 <= sess.loader.elf.size(); slot += 8) {
+                    if (!sess.loader.relocated_data_slots.count(slot)) break;
+                    uint64_t ptr = readU64(sess.loader.elf, slot) & 0xFFFFFFFFFFFFULL;
+                    if (!sess.loader.func_by_addr.count(ptr)) break;
+                    try_enqueue(ptr, d);
+                }
+                return;
+            }
+        }
+        if (base_addr >= relro_lo && base_addr < relro_hi) {
+            for (uint64_t slot = base_addr; slot < std::min<uint64_t>(relro_hi, base_addr + 0x800ULL) && slot + 8 <= sess.loader.elf.size(); slot += 8) {
+                if (!sess.loader.relocated_data_slots.count(slot)) continue;
+                uint64_t ptr = readU64(sess.loader.elf, slot) & 0xFFFFFFFFFFFFULL;
+                if (sess.loader.func_by_addr.count(ptr)) {
+                    try_enqueue(ptr, d);
+                }
+            }
+        }
+    };
+
+    uint64_t root_fst = sess.loader.findFuncStart(root_rva);
+    if (sess.loader.isExecutableRva(root_rva)) {
+        batch_set.insert(root_rva);
+        batch_funcs.push_back(root_rva);
+        q.push_back({root_rva, 0});
+    }
+    if (root_fst != 0 && root_fst != root_rva && sess.loader.isExecutableRva(root_fst)) {
+        try_enqueue(root_fst, 0);
+    }
+    if (batch_funcs.empty()) return -1;
+
+    while (!q.empty()) {
+        auto [faddr, depth] = q.front();
+        q.pop_front();
+        uint64_t fsize = sess.loader.getFuncExtent(faddr);
+        std::map<unsigned, uint64_t> regs_page;
+        for (uint64_t off = 0; off < fsize; off += 4) {
+            uint64_t pc = faddr + off;
+            uint32_t insn = readU32(sess.loader.elf, pc);
+            unsigned top6 = (insn >> 26) & 0x3F;
+            if (top6 == 0x25 || top6 == 0x05) {
+                int64_t imm26 = sext64(insn & 0x3FFFFFFU, 26);
+                uint64_t target = static_cast<uint64_t>(static_cast<int64_t>(pc) + (imm26 << 2));
+                if (!sess.loader.plt_map.count(target) && (top6 == 0x25 || !(target >= faddr && target < faddr + fsize))) {
+                    uint64_t tst = sess.loader.findFuncStart(target);
+                    uint64_t cand = tst ? tst : target;
+                    if (depth < max_depth) {
+                        try_enqueue(cand, depth + 1);
+                    } else if (query_rva_status && query_rva_status(cand, user) == 2) {
+                        aot_known.insert(cand);
+                    }
+                }
+            } else if (((insn >> 24) & 0x1F) == 0x10) {
+                unsigned sf = (insn >> 31) & 1;
+                unsigned rd = insn & 0x1F;
+                int64_t imm = sext64(((insn >> 5) & 0x7FFFFU) << 2 | ((insn >> 29) & 3U), 21);
+                if (sf == 0) {
+                    uint64_t tgt = static_cast<uint64_t>(static_cast<int64_t>(pc) + imm);
+                    if (sess.loader.func_by_addr.count(tgt) && depth < max_depth) {
+                        try_enqueue(tgt, depth + 1);
+                    }
+                } else {
+                    regs_page[rd] = (pc & ~0xFFFULL) + static_cast<uint64_t>(imm << 12);
+                }
+            } else if (((insn >> 22) & 0x3FF) == 0x244) {
+                unsigned rn = (insn >> 5) & 0x1F;
+                uint64_t imm12 = (insn >> 10) & 0xFFF;
+                if (regs_page.count(rn)) {
+                    uint64_t tgt = regs_page[rn] + imm12;
+                    if (sess.loader.func_by_addr.count(tgt) && depth < max_depth) {
+                        try_enqueue(tgt, depth + 1);
+                    } else if (depth < max_depth) {
+                        seed_vtable_slots(tgt, depth + 1);
+                    }
+                }
+            } else if ((insn & 0xFFC00000U) == 0xF9400000U) {
+                unsigned rn = (insn >> 5) & 0x1F;
+                uint64_t imm12 = ((insn >> 10) & 0xFFFULL) << 3;
+                if (regs_page.count(rn)) {
+                    uint64_t got_addr = regs_page[rn] + imm12;
+                    if (got_addr + 8 <= sess.loader.elf.size()) {
+                        uint64_t ptr_val = readU64(sess.loader.elf, got_addr) & 0xFFFFFFFFFFFFULL;
+                        if (sess.loader.func_by_addr.count(ptr_val) && depth < max_depth) {
+                            try_enqueue(ptr_val, depth + 1);
+                        } else if (depth < max_depth) {
+                            seed_vtable_slots(ptr_val, depth + 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Only coalesce immediate neighbors if explicitly requested via MALI_AOT_JIT_SPATIAL=1
+    if (const char *sp_env = std::getenv("MALI_AOT_JIT_SPATIAL")) {
+        if (sp_env[0] == '1' && max_batch_funcs > 1) {
+            uint64_t anchor = root_fst ? root_fst : root_rva;
+            const auto &fstarts = sess.loader.sorted_fstarts;
+            auto it = std::lower_bound(fstarts.begin(), fstarts.end(), anchor);
+            for (; it != fstarts.end() && static_cast<int>(batch_funcs.size()) < std::min(max_batch_funcs, 16); ++it) {
+                if (*it > anchor + 0x800ULL) break;
+                try_enqueue(*it, max_depth);
+            }
+        }
+    }
+
+    uint32_t bid = ++sess.batch_counter;
+    char base_name[128];
+    std::snprintf(base_name, sizeof(base_name), "jit_batch_%04u_%08" PRIx64, bid, root_rva);
+    std::string so_path = sess.cache_dir + "/" + base_name + ".so";
+
+    LifterConfig cfg;
+    cfg.is_libcpp = false;
+    cfg.prefix = "aot";
+    cfg.plt_table_name = "g_aot_plt_table";
+    cfg.image_base = 0x400000000ULL;
+    cfg.is_jit_module = true;
+    cfg.aot_known_funcs = std::move(aot_known);
+
+    bool inst_calls = true;
+    if (const char *env_ic = std::getenv("MALI_AOT_INSTRUMENT_CALLS")) {
+        if (std::strcmp(env_ic, "0") == 0) inst_calls = false;
+    }
+
+    bool verbose = false;
+    if (const char *v_env = std::getenv("MALI_AOT_JIT_VERBOSE")) {
+        if (v_env[0] && std::strcmp(v_env, "0") != 0) verbose = true;
+    }
+
+    // Partition batch_funcs across up to 8 parallel codegen slices for multi-core JIT speed
+    size_t n_slices = 1;
+    if (batch_funcs.size() >= 192) n_slices = 8;
+    else if (batch_funcs.size() >= 64) n_slices = 4;
+    else if (batch_funcs.size() >= 16) n_slices = 2;
+
+    std::vector<std::string> slice_irs(n_slices);
+    std::vector<std::string> slice_objs(n_slices);
+    int total_lifted_insns = 0;
+
+    for (size_t s = 0; s < n_slices; ++s) {
+        std::vector<uint64_t> sub_funcs;
+        std::set<uint64_t> sub_set;
+        for (size_t i = s; i < batch_funcs.size(); i += n_slices) {
+            sub_funcs.push_back(batch_funcs[i]);
+            sub_set.insert(batch_funcs[i]);
+        }
+        AArch64ToLLVMIRLiftingPass lifter(sess.loader, cfg, sess.plt_index_map, inst_calls);
+        lifter.func_set = batch_set;
+        char mod_name[160];
+        std::snprintf(mod_name, sizeof(mod_name), "%s_s%zu", base_name, s);
+        ultrs::llvm_ir::Module M(mod_name, "x86_64-pc-linux-gnu");
+        for (uint64_t faddr : sub_funcs) {
+            auto *fn = M.create_function(cfg.prefix + "_sub_" + AArch64ToLLVMIRLiftingPass::hex8(faddr), faddr, faddr + 4);
+            lifter.liftFunction(faddr, M, fn);
+            fn->ssa_values.clear();
+#if defined(HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS) && HORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS
+            for (auto &bb : fn->blocks) {
+                bb->llvm_bb = nullptr;
+                for (auto &inst : bb->insts) inst.llvm_inst = nullptr;
+            }
+            if (fn->llvm_fn) fn->llvm_fn->deleteBody();
+            fn->synthetic_ssa_vals.clear();
+#else
+            fn->synthetic_ssa_vals.clear();
+#endif
+        }
+        lifter.populateModuleHeader(M, sub_set, false);
+        AArch64ToLLVMIRLiftingPass::runHorizonLoweringPasses(M);
+        slice_irs[s] = M.serialize();
+        slice_objs[s] = sess.cache_dir + "/" + mod_name + ".o";
+        total_lifted_insns += lifter.stats.total_instructions;
+    }
+
+    auto compile_one_slice = [&](size_t s) -> int {
+        const std::string &ir_str = slice_irs[s];
+        if (ir_str.empty()) return 1;
+        LLVMContextRef C = LLVMContextCreate();
+        LLVMMemoryBufferRef memBuf = LLVMCreateMemoryBufferWithMemoryRange(
+            ir_str.data(), ir_str.size(), base_name, 0);
+        LLVMModuleRef llvm_mod = nullptr;
+        char *errMsg = nullptr;
+        if (LLVMParseIRInContext(C, memBuf, &llvm_mod, &errMsg) != 0) {
+            fprintf(stderr, "[MALI_JIT] LLVM IR Parse Error (%s): %s\n", base_name, errMsg ? errMsg : "unknown");
+            if (errMsg) LLVMDisposeMessage(errMsg);
+            LLVMContextDispose(C);
+            return 1;
+        }
+        int crc = runLoweringAndCodegenOnModule(llvm_mod, slice_objs[s].c_str(), false, true, nullptr, !verbose, true);
+        LLVMDisposeModule(llvm_mod);
+        LLVMContextDispose(C);
+        return crc;
+    };
+
+    if (n_slices == 1) {
+        if (compile_one_slice(0) != 0) return -1;
+    } else {
+        std::vector<pid_t> pids;
+        for (size_t s = 0; s < n_slices; ++s) {
+            pid_t pid = fork();
+            if (pid < 0) return -1;
+            if (pid == 0) {
+                int crc = compile_one_slice(s);
+                _exit(crc);
+            }
+            pids.push_back(pid);
+        }
+        bool any_failed = false;
+        for (pid_t p : pids) {
+            int st = 0;
+            if (waitpid(p, &st, 0) <= 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+                any_failed = true;
+            }
+        }
+        if (any_failed) return -1;
+    }
+
+    // Link PIC .o slices into shared library via ld -shared
+    pid_t ld_pid = fork();
+    if (ld_pid < 0) return -1;
+    if (ld_pid == 0) {
+        std::vector<const char *> args = {"ld", "-shared", "--hash-style=gnu", "-o", so_path.c_str()};
+        for (const auto &o : slice_objs) args.push_back(o.c_str());
+        args.push_back(nullptr);
+        execvp("ld", const_cast<char *const *>(args.data()));
+        _exit(127);
+    }
+    int ld_status = 0;
+    if (waitpid(ld_pid, &ld_status, 0) <= 0 || !WIFEXITED(ld_status) || WEXITSTATUS(ld_status) != 0) {
+        fprintf(stderr, "[MALI_JIT] ld -shared failed for %s\n", so_path.c_str());
+        return -1;
+    }
+    const char *keep_o = std::getenv("MALI_AOT_JIT_KEEP_OBJ");
+    if (!keep_o || std::strcmp(keep_o, "1") != 0) {
+        for (const auto &o : slice_objs) std::remove(o.c_str());
+    }
+
+    void *dlh = dlopen(so_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!dlh) {
+        fprintf(stderr, "[MALI_JIT] dlopen(%s) failed: %s\n", so_path.c_str(), dlerror());
+        return -1;
+    }
+    sess.loaded_batch_handles.push_back(dlh);
+
+    int registered = 0;
+    for (uint64_t faddr : batch_funcs) {
+        std::string sym = cfg.prefix + "_sub_" + AArch64ToLLVMIRLiftingPass::hex8(faddr);
+        void *fn_ptr = dlsym(dlh, sym.c_str());
+        if (fn_ptr && on_compiled) {
+            const char *fname = nullptr;
+            uint32_t fsz = 0;
+            mali_jit_get_func_info(faddr, &fname, &fsz);
+            on_compiled(faddr, fn_ptr, fname ? fname : sym.c_str(), fsz, user);
+            registered++;
+        }
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    const char *jit_log = std::getenv("MALI_AOT_JIT_LOG");
+    const char *icd_log = std::getenv("MALI_AOT_ICD_LOG");
+    if ((jit_log && jit_log[0] != '0') || (icd_log && icd_log[0] != '0')) {
+        fprintf(stderr, "[MALI_JIT] Compiled batch #%u (root=0x%08" PRIx64 ", %d funcs, %d insns, %zu slices) -> %s in %.2f ms\n",
+                bid, root_rva, registered, total_lifted_insns, n_slices, so_path.c_str(), ms);
+    }
+    return registered;
+}
+
+} // extern "C"
 
 int mali_llvm_passes_main(int argc, char **argv) {
     LLVMInitializeX86TargetInfo();
@@ -4000,6 +4661,17 @@ int mali_llvm_passes_main(int argc, char **argv) {
     LLVMInitializeX86TargetMC();
     LLVMInitializeX86AsmPrinter();
     LLVMInitializeX86AsmParser();
+
+    // Mode 1c: Single-function or subgraph JIT CLI: --jit-fn <libGLES_mali.so> <rva_hex> <out_cache_dir>
+    if (argc >= 5 && std::strcmp(argv[1], "--jit-fn") == 0) {
+        std::string soPath = argv[2];
+        uint64_t rva = std::strtoull(argv[3], nullptr, 0);
+        if (rva >= 0x400000000ULL) rva -= 0x400000000ULL;
+        std::string cacheDir = argv[4];
+        if (mali_jit_init_session(soPath.c_str(), cacheDir.c_str()) != 0) return 1;
+        int n = mali_jit_compile_subgraph(rva, 1, 0, nullptr, nullptr, nullptr);
+        return (n > 0) ? 0 : 1;
+    }
 
     // Mode 1b: Standalone Backend --compile-ll-dir <manifest.txt> <out.o> [-j N]
     if (argc >= 4 && std::strcmp(argv[1], "--compile-ll-dir") == 0) {
@@ -4117,15 +4789,63 @@ int mali_llvm_passes_main(int argc, char **argv) {
         std::string soPath = argv[2];
         std::string outDir = argv[3];
 
+        for (int i = 4; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--closure-mode") == 0 && i + 1 < argc) {
+                cfg.closure_mode = argv[++i];
+            } else if (std::strncmp(argv[i], "--closure-mode=", 15) == 0) {
+                cfg.closure_mode = argv[i] + 15;
+            } else if (std::strcmp(argv[i], "--closure-depth") == 0 && i + 1 < argc) {
+                cfg.closure_depth = std::atoi(argv[++i]);
+            } else if (std::strncmp(argv[i], "--closure-depth=", 16) == 0) {
+                cfg.closure_depth = std::atoi(argv[i] + 16);
+            } else if (std::strcmp(argv[i], "--seed-file") == 0 && i + 1 < argc) {
+                cfg.seed_file = argv[++i];
+            } else if (std::strncmp(argv[i], "--seed-file=", 12) == 0) {
+                cfg.seed_file = argv[i] + 12;
+            }
+        }
+
         printf("[LLVM Pass 1] ELF64LoaderAndCallGraphPass (%s): %s\n", cfg.prefix.c_str(), soPath.c_str());
         ELF64LoaderAndCallGraphPass loader;
+        loader.closure_mode = cfg.closure_mode;
+        loader.closure_depth = cfg.closure_depth;
+        loader.seed_file = cfg.seed_file;
         if (!loader.run(soPath, cfg.image_base, cfg.seed_all_dynsyms)) {
             fprintf(stderr, "Failed to load 64-bit ELF64 AArch64 binary: %s\n", soPath.c_str());
             return 1;
         }
         printf("  Driver version      : %s (build-id: %s)\n", loader.driver_version.c_str(), loader.build_id_short.c_str());
+        printf("  Closure mode        : %s (depth=%d, seed_file=%s, extra_seeds=%zu)\n",
+               loader.closure_mode.c_str(), loader.closure_depth,
+               loader.seed_file.empty() ? "(none)" : loader.seed_file.c_str(),
+               loader.seed_file_loaded_count);
         printf("  Closure functions   : %zu internal functions, %zu PLT imports, %zu GLOB_DAT relocs\n",
                loader.closure_funcs.size(), loader.closure_plts.size(), loader.glob_dat_relocs.size());
+        if (!is_libcpp) {
+            std::string closureRvaPath = outDir + "/r54p3_aot_closure_rvas.txt";
+            std::ofstream cf(closureRvaPath);
+            cf << "# AOT closure RVAs (" << loader.closure_funcs.size() << " functions, mode=" << loader.closure_mode << ")\n";
+            for (uint64_t rva : loader.closure_funcs) {
+                cf << "0x" << AArch64ToLLVMIRLiftingPass::hex8(rva) << "\n";
+            }
+            std::string fdeIncPath = outDir + "/aot_fde_table.inc";
+            std::ofstream fi(fdeIncPath);
+            fi << "// Auto-generated FDE table (" << loader.func_by_addr.size() << " entries)\n";
+            fi << "#ifdef AOT_FDE\n";
+            for (const auto &kv : loader.func_by_addr) {
+                fi << "AOT_FDE(0x" << AArch64ToLLVMIRLiftingPass::hex8(kv.first)
+                   << "ULL, 0x" << std::hex << kv.second.second << std::dec
+                   << "U, \"" << kv.second.first << "\")\n";
+            }
+            fi << "#endif\n";
+            std::string globIncPath = outDir + "/aot_globals.inc";
+            std::ofstream gi(globIncPath);
+            gi << "// Auto-generated guest globals table\n#ifdef AOT_GLOBAL\n";
+            for (const auto &kv : loader.exported_data) {
+                gi << "AOT_GLOBAL(\"" << kv.first << "\", 0x" << AArch64ToLLVMIRLiftingPass::hex8(kv.second) << "ULL)\n";
+            }
+            gi << "#endif\n";
+        }
         if (!is_libcpp) {
             printf("  Auto ctx malloc off : 0x%02" PRIx64 " | Vulkan HMI RVA: 0x%08" PRIx64 "\n", loader.ctx_malloc_offset, loader.hmi_rva);
         }

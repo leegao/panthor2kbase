@@ -133,10 +133,15 @@ VkResult vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInf
             g_aot_rt.resetGuestStackLocked(); aot_kbase_kcpu_queue_create(&cpu);
             dev->kcpu_queue_id = kcpu_id;
         }
-        if (aot_sub_01c64f90) {
+        {
             cpu.x[0] = reinterpret_cast<uint64_t>(cctx_ptr);
             cpu.x[1] = reinterpret_cast<uint64_t>(cctx_ptr + 0x408);
-            g_aot_rt.resetGuestStackLocked(); aot_sub_01c64f90(&cpu);
+            g_aot_rt.resetGuestStackLocked();
+            if (aot_sub_01c64f90) {
+                aot_sub_01c64f90(&cpu);
+            } else {
+                aot_indirect_dispatch(&cpu, IMAGE_BASE + 0x01c64f90ULL);
+            }
         }
     }
 
