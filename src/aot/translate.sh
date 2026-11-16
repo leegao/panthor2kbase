@@ -20,8 +20,22 @@ elif [ -f "$REPO_ROOT/$SO_ARG" ]; then
 fi
 
 # Pinned static LLVM-21 headers & libraries in third_party/
-LLVM21_INC_DIR="$REPO_ROOT/third_party/prebuilts/llvm-21/includes"
+LLVM21_INC_DIR="$REPO_ROOT/third_party/prebuilts/llvm-21/include"
 LLVM21_LIB_DIR="$REPO_ROOT/third_party/prebuilts/llvm-21/lib"
+
+# The pinned prebuilt static libs are .gitignored, so fall back to llvm-config's libLLVM.
+if compgen -G "$LLVM21_LIB_DIR/*.a" > /dev/null; then
+    LLVM21_LINK_LIBS=(-Wl,--start-group "$LLVM21_LIB_DIR"/*.a -Wl,--end-group)
+else
+    LLVM_CONFIG="${LLVM_CONFIG:-$(command -v llvm-config || command -v llvm-config-21 || command -v llvm-config-20 || true)}"
+    if [ -n "$LLVM_CONFIG" ]; then
+        LLVM21_INC_DIR="$($LLVM_CONFIG --includedir)"
+        LLVM21_LINK_LIBS=("-L$($LLVM_CONFIG --libdir)" -lLLVM)
+    else
+        echo "[ERROR] No LLVM-21 found: $LLVM21_LIB_DIR is empty and no llvm-config on PATH." >&2
+        exit 1
+    fi
+fi
 
 ELF_TAG="r54p3-00eac0-6eda07"
 if [ -n "$SO_PATH" ] && [ -f "$SO_PATH" ]; then
@@ -85,7 +99,7 @@ if [ "$NEEDS_REBUILD" -eq 1 ]; then
         "$ROOT_DIR/horizon2llvm/aarch64/aarch64_lifter.cpp" \
         "$ROOT_DIR/horizon2llvm/passes.cpp" \
         "$ROOT_DIR"/horizon2llvm/lowering/*.cpp \
-        -Wl,--start-group "$LLVM21_LIB_DIR"/*.a -Wl,--end-group \
+        "${LLVM21_LINK_LIBS[@]}" \
         -lz -l:libzstd.so.1 -ldl -lpthread -lm -o "$PASS_DRIVER"
 fi
 

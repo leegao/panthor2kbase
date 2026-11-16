@@ -11,6 +11,40 @@ set(LLVM21_LIB_DIR "${REPO_ROOT}/third_party/prebuilts/llvm-21/lib")
 file(GLOB LLVM21_STATIC_LIBS "${LLVM21_LIB_DIR}/*.a")
 list(SORT LLVM21_STATIC_LIBS)
 
+# The pinned prebuilt static libs are .gitignored, so fall back to llvm-config's libLLVM.
+set(LLVM21_LINK_LIBS "")
+if(LLVM21_STATIC_LIBS)
+    list(APPEND LLVM21_LINK_LIBS -Wl,--start-group ${LLVM21_STATIC_LIBS} -Wl,--end-group)
+else()
+    if(NOT LLVM_CONFIG)
+        find_program(LLVM_CONFIG NAMES llvm-config llvm-config-21 llvm-config-20 llvm-config-19 llvm-config-18)
+    endif()
+    if(LLVM_CONFIG)
+        execute_process(COMMAND ${LLVM_CONFIG} --includedir OUTPUT_VARIABLE LLVM21_SYS_INCLUDE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        execute_process(COMMAND ${LLVM_CONFIG} --libdir OUTPUT_VARIABLE LLVM21_SYS_LIB_DIR OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        execute_process(COMMAND ${LLVM_CONFIG} --version OUTPUT_VARIABLE LLVM21_SYS_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        # The sources are pinned to the LLVM 21 API, so a different major version is not usable.
+        if(LLVM21_SYS_VERSION AND NOT LLVM21_SYS_VERSION MATCHES "^21\.")
+            message(FATAL_ERROR
+                "horizon2llvm: llvm-config reports LLVM ${LLVM21_SYS_VERSION}, but the sources require LLVM 21. "
+                "Point -DLLVM_CONFIG= at an llvm-config-21, or install llvm-21-dev.")
+        endif()
+        if(LLVM21_SYS_INCLUDE_DIR AND EXISTS "${LLVM21_SYS_INCLUDE_DIR}/llvm/IR/IRBuilder.h")
+            set(LLVM21_INC_DIR "${LLVM21_SYS_INCLUDE_DIR}")
+        endif()
+        find_library(LLVM21_SHARED_LIB NAMES LLVM LLVM-${LLVM21_SYS_VERSION} LLVM-${LLVM21_SYS_VERSION}.1 HINTS "${LLVM21_SYS_LIB_DIR}" NO_DEFAULT_PATH)
+        if(NOT LLVM21_SHARED_LIB)
+            find_library(LLVM21_SHARED_LIB NAMES LLVM LLVM-${LLVM21_SYS_VERSION} HINTS "${LLVM21_SYS_LIB_DIR}")
+        endif()
+    endif()
+    if(LLVM21_SHARED_LIB)
+        message(STATUS "horizon2llvm: using system llvm-config LLVM ${LLVM21_SYS_VERSION} (${LLVM21_SHARED_LIB})")
+        list(APPEND LLVM21_LINK_LIBS "${LLVM21_SHARED_LIB}")
+    else()
+        message(FATAL_ERROR "horizon2llvm: no LLVM-21 found (third_party/prebuilts/llvm-21/lib is empty and no llvm-config).")
+    endif()
+endif()
+
 include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${LLVM21_INC_DIR})
 
 file(GLOB_RECURSE CORE_SRCS
@@ -30,7 +64,7 @@ add_executable(horizon2llvm main.cpp)
 target_compile_options(horizon2llvm PRIVATE -O2 -Wall -Wextra)
 target_link_libraries(horizon2llvm PRIVATE
     horizon2llvm_core
-    -Wl,--start-group ${LLVM21_STATIC_LIBS} -Wl,--end-group
+    ${LLVM21_LINK_LIBS}
     ${ZLIB_LIB}
     ${ZSTD_LIB}
     dl pthread m

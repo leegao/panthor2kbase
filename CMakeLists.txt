@@ -172,10 +172,54 @@ if(NOT ANDROID)
       src/aot/horizon2llvm/lowering/pass_nzcv_predicate_fusion.cpp
       src/aot/horizon2llvm/lowering/pass_tail_call_devirt.cpp
    )
+   # Preferred: the pinned static LLVM-21 prebuilt under third_party/prebuilts/llvm-21.
+   # That directory is .gitignored (only the headers are tracked), so it is absent on a
+   # fresh checkout such as GitHub CI. Fall back to whatever llvm-config is installed.
    set(LLVM21_INC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/prebuilts/llvm-21/include")
    set(LLVM21_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/prebuilts/llvm-21/lib")
    file(GLOB LLVM21_STATIC_LIBS "${LLVM21_LIB_DIR}/*.a")
    list(SORT LLVM21_STATIC_LIBS)
+
+   set(LLVM21_LINK_LIBS "")
+   if(LLVM21_STATIC_LIBS)
+      message(STATUS "horizon2llvm: using pinned static LLVM-21 prebuilt (${LLVM21_LIB_DIR})")
+      list(APPEND LLVM21_LINK_LIBS -Wl,--start-group ${LLVM21_STATIC_LIBS} -Wl,--end-group)
+   else()
+      # No prebuilt static libs: locate llvm-config (LLVM_CONFIG cache var wins) and use
+      # the shared libLLVM it points at. The headers still come from the tracked
+      # third_party/prebuilts/llvm-21/include tree, which is the same LLVM-21 ABI.
+      if(NOT LLVM_CONFIG)
+         find_program(LLVM_CONFIG NAMES llvm-config llvm-config-21 llvm-config-20 llvm-config-19 llvm-config-18)
+      endif()
+      if(LLVM_CONFIG)
+         execute_process(COMMAND ${LLVM_CONFIG} --includedir OUTPUT_VARIABLE LLVM21_SYS_INCLUDE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+         execute_process(COMMAND ${LLVM_CONFIG} --libdir OUTPUT_VARIABLE LLVM21_SYS_LIB_DIR OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+         execute_process(COMMAND ${LLVM_CONFIG} --version OUTPUT_VARIABLE LLVM21_SYS_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+         # The sources are pinned to the LLVM 21 API, so a different major version is not usable.
+         if(LLVM21_SYS_VERSION AND NOT LLVM21_SYS_VERSION MATCHES "^21\.")
+            message(FATAL_ERROR
+               "horizon2llvm: llvm-config reports LLVM ${LLVM21_SYS_VERSION}, but the sources require LLVM 21. "
+               "Point -DLLVM_CONFIG= at an llvm-config-21, or install llvm-21-dev.")
+         endif()
+         if(LLVM21_SYS_INCLUDE_DIR AND EXISTS "${LLVM21_SYS_INCLUDE_DIR}/llvm/IR/IRBuilder.h")
+            set(LLVM21_INC_DIR "${LLVM21_SYS_INCLUDE_DIR}")
+         endif()
+         find_library(LLVM21_SHARED_LIB NAMES LLVM LLVM-${LLVM21_SYS_VERSION} LLVM-${LLVM21_SYS_VERSION}.1 HINTS "${LLVM21_SYS_LIB_DIR}" NO_DEFAULT_PATH)
+         if(NOT LLVM21_SHARED_LIB)
+            find_library(LLVM21_SHARED_LIB NAMES LLVM LLVM-${LLVM21_SYS_VERSION} HINTS "${LLVM21_SYS_LIB_DIR}")
+         endif()
+      endif()
+
+      if(LLVM21_SHARED_LIB)
+         message(STATUS "horizon2llvm: using system llvm-config LLVM ${LLVM21_SYS_VERSION} (${LLVM21_SHARED_LIB})")
+         list(APPEND LLVM21_LINK_LIBS "${LLVM21_SHARED_LIB}")
+      else()
+         message(FATAL_ERROR
+            "horizon2llvm: no LLVM-21 available. Expected static libs in "
+            "third_party/prebuilts/llvm-21/lib (gitignored, so absent on fresh checkouts) "
+            "or an llvm-config providing libLLVM. Install llvm-dev (or set -DLLVM_CONFIG=/path/to/llvm-config).")
+      endif()
+   endif()
 
    target_include_directories(horizon2llvm_passes PRIVATE
       "${CMAKE_CURRENT_SOURCE_DIR}/src/aot/horizon2llvm"
@@ -208,7 +252,7 @@ if(NOT ANDROID)
       list(APPEND LLVM21_EXT_LIBS "${ZSTD_LIB}")
    endif()
    target_link_libraries(horizon2llvm PRIVATE
-      -Wl,--start-group ${LLVM21_STATIC_LIBS} -Wl,--end-group
+      ${LLVM21_LINK_LIBS}
       ${LLVM21_EXT_LIBS}
       dl ${PLATFORM_LIBS}
    )
@@ -222,7 +266,7 @@ if(NOT ANDROID)
    )
    target_link_options(mali_jit PRIVATE -Wl,-Bsymbolic -Wl,-Bsymbolic-functions)
    target_link_libraries(mali_jit PRIVATE
-      -Wl,--start-group ${LLVM21_STATIC_LIBS} -Wl,--end-group
+      ${LLVM21_LINK_LIBS}
       ${LLVM21_EXT_LIBS}
       dl ${PLATFORM_LIBS}
    )

@@ -29,10 +29,10 @@ jobs:
           sudo apt-get install -y \
               build-essential \
               cmake \
-              llvm-20-dev \
-              libclang-20-dev \
-              libclc-20-dev \
-              libllvmspirvlib-20-dev \
+              llvm-21-dev \
+              libclang-21-dev \
+              libclc-21-dev \
+              libllvmspirvlib-21-dev \
               libelf-dev \
               spirv-tools \
               spirv-tools-dev \
@@ -116,10 +116,10 @@ jobs:
 
       - name: Generate Host Tools (build-x86-64/mesa BEFORE applying mesa_overlay)
         env:
-          LLVM_CONFIG: /usr/bin/llvm-config-20
+          LLVM_CONFIG: /usr/bin/llvm-config-21
         run: |
           export MESON_WORKING_DIR="$GITHUB_WORKSPACE"
-          export LLVM_CONFIG=/usr/bin/llvm-config-20
+          export LLVM_CONFIG=/usr/bin/llvm-config-21
 
           meson setup build-x86-64/mesa mesa \
               -Dplatforms=[] \

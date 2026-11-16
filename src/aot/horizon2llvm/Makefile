@@ -10,7 +10,18 @@ RUNTIME_DIR := $(LIFTER_DIR)/runtime
 REPO_ROOT_3P := $(abspath $(LIFTER_DIR)/../../..)
 LLVM_INC := -I$(REPO_ROOT_3P)/third_party/prebuilts/llvm-21/include
 LLVM_LIB_DIR := $(REPO_ROOT_3P)/third_party/prebuilts/llvm-21/lib
-LLVM_LIB := -Wl,--start-group $(wildcard $(LLVM_LIB_DIR)/*.a) -Wl,--end-group
+LLVM_STATIC_LIBS := $(wildcard $(LLVM_LIB_DIR)/*.a)
+# The pinned prebuilt static libs are .gitignored, so fall back to llvm-config's libLLVM.
+ifeq ($(strip $(LLVM_STATIC_LIBS)),)
+LLVM_CONFIG ?= $(shell command -v llvm-config 2>/dev/null || command -v llvm-config-21 2>/dev/null || command -v llvm-config-20 2>/dev/null)
+ifeq ($(strip $(LLVM_CONFIG)),)
+$(error No LLVM-21 found: third_party/prebuilts/llvm-21/lib is empty and no llvm-config on PATH)
+endif
+LLVM_INC := -I$(shell $(LLVM_CONFIG) --includedir)
+LLVM_LIB := -L$(shell $(LLVM_CONFIG) --libdir) -lLLVM
+else
+LLVM_LIB := -Wl,--start-group $(LLVM_STATIC_LIBS) -Wl,--end-group
+endif
 LLVM_LIB_FLAG := -lz -l:libzstd.so.1
 
 CXX ?= g++
