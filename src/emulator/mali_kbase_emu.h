@@ -194,6 +194,7 @@ int mali_kbase_emu_stat_direct(const char *pathname, struct stat *statbuf);
 int mali_kbase_emu_fstat_direct(int fd, struct stat *statbuf);
 int mali_kbase_emu_access_direct(const char *pathname, int mode);
 bool mali_kbase_emu_is_emulated_fd(int fd);
+bool mali_kbase_emu_is_valid_gpu_va(uint64_t va, size_t len);
 
 #ifdef __cplusplus
 }

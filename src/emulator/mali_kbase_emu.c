@@ -1274,6 +1274,16 @@ static void execute_valhall_shader(const struct valhall_shader_desc *spd)
    }
 }
 
+static bool emu_is_valid_host_range(uint64_t va, size_t len);
+__attribute__((visibility("default")))
+bool mali_kbase_emu_is_valid_gpu_va(uint64_t va, size_t len)
+{
+   pthread_mutex_lock(&g_emu_lock);
+   bool ok = emu_is_valid_host_range(va, len);
+   pthread_mutex_unlock(&g_emu_lock);
+   return ok;
+}
+
 static bool emu_is_valid_host_range(uint64_t va, size_t len)
 {
    if (va < 0x10000ULL || len == 0 || (va + len) < va)

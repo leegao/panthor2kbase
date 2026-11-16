@@ -331,6 +331,8 @@ add_library(mali_kbase_emu SHARED
    src/emulator/lifted_csffw.c
    ${LIFTED_KBASE_KO_LL_OBJ}
    src/emulator/panfrost_valhall_disasm_gen.c
+    src/emulator/valhall_vulkan_renderer.cpp
+    src/r54p3_vulkan_icd/valhall_spirv_lifter.cpp
 )
 target_link_options(mali_kbase_emu PRIVATE -Wl,-Bsymbolic -Wl,-Bsymbolic-functions)
 target_link_libraries(mali_kbase_emu PRIVATE panthor_kbase_adapter ${PLATFORM_LIBS})
@@ -348,6 +350,8 @@ add_library(mali_kbase_emu_static STATIC
    src/emulator/lifted_csffw.c
    ${LIFTED_KBASE_KO_LL_OBJ}
    src/emulator/panfrost_valhall_disasm_gen.c
+    src/emulator/valhall_vulkan_renderer.cpp
+    src/r54p3_vulkan_icd/valhall_spirv_lifter.cpp
 )
 set_target_properties(mali_kbase_emu_static PROPERTIES
    OUTPUT_NAME mali_kbase_emu
