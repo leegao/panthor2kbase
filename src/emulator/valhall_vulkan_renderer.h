@@ -33,6 +33,11 @@ extern "C" {
  *   5. Executes real Vulkan graphics and compute pipelines on a self-contained host
  *      VkDevice (Lavapipe / host ICD) and writes rendered pixels & storage buffer
  *      outputs directly back into guest GPU VA memory mapped by /dev/mali0.
+ *
+ * Environment:
+ *   MALI_EMU_HEADLESS=1  Disable the renderer entirely (no host VkDevice, no
+ *                        Lavapipe submit/readback). Any other value or unset
+ *                        leaves the renderer enabled (default).
  */
 
 void valhall_vk_renderer_init(void);

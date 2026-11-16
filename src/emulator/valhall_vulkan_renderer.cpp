@@ -1735,11 +1735,18 @@ static void handle_csf_run_compute(uint8_t cs_opcode, uint64_t insn, const uint6
     g_vvr.fp_vkDestroyShaderModule(g_vvr.device, cs_mod, nullptr);
 }
 
+/* MALI_EMU_HEADLESS=1 explicitly disables the CSF-hooked Vulkan renderer. */
+static bool renderer_disabled() {
+    const char* env = std::getenv("MALI_EMU_HEADLESS");
+    return env && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
+
 } // namespace
 
 extern "C" {
 
 void valhall_vk_renderer_init(void) {
+    if (renderer_disabled()) return;
     std::lock_guard<std::mutex> lk(g_vvr.mtx);
     ensure_host_vk_initialized_locked();
 }
@@ -1753,6 +1760,7 @@ void valhall_vk_csf_job_hook(uint8_t cs_opcode,
                              const uint64_t* cs_regs,
                              void* /*user_data*/) {
     if (!cs_regs) return;
+    if (renderer_disabled()) return;
     switch (cs_opcode) {
         case CSF_OP_RUN_IDVS_SHORT:
         case CSF_OP_RUN_IDVS_EXT:
