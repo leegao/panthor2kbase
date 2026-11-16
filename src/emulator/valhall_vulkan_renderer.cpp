@@ -537,163 +537,6 @@ static bool ensure_host_vk_initialized_locked() {
     return true;
 }
 
-static void build_valhall_idvs_vertex_spirv(std::vector<uint32_t>& w) {
-    static const uint32_t kLiftedIdvsVertSpv[] = {
-        0x07230203,0x00010000,0x0008000b,0x0000002f,0x00000000,0x00020011,0x00000001,0x0006000b,
-        0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
-        0x0009000f,0x00000000,0x00000004,0x6e69616d,0x00000000,0x00000009,0x00000015,0x0000001e,
-        0x0000002b,0x00030003,0x00000002,0x00000190,0x00090004,0x415f4c47,0x735f4252,0x72617065,
-        0x5f657461,0x64616873,0x6f5f7265,0x63656a62,0x00007374,0x00090004,0x415f4c47,0x735f4252,
-        0x69646168,0x6c5f676e,0x75676e61,0x5f656761,0x70303234,0x006b6361,0x00040005,0x00000004,
-        0x6e69616d,0x00000000,0x00050005,0x00000009,0x63786574,0x64726f6f,0x00000000,0x00030005,
-        0x0000000f,0x00667562,0x00040006,0x0000000f,0x00000000,0x0050564d,0x00060006,0x0000000f,
-        0x00000001,0x69736f70,0x6e6f6974,0x00000000,0x00050006,0x0000000f,0x00000002,0x72747461,
-        0x00000000,0x00040005,0x00000011,0x66756275,0x00000000,0x00060005,0x00000015,0x565f6c67,
-        0x65747265,0x646e4978,0x00007865,0x00060005,0x0000001c,0x505f6c67,0x65567265,0x78657472,
-        0x00000000,0x00060006,0x0000001c,0x00000000,0x505f6c67,0x7469736f,0x006e6f69,0x00070006,
-        0x0000001c,0x00000001,0x505f6c67,0x746e696f,0x657a6953,0x00000000,0x00070006,0x0000001c,
-        0x00000002,0x435f6c67,0x4470696c,0x61747369,0x0065636e,0x00030005,0x0000001e,0x00000000,
-        0x00050005,0x0000002b,0x67617266,0x736f705f,0x00000000,0x00040047,0x00000009,0x0000001e,
-        0x00000000,0x00040047,0x0000000d,0x00000006,0x00000010,0x00040047,0x0000000e,0x00000006,
-        0x00000010,0x00030047,0x0000000f,0x00000002,0x00040048,0x0000000f,0x00000000,0x00000005,
-        0x00050048,0x0000000f,0x00000000,0x00000007,0x00000010,0x00050048,0x0000000f,0x00000000,
-        0x00000023,0x00000000,0x00050048,0x0000000f,0x00000001,0x00000023,0x00000040,0x00050048,
-        0x0000000f,0x00000002,0x00000023,0x00000280,0x00040047,0x00000011,0x00000021,0x00000000,
-        0x00040047,0x00000011,0x00000022,0x00000000,0x00040047,0x00000015,0x0000000b,0x0000002a,
-        0x00030047,0x0000001c,0x00000002,0x00050048,0x0000001c,0x00000000,0x0000000b,0x00000000,
-        0x00050048,0x0000001c,0x00000001,0x0000000b,0x00000001,0x00050048,0x0000001c,0x00000002,
-        0x0000000b,0x00000003,0x00040047,0x0000002b,0x0000001e,0x00000001,0x00020013,0x00000002,
-        0x00030021,0x00000003,0x00000002,0x00030016,0x00000006,0x00000020,0x00040017,0x00000007,
-        0x00000006,0x00000004,0x00040020,0x00000008,0x00000003,0x00000007,0x0004003b,0x00000008,
-        0x00000009,0x00000003,0x00040018,0x0000000a,0x00000007,0x00000004,0x00040015,0x0000000b,
-        0x00000020,0x00000000,0x0004002b,0x0000000b,0x0000000c,0x00000024,0x0004001c,0x0000000d,
-        0x00000007,0x0000000c,0x0004001c,0x0000000e,0x00000007,0x0000000c,0x0005001e,0x0000000f,
-        0x0000000a,0x0000000d,0x0000000e,0x00040020,0x00000010,0x00000002,0x0000000f,0x0004003b,
-        0x00000010,0x00000011,0x00000002,0x00040015,0x00000012,0x00000020,0x00000001,0x0004002b,
-        0x00000012,0x00000013,0x00000002,0x00040020,0x00000014,0x00000001,0x00000012,0x0004003b,
-        0x00000014,0x00000015,0x00000001,0x00040020,0x00000017,0x00000002,0x00000007,0x0004002b,
-        0x0000000b,0x0000001a,0x00000001,0x0004001c,0x0000001b,0x00000006,0x0000001a,0x0005001e,
-        0x0000001c,0x00000007,0x00000006,0x0000001b,0x00040020,0x0000001d,0x00000003,0x0000001c,
-        0x0004003b,0x0000001d,0x0000001e,0x00000003,0x0004002b,0x00000012,0x0000001f,0x00000000,
-        0x00040020,0x00000020,0x00000002,0x0000000a,0x0004002b,0x00000012,0x00000023,0x00000001,
-        0x00040017,0x00000029,0x00000006,0x00000003,0x00040020,0x0000002a,0x00000003,0x00000029,
-        0x0004003b,0x0000002a,0x0000002b,0x00000003,0x00050036,0x00000002,0x00000004,0x00000000,
-        0x00000003,0x000200f8,0x00000005,0x0004003d,0x00000012,0x00000016,0x00000015,0x00060041,
-        0x00000017,0x00000018,0x00000011,0x00000013,0x00000016,0x0004003d,0x00000007,0x00000019,
-        0x00000018,0x0003003e,0x00000009,0x00000019,0x00050041,0x00000020,0x00000021,0x00000011,
-        0x0000001f,0x0004003d,0x0000000a,0x00000022,0x00000021,0x0004003d,0x00000012,0x00000024,
-        0x00000015,0x00060041,0x00000017,0x00000025,0x00000011,0x00000023,0x00000024,0x0004003d,
-        0x00000007,0x00000026,0x00000025,0x00050091,0x00000007,0x00000027,0x00000022,0x00000026,
-        0x00050041,0x00000008,0x00000028,0x0000001e,0x0000001f,0x0003003e,0x00000028,0x00000027,
-        0x00050041,0x00000008,0x0000002c,0x0000001e,0x0000001f,0x0004003d,0x00000007,0x0000002d,
-        0x0000002c,0x0008004f,0x00000029,0x0000002e,0x0000002d,0x0000002d,0x00000000,0x00000001,
-        0x00000002,0x0003003e,0x0000002b,0x0000002e,0x000100fd,0x00010038,
-    };
-    w.assign(kLiftedIdvsVertSpv, kLiftedIdvsVertSpv + (sizeof(kLiftedIdvsVertSpv) / sizeof(uint32_t)));
-}
-
-static void build_valhall_idvs_fragment_spirv(std::vector<uint32_t>& w) {
-    static const uint32_t kLiftedIdvsFragSpv[] = {
-        0x07230203,0x00010000,0x0008000b,0x00000073,0x00000000,0x00020011,0x00000001,0x0006000b,
-        0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
-        0x0008000f,0x00000004,0x00000004,0x6e69616d,0x00000000,0x0000004e,0x00000063,0x0000006b,
-        0x00030010,0x00000004,0x00000007,0x00030003,0x00000002,0x00000190,0x00090004,0x415f4c47,
-        0x735f4252,0x72617065,0x5f657461,0x64616873,0x6f5f7265,0x63656a62,0x00007374,0x00090004,
-        0x415f4c47,0x735f4252,0x69646168,0x6c5f676e,0x75676e61,0x5f656761,0x70303234,0x006b6361,
-        0x00040005,0x00000004,0x6e69616d,0x00000000,0x00070005,0x0000000a,0x656e696c,0x6f547261,
-        0x62677253,0x3b316628,0x00000000,0x00040005,0x00000009,0x656e696c,0x00007261,0x00070005,
-        0x00000010,0x656e696c,0x6f547261,0x62677253,0x33667628,0x0000003b,0x00040005,0x0000000f,
-        0x656e696c,0x00007261,0x00070005,0x00000016,0x656e696c,0x6f547261,0x62677253,0x34667628,
-        0x0000003b,0x00040005,0x00000015,0x656e696c,0x00007261,0x00040005,0x0000002c,0x61726170,
-        0x0000006d,0x00040005,0x00000032,0x61726170,0x0000006d,0x00040005,0x00000037,0x61726170,
-        0x0000006d,0x00040005,0x0000003f,0x61726170,0x0000006d,0x00030005,0x0000004c,0x00005864,
-        0x00050005,0x0000004e,0x67617266,0x736f705f,0x00000000,0x00030005,0x00000051,0x00005964,
-        0x00040005,0x00000054,0x6d726f6e,0x00006c61,0x00040005,0x00000059,0x6867696c,0x00000074,
-        0x00050005,0x00000063,0x61724675,0x6c6f4367,0x0000726f,0x00030005,0x00000068,0x00786574,
-        0x00050005,0x0000006b,0x63786574,0x64726f6f,0x00000000,0x00040005,0x00000071,0x61726170,
-        0x0000006d,0x00040047,0x0000004e,0x0000001e,0x00000001,0x00040047,0x00000063,0x0000001e,
-        0x00000000,0x00040047,0x00000068,0x00000021,0x00000001,0x00040047,0x00000068,0x00000022,
-        0x00000000,0x00040047,0x0000006b,0x0000001e,0x00000000,0x00020013,0x00000002,0x00030021,
-        0x00000003,0x00000002,0x00030016,0x00000006,0x00000020,0x00040020,0x00000007,0x00000007,
-        0x00000006,0x00040021,0x00000008,0x00000006,0x00000007,0x00040017,0x0000000c,0x00000006,
-        0x00000003,0x00040020,0x0000000d,0x00000007,0x0000000c,0x00040021,0x0000000e,0x0000000c,
-        0x0000000d,0x00040017,0x00000012,0x00000006,0x00000004,0x00040020,0x00000013,0x00000007,
-        0x00000012,0x00040021,0x00000014,0x00000012,0x00000013,0x0004002b,0x00000006,0x00000019,
-        0x3b4d2e1c,0x00020014,0x0000001a,0x0004002b,0x00000006,0x0000001f,0x414eb852,0x0004002b,
-        0x00000006,0x00000023,0x3f870a3d,0x0004002b,0x00000006,0x00000025,0x3ed55555,0x0004002b,
-        0x00000006,0x00000028,0x3d6147ae,0x00040015,0x0000002d,0x00000020,0x00000000,0x0004002b,
-        0x0000002d,0x0000002e,0x00000000,0x0004002b,0x0000002d,0x00000033,0x00000001,0x0004002b,
-        0x0000002d,0x00000038,0x00000002,0x0004002b,0x0000002d,0x00000043,0x00000003,0x00040020,
-        0x0000004d,0x00000001,0x0000000c,0x0004003b,0x0000004d,0x0000004e,0x00000001,0x0004002b,
-        0x00000006,0x0000005a,0x00000000,0x0004002b,0x00000006,0x0000005b,0x3ed91687,0x0004002b,
-        0x00000006,0x0000005c,0x3f10e560,0x0004002b,0x00000006,0x0000005d,0x3f34fdf4,0x0006002c,
-        0x0000000c,0x0000005e,0x0000005b,0x0000005c,0x0000005d,0x00040020,0x00000062,0x00000003,
-        0x00000012,0x0004003b,0x00000062,0x00000063,0x00000003,0x00090019,0x00000065,0x00000006,
-        0x00000001,0x00000000,0x00000000,0x00000000,0x00000001,0x00000000,0x0003001b,0x00000066,
-        0x00000065,0x00040020,0x00000067,0x00000000,0x00000066,0x0004003b,0x00000067,0x00000068,
-        0x00000000,0x00040020,0x0000006a,0x00000001,0x00000012,0x0004003b,0x0000006a,0x0000006b,
-        0x00000001,0x00040017,0x0000006c,0x00000006,0x00000002,0x00050036,0x00000002,0x00000004,
-        0x00000000,0x00000003,0x000200f8,0x00000005,0x0004003b,0x0000000d,0x0000004c,0x00000007,
-        0x0004003b,0x0000000d,0x00000051,0x00000007,0x0004003b,0x0000000d,0x00000054,0x00000007,
-        0x0004003b,0x00000007,0x00000059,0x00000007,0x0004003b,0x00000013,0x00000071,0x00000007,
-        0x0004003d,0x0000000c,0x0000004f,0x0000004e,0x000400cf,0x0000000c,0x00000050,0x0000004f,
-        0x0003003e,0x0000004c,0x00000050,0x0004003d,0x0000000c,0x00000052,0x0000004e,0x000400d0,
-        0x0000000c,0x00000053,0x00000052,0x0003003e,0x00000051,0x00000053,0x0004003d,0x0000000c,
-        0x00000055,0x0000004c,0x0004003d,0x0000000c,0x00000056,0x00000051,0x0007000c,0x0000000c,
-        0x00000057,0x00000001,0x00000044,0x00000055,0x00000056,0x0006000c,0x0000000c,0x00000058,
-        0x00000001,0x00000045,0x00000057,0x0003003e,0x00000054,0x00000058,0x0004003d,0x0000000c,
-        0x0000005f,0x00000054,0x00050094,0x00000006,0x00000060,0x0000005e,0x0000005f,0x0007000c,
-        0x00000006,0x00000061,0x00000001,0x00000028,0x0000005a,0x00000060,0x0003003e,0x00000059,
-        0x00000061,0x0004003d,0x00000006,0x00000064,0x00000059,0x0004003d,0x00000066,0x00000069,
-        0x00000068,0x0004003d,0x00000012,0x0000006d,0x0000006b,0x0007004f,0x0000006c,0x0000006e,
-        0x0000006d,0x0000006d,0x00000000,0x00000001,0x00050057,0x00000012,0x0000006f,0x00000069,
-        0x0000006e,0x0005008e,0x00000012,0x00000070,0x0000006f,0x00000064,0x0003003e,0x00000071,
-        0x00000070,0x00050039,0x00000012,0x00000072,0x00000016,0x00000071,0x0003003e,0x00000063,
-        0x00000072,0x000100fd,0x00010038,0x00050036,0x00000006,0x0000000a,0x00000000,0x00000008,
-        0x00030037,0x00000007,0x00000009,0x000200f8,0x0000000b,0x0004003d,0x00000006,0x00000018,
-        0x00000009,0x000500bc,0x0000001a,0x0000001b,0x00000018,0x00000019,0x000300f7,0x0000001d,
-        0x00000000,0x000400fa,0x0000001b,0x0000001c,0x00000022,0x000200f8,0x0000001c,0x0004003d,
-        0x00000006,0x0000001e,0x00000009,0x00050085,0x00000006,0x00000020,0x0000001e,0x0000001f,
-        0x000200fe,0x00000020,0x000200f8,0x00000022,0x0004003d,0x00000006,0x00000024,0x00000009,
-        0x0007000c,0x00000006,0x00000026,0x00000001,0x0000001a,0x00000024,0x00000025,0x00050085,
-        0x00000006,0x00000027,0x00000023,0x00000026,0x00050083,0x00000006,0x00000029,0x00000027,
-        0x00000028,0x000200fe,0x00000029,0x000200f8,0x0000001d,0x000100ff,0x00010038,0x00050036,
-        0x0000000c,0x00000010,0x00000000,0x0000000e,0x00030037,0x0000000d,0x0000000f,0x000200f8,
-        0x00000011,0x0004003b,0x00000007,0x0000002c,0x00000007,0x0004003b,0x00000007,0x00000032,
-        0x00000007,0x0004003b,0x00000007,0x00000037,0x00000007,0x00050041,0x00000007,0x0000002f,
-        0x0000000f,0x0000002e,0x0004003d,0x00000006,0x00000030,0x0000002f,0x0003003e,0x0000002c,
-        0x00000030,0x00050039,0x00000006,0x00000031,0x0000000a,0x0000002c,0x00050041,0x00000007,
-        0x00000034,0x0000000f,0x00000033,0x0004003d,0x00000006,0x00000035,0x00000034,0x0003003e,
-        0x00000032,0x00000035,0x00050039,0x00000006,0x00000036,0x0000000a,0x00000032,0x00050041,
-        0x00000007,0x00000039,0x0000000f,0x00000038,0x0004003d,0x00000006,0x0000003a,0x00000039,
-        0x0003003e,0x00000037,0x0000003a,0x00050039,0x00000006,0x0000003b,0x0000000a,0x00000037,
-        0x00060050,0x0000000c,0x0000003c,0x00000031,0x00000036,0x0000003b,0x000200fe,0x0000003c,
-        0x00010038,0x00050036,0x00000012,0x00000016,0x00000000,0x00000014,0x00030037,0x00000013,
-        0x00000015,0x000200f8,0x00000017,0x0004003b,0x0000000d,0x0000003f,0x00000007,0x0004003d,
-        0x00000012,0x00000040,0x00000015,0x0008004f,0x0000000c,0x00000041,0x00000040,0x00000040,
-        0x00000000,0x00000001,0x00000002,0x0003003e,0x0000003f,0x00000041,0x00050039,0x0000000c,
-        0x00000042,0x00000010,0x0000003f,0x00050041,0x00000007,0x00000044,0x00000015,0x00000043,
-        0x0004003d,0x00000006,0x00000045,0x00000044,0x00050051,0x00000006,0x00000046,0x00000042,
-        0x00000000,0x00050051,0x00000006,0x00000047,0x00000042,0x00000001,0x00050051,0x00000006,
-        0x00000048,0x00000042,0x00000002,0x00070050,0x00000012,0x00000049,0x00000046,0x00000047,
-        0x00000048,0x00000045,0x000200fe,0x00000049,0x00010038,
-    };
-    w.assign(kLiftedIdvsFragSpv, kLiftedIdvsFragSpv + (sizeof(kLiftedIdvsFragSpv) / sizeof(uint32_t)));
-}
-
-static void load_lifted_spirv_pair(const PendingIDVSJob& job,
-                                   std::vector<uint32_t>& out_vs,
-                                   std::vector<uint32_t>& out_fs) {
-    if (!job.pos_spirv.empty() && !job.frag_spirv.empty()) {
-        out_vs = job.pos_spirv;
-        out_fs = job.frag_spirv;
-    }
-    if (job.pos_insn_count >= 4 && job.var_insn_count >= 4 && job.primary_buf_size >= 1024) {
-        build_valhall_idvs_vertex_spirv(out_vs);
-        build_valhall_idvs_fragment_spirv(out_fs);
-    }
-}
-
 static void ensure_guest_texture_uploaded_locked(const PendingIDVSJob& job) {
     if (g_vvr.tex_uploaded) return;
 
@@ -851,20 +694,31 @@ static void ensure_guest_texture_uploaded_locked(const PendingIDVSJob& job) {
 static bool ensure_gfx_pipeline_locked(const PendingIDVSJob& job) {
     if (g_vvr.gfx_pipeline != VK_NULL_HANDLE) return true;
 
-    std::vector<uint32_t> vs_words, fs_words;
-    load_lifted_spirv_pair(job, vs_words, fs_words);
-    if (vs_words.empty() || fs_words.empty()) return false;
+    std::vector<uint32_t> vs_words = job.pos_spirv;
+    std::vector<uint32_t> fs_words = job.frag_spirv;
+    if (vs_words.empty() || fs_words.empty()) {
+        std::fprintf(stderr,
+                     "[valhall_vk_renderer] ERROR: no lifted SPIR-V for graphics job "
+                     "(pos=%zu words, frag=%zu words, pos_insn=%u, frag_insn=%u)\n",
+                     vs_words.size(), fs_words.size(),
+                     job.pos_insn_count, job.frag_insn_count);
+        return false;
+    }
 
     VkShaderModule vs_mod = VK_NULL_HANDLE, fs_mod = VK_NULL_HANDLE;
     VkShaderModuleCreateInfo smci{};
     smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     smci.codeSize = vs_words.size() * sizeof(uint32_t);
     smci.pCode = vs_words.data();
-    if (g_vvr.fp_vkCreateShaderModule(g_vvr.device, &smci, nullptr, &vs_mod) != VK_SUCCESS) return false;
+    if (g_vvr.fp_vkCreateShaderModule(g_vvr.device, &smci, nullptr, &vs_mod) != VK_SUCCESS) {
+        std::fprintf(stderr, "[valhall_vk_renderer] ERROR: vkCreateShaderModule(vertex) failed\n");
+        return false;
+    }
 
     smci.codeSize = fs_words.size() * sizeof(uint32_t);
     smci.pCode = fs_words.data();
     if (g_vvr.fp_vkCreateShaderModule(g_vvr.device, &smci, nullptr, &fs_mod) != VK_SUCCESS) {
+        std::fprintf(stderr, "[valhall_vk_renderer] ERROR: vkCreateShaderModule(fragment) failed\n");
         g_vvr.fp_vkDestroyShaderModule(g_vvr.device, vs_mod, nullptr);
         return false;
     }
@@ -1001,7 +855,13 @@ static bool ensure_gfx_pipeline_locked(const PendingIDVSJob& job) {
     g_vvr.fp_vkDestroyShaderModule(g_vvr.device, vs_mod, nullptr);
     g_vvr.fp_vkDestroyShaderModule(g_vvr.device, fs_mod, nullptr);
 
-    return (res == VK_SUCCESS && g_vvr.gfx_pipeline != VK_NULL_HANDLE);
+    if (res != VK_SUCCESS || g_vvr.gfx_pipeline == VK_NULL_HANDLE) {
+        std::fprintf(stderr,
+                     "[valhall_vk_renderer] ERROR: vkCreateGraphicsPipelines failed (VkResult=%d)\n",
+                     static_cast<int>(res));
+        return false;
+    }
+    return true;
 }
 
 /*
@@ -1084,9 +944,14 @@ static void handle_csf_run_idvs(uint64_t insn, const uint64_t* cs_regs) {
                             uint8_t inner_tag = static_cast<uint8_t>((ds_words[k] >> 56) & 0xFFU);
                             uint64_t inner_va = ds_words[k] & 0x00FFFFFFFFFFFFFFULL;
                             if (inner_tag >= 0x01U && inner_tag <= 0x08U && inner_va >= 0x10000ULL &&
-                                resolve_guest_va_ptr(inner_va, 1216)) {
-                                job.primary_buf_va   = inner_va;
-                                job.primary_buf_size = 1216;
+                                resolve_guest_va_ptr(inner_va, 16)) {
+                                uint32_t inner_len = (k + 1 < 12 && ds_words[k + 1] >= 16 &&
+                                                      ds_words[k + 1] <= 65536)
+                                    ? static_cast<uint32_t>(ds_words[k + 1]) : 64U;
+                                if (resolve_guest_va_ptr(inner_va, inner_len)) {
+                                    job.primary_buf_va   = inner_va;
+                                    job.primary_buf_size = inner_len;
+                                }
                             }
                             if (k + 1 < 12) {
                                 uint8_t dt = static_cast<uint8_t>(ds_words[k] & 0xFFU);
@@ -1125,11 +990,7 @@ static void handle_csf_run_idvs(uint64_t insn, const uint64_t* cs_regs) {
                         }
                         if (job.primary_buf_va != 0) break;
                     }
-                    if (resolve_guest_va_ptr(cand_va, 1344)) {
-                        job.primary_buf_va   = cand_va;
-                        job.primary_buf_size = 1344;
-                        break;
-                    } else if (resolve_guest_va_ptr(cand_va, 64)) {
+                    if (resolve_guest_va_ptr(cand_va, 64)) {
                         job.primary_buf_va   = cand_va;
                         job.primary_buf_size = static_cast<uint32_t>(
                             (pka_words[1] >= 64 && pka_words[1] <= 65536) ? pka_words[1] : 256);
@@ -1360,7 +1221,7 @@ static void handle_csf_run_fragment(uint64_t /*insn*/, const uint64_t* cs_regs) 
     VkDescriptorBufferInfo dbi{};
     dbi.buffer = g_vvr.ubo_buf;
     dbi.offset = 0;
-    dbi.range = (job.primary_buf_size > 0) ? job.primary_buf_size : 1344;
+    dbi.range = (job.primary_buf_size > 0) ? job.primary_buf_size : 64;
 
     VkDescriptorImageInfo dii{};
     dii.sampler = g_vvr.tex_sampler;
@@ -1457,17 +1318,15 @@ static void handle_csf_run_fragment(uint64_t /*insn*/, const uint64_t* cs_regs) 
 
     const char* log_env = std::getenv("KBASE_EMU_LOG");
     if (log_env && log_env[0] && std::strcmp(log_env, "0") != 0) {
-        uint32_t non_black = 0, cube_shaded = 0;
+        uint32_t non_black = 0;
         const uint32_t* px = reinterpret_cast<const uint32_t*>(guest_rt_ptr);
         for (uint32_t i = 0; i < fb_width * fb_height; ++i) {
-            uint32_t v = px[i] & 0x00FFFFFFU;
-            if (v != 0) non_black++;
-            if (v != 0 && v != 0x00333333U) cube_shaded++;
+            if ((px[i] & 0x00FFFFFFU) != 0) non_black++;
         }
         std::fprintf(stderr,
                      "[valhall_vk_renderer] frame=%llu RUN_FRAGMENT fbd=0x%llx rt_va=0x%llx (%ux%u stride=%u) "
                      "pos_spd=0x%llx(%u insns) var_spd=0x%llx(%u insns) frag_spd=0x%llx(%u insns) "
-                     "ubo=0x%llx(%u B) -> non_black=%u/%u cube_shaded=%u\n",
+                     "ubo=0x%llx(%u B) -> non_black=%u/%u\n",
                      static_cast<unsigned long long>(fnum),
                      static_cast<unsigned long long>(fbd_va),
                      static_cast<unsigned long long>(rt_color_va),
@@ -1476,21 +1335,7 @@ static void handle_csf_run_fragment(uint64_t /*insn*/, const uint64_t* cs_regs) 
                      static_cast<unsigned long long>(job.var_exec_va), job.var_insn_count,
                      static_cast<unsigned long long>(job.frag_exec_va), job.frag_insn_count,
                      static_cast<unsigned long long>(job.primary_buf_va), job.primary_buf_size,
-                     non_black, fb_width * fb_height, cube_shaded);
-        if (fnum == 1 || fnum == 5 || fnum == 10) {
-            FILE* fp = std::fopen("/tmp/vkcube_rendered_frame.ppm", "wb");
-            if (fp) {
-                std::fprintf(fp, "P6\n%u %u\n255\n", fb_width, fb_height);
-                for (uint32_t y = 0; y < fb_height; ++y) {
-                    const uint8_t* row = guest_rt_ptr + static_cast<size_t>(y) * rt_row_pitch;
-                    for (uint32_t x = 0; x < fb_width; ++x) {
-                        uint8_t rgb[3] = {row[x * 4 + 2], row[x * 4 + 1], row[x * 4 + 0]};
-                        std::fwrite(rgb, 1, 3, fp);
-                    }
-                }
-                std::fclose(fp);
-            }
-        }
+                     non_black, fb_width * fb_height);
     }
 
     g_vvr.fp_vkDestroyBuffer(g_vvr.device, read_buf, nullptr);
