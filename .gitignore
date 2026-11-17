@@ -1,6 +1,11 @@
 # Prerequisites
 *.d
 
+# Archives
+*.zip
+!shims.zip
+predownloaded/
+
 # Compiled Object files
 *.slo
 *.lo
@@ -42,12 +47,12 @@
 build/
 Build/
 build-*/
+build-host
 
 # CMake generated files
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
-Makefile
 install_manifest.txt
 compile_commands.json
 
@@ -66,3 +71,36 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+re_scripts/
+artifacts/*
+!artifacts/.gitkeep
+!ddk/*.so
+unit_tests_edge_cases
+run_vulkan_samples_and_equivalence_suite
+test_runtime_hook_unpatched
+mesa/
+shims/
+archives/
+*.pyc
+archive.zip
+winlator_log.txt
+screenshots
+sandbox_bundles/
+logcat.txt
+wrapper_log.txt
+panthor_drm_replayer
+panthor_vk_replayer
+*.txt
+!CMakeLists.txt
+!*/CMakeLists.txt
+patch.diff
+src/aot/bin/horizon2llvm
+src/aot/horizon2llvm/horizon2llvm
+src/emulator/lifted_kbase_ko.ll
+mali_uapi_trace.jsonl
+!third_party/prebuilts/**/*.so
+!build-host
+third_party/prebuilts/llvm-21/lib
+!aot_seeds.txt
+docs/

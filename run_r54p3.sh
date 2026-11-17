@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+export DISPLAY="${DISPLAY:-:1}"
+
+VK_LAYER_PATH="$ROOT_DIR/third_party/prebuilts/bcn_layer/x86-64:$ROOT_DIR/third_party/prebuilts/compat_layer/x86-64:$ROOT_DIR/third_party/prebuilts/vulkan_wsi_layer/x86-64" \
+VK_LOADER_DEBUG=all \
+VK_INSTANCE_LAYERS="${VK_INSTANCE_LAYERS:-}" \
+AOT_SO_PROFILE_TOP_N=10 \
+AOT_SO_DEBUG_FLAGS=7 \
+LIFTED_KO_PROFILE_TOP_N=10 \
+LIFTED_KO_DEBUG_FLAGS=7 \
+MALI_KO_PROFILE_CALLS=1 \
+MALI_KO_TRACE_CALLS=1 \
+MALI_SO_PROFILE_CALLS=1 \
+MALI_SO_TRACE_CALLS=1 \
+MALI_AOT_ICD_LOG=1 \
+KBASE_EMU_LOG=1 \
+KBASE_EMU_PROFILE=1 \
+VK_ICD_FILENAMES=$PWD/build-x86-64/r54p3_decompiled_icd.x86_64.json \
+"$@"

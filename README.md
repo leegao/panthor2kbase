@@ -1,2 +1,9 @@
 # panthor2kbase
-Panthor uapi to kbase w/ libdrm stubs
+
+```bash
+make clean && make all && make test
+make coverage
+# or: ./scripts/run_coverage.sh
+make conformance
+# or: ./scripts/run_conformance.sh
+```

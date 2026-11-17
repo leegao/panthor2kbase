@@ -1,0 +1,11 @@
+{
+   "file_format_version": "1.1.2",
+   "layer": {
+      "name": "VK_LAYER_PANTHOR_capture",
+      "type": "GLOBAL",
+      "library_path": "./libVkLayer_PANTHOR_capture.so",
+      "api_version": "1.3.250",
+      "implementation_version": "1",
+      "description": "Panthor-Kbase Vulkan API & SPIR-V/Memory Capture Layer (.panvkcap)"
+   }
+}

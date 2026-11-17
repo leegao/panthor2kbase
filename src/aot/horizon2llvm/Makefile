@@ -1,0 +1,87 @@
+# Scoped-down Makefile for src/aot/horizon2llvm (AArch64-to-LLVM-IR Lifter & Core Lowering Passes)
+
+THIS_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+REPO_ROOT := $(THIS_DIR)
+LIFTER_DIR := $(THIS_DIR)
+BUILD_DIR := $(THIS_DIR)/build
+OBJ_DIR := $(BUILD_DIR)/lifter_obj
+RUNTIME_DIR := $(LIFTER_DIR)/runtime
+
+REPO_ROOT_3P := $(abspath $(LIFTER_DIR)/../../..)
+LLVM_INC := -I$(REPO_ROOT_3P)/third_party/prebuilts/llvm-21/include
+LLVM_LIB_DIR := $(REPO_ROOT_3P)/third_party/prebuilts/llvm-21/lib
+LLVM_STATIC_LIBS := $(wildcard $(LLVM_LIB_DIR)/*.a)
+# The pinned prebuilt static libs are .gitignored, so fall back to llvm-config's libLLVM.
+ifeq ($(strip $(LLVM_STATIC_LIBS)),)
+LLVM_CONFIG ?= $(shell command -v llvm-config 2>/dev/null || command -v llvm-config-21 2>/dev/null || command -v llvm-config-20 2>/dev/null)
+ifeq ($(strip $(LLVM_CONFIG)),)
+$(error No LLVM-21 found: third_party/prebuilts/llvm-21/lib is empty and no llvm-config on PATH)
+endif
+LLVM_INC := -I$(shell $(LLVM_CONFIG) --includedir)
+LLVM_LIB := -L$(shell $(LLVM_CONFIG) --libdir) -lLLVM
+else
+LLVM_LIB := -Wl,--start-group $(LLVM_STATIC_LIBS) -Wl,--end-group
+endif
+LLVM_LIB_FLAG := -lz -l:libzstd.so.1
+
+CXX ?= g++
+CC ?= gcc
+CXXFLAGS := -std=c++17 -O3 -Wall -Wextra -Wno-unused-parameter -DH2L_HAVE_LLVM_HEADERS=1 -DHORIZON2LLVM_USE_SYSTEM_LLVM_HEADERS=1 -I$(LIFTER_DIR) -I$(RUNTIME_DIR) $(LLVM_INC) $(EXTRA_CXXFLAGS) -pthread
+CFLAGS := -O2 -fPIC -fno-strict-aliasing -I$(LIFTER_DIR) -I$(RUNTIME_DIR)
+LDFLAGS := $(LLVM_LIB_FLAG) -pthread -ldl
+
+CORE_SRCS := \
+	llvm_backend.cpp \
+	aarch64/aarch64_lifter.cpp \
+	passes.cpp \
+	lowering/pass_guest_stack_alignment.cpp \
+	lowering/pass_aarch64_idiom_deconstruct.cpp \
+	lowering/pass_jump_table_lowering.cpp \
+	lowering/pass_fcmp_predicate_fusion.cpp \
+	lowering/pass_nzcv_predicate_fusion.cpp \
+	lowering/pass_nzcv_dead_flag_elim.cpp \
+	lowering/pass_link_register_elision.cpp \
+	lowering/pass_tail_call_devirt.cpp \
+	lowering/pass_aapcs64_abi_contract.cpp \
+	lowering/pass_cpu_state_promotion.cpp
+
+CORE_OBJS := $(patsubst %.cpp,$(OBJ_DIR)/%.o,$(CORE_SRCS))
+MAIN_OBJS := $(OBJ_DIR)/main.o
+SIMD_RT_OBJ := $(OBJ_DIR)/simd_rt.o
+
+LIFTER_BIN := $(BUILD_DIR)/horizon2llvm
+UNIT_BIN   := $(BUILD_DIR)/lifter_unit_tests
+
+.PHONY: all tests clean horizon2llvm
+
+all: $(LIFTER_BIN) $(UNIT_BIN)
+
+tests: $(UNIT_BIN)
+	$(UNIT_BIN)
+
+$(OBJ_DIR)/%.o: $(LIFTER_DIR)/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) -MMD -MP $(CXXFLAGS) -c $< -o $@
+
+$(SIMD_RT_OBJ): $(RUNTIME_DIR)/simd_rt.c
+	@mkdir -p $(dir $@)
+	$(CC) -MMD -MP $(CFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/test_main_snippets.o: $(LIFTER_DIR)/tests/test_main_snippets.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) -MMD -MP $(CXXFLAGS) -I$(LIFTER_DIR)/tests -c $< -o $@
+
+$(LIFTER_BIN): $(CORE_OBJS) $(MAIN_OBJS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $^ $(LLVM_LIB) $(LDFLAGS) -o $@
+
+$(UNIT_BIN): $(CORE_OBJS) $(SIMD_RT_OBJ) $(OBJ_DIR)/test_main_snippets.o
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $^ $(LLVM_LIB) $(LDFLAGS) -lm -o $@
+
+horizon2llvm: $(LIFTER_BIN)
+
+clean:
+	rm -rf $(BUILD_DIR)
+
+-include $(OBJ_DIR)/*.d $(OBJ_DIR)/lowering/*.d
